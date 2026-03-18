@@ -48,7 +48,7 @@ struct PathTracerConfig {
     float cloudVisibility    = 50.0f;   // km (Koschmieder)
 
     // Path tracing quality
-    int   maxBounces         = 8;       // 1-8 bounces
+    int   maxBounces         = 2;       // 1-8 bounces (default 2)
 
     // Debug
     int   debugView          = 0;       // 0 = off, >0 = debug view mode

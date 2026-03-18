@@ -640,12 +640,17 @@ void main() {
             else specularRadiance += emissionContrib;
         }
 
+        // ---- NEE throughput early-out (skip shadow rays when contribution is negligible) ----
+        float maxThroughput = max(throughput.r, max(throughput.g, throughput.b));
+        bool skipSunNEE = (bounce >= 2 && maxThroughput < 0.01);
+        bool skipLocalNEE = (bounce >= 2);  // point/spot/emissive only on bounce 0-1
+
         // ---- NEE: Direct sun light ----
         vec3 sunDir = normalize(cam.sunLight.xyz);
         float sunIntensity = cam.sunLight.w;
         vec3 sunColor = cam.skyLight.rgb;
 
-        if (sunIntensity > 0.0 && sunDir.y > -0.01) {
+        if (!skipSunNEE && sunIntensity > 0.0 && sunDir.y > -0.01) {
             float NdotL = dot(N, sunDir);
             if (NdotL > 0.0) {
                 // Shadow ray with alpha test support
@@ -765,7 +770,8 @@ void main() {
             }
         }
 
-        // ---- NEE: Point/spot/area lights ----
+        // ---- NEE: Point/spot/area lights (bounce 0-1 only) ----
+        if (!skipLocalNEE)
         for (uint li = 0u; li < cam.lightCount && li < 8u; li++) {
             vec4 lightPosRange = cam.lights[li * 4u];
             vec4 lightColInt   = cam.lights[li * 4u + 1u];
@@ -901,9 +907,9 @@ void main() {
             }
         }
 
-        // ---- NEE: Emissive triangle lights (MIS) ----
+        // ---- NEE: Emissive triangle lights (MIS, bounce 0-1 only) ----
         uint emissiveTriCount = cam.lightPad0;
-        if (emissiveTriCount > 0u) {
+        if (!skipLocalNEE && emissiveTriCount > 0u) {
             EmissiveSample eSample = sampleEmissiveTriangle(emissiveTriCount, rand01(), rand2());
             if (eSample.pdf > 0.0) {
                 vec3 toEmissive = eSample.position - pbrHit.worldPos;

@@ -28,6 +28,10 @@ bool AccelStructureBuilder::Initialize(Context* context) {
         vkGetDeviceProcAddr(device, "vkGetAccelerationStructureDeviceAddressKHR");
     vkGetBufferDeviceAddressKHR_ = (PFN_vkGetBufferDeviceAddressKHR)
         vkGetDeviceProcAddr(device, "vkGetBufferDeviceAddressKHR");
+    vkCmdCopyAccelerationStructureKHR_ = (PFN_vkCmdCopyAccelerationStructureKHR)
+        vkGetDeviceProcAddr(device, "vkCmdCopyAccelerationStructureKHR");
+    vkCmdWriteAccelerationStructuresPropertiesKHR_ = (PFN_vkCmdWriteAccelerationStructuresPropertiesKHR)
+        vkGetDeviceProcAddr(device, "vkCmdWriteAccelerationStructuresPropertiesKHR");
 
     if (!vkGetAccelerationStructureBuildSizesKHR_ || !vkCreateAccelerationStructureKHR_ ||
         !vkCmdBuildAccelerationStructuresKHR_ || !vkGetBufferDeviceAddressKHR_) {
@@ -234,6 +238,11 @@ int AccelStructureBuilder::BuildBLAS(const float* vertices, uint32_t vertexCount
     if (allowUpdate) {
         buildInfo.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
     }
+    // Enable compaction for static BLAS (saves ~40-60% VRAM)
+    bool canCompact = !allowUpdate && vkCmdCopyAccelerationStructureKHR_ && vkCmdWriteAccelerationStructuresPropertiesKHR_;
+    if (canCompact) {
+        buildInfo.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR;
+    }
     buildInfo.geometryCount = 1;
     buildInfo.pGeometries = &geometry;
 
@@ -285,6 +294,62 @@ int AccelStructureBuilder::BuildBLAS(const float* vertices, uint32_t vertexCount
     context_->EndSingleTimeCommands(cmd);
 
     DestroyAccelBuffer(scratchBuf);
+
+    // BVH compaction: query compacted size, copy to smaller buffer
+    if (canCompact) {
+        VkQueryPoolCreateInfo queryPoolInfo{};
+        queryPoolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        queryPoolInfo.queryType = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR;
+        queryPoolInfo.queryCount = 1;
+        VkQueryPool queryPool;
+        if (vkCreateQueryPool(device, &queryPoolInfo, nullptr, &queryPool) == VK_SUCCESS) {
+            vkResetQueryPool(device, queryPool, 0, 1);
+
+            cmd = context_->BeginSingleTimeCommands();
+            vkCmdWriteAccelerationStructuresPropertiesKHR_(cmd,
+                1, &blas, VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR, queryPool, 0);
+            context_->EndSingleTimeCommands(cmd);
+
+            VkDeviceSize compactedSize = 0;
+            vkGetQueryPoolResults(device, queryPool, 0, 1, sizeof(VkDeviceSize),
+                &compactedSize, sizeof(VkDeviceSize), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            vkDestroyQueryPool(device, queryPool, nullptr);
+
+            if (compactedSize > 0 && compactedSize < sizeInfo.accelerationStructureSize) {
+                AccelBuffer compactBuf = CreateAccelBuffer(compactedSize,
+                    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+                VkAccelerationStructureCreateInfoKHR compactCreateInfo{};
+                compactCreateInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+                compactCreateInfo.buffer = compactBuf.buffer;
+                compactCreateInfo.size = compactedSize;
+                compactCreateInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+
+                VkAccelerationStructureKHR compactBlas;
+                if (vkCreateAccelerationStructureKHR_(device, &compactCreateInfo, nullptr, &compactBlas) == VK_SUCCESS) {
+                    VkCopyAccelerationStructureInfoKHR copyInfo{};
+                    copyInfo.sType = VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR;
+                    copyInfo.src = blas;
+                    copyInfo.dst = compactBlas;
+                    copyInfo.mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR;
+
+                    cmd = context_->BeginSingleTimeCommands();
+                    vkCmdCopyAccelerationStructureKHR_(cmd, &copyInfo);
+                    context_->EndSingleTimeCommands(cmd);
+
+                    // Replace original with compacted version
+                    vkDestroyAccelerationStructureKHR_(device, blas, nullptr);
+                    DestroyAccelBuffer(asBuf);
+                    blas = compactBlas;
+                    asBuf = compactBuf;
+                } else {
+                    DestroyAccelBuffer(compactBuf);
+                }
+            }
+        }
+    }
 
     // Get device address
     VkAccelerationStructureDeviceAddressInfoKHR addressInfo{};
