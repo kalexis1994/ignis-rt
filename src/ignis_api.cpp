@@ -509,6 +509,7 @@ IGNIS_API void ignis_set_int(const char* key, int value) {
     else if (strcmp(key, "nrd_history_fix_frames") == 0) cfg->nrdHistoryFixFrameNum = (value < 0 ? 0 : (value > 6 ? 6 : value));
     else if (strcmp(key, "max_bounces") == 0)       cfg->maxBounces = (value < 1 ? 1 : (value > 8 ? 8 : value));
     else if (strcmp(key, "shader_mode") == 0)       cfg->shaderMode = value;
+    else if (strcmp(key, "use_wavefront") == 0)    cfg->useWavefront = (value != 0);
 }
 
 IGNIS_API int ignis_get_int(const char* key) {
@@ -527,6 +528,7 @@ IGNIS_API int ignis_get_int(const char* key) {
     if (strcmp(key, "max_bounces") == 0)       return cfg->maxBounces;
     if (strcmp(key, "debug_view") == 0)        return cfg->debugView;
     if (strcmp(key, "shader_mode") == 0)       return cfg->shaderMode;
+    if (strcmp(key, "use_wavefront") == 0)    return cfg->useWavefront ? 1 : 0;
 
     return 0;
 }

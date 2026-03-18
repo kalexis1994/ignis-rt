@@ -425,6 +425,9 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                     _log(f" DLSS enabled, quality={props.dlss_quality}, Ray Reconstruction=ON")
                 else:
                     _log(f" DLSS enabled, quality={props.dlss_quality}")
+            if props.use_wavefront:
+                dll_wrapper.set_int("use_wavefront", 1)
+                _log(f" Wavefront path tracing enabled")
         except Exception:
             pass
 

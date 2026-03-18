@@ -170,6 +170,13 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         default=False,
     )
 
+    # -- Experimental --
+    use_wavefront: BoolProperty(
+        name="Wavefront Path Tracing",
+        description="Experimental: compute-based multi-kernel path tracing for better GPU occupancy",
+        default=False,
+    )
+
     # -- Performance --
     fps_limit: IntProperty(
         name="FPS Limit", default=0, min=0, max=240,
@@ -228,6 +235,8 @@ class IGNIS_PT_sampling(bpy.types.Panel):
         col.active = props.dlss_enabled
         col.prop(props, "dlss_quality")
         col.prop(props, "dlss_rr_enabled")
+        layout.separator()
+        layout.prop(props, "use_wavefront")
         layout.separator()
         layout.prop(props, "fps_limit")
         layout.prop(props, "show_fps")
