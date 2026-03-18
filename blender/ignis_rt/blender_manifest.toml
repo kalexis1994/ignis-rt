@@ -1,0 +1,18 @@
+schema_version = "1.0.0"
+
+id = "ignis_rt"
+version = "0.0.1"
+name = "Ignis RT"
+tagline = "Real-time Vulkan path tracing render engine"
+maintainer = "kalexis1994"
+type = "add-on"
+license = ["SPDX:GPL-3.0-or-later"]
+
+website = "https://github.com/kalexis1994/ignis-rt"
+
+blender_version_min = "4.2.0"
+
+platforms = ["windows-x64"]
+
+[permissions]
+files = "Read/write log files and load shaders from disk"

@@ -3,7 +3,7 @@
 bl_info = {
     "name": "Ignis RT",
     "author": "Alexis",
-    "version": (0, 1, 0),
+    "version": (0, 0, 1),
     "blender": (4, 0, 0),
     "category": "Render",
     "description": "Vulkan ray tracing render engine (viewport preview)",
