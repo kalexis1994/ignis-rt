@@ -386,6 +386,9 @@ void RTPipeline::Shutdown() {
     }
     if (prevTransformsMemory_) { vkFreeMemory(device, prevTransformsMemory_, nullptr); prevTransformsMemory_ = VK_NULL_HANDLE; }
     prevTransformsCapacity_ = 0;
+    if (emissiveTriBuffer_) { vkDestroyBuffer(device, emissiveTriBuffer_, nullptr); emissiveTriBuffer_ = VK_NULL_HANDLE; }
+    if (emissiveTriMemory_) { vkFreeMemory(device, emissiveTriMemory_, nullptr); emissiveTriMemory_ = VK_NULL_HANDLE; }
+    emissiveTriCount_ = 0;
     if (pipeline_) { vkDestroyPipeline(device, pipeline_, nullptr); pipeline_ = VK_NULL_HANDLE; }
     if (pipelineLayout_) { vkDestroyPipelineLayout(device, pipelineLayout_, nullptr); pipelineLayout_ = VK_NULL_HANDLE; }
     if (descriptorPool_) { vkDestroyDescriptorPool(device, descriptorPool_, nullptr); descriptorPool_ = VK_NULL_HANDLE; }
@@ -916,14 +919,19 @@ bool RTPipeline::CreateDescriptorSetLayout() {
     bindings[25].descriptorCount = 1;
     bindings[25].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
 
-    // bindings 26-27: reserved (dummy storage images for future use)
-    for (int i = 26; i <= 27; i++) {
-        bindings[i] = {};
-        bindings[i].binding = i;
-        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        bindings[i].descriptorCount = 1;
-        bindings[i].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
-    }
+    // binding 26: emissive triangles SSBO (MIS)
+    bindings[26] = {};
+    bindings[26].binding = 26;
+    bindings[26].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[26].descriptorCount = 1;
+    bindings[26].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
+    // binding 27: reserved (dummy storage image for future use)
+    bindings[27] = {};
+    bindings[27].binding = 27;
+    bindings[27].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bindings[27].descriptorCount = 1;
+    bindings[27].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
 
     // binding 28: prevTransforms SSBO (dummy for now — needed for dynamic objects)
     bindings[28] = {};
@@ -1153,9 +1161,9 @@ bool RTPipeline::CreateSBT() {
 bool RTPipeline::CreateDescriptorPool() {
     VkDescriptorPoolSize poolSizes[] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 22},   // 13 base + 2 reserved(26-27) + 3 masks(29-31) + padding
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 21},   // 13 base + 1 reserved(27) + 3 masks(29-31) + padding
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},   // 3 base + 2 SHARC + 1 prevTransforms(28) + 2 GI reservoir(24-25)
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9},   // 3 base + 2 SHARC + 1 prevTransforms(28) + 2 GI reservoir(24-25) + 1 emissive(26)
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1034},  // 1024 textures + 10 other samplers
     };
 
@@ -1441,12 +1449,24 @@ bool RTPipeline::CreateDescriptorSet() {
         wr.pBufferInfo = &geomInfo;  // reuse dummy buffer
         writes.push_back(wr);
     }
-    // bindings 26-27: reserved storage images (dummy)
-    for (int i = 26; i <= 27; i++) {
+    // binding 26: emissive triangles SSBO (dummy)
+    {
         VkWriteDescriptorSet wr{};
         wr.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         wr.dstSet = descriptorSet_;
-        wr.dstBinding = i;
+        wr.dstBinding = 26;
+        wr.descriptorCount = 1;
+        wr.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        wr.pBufferInfo = &geomInfo;  // reuse dummy buffer
+        writes.push_back(wr);
+    }
+
+    // binding 27: reserved storage image (dummy)
+    {
+        VkWriteDescriptorSet wr{};
+        wr.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr.dstSet = descriptorSet_;
+        wr.dstBinding = 27;
         wr.descriptorCount = 1;
         wr.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         wr.pImageInfo = &dummyImage16fInfo;
@@ -1701,6 +1721,61 @@ void RTPipeline::UpdateMaterialBuffer(const GPUMaterial* materials, uint32_t cou
 
     vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
     Log(L"[VK RTPipeline] Material buffer updated: %u materials\n", count);
+}
+
+void RTPipeline::UpdateEmissiveTriangleBuffer(const float* data, uint32_t triangleCount) {
+    if (!data || triangleCount == 0) {
+        emissiveTriCount_ = 0;
+        return;
+    }
+
+    VkDevice device = context_->GetDevice();
+    VkDeviceSize bufSize = triangleCount * 16 * sizeof(float);  // 16 floats per triangle
+
+    // Recreate if needed
+    if (emissiveTriBuffer_) { vkDestroyBuffer(device, emissiveTriBuffer_, nullptr); }
+    if (emissiveTriMemory_) { vkFreeMemory(device, emissiveTriMemory_, nullptr); }
+
+    VkBufferCreateInfo bufInfo{};
+    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufInfo.size = bufSize;
+    bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    vkCreateBuffer(device, &bufInfo, nullptr, &emissiveTriBuffer_);
+
+    VkMemoryRequirements memReqs;
+    vkGetBufferMemoryRequirements(device, emissiveTriBuffer_, &memReqs);
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = context_->FindMemoryType(memReqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    vkAllocateMemory(device, &allocInfo, nullptr, &emissiveTriMemory_);
+    vkBindBufferMemory(device, emissiveTriBuffer_, emissiveTriMemory_, 0);
+
+    void* mapped;
+    vkMapMemory(device, emissiveTriMemory_, 0, bufSize, 0, &mapped);
+    memcpy(mapped, data, bufSize);
+    vkUnmapMemory(device, emissiveTriMemory_);
+
+    emissiveTriCount_ = triangleCount;
+
+    // Update descriptor binding 26
+    VkDescriptorBufferInfo emissiveInfo{};
+    emissiveInfo.buffer = emissiveTriBuffer_;
+    emissiveInfo.offset = 0;
+    emissiveInfo.range = bufSize;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = descriptorSet_;
+    write.dstBinding = 26;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &emissiveInfo;
+
+    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+    Log(L"[VK RTPipeline] Emissive triangle buffer updated: %u triangles\n", triangleCount);
 }
 
 void RTPipeline::UpdatePrevTransforms(const float* transforms, uint32_t instanceCount) {

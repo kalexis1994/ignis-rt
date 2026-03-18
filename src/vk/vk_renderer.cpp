@@ -421,6 +421,12 @@ void Renderer::UploadMaterialBuffer(const void* materials, uint32_t count) {
     }
 }
 
+void Renderer::UploadEmissiveTriangles(const float* data, uint32_t triangleCount) {
+    if (rtPipeline_) {
+        rtPipeline_->UpdateEmissiveTriangleBuffer(data, triangleCount);
+    }
+}
+
 void Renderer::UpdateTextureDescriptors(void* texManager) {
     if (rtPipeline_) {
         rtPipeline_->UpdateTextureDescriptors(static_cast<vk::TextureManager*>(texManager));

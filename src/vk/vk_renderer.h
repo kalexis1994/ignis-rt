@@ -38,6 +38,7 @@ public:
     bool UploadBLASPrimitiveMaterials(int blasIndex, const uint32_t* materialIds, uint32_t primitiveCount);
     bool UploadBLASPrimitiveYBounds(int blasIndex, const float* yBounds, uint32_t primitiveCount);
     void UploadMaterialBuffer(const void* materials, uint32_t count);
+    void UploadEmissiveTriangles(const float* data, uint32_t triangleCount);
     void UpdateTextureDescriptors(void* texManager);
     bool BuildTLASInstanced(const std::vector<vk::TLASInstance>& instances);
     void UpdateCamera(const CameraUBO& camera);

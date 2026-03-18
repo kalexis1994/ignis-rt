@@ -134,6 +134,9 @@ def load():
     _lib.ignis_upload_lights.argtypes = [POINTER(c_float), c_uint32]
     _lib.ignis_upload_lights.restype = None
 
+    _lib.ignis_upload_emissive_triangles.argtypes = [POINTER(c_float), c_uint32]
+    _lib.ignis_upload_emissive_triangles.restype = None
+
     # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
@@ -274,8 +277,18 @@ def upload_mesh_primitive_materials(blas_handle: int, material_ids, primitive_co
         c_uint32(primitive_count))
 
 
+def upload_emissive_triangles(data, count: int):
+    """Upload emissive triangle data for MIS. data = flat float array (16 per tri)."""
+    if count == 0:
+        arr = (c_float * 1)(0.0)
+        _lib.ignis_upload_emissive_triangles(arr, c_uint32(0))
+        return
+    arr = (c_float * len(data))(*data)
+    _lib.ignis_upload_emissive_triangles(arr, c_uint32(count))
+
+
 def upload_lights(light_data_floats, count: int):
-    """Upload point/spot lights. light_data_floats = flat list of floats (8 per light)."""
+    """Upload point/spot/area lights. light_data_floats = flat list of floats (16 per light)."""
     if count == 0:
         arr = (c_float * 1)(0.0)
         _lib.ignis_upload_lights(arr, c_uint32(0))

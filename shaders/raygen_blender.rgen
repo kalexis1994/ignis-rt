@@ -34,7 +34,7 @@ layout(binding = 2, set = 0) uniform CameraProperties {
     // Point/spot lights
     uint lightCount;
     uint lightPad0, lightPad1, lightPad2;
-    vec4 lights[16]; // 8 lights × 2 vec4s: [pos.xyz+range, color.rgb+intensity]
+    vec4 lights[32]; // 8 lights × 4 vec4s: [pos.xyz+range, col.rgb+intensity, dir.xyz+sizeX, tan.xyz+sizeY]
 } cam;
 
 // Geometry metadata
@@ -135,6 +135,12 @@ layout(binding = 21, set = 0, std430) buffer SHARCReadBuffer  { uint sharcReadDa
 layout(binding = 24, set = 0, std430) buffer GIReservoirCurrBuf { vec4 data[]; } giReservoirCurr;
 layout(binding = 25, set = 0, std430) buffer GIReservoirPrevBuf { vec4 data[]; } giReservoirPrev;
 
+// Emissive triangles for MIS (16 floats per triangle)
+// Layout: [v0.xyz, area, v1.xyz, cdf, v2.xyz, totalPower, emission.rgb, pad]
+layout(binding = 26, set = 0, std430) buffer EmissiveTriBuf {
+    vec4 data[];  // 4 vec4s per triangle
+} emissiveTris;
+
 // Per-instance previous-frame transforms (3 vec4s per instance: row0, row1, row2 of 3x4 row-major)
 layout(binding = 28, set = 0, std430) buffer PrevTransformBuf {
     vec4 data[];  // 3 vec4s per instance
@@ -221,6 +227,11 @@ vec3 proceduralSky(vec3 dir, vec3 sunDirL, vec3 ambColor, vec3 sunTint) {
 }
 
 vec3 evaluateSky(vec3 dir) {
+    float sunIntensitySky = cam.sunLight.w;
+
+    // No sun in scene → black sky (no procedural sky without a sun)
+    if (sunIntensitySky <= 0.0) return vec3(0.0);
+
     vec3 sunDir = normalize(cam.sunLight.xyz);
     vec3 ambColor = cam.ambientLight.rgb;
     vec3 sunTint = cam.skyLight.rgb;
@@ -297,15 +308,55 @@ PBRHit evaluateBlenderMaterial(
     if (mat.normalTexIndex != 0xFFFFFFFFu) {
         vec3 T, B;
         computeTBN(v0, v1, v2, uv0, uv1, uv2, N, T, B);
-        vec3 texN = texture(textures[nonuniformEXT(mat.normalTexIndex)], uv).rgb;
-        float strength = mat.detailNormalBlend > 0.0 ? mat.detailNormalBlend : 1.0;
-        N = applyNormalMap(texN, T, N, B, strength);
+        float rawStrength = mat.detailNormalBlend;
+
+        if (rawStrength < 0.0) {
+            // Negative strength = bump/height map (Cycles-style)
+            // Cycles formula (svm_node_set_bump in displace.h):
+            //   Rx = cross(dP.dy, N), Ry = cross(N, dP.dx)
+            //   det = dot(dP.dx, Rx)
+            //   surfgrad = (h_x - h_c) * Rx + (h_y - h_c) * Ry
+            //   N' = normalize(|det| * N - distance * sign(det) * surfgrad)
+            //   N_final = normalize(strength * N' + (1 - strength) * N)
+
+            // Decode packed: abs(rawStrength) = strength + distance * 100
+            // e.g. Strength=0.06, Distance=0.1 → 0.06 + 10.0 = 10.06
+            float packed = abs(rawStrength);
+            float bumpDistance = floor(packed) / 100.0;  // 10 / 100 = 0.1
+            float bumpStrength = fract(packed);          // 0.06
+
+            ivec2 texDim = textureSize(textures[nonuniformEXT(mat.normalTexIndex)], 0);
+            float texelSize = 1.0 / float(max(texDim.x, texDim.y));
+            float h_c = texture(textures[nonuniformEXT(mat.normalTexIndex)], uv).r;
+            float h_x = texture(textures[nonuniformEXT(mat.normalTexIndex)], uv + vec2(texelSize, 0)).r;
+            float h_y = texture(textures[nonuniformEXT(mat.normalTexIndex)], uv + vec2(0, texelSize)).r;
+
+            // Cycles uses ray differentials to auto-scale bump. Without them,
+            // we normalize T/B and use a scale that approximates Cycles' result.
+            // The per-texel height differences are very small, so we amplify by
+            // sqrt(texDim) which approximates the dP/texel relationship.
+            vec3 Tn = normalize(T);
+            vec3 Bn = normalize(B);
+            float texScale = pow(float(max(texDim.x, texDim.y)), 0.65);
+            vec3 surfgrad = (h_x - h_c) * Tn + (h_y - h_c) * Bn;
+
+            // Cycles: N' = normalize(N - distance * surfgrad_scaled)
+            vec3 bumpN = normalize(N - bumpDistance * texScale * surfgrad);
+
+            // Cycles: N_final = normalize(strength * N' + (1-strength) * N)
+            N = normalize(bumpStrength * bumpN + (1.0 - bumpStrength) * N);
+        } else {
+            // Positive strength = RGB normal map
+            vec3 texN = texture(textures[nonuniformEXT(mat.normalTexIndex)], uv).rgb;
+            float strength = rawStrength > 0.0 ? rawStrength : 1.0;
+            N = applyNormalMap(texN, T, N, B, strength);
+        }
     }
     hit.worldNormal = N;
 
     // Emission (with optional emission texture)
-    // Blender's emission strength is in W/m²/sr. Scale by PI to match
-    // Cycles' Lambertian emission convention (total hemispherical power = strength * PI).
+    // Multiply by PI to compensate the BRDF's 1/PI diffuse term in indirect
+    // bounces, so emission_strength=1 matches Cycles perceived brightness.
     vec3 emissionColor = vec3(mat.emissiveR, mat.emissiveG, mat.emissiveB);
     if (mat.detailTexIndex != 0xFFFFFFFFu) {
         emissionColor *= texture(textures[nonuniformEXT(mat.detailTexIndex)], uv).rgb;
@@ -313,6 +364,78 @@ PBRHit evaluateBlenderMaterial(
     hit.emission = emissionColor * mat.fresnelMaxLevel * PI;
 
     return hit;
+}
+
+// ============================================================
+// Emissive Triangle MIS Sampling
+// ============================================================
+
+struct EmissiveSample {
+    vec3 position;
+    vec3 emission;
+    vec3 normal;
+    float pdf;
+    float area;
+};
+
+// Sample an emissive triangle using CDF binary search
+EmissiveSample sampleEmissiveTriangle(uint triCount, float rnd, vec2 baryRnd) {
+    EmissiveSample s;
+    s.pdf = 0.0;
+    s.emission = vec3(0.0);
+    s.normal = vec3(0, 1, 0);
+    s.position = vec3(0.0);
+    s.area = 0.0;
+
+    if (triCount == 0u) return s;
+
+    // Binary search CDF to select triangle
+    uint lo = 0u, hi = triCount - 1u;
+    while (lo < hi) {
+        uint mid = (lo + hi) / 2u;
+        float cdf = emissiveTris.data[mid * 4u + 1u].w;  // v1.w = cdf
+        if (rnd <= cdf)
+            hi = mid;
+        else
+            lo = mid + 1u;
+    }
+    uint idx = lo;
+    uint base = idx * 4u;
+
+    vec4 d0 = emissiveTris.data[base + 0u];  // v0.xyz, area
+    vec4 d1 = emissiveTris.data[base + 1u];  // v1.xyz, cdf
+    vec4 d2 = emissiveTris.data[base + 2u];  // v2.xyz, totalPower
+    vec4 d3 = emissiveTris.data[base + 3u];  // emission.rgb, pad
+
+    vec3 v0 = d0.xyz;
+    vec3 v1 = d1.xyz;
+    vec3 v2 = d2.xyz;
+    s.area = d0.w;
+    float totalPower = d2.w;
+    s.emission = d3.xyz;
+
+    // CDF probability for this triangle
+    float prevCdf = (idx > 0u) ? emissiveTris.data[(idx - 1u) * 4u + 1u].w : 0.0;
+    float triProb = d1.w - prevCdf;
+
+    // Uniform barycentric sampling on triangle
+    float u = baryRnd.x;
+    float v = baryRnd.y;
+    if (u + v > 1.0) {
+        u = 1.0 - u;
+        v = 1.0 - v;
+    }
+    s.position = v0 * (1.0 - u - v) + v1 * u + v2 * v;
+
+    // Triangle normal (unnormalized cross product direction)
+    vec3 edge1 = v1 - v0;
+    vec3 edge2 = v2 - v0;
+    s.normal = normalize(cross(edge1, edge2));
+
+    // PDF = triProb / area (probability of this point on this triangle)
+    s.pdf = (s.area > 0.0) ? triProb / s.area : 0.0;
+
+    return s;
 }
 
 // ============================================================
@@ -450,10 +573,10 @@ void main() {
         // Transform normal to world space (use transpose of inverse = normalMatrix)
         vec3 worldN = normalize(mat3(objToWorld) * localN);
 
-        // UVs
-        vec2 uv0_ = vec2(uvData.uv[i0*2+0], uvData.uv[i0*2+1]);
-        vec2 uv1_ = vec2(uvData.uv[i1*2+0], uvData.uv[i1*2+1]);
-        vec2 uv2_ = vec2(uvData.uv[i2*2+0], uvData.uv[i2*2+1]);
+        // UVs (flip V: Blender V=0 bottom, stb_image/Vulkan V=0 top)
+        vec2 uv0_ = vec2(uvData.uv[i0*2+0], 1.0 - uvData.uv[i0*2+1]);
+        vec2 uv1_ = vec2(uvData.uv[i1*2+0], 1.0 - uvData.uv[i1*2+1]);
+        vec2 uv2_ = vec2(uvData.uv[i2*2+0], 1.0 - uvData.uv[i2*2+1]);
         vec2 hitUV = uv0_ * bary.x + uv1_ * bary.y + uv2_ * bary.z;
 
         // Fetch material
@@ -503,8 +626,10 @@ void main() {
         }
 
         // ---- Accumulate emission ----
-        // Emission always goes to diffuseRadiance so NRD preserves it
-        // and the composite shader includes it in the final output.
+        // Emission always goes to diffuseRadiance so NRD preserves it.
+        // TODO: BSDF-side MIS weight requires searching the emissive triangle buffer
+        // to find the exact light PDF. For now, pass emission unweighted — the NEE side
+        // already has correct MIS weights which partially compensate for double-counting.
         vec3 emissionContrib = pbrHit.emission * throughput;
         if (bounce == 0) {
             diffuseRadiance += emissionContrib;
@@ -549,10 +674,16 @@ void main() {
                     }
                     Material sMat = materialBuffer.materials[sMatIdx];
 
-                    if ((sMat.flags & 1u) == 0u) {
-                        inShadow = true; // Opaque — in shadow
+                    if ((sMat.flags & 3u) == 0u) {
+                        inShadow = true; // Opaque (no alpha test, no transmission)
                         shadowHitDist = sHitT;
                         break;
+                    }
+
+                    // Transmission (Glass): let shadow ray pass through
+                    if ((sMat.flags & 2u) != 0u) {
+                        shadowOrigin = shadowOrigin + sunDir * (sHitT + 0.004);
+                        continue;
                     }
 
                     // Sample alpha at shadow hit
@@ -563,9 +694,9 @@ void main() {
                     uint si0 = sIdx.i[sPrimId * 3 + 0];
                     uint si1 = sIdx.i[sPrimId * 3 + 1];
                     uint si2 = sIdx.i[sPrimId * 3 + 2];
-                    vec2 sUV = vec2(sUVs.uv[si0*2], sUVs.uv[si0*2+1]) * sBary.x
-                             + vec2(sUVs.uv[si1*2], sUVs.uv[si1*2+1]) * sBary.y
-                             + vec2(sUVs.uv[si2*2], sUVs.uv[si2*2+1]) * sBary.z;
+                    vec2 sUV = vec2(sUVs.uv[si0*2], 1.0 - sUVs.uv[si0*2+1]) * sBary.x
+                             + vec2(sUVs.uv[si1*2], 1.0 - sUVs.uv[si1*2+1]) * sBary.y
+                             + vec2(sUVs.uv[si2*2], 1.0 - sUVs.uv[si2*2+1]) * sBary.z;
 
                     float sAlpha = sMat.multG;
                     if (sMat.diffuseTexIndex != 0xFFFFFFFFu) {
@@ -621,15 +752,22 @@ void main() {
             }
         }
 
-        // ---- NEE: Point/spot lights (soft shadows via area sampling) ----
+        // ---- NEE: Point/spot/area lights ----
         for (uint li = 0u; li < cam.lightCount && li < 8u; li++) {
-            vec4 lightPosRange = cam.lights[li * 2u];
-            vec4 lightColInt   = cam.lights[li * 2u + 1u];
+            vec4 lightPosRange = cam.lights[li * 4u];
+            vec4 lightColInt   = cam.lights[li * 4u + 1u];
+            vec4 lightDirSizeX = cam.lights[li * 4u + 2u];
+            vec4 lightTanSizeY = cam.lights[li * 4u + 3u];
 
             vec3 lightPos   = lightPosRange.xyz;
-            float lightRange = lightPosRange.w;
+            float rawRange  = lightPosRange.w;
             vec3 lightColor = lightColInt.rgb;
             float lightInt  = lightColInt.w;
+
+            // Negative range = area light
+            bool isAreaLight = (rawRange < 0.0);
+            float lightRange = isAreaLight ? max(sqrt(lightInt / 0.01), 1.0) : rawRange;
+            lightRange = min(lightRange, 100.0);
 
             vec3 toLight = lightPos - pbrHit.worldPos;
             float dist = length(toLight);
@@ -638,39 +776,98 @@ void main() {
             float NdotL_pt = dot(N, L);
             if (NdotL_pt <= 0.0) continue;
 
+            // Area light: check direction cull and sample on the light plane
+            vec3 jitteredTarget;
+            if (isAreaLight) {
+                vec3 lightNormal = lightDirSizeX.xyz;
+                vec3 lightTangent = lightTanSizeY.xyz;
+                float sizeX = lightDirSizeX.w;
+                float sizeY = lightTanSizeY.w;
+
+                // Area light only emits from front face (toward -normal in Blender convention)
+                // Skip if shading point is behind the light
+                float lightFacing = dot(-L, lightNormal);
+                if (lightFacing <= 0.0) continue;
+
+                // Sample a random point on the area light rectangle
+                vec3 lightBitangent = cross(lightNormal, lightTangent);
+                vec2 areaRnd = rand2() * 2.0 - 1.0;  // [-1, 1]
+                jitteredTarget = lightPos
+                    + lightTangent * (areaRnd.x * sizeX * 0.5)
+                    + lightBitangent * (areaRnd.y * sizeY * 0.5);
+            } else {
+                // Point/spot light: small jitter for soft shadows
+                float softRadius = clamp(dist * 0.015, 0.01, 0.3);
+                vec2 diskSample = rand2();
+                float diskR = sqrt(diskSample.x) * softRadius;
+                float diskAngle = diskSample.y * 2.0 * PI;
+                vec3 lTangent = abs(L.y) < 0.999 ? normalize(cross(L, vec3(0,1,0))) : normalize(cross(L, vec3(1,0,0)));
+                vec3 lBitangent = cross(L, lTangent);
+                jitteredTarget = lightPos + lTangent * (cos(diskAngle) * diskR) + lBitangent * (sin(diskAngle) * diskR);
+            }
+
+            vec3 toSample = jitteredTarget - pbrHit.worldPos;
+            float sampleDist = length(toSample);
+            vec3 shadowDir = toSample / sampleDist;
+            float shadowDist = sampleDist;
+
+            // For area lights: use distance to sampled point for uniform emission
+            // For point lights: use distance to center (jitter is just for soft shadows)
+            float effectiveDist = isAreaLight ? sampleDist : dist;
+
             // Inverse-square falloff with windowed range
-            float falloff = 1.0 / (dist * dist + 0.01);
-            float window = clamp(1.0 - pow(dist / lightRange, 4.0), 0.0, 1.0);
+            float falloff = 1.0 / (effectiveDist * effectiveDist + 0.01);
+            float window = clamp(1.0 - pow(effectiveDist / lightRange, 4.0), 0.0, 1.0);
             window = window * window;
             float attenuation = falloff * window;
 
-            // Soft shadow: jitter target within a small sphere around light position.
-            // This simulates an area light source and produces smooth penumbra
-            // that NRD converges to cleanly instead of binary 0/1 noise.
-            float softRadius = clamp(dist * 0.015, 0.01, 0.3);  // ~1.5% of distance
-            vec2 diskSample = rand2();
-            float diskR = sqrt(diskSample.x) * softRadius;
-            float diskAngle = diskSample.y * 2.0 * PI;
-            // Build tangent frame around L
-            vec3 lTangent = abs(L.y) < 0.999 ? normalize(cross(L, vec3(0,1,0))) : normalize(cross(L, vec3(1,0,0)));
-            vec3 lBitangent = cross(L, lTangent);
-            vec3 jitteredTarget = lightPos + lTangent * (cos(diskAngle) * diskR) + lBitangent * (sin(diskAngle) * diskR);
-            vec3 shadowDir = normalize(jitteredTarget - pbrHit.worldPos);
-            float shadowDist = length(jitteredTarget - pbrHit.worldPos);
+            // Area light: multiply by area (uniform sampling PDF = 1/area)
+            // and cosine at light surface for correct geometric term
+            if (isAreaLight) {
+                vec3 lightNormal = lightDirSizeX.xyz;
+                float cosAtLight = max(dot(-shadowDir, lightNormal), 0.0);
+                float areaSize = lightDirSizeX.w * lightTanSizeY.w;
+                attenuation *= cosAtLight * areaSize;
+            }
 
-            // Shadow ray to jittered target
-            vec3 shadowOrigin = pbrHit.worldPos + N * 0.002;
-            rayQueryEXT shadowRQ;
-            rayQueryInitializeEXT(shadowRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
-                0xFF, shadowOrigin, 0.0, shadowDir, shadowDist - 0.004);
-            while (rayQueryProceedEXT(shadowRQ)) {}
-            bool inShadow = (rayQueryGetIntersectionTypeEXT(shadowRQ, true)
-                != gl_RayQueryCommittedIntersectionNoneEXT);
+            // Shadow ray to jittered target (skip glass surfaces)
+            vec3 ptShadowOrigin = pbrHit.worldPos + N * 0.002;
+            bool inShadow = false;
+            for (int ptShadowSkip = 0; ptShadowSkip < 4; ptShadowSkip++) {
+                rayQueryEXT shadowRQ;
+                rayQueryInitializeEXT(shadowRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
+                    0xFF, ptShadowOrigin, 0.0, shadowDir, shadowDist - 0.004);
+                while (rayQueryProceedEXT(shadowRQ)) {}
+                if (rayQueryGetIntersectionTypeEXT(shadowRQ, true)
+                    == gl_RayQueryCommittedIntersectionNoneEXT) {
+                    break; // No hit — not in shadow
+                }
+                // Check if hit is glass (transmission flag)
+                uint ptsCustIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(shadowRQ, true);
+                int ptsPrimId = rayQueryGetIntersectionPrimitiveIndexEXT(shadowRQ, true);
+                float ptsHitT = rayQueryGetIntersectionTEXT(shadowRQ, true);
+                GeometryMetadata ptsGeo = geometryMetadata.geometries[ptsCustIdx];
+                uint ptsMatIdx = 0u;
+                if (ptsGeo.primMaterialBufferAddress != 0u) {
+                    PrimMaterials ptsPM = PrimMaterials(ptsGeo.primMaterialBufferAddress);
+                    ptsMatIdx = ptsPM.m[ptsPrimId];
+                }
+                Material ptsMat = materialBuffer.materials[ptsMatIdx];
+                if ((ptsMat.flags & 2u) != 0u) {
+                    // Glass — skip and continue shadow ray
+                    ptShadowOrigin = ptShadowOrigin + shadowDir * (ptsHitT + 0.004);
+                    continue;
+                }
+                inShadow = true;
+                break;
+            }
 
-            // BRDF evaluation (use un-jittered L for correct shading)
+            // BRDF evaluation: area lights use direction to sampled point,
+            // point lights use direction to center (jitter is only for shadows)
             vec3 V = -rayDir;
+            vec3 brdfL = isAreaLight ? shadowDir : L;
             vec3 diffC, specC;
-            evaluateCookTorrance(N, V, L, pbrHit.baseColor, pbrHit.roughness,
+            evaluateCookTorrance(N, V, brdfL, pbrHit.baseColor, pbrHit.roughness,
                                  pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior,
                                  diffC, specC);
 
@@ -687,6 +884,85 @@ void main() {
                     diffuseRadiance += directLight * throughput * giIntensity;
                 } else {
                     specularRadiance += directLight * throughput * giIntensity;
+                }
+            }
+        }
+
+        // ---- NEE: Emissive triangle lights (MIS) ----
+        uint emissiveTriCount = cam.lightPad0;
+        if (emissiveTriCount > 0u) {
+            EmissiveSample eSample = sampleEmissiveTriangle(emissiveTriCount, rand01(), rand2());
+            if (eSample.pdf > 0.0) {
+                vec3 toEmissive = eSample.position - pbrHit.worldPos;
+                float eDist = length(toEmissive);
+                vec3 eDir = toEmissive / eDist;
+                float eNdotL = dot(N, eDir);
+                // Check emissive surface faces us
+                float eCosTheta = dot(-eDir, eSample.normal);
+
+                if (eNdotL > 0.0 && eCosTheta > 0.0 && eDist > 0.01) {
+                    // Shadow ray to emissive surface (skip glass)
+                    vec3 eShadowOrigin = pbrHit.worldPos + N * 0.002;
+                    bool eInShadow = false;
+                    for (int eShadowSkip = 0; eShadowSkip < 4; eShadowSkip++) {
+                        rayQueryEXT eShadowRQ;
+                        rayQueryInitializeEXT(eShadowRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
+                            0xFF, eShadowOrigin, 0.0, eDir, eDist - 0.01);
+                        while (rayQueryProceedEXT(eShadowRQ)) {}
+                        if (rayQueryGetIntersectionTypeEXT(eShadowRQ, true)
+                            == gl_RayQueryCommittedIntersectionNoneEXT) {
+                            break;
+                        }
+                        uint eCustIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(eShadowRQ, true);
+                        int ePrimId = rayQueryGetIntersectionPrimitiveIndexEXT(eShadowRQ, true);
+                        float eHitT = rayQueryGetIntersectionTEXT(eShadowRQ, true);
+                        GeometryMetadata eGeo = geometryMetadata.geometries[eCustIdx];
+                        uint eMatIdx = 0u;
+                        if (eGeo.primMaterialBufferAddress != 0u) {
+                            PrimMaterials ePM = PrimMaterials(eGeo.primMaterialBufferAddress);
+                            eMatIdx = ePM.m[ePrimId];
+                        }
+                        Material eMat = materialBuffer.materials[eMatIdx];
+                        if ((eMat.flags & 2u) != 0u) {
+                            eShadowOrigin = eShadowOrigin + eDir * (eHitT + 0.004);
+                            continue;
+                        }
+                        eInShadow = true;
+                        break;
+                    }
+
+                    if (!eInShadow) {
+                        // Evaluate BRDF
+                        vec3 V = -rayDir;
+                        vec3 eDiffC, eSpecC;
+                        evaluateCookTorrance(N, V, eDir, pbrHit.baseColor, pbrHit.roughness,
+                                             pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior,
+                                             eDiffC, eSpecC);
+
+                        // Geometric term: emission / (dist^2) * cosTheta_emitter
+                        vec3 eRadiance = eSample.emission * eCosTheta / (eDist * eDist);
+
+                        // MIS weight: power heuristic (light_pdf^2 / (light_pdf^2 + bsdf_pdf^2))
+                        // BSDF pdf for diffuse: cosTheta / PI
+                        float bsdfPdf = eNdotL / PI;
+                        float lightPdf = eSample.pdf * eDist * eDist / eCosTheta;
+                        float misWeight = (lightPdf * lightPdf) / (lightPdf * lightPdf + bsdfPdf * bsdfPdf + 1e-8);
+
+                        vec3 eDiffContrib = eDiffC * eRadiance * misWeight / eSample.pdf;
+                        vec3 eSpecContrib = eSpecC * eRadiance * misWeight / eSample.pdf;
+
+                        if (bounce == 0) {
+                            diffuseRadiance += eDiffContrib * throughput;
+                            specularRadiance += eSpecContrib * throughput;
+                        } else {
+                            vec3 directLight = eDiffContrib + eSpecContrib;
+                            if (isDiffusePath) {
+                                diffuseRadiance += directLight * throughput * giIntensity;
+                            } else {
+                                specularRadiance += directLight * throughput * giIntensity;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -723,18 +999,51 @@ void main() {
             throughput /= p;
         }
 
-        // ---- Transmission / Glass ----
-        if (pbrHit.transmission > 0.0 && rand01() < pbrHit.transmission) {
+        // ---- Transmission / Glass (GGX Microfacet, like Cycles) ----
+        if (pbrHit.transmission > 0.5) {
             float eta = frontFace ? (1.0 / pbrHit.ior) : pbrHit.ior;
-            vec3 refracted = refract(rayDir, N, eta);
-            if (length(refracted) > 0.001) {
-                rayDir = refracted;
-                rayOrigin = pbrHit.worldPos - N * 0.002;  // offset behind surface
-                throughput *= pbrHit.baseColor;  // tinted glass
-                if (bounce == 0) isDiffusePath = false;
-                continue;
+            float alpha = max(pbrHit.roughness * pbrHit.roughness, 0.001);
+
+            // Sample microfacet normal (GGX) for rough glass
+            vec3 V = -rayDir;
+            vec3 H;
+            if (alpha > 0.002) {
+                // GGX importance sampling of half-vector
+                vec2 xi = rand2();
+                float phi = 2.0 * PI * xi.x;
+                float cosTheta = sqrt((1.0 - xi.y) / (1.0 + (alpha * alpha - 1.0) * xi.y));
+                float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+                // Build TBN from N
+                vec3 up = abs(N.y) < 0.999 ? vec3(0,1,0) : vec3(1,0,0);
+                vec3 tanX = normalize(cross(up, N));
+                vec3 tanY = cross(N, tanX);
+                H = normalize(sinTheta * cos(phi) * tanX + sinTheta * sin(phi) * tanY + cosTheta * N);
+            } else {
+                H = N;
             }
-            // Total internal reflection — fall through to specular
+
+            // Fresnel at microfacet
+            float cosI = abs(dot(V, H));
+            float f0 = (pbrHit.ior - 1.0) / (pbrHit.ior + 1.0);
+            f0 = f0 * f0;
+            float fresnel = f0 + (1.0 - f0) * pow(1.0 - cosI, 5.0);
+
+            // Decide reflect vs refract based on Fresnel
+            vec3 refracted = refract(-V, H, eta);
+            bool canRefract = dot(refracted, refracted) > 0.0001;
+
+            if (!canRefract || rand01() < fresnel) {
+                // Reflection off microfacet
+                rayDir = reflect(rayDir, H);
+                rayOrigin = pbrHit.worldPos + N * 0.003;
+            } else {
+                // Refraction through microfacet
+                rayDir = refracted;
+                rayOrigin = pbrHit.worldPos + rayDir * 0.01;
+            }
+            throughput *= pbrHit.baseColor;
+            if (bounce == 0) isDiffusePath = false;
+            continue;
         }
 
         // ---- Sample BRDF lobe ----

@@ -265,8 +265,12 @@ static float s_projPrev[16] = {0};
 static bool s_hasPrevFrame = false;
 
 // Point/spot lights
-static float s_lightData[64] = {0};  // 8 lights × 8 floats
+static float s_lightData[128] = {0};  // 8 lights × 16 floats
 static uint32_t s_lightCount = 0;
+
+// Emissive triangles for MIS
+static float s_emissiveTriData[4096] = {0};  // 256 triangles × 16 floats
+static uint32_t s_emissiveTriCount = 0;
 
 void ignis_reset_prev_frame() {
     s_hasPrevFrame = false;
@@ -313,7 +317,25 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
     acpt::PathTracerConfig* cfg = &acpt::g_config;
 
     if (cfg->autoSkyColors) {
-        ComputeAtmosphericColors(cfg->sunElevation, cfg);
+        // Save Blender's sun intensity/color before atmospheric override
+        float savedSunIntensity = cfg->sunIntensity;
+        float savedSunColorR = cfg->sunColorR;
+        float savedSunColorG = cfg->sunColorG;
+        float savedSunColorB = cfg->sunColorB;
+
+        if (savedSunIntensity > 0.0f) {
+            // Sun light exists — compute atmospheric sky/ambient from elevation
+            ComputeAtmosphericColors(cfg->sunElevation, cfg);
+            // Restore Blender's sun intensity/color
+            cfg->sunIntensity = savedSunIntensity;
+            cfg->sunColorR = savedSunColorR;
+            cfg->sunColorG = savedSunColorG;
+            cfg->sunColorB = savedSunColorB;
+        } else {
+            // No sun light in scene — zero out atmospheric ambient
+            cfg->ambientColorR = 0.0f; cfg->ambientColorG = 0.0f; cfg->ambientColorB = 0.0f;
+            cfg->ambientIntensity = 0.0f;
+        }
     }
 
     cam.parameters[0] = frameIndex;
@@ -361,9 +383,10 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
 
     // Point/spot lights
     cam.lightCount = s_lightCount;
-    cam.lightPad[0] = cam.lightPad[1] = cam.lightPad[2] = 0;
+    cam.lightPad[0] = s_emissiveTriCount;
+    cam.lightPad[1] = cam.lightPad[2] = 0;
     if (s_lightCount > 0) {
-        memcpy(cam.lights, s_lightData, s_lightCount * 8 * sizeof(float));
+        memcpy(cam.lights, s_lightData, s_lightCount * 16 * sizeof(float));
     }
 
     if (frameIndex < 3) {
@@ -382,8 +405,19 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
 IGNIS_API void ignis_upload_lights(const float* lightData, uint32_t lightCount) {
     s_lightCount = (lightCount > 8) ? 8 : lightCount;
     if (lightData && s_lightCount > 0) {
-        memcpy(s_lightData, lightData, s_lightCount * 8 * sizeof(float));
+        memcpy(s_lightData, lightData, s_lightCount * 16 * sizeof(float));
     }
+}
+
+IGNIS_API void ignis_upload_emissive_triangles(const float* data, uint32_t triangleCount) {
+    s_emissiveTriCount = (triangleCount > 256) ? 256 : triangleCount;
+    if (data && s_emissiveTriCount > 0) {
+        memcpy(s_emissiveTriData, data, s_emissiveTriCount * 16 * sizeof(float));
+    }
+    if (g_renderer) {
+        g_renderer->UploadEmissiveTriangles(s_emissiveTriData, s_emissiveTriCount);
+    }
+    Log(L"[Ignis] Uploaded %u emissive triangles\n", s_emissiveTriCount);
 }
 
 IGNIS_API void ignis_render_frame(void) {

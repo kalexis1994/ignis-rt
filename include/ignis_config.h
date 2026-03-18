@@ -33,7 +33,7 @@ struct PathTracerConfig {
     float sunColorR          = 1.0f;
     float sunColorG          = 0.96f;
     float sunColorB          = 0.92f;
-    bool  autoSkyColors      = true;
+    bool  autoSkyColors      = false;
 
     // Ambient / sky
     float ambientColorR      = 0.5f;
@@ -48,7 +48,7 @@ struct PathTracerConfig {
     float cloudVisibility    = 50.0f;   // km (Koschmieder)
 
     // Path tracing quality
-    int   maxBounces         = 2;       // 1-8 bounces (2+ needed for emissive GI)
+    int   maxBounces         = 8;       // 1-8 bounces
 
     // Debug
     int   debugView          = 0;       // 0 = off, >0 = debug view mode

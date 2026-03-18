@@ -45,6 +45,10 @@ IGNIS_API void   ignis_set_camera(const float* viewInverse, const float* projInv
 // Each light: 8 floats [posX, posY, posZ, range, colorR, colorG, colorB, intensity]
 IGNIS_API void   ignis_upload_lights(const float* lightData, uint32_t lightCount);
 
+// Emissive triangles for MIS (max 256)
+// Each triangle: 16 floats [v0.xyz+area, v1.xyz+cdf, v2.xyz+totalPower, emission.rgb+matIdx]
+IGNIS_API void   ignis_upload_emissive_triangles(const float* data, uint32_t triangleCount);
+
 // Rendering
 IGNIS_API void   ignis_render_frame(void);
 IGNIS_API bool   ignis_readback(void* outPixels, uint32_t bufferSize);

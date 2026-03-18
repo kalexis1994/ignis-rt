@@ -238,7 +238,8 @@ def export_sun(depsgraph):
     defaults = {
         "sun_elevation": 45.0,
         "sun_azimuth": 180.0,
-        "sun_intensity": 1.8,
+        "sun_intensity": 0.0,
+        "sun_color": (1.0, 1.0, 1.0),
     }
 
     for obj in depsgraph.objects:
@@ -248,10 +249,10 @@ def export_sun(depsgraph):
         if light.type != 'SUN':
             continue
 
-        # Sun direction = -Z axis of the light's world matrix
+        # Sun position direction = +Z axis of the light's world matrix
+        # (light travels along -Z local; we want the direction TO the sun)
         mat = obj.matrix_world
-        # -Z axis is column 2, negated
-        direction = -mat.col[2].xyz.normalized()
+        direction = mat.col[2].xyz.normalized()
 
         # Convert to Vulkan Y-up: Blender Z → Vulkan Y, Blender -Y → Vulkan Z
         dx = direction.x
@@ -265,10 +266,19 @@ def export_sun(depsgraph):
         if azimuth < 0:
             azimuth += 360.0
 
+        final_intensity = light.energy * math.pi
+
+        # Cycles sun: strength is irradiance (W/m²) applied as Li in the
+        # rendering equation.  Our Cook-Torrance diffuse = albedo/PI * Li * NdotL,
+        # so with Li=1 a white surface gives ~0.25.  Cycles produces the same
+        # math but its viewport "feels" brighter because Color Management exposure
+        # defaults differ.  Multiply by PI so energy=1 in Blender matches
+        # Cycles' perceived brightness (the PI cancels the BRDF's 1/PI).
         return {
             "sun_elevation": elevation,
             "sun_azimuth": azimuth,
-            "sun_intensity": light.energy,
+            "sun_intensity": light.energy * math.pi,
+            "sun_color": (light.color[0], light.color[1], light.color[2]),
         }
 
     return defaults
@@ -277,8 +287,9 @@ def export_sun(depsgraph):
 def export_lights(depsgraph):
     """Export point/spot/area lights (max 8) for NEE direct sampling.
 
-    Returns a flat list of floats: [posX, posY, posZ, range, colR, colG, colB, intensity, ...]
-    Each light = 8 floats. Coordinate conversion: Blender Z-up -> Vulkan Y-up.
+    Returns a flat list of floats: 16 floats per light.
+    [posX, posY, posZ, range, colR, colG, colB, intensity, dirX, dirY, dirZ, sizeX, tanX, tanY, tanZ, sizeY]
+    Coordinate conversion: Blender Z-up -> Vulkan Y-up.
     """
     lights = []
     for obj in depsgraph.objects:
@@ -287,7 +298,7 @@ def export_lights(depsgraph):
         light = obj.data
         if light.type == 'SUN':
             continue  # sun is handled separately
-        if len(lights) >= 64:  # 8 lights × 8 floats each
+        if len(lights) >= 128:  # 8 lights × 16 floats each
             break
 
         # World position (Blender Z-up -> Vulkan Y-up)
@@ -296,35 +307,227 @@ def export_lights(depsgraph):
         vk_y = pos.z        # Blender Z -> Vulkan Y
         vk_z = -pos.y       # Blender -Y -> Vulkan Z
 
-        # Range: Blender uses energy falloff, we derive range from energy
-        # For point/spot lights, use shadow_soft_size as physical radius
-        # Range = distance where attenuation drops to ~1%
         energy = light.energy
         color = light.color
-        # Blender energy is in Watts; convert to our intensity scale
-        # A reasonable range: sqrt(energy / 0.01) to capture 99% of light
         estimated_range = max(math.sqrt(energy / 0.01), 1.0) if energy > 0 else 10.0
-        # Clamp to reasonable range
         estimated_range = min(estimated_range, 100.0)
 
-        # Blender energy for point lights is in Watts.
-        # Blender uses a physically-based 1/(4*pi*r^2) model internally.
-        # Our shader uses raw inverse-square: radiance = color * intensity / (r^2).
-        # To match Blender's rendering: intensity = energy / (4*pi)
-        # This keeps the physical scale correct.
-        intensity = energy / (4.0 * math.pi)
+        # Cycles: point light radiance = strength / (4*PI) / r^2
+        # Our shader: radiance = color * intensity / r^2
+        intensity = energy / math.pi
+
+        # Direction and tangent (for area lights)
+        # Area light emits along -Z local axis in Blender
+        mat_w = obj.matrix_world
+        # Light normal: -Z local → world, then Blender→Vulkan
+        bl_normal = -mat_w.col[2].xyz.normalized()
+        dir_x = bl_normal.x
+        dir_y = bl_normal.z       # Blender Z → Vulkan Y
+        dir_z = -bl_normal.y      # Blender -Y → Vulkan Z
+
+        # Light tangent: +X local → world, then Blender→Vulkan
+        bl_tangent = mat_w.col[0].xyz.normalized()
+        tan_x = bl_tangent.x
+        tan_y = bl_tangent.z
+        tan_z = -bl_tangent.y
+
+        size_x = 0.0
+        size_y = 0.0
+
+        if light.type == 'AREA':
+            size_x = light.size if hasattr(light, 'size') else 1.0
+            size_y = light.size_y if light.shape in ('RECTANGLE', 'ELLIPSE') else size_x
+            # Negative range signals area light to shader
+            export_range = -max(size_x, size_y) * 0.5
+            # Cycles area light: energy is total power (Watts).
+            # Radiance = power * PI / area.  The extra PI compensates the
+            # BRDF's 1/PI diffuse term so energy=1 matches Cycles brightness.
+            area = size_x * size_y
+            intensity = energy * math.pi / area if area > 0 else energy
+        else:
+            export_range = estimated_range
 
         print(f"[ignis_rt] export_light: '{obj.name}' type={light.type} "
               f"pos=({vk_x:.2f},{vk_y:.2f},{vk_z:.2f}) "
               f"energy={energy:.1f}W intensity={intensity:.2f} "
-              f"range={estimated_range:.1f} color=({color[0]:.2f},{color[1]:.2f},{color[2]:.2f})")
+              f"range={estimated_range:.1f} "
+              f"dir=({dir_x:.2f},{dir_y:.2f},{dir_z:.2f}) "
+              f"size=({size_x:.2f},{size_y:.2f}) "
+              f"color=({color[0]:.2f},{color[1]:.2f},{color[2]:.2f})")
 
         lights.extend([
-            vk_x, vk_y, vk_z, estimated_range,
+            vk_x, vk_y, vk_z, export_range,
             color[0], color[1], color[2], intensity,
+            dir_x, dir_y, dir_z, size_x,
+            tan_x, tan_y, tan_z, size_y,
         ])
 
     return lights
+
+
+def export_emissive_triangles(depsgraph):
+    """Export emissive mesh triangles for MIS (Multiple Importance Sampling).
+
+    Iterates all mesh instances, finds triangles whose material has emission > 0,
+    computes world-space vertices, builds a CDF weighted by area * luminance.
+
+    Returns a flat list of floats: 16 floats per triangle (max 256 triangles).
+    Layout per tri: [v0.xyz, area, v1.xyz, cdf, v2.xyz, totalPower, emission.rgb, 0]
+    """
+    MAX_EMISSIVE_TRIS = 256
+    emissive_tris = []  # list of (power, [16 floats])
+
+    for instance in depsgraph.object_instances:
+        obj = instance.object
+        if obj.type != 'MESH':
+            continue
+
+        # Check if any material slot has emission
+        has_emission = False
+        for slot in obj.material_slots:
+            mat = slot.material
+            if mat is None:
+                continue
+            if not mat.use_nodes or not mat.node_tree:
+                continue
+            for node in mat.node_tree.nodes:
+                if node.type == 'BSDF_PRINCIPLED':
+                    es_inp = node.inputs.get('Emission Strength')
+                    if es_inp and float(es_inp.default_value) > 0.0:
+                        has_emission = True
+                        break
+                elif node.type == 'EMISSION':
+                    strength_inp = node.inputs.get('Strength')
+                    if strength_inp and float(strength_inp.default_value) > 0.0:
+                        has_emission = True
+                        break
+            if has_emission:
+                break
+        if not has_emission:
+            continue
+
+        # Get evaluated mesh
+        eval_obj = obj.evaluated_get(depsgraph)
+        mesh = eval_obj.to_mesh()
+        if mesh is None:
+            continue
+
+        mesh.calc_loop_triangles()
+        if len(mesh.loop_triangles) == 0:
+            eval_obj.to_mesh_clear()
+            continue
+
+        # Get world transform (Blender 4x4) and convert to numpy
+        mat_world = np.array(instance.matrix_world, dtype=np.float64)
+
+        # Get all vertex positions
+        all_positions = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+        mesh.vertices.foreach_get("co", all_positions)
+        all_positions = all_positions.reshape(-1, 3)
+
+        # Build per-slot emission info
+        slot_emission = []  # list of (emission_rgb, strength) per slot
+        for slot in obj.material_slots:
+            mat = slot.material
+            em_color = (0.0, 0.0, 0.0)
+            em_strength = 0.0
+            if mat and mat.use_nodes and mat.node_tree:
+                for node in mat.node_tree.nodes:
+                    if node.type == 'BSDF_PRINCIPLED':
+                        es_inp = node.inputs.get('Emission Strength')
+                        em_strength = float(es_inp.default_value) if es_inp else 0.0
+                        if em_strength > 0.0:
+                            ec_inp = node.inputs.get('Emission Color')
+                            if ec_inp and hasattr(ec_inp.default_value, '__len__'):
+                                ec = ec_inp.default_value
+                                em_color = (float(ec[0]), float(ec[1]), float(ec[2]))
+                            else:
+                                em_color = (1.0, 1.0, 1.0)
+                        break
+                    elif node.type == 'EMISSION':
+                        strength_inp = node.inputs.get('Strength')
+                        color_inp = node.inputs.get('Color')
+                        if strength_inp:
+                            em_strength = float(strength_inp.default_value)
+                        if color_inp:
+                            c = color_inp.default_value
+                            em_color = (float(c[0]), float(c[1]), float(c[2]))
+                        break
+            slot_emission.append((em_color, em_strength))
+
+        if not slot_emission:
+            slot_emission = [((0.0, 0.0, 0.0), 0.0)]
+
+        for tri in mesh.loop_triangles:
+            mat_idx = tri.material_index
+            if mat_idx >= len(slot_emission):
+                mat_idx = 0
+            em_color, em_strength = slot_emission[mat_idx]
+            if em_strength <= 0.0:
+                continue
+
+            # Get local-space vertices
+            vi = tri.vertices
+            lp0 = all_positions[vi[0]]
+            lp1 = all_positions[vi[1]]
+            lp2 = all_positions[vi[2]]
+
+            # Transform to world space (Blender coordinate system)
+            wp0_b = (mat_world @ np.append(lp0, 1.0))[:3]
+            wp1_b = (mat_world @ np.append(lp1, 1.0))[:3]
+            wp2_b = (mat_world @ np.append(lp2, 1.0))[:3]
+
+            # Convert Blender Z-up → Vulkan Y-up
+            wp0 = np.array([wp0_b[0], wp0_b[2], -wp0_b[1]], dtype=np.float64)
+            wp1 = np.array([wp1_b[0], wp1_b[2], -wp1_b[1]], dtype=np.float64)
+            wp2 = np.array([wp2_b[0], wp2_b[2], -wp2_b[1]], dtype=np.float64)
+
+            # Compute area
+            edge1 = wp1 - wp0
+            edge2 = wp2 - wp0
+            cross = np.cross(edge1, edge2)
+            area = 0.5 * np.linalg.norm(cross)
+            if area < 1e-8:
+                continue
+
+            # Emission = color * strength
+            emission = (em_color[0] * em_strength,
+                        em_color[1] * em_strength,
+                        em_color[2] * em_strength)
+
+            # Power = area * luminance(emission)
+            luminance = 0.2126 * emission[0] + 0.7152 * emission[1] + 0.0722 * emission[2]
+            power = area * luminance
+            if power < 1e-8:
+                continue
+
+            emissive_tris.append((power, [
+                wp0[0], wp0[1], wp0[2], area,
+                wp1[0], wp1[1], wp1[2], 0.0,  # cdf placeholder
+                wp2[0], wp2[1], wp2[2], 0.0,  # totalPower placeholder
+                emission[0], emission[1], emission[2], 0.0,
+            ]))
+
+        eval_obj.to_mesh_clear()
+
+    if not emissive_tris:
+        return []
+
+    # Sort by power descending and cap
+    emissive_tris.sort(key=lambda x: x[0], reverse=True)
+    emissive_tris = emissive_tris[:MAX_EMISSIVE_TRIS]
+
+    # Build CDF
+    total_power = sum(t[0] for t in emissive_tris)
+    cumulative = 0.0
+    result = []
+    for power, data in emissive_tris:
+        cumulative += power
+        data[7] = cumulative / total_power  # cdf in v1.w
+        data[11] = total_power               # totalPower in v2.w
+        result.extend(data)
+
+    return result
 
 
 # ---- GPUMaterial struct layout (140 bytes, scalar) ----
@@ -450,37 +653,56 @@ def _get_principled_input(node, input_name, default):
     return inp.default_value
 
 
-def _find_image_texture_node(socket):
-    """Follow links from a Principled BSDF input to find an Image Texture node.
+def _find_image_texture_node(socket, _depth=0):
+    """Follow links from a BSDF input to find an Image Texture node.
 
-    Handles:
-      - Direct: Image Texture → input
-      - Normal: Image Texture → Normal Map → Normal input
-      - Separate: Image Texture → Separate RGB/Color → channel → input
+    Recursively traverses common intermediate nodes (Color Ramp, Mix RGB,
+    Gamma, Hue/Sat, Invert, etc.) up to 8 levels deep.
     """
-    if not socket or not socket.is_linked:
+    if not socket or not socket.is_linked or _depth > 8:
         return None
     from_node = socket.links[0].from_node
 
     if from_node.type == 'TEX_IMAGE':
         return from_node
 
-    # Image Texture → Normal Map → Principled Normal
+    # Normal Map — check Color input
     if from_node.type == 'NORMAL_MAP':
-        color_inp = from_node.inputs.get('Color')
-        if color_inp and color_inp.is_linked:
-            nn = color_inp.links[0].from_node
-            if nn.type == 'TEX_IMAGE':
-                return nn
+        return _find_image_texture_node(from_node.inputs.get('Color'), _depth + 1)
 
-    # Image Texture → Separate RGB/Color → channel (for ORM maps)
+    # Separate RGB/Color/XYZ — check common input names
     if from_node.type in ('SEPRGB', 'SEPARATE_XYZ', 'SEPARATE_COLOR'):
         for inp_name in ('Image', 'Color', 'Vector'):
             inp = from_node.inputs.get(inp_name)
-            if inp and inp.is_linked:
-                nn = inp.links[0].from_node
-                if nn.type == 'TEX_IMAGE':
-                    return nn
+            result = _find_image_texture_node(inp, _depth + 1)
+            if result:
+                return result
+
+    # Pass-through nodes: follow the first color/image input
+    _PASSTHROUGH_TYPES = {
+        'VALTORGB',          # Color Ramp
+        'MIX_RGB', 'MIX',   # Mix Color (old and new)
+        'HUE_SAT',          # Hue/Saturation
+        'GAMMA',            # Gamma
+        'BRIGHTCONTRAST',   # Bright/Contrast
+        'INVERT',           # Invert
+        'CURVE_RGB',        # RGB Curves
+        'MAP_RANGE',        # Map Range
+    }
+    if from_node.type in _PASSTHROUGH_TYPES:
+        # Try common color input names
+        for inp_name in ('Color', 'Color1', 'Color2', 'Fac', 'Image', 'A', 'B', 'Value'):
+            inp = from_node.inputs.get(inp_name)
+            result = _find_image_texture_node(inp, _depth + 1)
+            if result:
+                return result
+
+    # Group nodes — try to follow the first linked input
+    if from_node.type == 'GROUP':
+        for inp in from_node.inputs:
+            result = _find_image_texture_node(inp, _depth + 1)
+            if result:
+                return result
 
     return None
 
@@ -571,6 +793,199 @@ def _encode_bmp(rgba_u8, w, h):
     return bytes(hdr) + bytes(pixel_data)
 
 
+def _find_surface_shader(node_tree):
+    """Find the shader node connected to Material Output's Surface input."""
+    for node in node_tree.nodes:
+        if node.type == 'OUTPUT_MATERIAL' and node.is_active_output:
+            surface_inp = node.inputs.get('Surface')
+            if surface_inp and surface_inp.is_linked:
+                return surface_inp.links[0].from_node
+    return None
+
+
+def _extract_normal_texture(node, register_image_fn):
+    """Extract normal/bump texture from a BSDF node's Normal input.
+
+    Returns (tex_index, strength, is_bump).
+    is_bump=True means it's a height/bump map, False means RGB normal map.
+    """
+    normal_tex = _NO_TEX
+    normal_strength = 1.0
+    is_bump = False
+    norm_inp = node.inputs.get('Normal') if node else None
+    if norm_inp and norm_inp.is_linked:
+        from_node = norm_inp.links[0].from_node
+        if from_node.type == 'NORMAL_MAP':
+            normal_strength = float(from_node.inputs['Strength'].default_value)
+            color_inp = from_node.inputs.get('Color')
+            if color_inp and color_inp.is_linked:
+                nn = color_inp.links[0].from_node
+                if nn.type == 'TEX_IMAGE' and nn.image:
+                    normal_tex = register_image_fn(nn.image)
+        elif from_node.type == 'BUMP':
+            strength_inp = from_node.inputs.get('Strength')
+            distance_inp = from_node.inputs.get('Distance')
+            bump_strength = float(strength_inp.default_value) if strength_inp else 1.0
+            bump_distance = float(distance_inp.default_value) if distance_inp else 1.0
+            # Cycles formula:
+            #   N' = normalize(|det| * N - distance * surfgrad)
+            #   N_final = normalize(strength * N' + (1 - strength) * N)
+            # We only have one float, so encode both:
+            #   magnitude = distance, fractional part encodes strength.
+            #   E.g., 0.1 distance + 0.06 strength → encode as distance (shader uses it
+            #   as scale) and pass strength * distance as combined effective scale.
+            # Simplest correct approach: pass distance as scale, shader handles det.
+            normal_strength = bump_distance
+            height_inp = from_node.inputs.get('Height')
+            tex_node = _find_image_texture_node(height_inp)
+            if tex_node and tex_node.image:
+                normal_tex = register_image_fn(tex_node.image)
+                is_bump = True
+                # Pack: integer part = strength * 100, fractional = distance
+                # shader extracts: strength = floor(abs * 10) / 10, distance = fract(abs * 10) * 10
+                # Actually just encode the two values simply:
+                normal_strength = bump_strength + bump_distance * 100.0
+    return normal_tex, normal_strength, is_bump
+
+
+def _extract_shader_props(node, register_image_fn):
+    """Extract PBR-approximated properties from a single shader node."""
+    props = {
+        'base_color': (0.8, 0.8, 0.8),
+        'roughness': 0.5,
+        'metallic': 0.0,
+        'emission': (0.0, 0.0, 0.0),
+        'emission_strength': 0.0,
+        'diffuse_tex': _NO_TEX,
+        'normal_tex': _NO_TEX,
+        'normal_strength': 1.0,
+        'emission_tex': _NO_TEX,
+        'transmission': 0.0,
+        'ior': 1.5,
+    }
+    if node is None:
+        return props
+
+    if node.type == 'BSDF_DIFFUSE':
+        color_inp = node.inputs.get('Color')
+        if color_inp:
+            c = color_inp.default_value
+            props['base_color'] = (c[0], c[1], c[2])
+            tex_node = _find_image_texture_node(color_inp)
+            if tex_node and tex_node.image:
+                props['diffuse_tex'] = register_image_fn(tex_node.image)
+        # Cycles: Diffuse BSDF is always Lambertian (roughness=0) or Oren-Nayar (roughness>0).
+        # In PBR terms, a Lambertian surface = fully rough (roughness=1.0).
+        props['roughness'] = 1.0
+        props['metallic'] = 0.0
+    elif node.type == 'BSDF_GLOSSY':
+        color_inp = node.inputs.get('Color')
+        if color_inp:
+            c = color_inp.default_value
+            props['base_color'] = (c[0], c[1], c[2])
+            tex_node = _find_image_texture_node(color_inp)
+            if tex_node and tex_node.image:
+                props['diffuse_tex'] = register_image_fn(tex_node.image)
+        rough_inp = node.inputs.get('Roughness')
+        if rough_inp:
+            props['roughness'] = float(rough_inp.default_value)
+        props['metallic'] = 1.0
+    elif node.type == 'BSDF_GLASS':
+        color_inp = node.inputs.get('Color')
+        if color_inp:
+            c = color_inp.default_value
+            props['base_color'] = (c[0], c[1], c[2])
+        rough_inp = node.inputs.get('Roughness')
+        if rough_inp:
+            props['roughness'] = float(rough_inp.default_value)
+            # If roughness is connected to a texture, try to extract it as ORM
+            if rough_inp.is_linked:
+                tex_node = _find_image_texture_node(rough_inp)
+                if tex_node and tex_node.image:
+                    props['diffuse_tex'] = register_image_fn(tex_node.image)
+                    # Use a mid roughness since texture will modulate
+                    props['roughness'] = 0.5
+        ior_inp = node.inputs.get('IOR')
+        if ior_inp:
+            props['ior'] = float(ior_inp.default_value)
+        props['transmission'] = 1.0
+    elif node.type == 'BSDF_TRANSPARENT':
+        # Fully transparent — invisible to camera, shadow rays pass through
+        props['base_color'] = (1.0, 1.0, 1.0)
+        props['alpha'] = 0.0
+        props['transmission'] = 1.0
+        props['roughness'] = 0.0
+        props['ior'] = 1.0
+    elif node.type == 'EMISSION':
+        color_inp = node.inputs.get('Color')
+        if color_inp:
+            props['emission'] = _resolve_color_input(color_inp, (1.0, 1.0, 1.0))
+            props['base_color'] = props['emission']
+            tex_node = _find_image_texture_node(color_inp)
+            if tex_node and tex_node.image:
+                props['emission_tex'] = register_image_fn(tex_node.image)
+        strength_inp = node.inputs.get('Strength')
+        if strength_inp:
+            props['emission_strength'] = float(strength_inp.default_value)
+    elif node.type == 'MIX_SHADER':
+        # Nested Mix Shader — recurse
+        props = _resolve_mix_shader(node, register_image_fn)
+
+    # Extract normal/bump texture for all BSDF types
+    if node.type in ('BSDF_DIFFUSE', 'BSDF_GLOSSY', 'BSDF_GLASS', 'BSDF_PRINCIPLED'):
+        ntex, nstr, is_bump = _extract_normal_texture(node, register_image_fn)
+        props['normal_tex'] = ntex
+        # Negative strength signals bump/height map to the shader
+        props['normal_strength'] = -nstr if is_bump else nstr
+
+    return props
+
+
+def _lerp_color(a, b, t):
+    return (a[0] * (1 - t) + b[0] * t,
+            a[1] * (1 - t) + b[1] * t,
+            a[2] * (1 - t) + b[2] * t)
+
+
+def _resolve_mix_shader(mix_node, register_image_fn):
+    """Resolve a Mix Shader node into blended PBR properties."""
+    fac_inp = mix_node.inputs.get('Fac')
+    fac = float(fac_inp.default_value) if fac_inp else 0.5
+
+    # Get the two input shaders (Shader inputs at index 1 and 2)
+    shader1_node = None
+    shader2_node = None
+    shader1_inp = mix_node.inputs[1] if len(mix_node.inputs) > 1 else None
+    shader2_inp = mix_node.inputs[2] if len(mix_node.inputs) > 2 else None
+    if shader1_inp and shader1_inp.is_linked:
+        shader1_node = shader1_inp.links[0].from_node
+    if shader2_inp and shader2_inp.is_linked:
+        shader2_node = shader2_inp.links[0].from_node
+
+    p1 = _extract_shader_props(shader1_node, register_image_fn)
+    p2 = _extract_shader_props(shader2_node, register_image_fn)
+
+    # Blend properties by mix factor
+    blended = {
+        'base_color': _lerp_color(p1['base_color'], p2['base_color'], fac),
+        'roughness': p1['roughness'] * (1 - fac) + p2['roughness'] * fac,
+        'metallic': p1['metallic'] * (1 - fac) + p2['metallic'] * fac,
+        'emission': _lerp_color(p1['emission'], p2['emission'], fac),
+        'emission_strength': p1['emission_strength'] * (1 - fac) + p2['emission_strength'] * fac,
+        'transmission': p1['transmission'] * (1 - fac) + p2['transmission'] * fac,
+        'ior': p1['ior'] * (1 - fac) + p2['ior'] * fac,
+        # Texture: prefer the dominant shader's texture
+        'diffuse_tex': p1['diffuse_tex'] if fac <= 0.5 else p2['diffuse_tex'],
+        'emission_tex': p1['emission_tex'] if p1['emission_tex'] != _NO_TEX else p2['emission_tex'],
+    }
+
+    # If dominant texture is missing, fallback to the other
+    if blended['diffuse_tex'] == _NO_TEX:
+        blended['diffuse_tex'] = p2['diffuse_tex'] if fac <= 0.5 else p1['diffuse_tex']
+
+    return blended
+
+
 def export_materials(depsgraph):
     """Export Blender Principled BSDF materials as GPUMaterial byte buffer.
 
@@ -588,9 +1003,19 @@ def export_materials(depsgraph):
         obj = inst.object
         if obj.type != 'MESH':
             continue
+        if not obj.material_slots:
+            # Mesh with no material slots — register a default "None" material
+            if '__ignis_default__' not in mat_name_to_index:
+                mat_name_to_index['__ignis_default__'] = len(mat_list)
+                mat_list.append(None)
+            continue
         for slot in obj.material_slots:
             mat = slot.material
             if mat is None:
+                # Empty material slot — register default
+                if '__ignis_default__' not in mat_name_to_index:
+                    mat_name_to_index['__ignis_default__'] = len(mat_list)
+                    mat_list.append(None)
                 continue
             if mat.name in mat_name_to_index:
                 continue
@@ -633,6 +1058,14 @@ def export_materials(depsgraph):
     # Pack each material
     all_bytes = bytearray()
     for mat in mat_list:
+        # Default material for meshes without material assignment
+        if mat is None:
+            data = _pack_gpu_material(
+                base_color=(0.8, 0.8, 0.8), roughness=0.5, metallic=0.0,
+            )
+            all_bytes.extend(data)
+            continue
+
         base_color = (0.8, 0.8, 0.8)
         roughness = 0.5
         metallic = 0.0
@@ -658,43 +1091,68 @@ def export_materials(depsgraph):
                     principled_node = node
                     break
 
-            # Fallback: extract from Diffuse/Glossy/Glass/Emission nodes
+            # Fallback: trace from Material Output to resolve Mix Shader
+            # and individual Diffuse/Glossy/Glass/Emission nodes
             if principled_node is None:
-                for node in mat.node_tree.nodes:
-                    if node.type == 'EMISSION':
-                        color_inp = node.inputs.get('Color')
-                        if color_inp:
-                            tex_node = _find_image_texture_node(color_inp)
-                            if tex_node and tex_node.image:
-                                emission_tex = _register_image(tex_node.image)
-                            # Resolve color (handles Blackbody, RGB nodes, or plain value)
-                            emission = _resolve_color_input(color_inp, (1.0, 1.0, 1.0))
-                        strength_inp = node.inputs.get('Strength')
-                        if strength_inp:
-                            emission_strength = float(strength_inp.default_value)
-                        # Emissive surfaces: base_color = emission color for visibility
-                        base_color = emission
-                        # Don't break — also check for a Diffuse/Glossy in the same mix
-                        continue
-                    if node.type in ('BSDF_DIFFUSE', 'BSDF_GLOSSY', 'BSDF_GLASS'):
-                        color_inp = node.inputs.get('Color')
-                        if color_inp:
-                            tex_node = _find_image_texture_node(color_inp)
-                            if tex_node and tex_node.image:
-                                diffuse_tex = _register_image(tex_node.image)
-                            c = color_inp.default_value
-                            base_color = (c[0], c[1], c[2])
-                        rough_inp = node.inputs.get('Roughness')
-                        if rough_inp:
-                            roughness = float(rough_inp.default_value)
-                        if node.type == 'BSDF_GLOSSY':
-                            metallic = 0.8
-                        if node.type == 'BSDF_GLASS':
-                            transmission = 1.0
-                            ior_inp = node.inputs.get('IOR')
-                            if ior_inp:
-                                ior = float(ior_inp.default_value)
-                        break
+                surface_node = _find_surface_shader(mat.node_tree)
+                if surface_node is not None and surface_node.type in ('MIX_SHADER', 'BSDF_DIFFUSE', 'BSDF_GLOSSY', 'BSDF_GLASS', 'BSDF_TRANSPARENT', 'EMISSION'):
+                    if surface_node.type == 'MIX_SHADER':
+                        props = _resolve_mix_shader(surface_node, _register_image)
+                    else:
+                        props = _extract_shader_props(surface_node, _register_image)
+                    base_color = props['base_color']
+                    roughness = props['roughness']
+                    metallic = props['metallic']
+                    emission = props['emission']
+                    emission_strength = props['emission_strength']
+                    diffuse_tex = props['diffuse_tex']
+                    emission_tex = props['emission_tex']
+                    transmission = props['transmission']
+                    ior = props['ior']
+                    if 'alpha' in props:
+                        alpha = props['alpha']
+                    if 'normal_tex' in props:
+                        normal_tex = props['normal_tex']
+                    if 'normal_strength' in props:
+                        normal_strength = props['normal_strength']
+                else:
+                    # No Mix Shader — scan individual nodes
+                    for node in mat.node_tree.nodes:
+                        if node.type == 'EMISSION':
+                            color_inp = node.inputs.get('Color')
+                            if color_inp:
+                                tex_node = _find_image_texture_node(color_inp)
+                                if tex_node and tex_node.image:
+                                    emission_tex = _register_image(tex_node.image)
+                                emission = _resolve_color_input(color_inp, (1.0, 1.0, 1.0))
+                            strength_inp = node.inputs.get('Strength')
+                            if strength_inp:
+                                emission_strength = float(strength_inp.default_value)
+                            base_color = emission
+                            continue
+                        if node.type in ('BSDF_DIFFUSE', 'BSDF_GLOSSY', 'BSDF_GLASS'):
+                            color_inp = node.inputs.get('Color')
+                            if color_inp:
+                                tex_node = _find_image_texture_node(color_inp)
+                                if tex_node and tex_node.image:
+                                    diffuse_tex = _register_image(tex_node.image)
+                                c = color_inp.default_value
+                                base_color = (c[0], c[1], c[2])
+                            if node.type == 'BSDF_DIFFUSE':
+                                # Lambertian = fully rough in PBR terms
+                                roughness = 1.0
+                            else:
+                                rough_inp = node.inputs.get('Roughness')
+                                if rough_inp:
+                                    roughness = float(rough_inp.default_value)
+                            if node.type == 'BSDF_GLOSSY':
+                                metallic = 1.0
+                            if node.type == 'BSDF_GLASS':
+                                transmission = 1.0
+                                ior_inp = node.inputs.get('IOR')
+                                if ior_inp:
+                                    ior = float(ior_inp.default_value)
+                            break
 
             if principled_node is not None:
                 node = principled_node
@@ -733,17 +1191,11 @@ def export_materials(depsgraph):
                 emission = (ec[0], ec[1], ec[2])
                 emission_strength = float(_get_principled_input(node, 'Emission Strength', 0.0))
 
-                # Normal map texture
-                norm_inp = node.inputs.get('Normal')
-                if norm_inp and norm_inp.is_linked:
-                    for link in norm_inp.links:
-                        if link.from_node.type == 'NORMAL_MAP':
-                            normal_strength = float(link.from_node.inputs['Strength'].default_value)
-                            color_inp = link.from_node.inputs.get('Color')
-                            if color_inp and color_inp.is_linked:
-                                nn = color_inp.links[0].from_node
-                                if nn.type == 'TEX_IMAGE' and nn.image:
-                                    normal_tex = _register_image(nn.image)
+                # Normal/Bump map texture
+                ntex, nstr, is_bump = _extract_normal_texture(node, _register_image)
+                if ntex != _NO_TEX:
+                    normal_tex = ntex
+                    normal_strength = -nstr if is_bump else nstr
 
                 # Alpha
                 alpha = float(_get_principled_input(node, 'Alpha', 1.0))
@@ -783,15 +1235,38 @@ def export_materials(depsgraph):
                 if transmission > 0.0:
                     flags |= 2   # bit1 = transmission
 
+        # Ensure transmission flag is set for all code paths (Mix Shader, individual nodes)
+        if transmission > 0.0:
+            flags |= 2  # bit1 = transmission
+
         # Log material to file directly
         import os
         _mat_log_path = os.path.join(os.path.expanduser("~"), "ignis-rt.log")
         try:
             with open(_mat_log_path, "a") as _mf:
                 _mf.write(f"[ignis-mat] '{mat.name}': color=({base_color[0]:.3f},{base_color[1]:.3f},{base_color[2]:.3f}) "
-                          f"rough={roughness:.2f} metal={metallic:.2f} "
+                          f"rough={roughness:.2f} metal={metallic:.2f} trans={transmission:.2f} ior={ior:.2f} "
                           f"emit=({emission[0]:.3f},{emission[1]:.3f},{emission[2]:.3f})*{emission_strength:.2f} "
-                          f"diffTex={diffuse_tex} emitTex={emission_tex}\n")
+                          f"diffTex={diffuse_tex} normTex={normal_tex} normStr={normal_strength:.2f} "
+                          f"emitTex={emission_tex} flags={flags}\n")
+                # Dump full node tree for debug
+                if mat.use_nodes and mat.node_tree and mat.name in ('beigeWall', 'frostedGlass'):
+                    _mf.write(f"  [node-tree] '{mat.name}':\n")
+                    for node in mat.node_tree.nodes:
+                        _mf.write(f"    node: '{node.name}' type={node.type}\n")
+                        for inp in node.inputs:
+                            linked = f" <- {inp.links[0].from_node.name}:{inp.links[0].from_socket.name}" if inp.is_linked else ""
+                            val = ""
+                            if not inp.is_linked:
+                                try:
+                                    v = inp.default_value
+                                    if hasattr(v, '__len__'):
+                                        val = f" = ({', '.join(f'{x:.3f}' for x in v)})"
+                                    else:
+                                        val = f" = {v:.4f}"
+                                except:
+                                    val = ""
+                            _mf.write(f"      in: '{inp.name}'{val}{linked}\n")
                 _mf.flush()
         except Exception:
             pass

@@ -106,7 +106,7 @@ struct CameraUBO {
     // Point/spot lights (NEE direct sampling)
     uint32_t lightCount;       // number of active lights (0-8)
     uint32_t lightPad[3];
-    float lights[64];          // 8 lights × 8 floats: [posX, posY, posZ, range, colR, colG, colB, intensity]
+    float lights[128];         // 8 lights × 16 floats: [pos.xyz+range, col.rgb+intensity, dir.xyz+sizeX, tan.xyz+sizeY]
 };
 
 // Pick result from GPU raycast
@@ -150,6 +150,9 @@ public:
 
     // Per-instance previous transforms (binding 28)
     void UpdatePrevTransforms(const float* transforms, uint32_t instanceCount);
+
+    // Emissive triangle buffer for MIS (binding 26)
+    void UpdateEmissiveTriangleBuffer(const float* data, uint32_t triangleCount);
 
     // Create full-resolution G-buffer images and update descriptors
     bool CreateGBuffers(uint32_t width, uint32_t height);
@@ -297,6 +300,11 @@ private:
     VkBuffer pickBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory pickMemory_ = VK_NULL_HANDLE;
     PickResult* pickMappedPtr_ = nullptr;
+
+    // Emissive triangle SSBO (binding 26)
+    VkBuffer emissiveTriBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory emissiveTriMemory_ = VK_NULL_HANDLE;
+    uint32_t emissiveTriCount_ = 0;
 
     // Previous-frame instance transforms SSBO (binding 28)
     VkBuffer prevTransformsBuffer_ = VK_NULL_HANDLE;

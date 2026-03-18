@@ -102,7 +102,7 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
     auto_sky_colors: BoolProperty(
         name="Auto Sky Colors",
         description="Compute sun/ambient colors automatically from sun elevation",
-        default=True, update=_tag_redraw,
+        default=False, update=_tag_redraw,
     )
     sun_intensity: FloatProperty(
         name="Sun Intensity", default=1.29, min=0.0, max=20.0, step=10,
@@ -138,7 +138,7 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
 
     # -- Quality --
     max_bounces: IntProperty(
-        name="Max Bounces", default=1, min=1, max=8,
+        name="Max Bounces", default=6, min=1, max=8,
         description="Path tracing bounces (1=direct only, higher=better GI, slower)",
         update=_tag_redraw,
     )
@@ -163,7 +163,7 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
 
     # -- Tonemap --
     exposure: FloatProperty(
-        name="Exposure", default=0.55, min=0.01, max=10.0, step=10,
+        name="Exposure", default=1.0, min=0.01, max=20.0, step=10,
         update=_tag_redraw,
     )
     tonemap_mode: IntProperty(

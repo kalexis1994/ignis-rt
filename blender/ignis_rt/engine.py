@@ -110,6 +110,7 @@ _ignis_last_full_upload = 0.0  # perf_counter timestamp (cooldown for init burst
 _ignis_instance_count = 0      # mesh instance count after last sync
 _ignis_last_tex_names = None   # texture name tuple from last upload (skip re-upload if same)
 _ignis_last_transforms = None  # cached instance transforms hash for change detection
+_ignis_last_light_count = -1   # track light count for emissive re-export
 
 # ── Staged loading state machine ──
 LOAD_IDLE = 0          # no loading in progress
@@ -511,7 +512,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                             continue
                         slots = first_inst["material_slots"]
                         n_slots = max(len(slots), 1)
-                        slot_to_global = np.zeros(n_slots, dtype=np.uint32)
+                        default_idx = _load_mat_name_to_index.get('__ignis_default__', 0)
+                        slot_to_global = np.full(n_slots, default_idx, dtype=np.uint32)
                         for i, mat in enumerate(slots):
                             if mat is not None and mat.name in _load_mat_name_to_index:
                                 slot_to_global[i] = _load_mat_name_to_index[mat.name]
@@ -567,12 +569,22 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             dll_wrapper.set_float("sun_elevation", sun["sun_elevation"])
             dll_wrapper.set_float("sun_azimuth", sun["sun_azimuth"])
             dll_wrapper.set_float("sun_intensity", sun["sun_intensity"])
+            sun_color = sun.get("sun_color", (1.0, 1.0, 1.0))
+            dll_wrapper.set_float("sun_color_r", sun_color[0])
+            dll_wrapper.set_float("sun_color_g", sun_color[1])
+            dll_wrapper.set_float("sun_color_b", sun_color[2])
 
-            # Point/spot lights
+            # Point/spot/area lights
             light_data = scene_export.export_lights(depsgraph)
-            n_lights = len(light_data) // 8
+            n_lights = len(light_data) // 16
             dll_wrapper.upload_lights(light_data, n_lights)
-            _log(f"Stage FINALIZE: {n_lights} point/spot lights uploaded")
+            _log(f"Stage FINALIZE: {n_lights} lights uploaded")
+
+            # Emissive triangles for MIS
+            emissive_data = scene_export.export_emissive_triangles(depsgraph)
+            n_emissive = len(emissive_data) // 16
+            dll_wrapper.upload_emissive_triangles(emissive_data, n_emissive)
+            _log(f"Stage FINALIZE: {n_emissive} emissive triangles uploaded")
 
             # Cleanup cached data
             _load_unique_meshes = None
@@ -705,11 +717,20 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         dll_wrapper.set_float("sun_elevation", sun["sun_elevation"])
         dll_wrapper.set_float("sun_azimuth", sun["sun_azimuth"])
         dll_wrapper.set_float("sun_intensity", sun["sun_intensity"])
+        sun_color = sun.get("sun_color", (1.0, 1.0, 1.0))
+        dll_wrapper.set_float("sun_color_r", sun_color[0])
+        dll_wrapper.set_float("sun_color_g", sun_color[1])
+        dll_wrapper.set_float("sun_color_b", sun_color[2])
 
-        # Re-sync point/spot lights (in case a light was moved/added)
+        # Re-sync point/spot/area lights (in case a light was moved/added)
         light_data = scene_export.export_lights(depsgraph)
-        n_lights = len(light_data) // 8
+        n_lights = len(light_data) // 16
         dll_wrapper.upload_lights(light_data, n_lights)
+
+        # Re-export emissive triangles (transforms may have changed)
+        emissive_data = scene_export.export_emissive_triangles(depsgraph)
+        n_emissive = len(emissive_data) // 16
+        dll_wrapper.upload_emissive_triangles(emissive_data, n_emissive)
 
         _ignis_tlas_dirty = False
         _ignis_instance_count = len(instances)
@@ -769,9 +790,27 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             self._rebuild_tlas(depsgraph)
 
         # ── Light sync (every frame — cheap) ──
+        sun = scene_export.export_sun(depsgraph)
+        dll_wrapper.set_float("sun_elevation", sun["sun_elevation"])
+        dll_wrapper.set_float("sun_azimuth", sun["sun_azimuth"])
+        dll_wrapper.set_float("sun_intensity", sun["sun_intensity"])
+        sun_color = sun.get("sun_color", (1.0, 1.0, 1.0))
+        dll_wrapper.set_float("sun_color_r", sun_color[0])
+        dll_wrapper.set_float("sun_color_g", sun_color[1])
+        dll_wrapper.set_float("sun_color_b", sun_color[2])
+
         light_data = scene_export.export_lights(depsgraph)
-        n_lights = len(light_data) // 8
+        n_lights = len(light_data) // 16
         dll_wrapper.upload_lights(light_data, n_lights)
+
+        # Re-export emissive triangles when scene objects change
+        # (cheap check: track light count changes as proxy for scene edits)
+        global _ignis_last_light_count
+        if n_lights != _ignis_last_light_count:
+            emissive_data = scene_export.export_emissive_triangles(depsgraph)
+            n_emissive = len(emissive_data) // 16
+            dll_wrapper.upload_emissive_triangles(emissive_data, n_emissive)
+            _ignis_last_light_count = n_lights
 
         # ── Transform sync (detect moved/added/removed objects per frame) ──
         global _ignis_last_transforms
@@ -831,10 +870,6 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         dll_wrapper.set_int("max_bounces", props.max_bounces)
         dll_wrapper.set_int("auto_sky_colors", 1 if props.auto_sky_colors else 0)
         if not props.auto_sky_colors:
-            dll_wrapper.set_float("sun_intensity", props.sun_intensity)
-            dll_wrapper.set_float("sun_color_r", props.sun_color[0])
-            dll_wrapper.set_float("sun_color_g", props.sun_color[1])
-            dll_wrapper.set_float("sun_color_b", props.sun_color[2])
             dll_wrapper.set_float("ambient_intensity", props.ambient_intensity)
             dll_wrapper.set_float("ambient_color_r", props.ambient_color[0])
             dll_wrapper.set_float("ambient_color_g", props.ambient_color[1])
