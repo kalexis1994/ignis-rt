@@ -104,6 +104,9 @@ struct PathTracerConfig {
 
     // Shader mode: 0=AC (raygen.rgen), 1=Blender GI (raygen_blender.rgen)
     int   shaderMode         = 0;
+
+    // Wavefront path tracing (experimental — compute-based multi-kernel pipeline)
+    bool  useWavefront       = false;
 };
 
 } // namespace acpt

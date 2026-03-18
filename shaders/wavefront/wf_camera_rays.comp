@@ -1,0 +1,111 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 256) in;
+
+// Scene data (set 0) — shared with RTPipeline
+layout(binding = 2, set = 0) uniform CameraProperties {
+    mat4 viewInverse;
+    mat4 projInverse;
+    mat4 view;
+    mat4 proj;
+    mat4 viewPrev;
+    mat4 projPrev;
+    uvec4 parameters;
+    vec4 jitterData;
+    vec4 sunLight;
+    vec4 ambientLight;
+    vec4 skyLight;
+    vec4 ptParams0;
+    vec4 ptParams1;
+    vec4 windParams;
+    vec4 rainParams;
+    ivec4 jitterPattern[8];
+    uint lightCount;
+    uint lightPad0, lightPad1, lightPad2;
+    vec4 lights[32];
+} cam;
+
+layout(binding = 12, set = 0) uniform sampler2D blueNoiseTexture;
+
+// Wavefront buffers (set 1)
+layout(binding = 0, set = 1, scalar) buffer PathStateBuffer {
+    // PathState: origin(vec3), pixelIndex(uint), direction(vec3), rngState(uint),
+    //            throughput(vec3), flags(uint) = 48 bytes = 12 floats
+    float pathData[];
+} pathStates;
+
+layout(binding = 5, set = 1, scalar) buffer CountersBuffer {
+    uint activeRayCount;
+    uint shadowRayCount;
+    uint nextActiveRayCount;
+    uint pad0;
+} counters;
+
+// Push constants
+layout(push_constant) uniform PushConst {
+    uint width;
+    uint height;
+    uint frameIndex;
+    uint maxBounces;
+    uint currentBounce;
+} pc;
+
+#include "../include/common.glsl"
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint totalPixels = pc.width * pc.height;
+    if (idx >= totalPixels) return;
+
+    uint px = idx % pc.width;
+    uint py = idx / pc.width;
+
+    // Initialize RNG
+    rngState = px * 1973u + py * 9277u + pc.frameIndex * 26699u;
+    pcg(rngState);
+
+    // Blue noise temporal offset
+    ivec2 bnCoord = ivec2(px & 63, py & 63);
+    float blueNoise = texelFetch(blueNoiseTexture, bnCoord, 0).r;
+    rngState += uint(blueNoise * 4294967295.0);
+
+    // Generate camera ray (same math as raygen_blender.rgen)
+    vec2 pixelCenter = vec2(px, py) + 0.5 + vec2(rand01() - 0.5, rand01() - 0.5);
+    vec2 uv = pixelCenter / vec2(pc.width, pc.height);
+    vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+
+    vec4 origin4 = cam.viewInverse * vec4(0, 0, 0, 1);
+    vec4 target4 = cam.projInverse * vec4(ndc.x, ndc.y, 1, 1);
+    target4.xyz /= target4.w;
+    vec4 dir4 = cam.viewInverse * vec4(normalize(target4.xyz), 0);
+
+    // Write PathState (48 bytes = 12 floats per path)
+    uint base = idx * 12u;
+    // origin.xyz + pixelIndex
+    pathStates.pathData[base + 0] = origin4.x;
+    pathStates.pathData[base + 1] = origin4.y;
+    pathStates.pathData[base + 2] = origin4.z;
+    pathStates.pathData[base + 3] = uintBitsToFloat(idx);
+    // direction.xyz + rngState
+    vec3 dir = normalize(dir4.xyz);
+    pathStates.pathData[base + 4] = dir.x;
+    pathStates.pathData[base + 5] = dir.y;
+    pathStates.pathData[base + 6] = dir.z;
+    pathStates.pathData[base + 7] = uintBitsToFloat(rngState);
+    // throughput.xyz + flags
+    pathStates.pathData[base + 8] = 1.0;
+    pathStates.pathData[base + 9] = 1.0;
+    pathStates.pathData[base + 10] = 1.0;
+    pathStates.pathData[base + 11] = uintBitsToFloat(0u); // bounce=0, no flags
+
+    // First thread sets counter
+    if (idx == 0u) {
+        counters.activeRayCount = totalPixels;
+        counters.shadowRayCount = 0u;
+        counters.nextActiveRayCount = 0u;
+    }
+}

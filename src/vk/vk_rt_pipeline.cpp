@@ -769,42 +769,42 @@ bool RTPipeline::CreateDescriptorSetLayout() {
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
     bindings[0].descriptorCount = 1;
-    bindings[0].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[0].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 1: output image (rgba8)
     bindings[1] = {};
     bindings[1].binding = 1;
     bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     bindings[1].descriptorCount = 1;
-    bindings[1].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[1].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 2: Camera UBO
     bindings[2] = {};
     bindings[2].binding = 2;
     bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[2].descriptorCount = 1;
-    bindings[2].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[2].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 3: GeometryMetadata SSBO
     bindings[3] = {};
     bindings[3].binding = 3;
     bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[3].descriptorCount = 1;
-    bindings[3].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[3].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 4: MaterialBuffer SSBO
     bindings[4] = {};
     bindings[4].binding = 4;
     bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[4].descriptorCount = 1;
-    bindings[4].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[4].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 5: textures[] (variable count array, max 1024)
     bindings[5] = {};
     bindings[5].binding = 5;
     bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindings[5].descriptorCount = 1024;
-    bindings[5].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[5].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // bindings 6-10: G-buffer storage images
     for (int i = 6; i <= 10; i++) {
@@ -812,7 +812,7 @@ bool RTPipeline::CreateDescriptorSetLayout() {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         bindings[i].descriptorCount = 1;
-        bindings[i].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+        bindings[i].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
     }
 
     // binding 11: sky LUT sampler
@@ -820,146 +820,146 @@ bool RTPipeline::CreateDescriptorSetLayout() {
     bindings[11].binding = 11;
     bindings[11].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindings[11].descriptorCount = 1;
-    bindings[11].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[11].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 12: blue noise sampler
     bindings[12] = {};
     bindings[12].binding = 12;
     bindings[12].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindings[12].descriptorCount = 1;
-    bindings[12].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[12].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 13: cloud low-res storage image
     bindings[13] = {};
     bindings[13].binding = 13;
     bindings[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     bindings[13].descriptorCount = 1;
-    bindings[13].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[13].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 14: cloud history sampler
     bindings[14] = {};
     bindings[14].binding = 14;
     bindings[14].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindings[14].descriptorCount = 1;
-    bindings[14].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[14].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 15: cloud reconstructed storage image
     bindings[15] = {};
     bindings[15].binding = 15;
     bindings[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     bindings[15].descriptorCount = 1;
-    bindings[15].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[15].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 16: albedo storage image
     bindings[16] = {};
     bindings[16].binding = 16;
     bindings[16].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     bindings[16].descriptorCount = 1;
-    bindings[16].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[16].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 17: PickBuffer SSBO
     bindings[17] = {};
     bindings[17].binding = 17;
     bindings[17].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[17].descriptorCount = 1;
-    bindings[17].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[17].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 18: shadow accumulation current (storage image, write)
     bindings[18] = {};
     bindings[18].binding = 18;
     bindings[18].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     bindings[18].descriptorCount = 1;
-    bindings[18].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[18].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 19: shadow accumulation previous (sampler, read)
     bindings[19] = {};
     bindings[19].binding = 19;
     bindings[19].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindings[19].descriptorCount = 1;
-    bindings[19].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[19].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 20: SHARC write buffer (SSBO)
     bindings[20] = {};
     bindings[20].binding = 20;
     bindings[20].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[20].descriptorCount = 1;
-    bindings[20].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[20].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 21: SHARC read buffer (SSBO)
     bindings[21] = {};
     bindings[21].binding = 21;
     bindings[21].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[21].descriptorCount = 1;
-    bindings[21].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[21].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 22: DLSS NDC depth (R32F storage image)
     bindings[22] = {};
     bindings[22].binding = 22;
     bindings[22].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     bindings[22].descriptorCount = 1;
-    bindings[22].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[22].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 23: cloud shadow map (R16F sampler)
     bindings[23] = {};
     bindings[23].binding = 23;
     bindings[23].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindings[23].descriptorCount = 1;
-    bindings[23].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[23].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // bindings 24-25: GI Reservoir SSBOs (ReSTIR temporal reuse)
     bindings[24] = {};
     bindings[24].binding = 24;
     bindings[24].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[24].descriptorCount = 1;
-    bindings[24].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[24].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     bindings[25] = {};
     bindings[25].binding = 25;
     bindings[25].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[25].descriptorCount = 1;
-    bindings[25].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[25].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 26: emissive triangles SSBO (MIS)
     bindings[26] = {};
     bindings[26].binding = 26;
     bindings[26].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[26].descriptorCount = 1;
-    bindings[26].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[26].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 27: reserved (dummy storage image for future use)
     bindings[27] = {};
     bindings[27].binding = 27;
     bindings[27].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     bindings[27].descriptorCount = 1;
-    bindings[27].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[27].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 28: prevTransforms SSBO (dummy for now — needed for dynamic objects)
     bindings[28] = {};
     bindings[28].binding = 28;
     bindings[28].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[28].descriptorCount = 1;
-    bindings[28].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[28].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 29: reactive mask (R8_UNORM storage image)
     bindings[29] = {};
     bindings[29].binding = 29;
     bindings[29].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     bindings[29].descriptorCount = 1;
-    bindings[29].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[29].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 30: diffuse confidence (R8_UNORM storage image)
     bindings[30] = {};
     bindings[30].binding = 30;
     bindings[30].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     bindings[30].descriptorCount = 1;
-    bindings[30].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[30].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // binding 31: specular confidence (R8_UNORM storage image)
     bindings[31] = {};
     bindings[31].binding = 31;
     bindings[31].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     bindings[31].descriptorCount = 1;
-    bindings[31].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[31].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // Binding flags for partially bound descriptors
     // Note: VARIABLE_DESCRIPTOR_COUNT can only be on the LAST binding (highest number).

@@ -57,6 +57,7 @@ set(IGNIS_CORE_SOURCES
     src/vk/vk_pipeline.cpp
     src/vk/vk_geometry.cpp
     src/vk/vk_rasterizer.cpp
+    src/vk/vk_wavefront_pipeline.cpp
     src/vk/vk_accel_structure.cpp
     src/vk/vk_rt_pipeline.cpp
     src/vk/vk_interop.cpp

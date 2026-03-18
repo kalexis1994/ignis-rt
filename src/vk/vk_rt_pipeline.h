@@ -174,6 +174,8 @@ public:
     VkImage GetReactiveMaskImage() const { return reactiveMaskGBuffer_.image; }
     VkImageView GetReactiveMaskView() const { return reactiveMaskGBuffer_.view; }
     VkImage GetDiffConfidenceImage() const { return diffConfidenceGBuffer_.image; }
+    VkDescriptorSetLayout GetDescriptorSetLayout() const { return descriptorSetLayout_; }
+    VkDescriptorSet GetDescriptorSet() const { return descriptorSet_; }
     VkImage GetSpecConfidenceImage() const { return specConfidenceGBuffer_.image; }
     bool HasGBuffers() const { return gbuffersCreated_; }
 
