@@ -5,6 +5,7 @@
 #include "vk_rasterizer.h"
 #include "vk_accel_structure.h"
 #include "vk_rt_pipeline.h"
+#include "vk_wavefront_pipeline.h"
 #include "vk_interop.h"
 #include "vk_texture_manager.h"
 #include "ignis_log.h"
@@ -377,6 +378,17 @@ bool Renderer::InitRT() {
     } else {
         Log(L"[VK Renderer] RT modules initialized with NRD denoiser\n");
     }
+
+    // Initialize wavefront pipeline (experimental)
+    if (cfg && cfg->useWavefront) {
+        wavefrontPipeline_ = new WavefrontPipeline();
+        if (!wavefrontPipeline_->Initialize(context_, rtPipeline_, renderWidth_, renderHeight_, cfg->maxBounces)) {
+            Log(L"[VK Renderer] WARNING: Wavefront init failed, using monolithic raygen\n");
+            delete wavefrontPipeline_;
+            wavefrontPipeline_ = nullptr;
+        }
+    }
+
     return true;
 }
 
@@ -551,9 +563,15 @@ void Renderer::RenderFrameRT() {
 
     bool diagFlush = false;  // Set true to flush GPU between stages for crash isolation
 
-    // 1. RT dispatch (writes noisy output + G-buffers) at render resolution
+    // 1. Path tracing dispatch (wavefront or monolithic)
     interop_->TransitionForRTWrite(cmd);
-    rtPipeline_->RecordDispatch(cmd, renderWidth_, renderHeight_);
+    if (wavefrontPipeline_ && wavefrontPipeline_->IsReady()) {
+        PathTracerConfig* wfCfg = VK_GetConfig();
+        wavefrontPipeline_->RecordDispatch(cmd, renderWidth_, renderHeight_,
+            rtPipeline_->GetDescriptorSet(), wfCfg ? wfCfg->maxBounces : 2);
+    } else {
+        rtPipeline_->RecordDispatch(cmd, renderWidth_, renderHeight_);
+    }
 
     if (diagFlush) {
         if (!VK_CHECK(vkEndCommandBuffer(cmd))) return;
@@ -2076,7 +2094,8 @@ void Renderer::Shutdown() {
     ShutdownNRD();
     ShutdownDLSS();
 
-    // Shutdown RT modules
+    // Shutdown wavefront + RT modules
+    if (wavefrontPipeline_) { wavefrontPipeline_->Shutdown(); delete wavefrontPipeline_; wavefrontPipeline_ = nullptr; }
     if (rtPipeline_) { rtPipeline_->Shutdown(); delete rtPipeline_; rtPipeline_ = nullptr; }
     if (accelBuilder_) { accelBuilder_->Shutdown(); delete accelBuilder_; accelBuilder_ = nullptr; }
     if (interop_) { interop_->Shutdown(); delete interop_; interop_ = nullptr; }

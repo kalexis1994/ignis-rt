@@ -14,6 +14,7 @@ class Pipeline;
 class Geometry;
 class Rasterizer;
 class RTPipeline;
+class WavefrontPipeline;
 class Interop;
 struct Mesh;
 struct CameraUBO;
@@ -90,6 +91,7 @@ private:
     // RT modules
     AccelStructureBuilder* accelBuilder_ = nullptr;
     RTPipeline* rtPipeline_ = nullptr;
+    WavefrontPipeline* wavefrontPipeline_ = nullptr;
     Interop* interop_ = nullptr;
     bool rtReady_ = false;
     bool useDirectInterop_ = false;

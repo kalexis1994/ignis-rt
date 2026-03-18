@@ -296,13 +296,21 @@ bool WavefrontPipeline::CreatePipelines() {
         return result == VK_SUCCESS;
     };
 
-    // For now, only create K0 (camera rays) — others added in subsequent phases
     if (!createCompute("shaders/wavefront/wf_camera_rays.comp.spv", &pipelineK0_)) {
-        Log(L"[Wavefront] WARNING: K0 (camera rays) shader not found — wavefront not ready\n");
+        Log(L"[Wavefront] ERROR: K0 (camera rays) shader not found\n");
+        return false;
+    }
+    if (!createCompute("shaders/wavefront/wf_intersect.comp.spv", &pipelineK1_)) {
+        Log(L"[Wavefront] ERROR: K1 (intersect) shader not found\n");
+        return false;
+    }
+    if (!createCompute("shaders/wavefront/wf_output.comp.spv", &pipelineK5_)) {
+        Log(L"[Wavefront] ERROR: K5 (output) shader not found\n");
         return false;
     }
 
-    Log(L"[Wavefront] Compute pipelines created\n");
+    // K2, K3, K4 created in later phases
+    Log(L"[Wavefront] Compute pipelines created (K0, K1, K5)\n");
     return true;
 }
 
@@ -310,9 +318,75 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
                                          VkDescriptorSet sceneDescSet, uint32_t maxBounces) {
     if (!ready_) return;
 
-    // TODO: implement full wavefront dispatch loop
-    // Phase 2+: K0 → [K1 → K2 → K3 → K4] × bounces → K5
-    Log(L"[Wavefront] RecordDispatch called (not yet functional)\n");
+    uint32_t totalPixels = width * height;
+    uint32_t groupsAll = (totalPixels + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+
+    // Push constants shared by all kernels
+    struct {
+        uint32_t width, height, frameIndex, maxBounces, currentBounce;
+    } push;
+    push.width = width;
+    push.height = height;
+    push.frameIndex = 0; // TODO: pass from renderer
+    push.maxBounces = maxBounces;
+    push.currentBounce = 0;
+
+    // Bind both descriptor sets (set 0 = scene, set 1 = wavefront)
+    VkDescriptorSet sets[2] = { sceneDescSet, wfDescSet_ };
+
+    // Clear pixel radiance buffer
+    vkCmdFillBuffer(cmd, pixelRadianceBuffer_, 0, totalPixels * 32, 0);
+
+    VkMemoryBarrier clearBarrier{};
+    clearBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    clearBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    clearBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &clearBarrier, 0, nullptr, 0, nullptr);
+
+    // K0: Camera ray generation
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK0_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+        0, 2, sets, 0, nullptr);
+    vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(cmd, groupsAll, 1, 1);
+
+    // Barrier: K0 writes → K1 reads
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+    // Bounce loop: for now just one bounce (K1 only, no K2-K4)
+    for (uint32_t bounce = 0; bounce < maxBounces; bounce++) {
+        push.currentBounce = bounce;
+
+        // K1: Intersection
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK1_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+            0, 2, sets, 0, nullptr);
+        vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, groupsAll, 1, 1);
+
+        // Barrier
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+        // K2-K4: shade + shadow + accumulate (not yet implemented)
+        // Without these, only sky radiance is accumulated (miss rays)
+        break; // single bounce for now
+    }
+
+    // K5: Output
+    uint32_t groupsX = (width + 7) / 8;
+    uint32_t groupsY = (height + 7) / 8;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK5_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+        0, 2, sets, 0, nullptr);
+    vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(cmd, groupsX, groupsY, 1);
 }
 
 } // namespace vk

@@ -1,0 +1,132 @@
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Scene data (set 0)
+layout(binding = 1, set = 0) writeonly uniform image2D outputImage;
+
+layout(binding = 2, set = 0) uniform CameraProperties {
+    mat4 viewInverse;
+    mat4 projInverse;
+    mat4 view;
+    mat4 proj;
+    mat4 viewPrev;
+    mat4 projPrev;
+    uvec4 parameters;
+    vec4 jitterData;
+    vec4 sunLight;
+    vec4 ambientLight;
+    vec4 skyLight;
+    vec4 ptParams0;
+    vec4 ptParams1;
+    vec4 windParams;
+    vec4 rainParams;
+    ivec4 jitterPattern[8];
+    uint lightCount;
+    uint lightPad0, lightPad1, lightPad2;
+    vec4 lights[32];
+} cam;
+
+// G-buffer images (set 0)
+layout(binding = 6, set = 0, rgba16f) uniform image2D normalRoughnessImg;
+layout(binding = 7, set = 0, r32f)    uniform image2D viewDepthImg;
+layout(binding = 8, set = 0, rgba16f) uniform image2D motionVectorsImg;
+layout(binding = 9, set = 0, rgba16f) uniform image2D diffuseRadianceImg;
+layout(binding = 10, set = 0, rgba16f) uniform image2D specularRadianceImg;
+layout(binding = 16, set = 0, rgba16f) uniform image2D albedoBufferImg;
+layout(binding = 18, set = 0, r16f) uniform image2D penumbraImg;
+layout(binding = 22, set = 0, r32f) uniform image2D dlssDepthImg;
+layout(binding = 29, set = 0, r8) uniform image2D reactiveMaskImg;
+layout(binding = 30, set = 0, r8) uniform image2D diffConfidenceImg;
+layout(binding = 31, set = 0, r8) uniform image2D specConfidenceImg;
+
+// Wavefront buffers (set 1)
+layout(binding = 3, set = 1, scalar) buffer PixelRadianceBuffer { float radData[]; } pixelRadiance;
+layout(binding = 4, set = 1, scalar) buffer PrimaryGBufBuffer { float gbufData[]; } primaryGBuf;
+
+layout(push_constant) uniform PushConst {
+    uint width;
+    uint height;
+    uint frameIndex;
+    uint maxBounces;
+    uint currentBounce;
+} pc;
+
+#include "../include/common.glsl"
+#include "../include/nrd_encode.glsl"
+#include "../include/tonemap.glsl"
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(pc.width) || pixel.y >= int(pc.height)) return;
+
+    uint pixelIndex = pixel.y * pc.width + pixel.x;
+
+    // Read accumulated radiance (8 floats per pixel)
+    uint rBase = pixelIndex * 8u;
+    vec3 diffuse = vec3(pixelRadiance.radData[rBase+0],
+                        pixelRadiance.radData[rBase+1],
+                        pixelRadiance.radData[rBase+2]);
+    float hitDist = pixelRadiance.radData[rBase+3];
+    vec3 specular = vec3(pixelRadiance.radData[rBase+4],
+                         pixelRadiance.radData[rBase+5],
+                         pixelRadiance.radData[rBase+6]);
+
+    // Read primary G-buffer (16 floats per pixel)
+    // TODO: use PrimaryGBuffer struct layout when K2 (shade) is implemented
+    // For now, write defaults for sky-only rendering
+    vec3 primaryNormal = vec3(0, 0, 1);
+    float primaryRoughness = 1.0;
+    float primaryViewZ = 1e7;
+    vec3 primaryAlbedo = vec3(0.0);
+    bool primaryHit = false;
+
+    // Combined radiance
+    vec3 color = diffuse + specular;
+
+    // Write G-buffers (defaults for now — will be filled by K2 in Phase 4)
+    imageStore(normalRoughnessImg, pixel, NRD_PackNormalRoughness(primaryNormal, primaryRoughness));
+    imageStore(viewDepthImg, pixel, vec4(primaryViewZ, 0, 0, 0));
+    imageStore(motionVectorsImg, pixel, vec4(0, 0, 0, 0));
+    imageStore(diffuseRadianceImg, pixel, vec4(0, 0, 0, 0));
+    imageStore(specularRadianceImg, pixel, vec4(0, 0, 0, 0));
+    imageStore(albedoBufferImg, pixel, vec4(0, 0, 0, 0));
+    imageStore(dlssDepthImg, pixel, vec4(1.0, 0, 0, 0));
+    imageStore(penumbraImg, pixel, vec4(0.0));
+    imageStore(reactiveMaskImg, pixel, vec4(0.0));
+    imageStore(diffConfidenceImg, pixel, vec4(1.0));
+    imageStore(specConfidenceImg, pixel, vec4(1.0));
+
+    // HDR output flag
+    bool hdrOutput = (cam.parameters.w != 0u);
+
+    if (!hdrOutput) {
+        float exposure = cam.ptParams0.x;
+        float ptSaturation = cam.ptParams0.z;
+        float ptContrast = cam.ptParams0.w;
+        uint ptTonemapMode = uint(cam.jitterData.z);
+
+        color *= exposure;
+        color = applyTonemap(color, ptTonemapMode);
+        float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        color = mix(vec3(luma), color, ptSaturation);
+        if (ptContrast > 0.01) {
+            vec3 curved = color * color * (3.0 - 2.0 * color);
+            color = mix(color, curved, ptContrast);
+        }
+        color = clamp(color, 0.0, 1.0);
+        color = pow(color, vec3(1.0 / 2.2));
+
+        // Dither
+        uint dh = uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + pc.frameIndex * 26699u;
+        dh = (dh ^ (dh >> 16u)) * 0x45d9f3bu;
+        dh = (dh ^ (dh >> 16u)) * 0x45d9f3bu;
+        float d1 = float(dh & 0xFFFFu) / 65535.0;
+        float d2 = float((dh >> 16u) & 0xFFFFu) / 65535.0;
+        color += (d1 - d2) * 0.6 / 255.0;
+    }
+
+    imageStore(outputImage, pixel, vec4(color, 1.0));
+}
