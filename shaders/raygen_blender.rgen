@@ -659,7 +659,8 @@ void main() {
                 float shadowHitDist = 65504.0;  // no occluder = far
                 for (int shadowSkip = 0; shadowSkip < 4; shadowSkip++) {
                     rayQueryEXT shadowRQ;
-                    rayQueryInitializeEXT(shadowRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
+                    rayQueryInitializeEXT(shadowRQ, topLevelAS,
+                        gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
                         0xFF, shadowOrigin, 0.0, sunDir, 10000.0);
                     while (rayQueryProceedEXT(shadowRQ)) {}
 
@@ -854,7 +855,8 @@ void main() {
             bool inShadow = false;
             for (int ptShadowSkip = 0; ptShadowSkip < 4; ptShadowSkip++) {
                 rayQueryEXT shadowRQ;
-                rayQueryInitializeEXT(shadowRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
+                rayQueryInitializeEXT(shadowRQ, topLevelAS,
+                    gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
                     0xFF, ptShadowOrigin, 0.0, shadowDir, shadowDist - 0.004);
                 while (rayQueryProceedEXT(shadowRQ)) {}
                 if (rayQueryGetIntersectionTypeEXT(shadowRQ, true)
@@ -925,7 +927,8 @@ void main() {
                     bool eInShadow = false;
                     for (int eShadowSkip = 0; eShadowSkip < 4; eShadowSkip++) {
                         rayQueryEXT eShadowRQ;
-                        rayQueryInitializeEXT(eShadowRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
+                        rayQueryInitializeEXT(eShadowRQ, topLevelAS,
+                            gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
                             0xFF, eShadowOrigin, 0.0, eDir, eDist - 0.01);
                         while (rayQueryProceedEXT(eShadowRQ)) {}
                         if (rayQueryGetIntersectionTypeEXT(eShadowRQ, true)
