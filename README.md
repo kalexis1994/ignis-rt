@@ -46,7 +46,7 @@ Real-time Vulkan ray tracing renderer designed as a Blender viewport render engi
 - **GPU**: NVIDIA RTX series (ray tracing hardware required)
 - **OS**: Windows 10/11
 - **Vulkan SDK**: 1.2+
-- **Blender**: 4.0+
+- **Blender**: 4.0+ (GPU backend must be set to **OpenGL**: Edit > Preferences > System > GPU Backend)
 - **Build tools**: CMake 3.20+, Visual Studio 2022
 
 ### Optional SDKs
