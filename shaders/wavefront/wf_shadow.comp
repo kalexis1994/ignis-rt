@@ -1,0 +1,47 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 256) in;
+
+// Scene data (set 0)
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+
+// Wavefront buffers (set 1)
+layout(binding = 2, set = 1, scalar) buffer ShadowRayBuffer { float shadowData[]; } shadowRays;
+layout(binding = 5, set = 1, scalar) buffer CountersBuffer {
+    uint activeRayCount;
+    uint shadowRayCount;
+    uint nextActiveRayCount;
+    uint pad0;
+} counters;
+
+#include "../include/common.glsl"
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= counters.shadowRayCount) return;
+
+    // Read ShadowRay (12 floats)
+    uint base = idx * 12u;
+    vec3 origin = vec3(shadowRays.shadowData[base+0], shadowRays.shadowData[base+1], shadowRays.shadowData[base+2]);
+    float maxDist = shadowRays.shadowData[base+3];
+    vec3 dir = vec3(shadowRays.shadowData[base+4], shadowRays.shadowData[base+5], shadowRays.shadowData[base+6]);
+
+    // Trace shadow ray with TerminateOnFirstHit
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, topLevelAS,
+        gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+        0xFF, origin, 0.0, dir, maxDist);
+    while (rayQueryProceedEXT(rq)) {}
+
+    // If occluded, zero out the radiance
+    if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+        shadowRays.shadowData[base+8] = 0.0;
+        shadowRays.shadowData[base+9] = 0.0;
+        shadowRays.shadowData[base+10] = 0.0;
+    }
+    // If not occluded, radiance stays as-is
+}

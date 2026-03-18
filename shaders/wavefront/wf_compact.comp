@@ -1,0 +1,19 @@
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 1) in;
+
+// Wavefront buffers (set 1)
+layout(binding = 5, set = 1, scalar) buffer CountersBuffer {
+    uint activeRayCount;
+    uint shadowRayCount;
+    uint nextActiveRayCount;
+    uint pad0;
+} counters;
+
+void main() {
+    // Swap: active = next, reset next and shadow counters
+    counters.activeRayCount = counters.nextActiveRayCount;
+    counters.nextActiveRayCount = 0u;
+    counters.shadowRayCount = 0u;
+}

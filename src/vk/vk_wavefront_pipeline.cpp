@@ -304,13 +304,28 @@ bool WavefrontPipeline::CreatePipelines() {
         Log(L"[Wavefront] ERROR: K1 (intersect) shader not found\n");
         return false;
     }
+    if (!createCompute("shaders/wavefront/wf_shade.comp.spv", &pipelineK2_)) {
+        Log(L"[Wavefront] ERROR: K2 (shade) shader not found\n");
+        return false;
+    }
+    if (!createCompute("shaders/wavefront/wf_shadow.comp.spv", &pipelineK3_)) {
+        Log(L"[Wavefront] ERROR: K3 (shadow) shader not found\n");
+        return false;
+    }
+    if (!createCompute("shaders/wavefront/wf_accumulate.comp.spv", &pipelineK4_)) {
+        Log(L"[Wavefront] ERROR: K4 (accumulate) shader not found\n");
+        return false;
+    }
     if (!createCompute("shaders/wavefront/wf_output.comp.spv", &pipelineK5_)) {
         Log(L"[Wavefront] ERROR: K5 (output) shader not found\n");
         return false;
     }
+    if (!createCompute("shaders/wavefront/wf_compact.comp.spv", &pipelineCompact_)) {
+        Log(L"[Wavefront] ERROR: Compact shader not found\n");
+        return false;
+    }
 
-    // K2, K3, K4 created in later phases
-    Log(L"[Wavefront] Compute pipelines created (K0, K1, K5)\n");
+    Log(L"[Wavefront] All compute pipelines created (K0-K5 + compact)\n");
     return true;
 }
 
@@ -359,7 +374,7 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
-    // Bounce loop: for now just one bounce (K1 only, no K2-K4)
+    // Bounce loop: K1 → K2 → K3 → K4 → compact
     for (uint32_t bounce = 0; bounce < maxBounces; bounce++) {
         push.currentBounce = bounce;
 
@@ -370,13 +385,47 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
         vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
         vkCmdDispatch(cmd, groupsAll, 1, 1);
 
-        // Barrier
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
-        // K2-K4: shade + shadow + accumulate (not yet implemented)
-        // Without these, only sky radiance is accumulated (miss rays)
-        break; // single bounce for now
+        // K2: Shade + NEE + bounce setup
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK2_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+            0, 2, sets, 0, nullptr);
+        vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, groupsAll, 1, 1);
+
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+        // K3: Shadow ray intersection
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK3_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+            0, 2, sets, 0, nullptr);
+        vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, groupsAll, 1, 1);
+
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+        // K4: Accumulate radiance from shadow results
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK4_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+            0, 2, sets, 0, nullptr);
+        vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, groupsAll, 1, 1);
+
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+        // Compact: swap counters for next bounce
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineCompact_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+            0, 2, sets, 0, nullptr);
+        vkCmdDispatch(cmd, 1, 1, 1);
+
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
     }
 
     // K5: Output
