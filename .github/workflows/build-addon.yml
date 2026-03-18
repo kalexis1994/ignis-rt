@@ -13,10 +13,23 @@ jobs:
 
       # ── Vulkan SDK ──────────────────────────────────────────────
       - name: Install Vulkan SDK
-        uses: humbletim/install-vulkan-sdk@v1.1.1
-        with:
-          version: 1.3.290.0
-          cache: true
+        run: |
+          $ver = "1.3.290.0"
+          $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/VulkanSDK-$ver-Installer.exe"
+          Invoke-WebRequest -Uri $url -OutFile VulkanSDK.exe
+          Start-Process -FilePath .\VulkanSDK.exe -Args "--accept-licenses --default-answer --confirm-command install" -Wait
+          echo "VULKAN_SDK=C:\VulkanSDK\$ver" >> $env:GITHUB_ENV
+          echo "C:\VulkanSDK\$ver\Bin" >> $env:GITHUB_PATH
+
+      # ── Download DLSS DLLs from NVIDIA repo ─────────────────────
+      - name: Download DLSS DLLs
+        shell: bash
+        run: |
+          DLSS_BASE="https://github.com/NVIDIA/DLSS/raw/main/lib/Windows_x86_64/rel"
+          mkdir -p vendor_dlls
+          curl -sL -o vendor_dlls/nvngx_dlss.dll  "$DLSS_BASE/nvngx_dlss.dll"
+          curl -sL -o vendor_dlls/nvngx_dlssd.dll "$DLSS_BASE/nvngx_dlssd.dll"
+          ls -lh vendor_dlls/
 
       # ── Build ignis_rt.dll ──────────────────────────────────────
       - name: Configure CMake
@@ -33,13 +46,21 @@ jobs:
           mkdir -p staging/ignis_rt/shaders
 
           # Python addon files
-          cp blender/ignis_rt/__init__.py  staging/ignis_rt/
+          cp blender/ignis_rt/__init__.py   staging/ignis_rt/
           cp blender/ignis_rt/dll_wrapper.py staging/ignis_rt/
           cp blender/ignis_rt/engine.py      staging/ignis_rt/
           cp blender/ignis_rt/scene_export.py staging/ignis_rt/
 
-          # DLL
+          # DLL (built)
           cp build/Release/ignis_rt.dll staging/ignis_rt/lib/
+
+          # Vendor DLLs (DLSS SR + RR)
+          cp vendor_dlls/nvngx_dlss.dll  staging/ignis_rt/lib/
+          cp vendor_dlls/nvngx_dlssd.dll staging/ignis_rt/lib/
+
+          # NRD DLL + composite shader (from repo lib/)
+          cp blender/ignis_rt/lib/NRD.dll          staging/ignis_rt/lib/ 2>/dev/null || true
+          cp blender/ignis_rt/lib/nrd_composite.spv staging/ignis_rt/lib/ 2>/dev/null || true
 
           # Compiled shaders
           cp shaders/*.spv staging/ignis_rt/shaders/

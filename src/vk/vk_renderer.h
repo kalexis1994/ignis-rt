@@ -58,6 +58,7 @@ public:
     bool HasInterop() const { return interop_ != nullptr; }
 
     bool IsDLSSActive() const { return dlssActive_; }
+    bool IsDLSSRRActive() const { return dlssRRActive_; }
     void GetRenderResolution(uint32_t* w, uint32_t* h) const { *w = renderWidth_; *h = renderHeight_; }
     void GetDisplayResolution(uint32_t* w, uint32_t* h) const { *w = width_; *h = height_; }
     float GetComputedExposure() const { return computedExposure_; }
@@ -124,6 +125,7 @@ private:
     // DLSS upscaling
     DLSS_NGX* dlss_ = nullptr;
     bool dlssActive_ = false;
+    bool dlssRRActive_ = false;
     bool dlssDebugBypass_ = false;
     uint32_t renderWidth_ = 0;
     uint32_t renderHeight_ = 0;

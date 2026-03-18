@@ -336,6 +336,16 @@ bool Renderer::InitRT() {
         }
     }
 
+    // Try Ray Reconstruction if requested (after DLSS SR init)
+    if (cfg && cfg->dlssRREnabled && dlssActive_ && dlss_) {
+        if (dlss_->InitializeRR()) {
+            dlssRRActive_ = true;
+            Log(L"[VK Renderer] DLSS Ray Reconstruction active — will skip NRD\n");
+        } else {
+            Log(L"[VK Renderer] RR unavailable, falling back to NRD + SR\n");
+        }
+    }
+
     // Create acceleration structure builder
     accelBuilder_ = new AccelStructureBuilder();
     if (!accelBuilder_->Initialize(context_)) {
@@ -478,32 +488,6 @@ void Renderer::UpdateCamera(const CameraUBO& camera) {
     jitterX_ = camera.jitterData[0];
     jitterY_ = camera.jitterData[1];
 
-    // Diagnostic: log projection matrix convention (once)
-    static bool s_projLogged = false;
-    if (!s_projLogged) {
-        s_projLogged = true;
-        // Column-major: proj[col*4 + row]
-        float p22 = camera.proj[2*4 + 2];  // proj[2][2]
-        float p23 = camera.proj[2*4 + 3];  // proj[2][3]
-        float p32 = camera.proj[3*4 + 2];  // proj[3][2]
-        float p33 = camera.proj[3*4 + 3];  // proj[3][3]
-        Log(L"[DLSS-Diag] Proj matrix: [2][2]=%.6f, [2][3]=%.6f, [3][2]=%.6f, [3][3]=%.6f\n",
-            p22, p23, p32, p33);
-        // Test NDC depth for viewZ=-5.0 (typical near object)
-        float testViewZ = -5.0f;
-        float clipZ = p22 * testViewZ + p32;
-        float clipW = p23 * testViewZ + p33;
-        float testNdcZ = (clipW != 0.0f) ? clipZ / clipW : -999.0f;
-        Log(L"[DLSS-Diag] Test viewZ=-5: clipZ=%.4f, clipW=%.4f, ndcZ=%.6f\n",
-            clipZ, clipW, testNdcZ);
-        // Test with positive viewZ (D3D11 LH convention)
-        testViewZ = 5.0f;
-        clipZ = p22 * testViewZ + p32;
-        clipW = p23 * testViewZ + p33;
-        testNdcZ = (clipW != 0.0f) ? clipZ / clipW : -999.0f;
-        Log(L"[DLSS-Diag] Test viewZ=+5: clipZ=%.4f, clipW=%.4f, ndcZ=%.6f\n",
-            clipZ, clipW, testNdcZ);
-    }
 }
 
 bool Renderer::ReadPickResult(uint32_t& outCustomIndex, uint32_t& outPrimitiveId, uint32_t& outMaterialId) {
@@ -524,10 +508,6 @@ void Renderer::RenderFrameRT() {
         return;
     }
 
-    if (frameIndex_ < 5) {
-        Log(L"[VK Renderer] RenderFrameRT frame=%u nrdInit=%d compositeReady=%d\n",
-            frameIndex_, (int)nrdInitialized_, (int)compositeReady_);
-    }
 
     VkDevice device = context_->GetDevice();
     VkCommandBuffer cmd = commandBuffers_[currentFrame_];
@@ -569,8 +549,7 @@ void Renderer::RenderFrameRT() {
         rtPipeline_->UpdatePrevTransforms(prevInstanceTransforms_.data(), instanceTransformCount_);
     }
 
-    // === DIAGNOSTIC: on first 3 frames, flush GPU after each stage to isolate crashes ===
-    bool diagFlush = (frameIndex_ < 3);
+    bool diagFlush = false;  // Set true to flush GPU between stages for crash isolation
 
     // 1. RT dispatch (writes noisy output + G-buffers) at render resolution
     interop_->TransitionForRTWrite(cmd);
@@ -616,8 +595,84 @@ void Renderer::RenderFrameRT() {
 
     // (SHARC diag flush removed — SHARC is disabled)
 
-    // 2. NRD denoise (reads G-buffers, writes denoised textures)
-    if (nrdInitialized_) {
+    // 2. Ray Reconstruction path (replaces NRD + composite + DLSS SR)
+    if (dlssRRActive_ && dlss_ && dlss_->IsRRActive()) {
+        // Barrier: RT writes → RR reads (G-buffers and noisy color)
+        VkMemoryBarrier rtToRR{};
+        rtToRR.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        rtToRR.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        rtToRR.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &rtToRR, 0, nullptr, 0, nullptr);
+
+        // Measure frame delta
+        static auto s_lastRRTime = std::chrono::high_resolution_clock::now();
+        auto rrNow = std::chrono::high_resolution_clock::now();
+        float rrDeltaMs = std::chrono::duration<float, std::milli>(rrNow - s_lastRRTime).count();
+        s_lastRRTime = rrNow;
+        if (rrDeltaMs < 1.0f) rrDeltaMs = 1.0f;
+        if (rrDeltaMs > 100.0f) rrDeltaMs = 100.0f;
+
+        bool rrReset = (frameIndex_ == 0);
+
+        dlss_->EvaluateRR(cmd,
+            dlssColorInput_, dlssColorInputView_,           // noisy color (render res)
+            dlssHdrOutput_, dlssHdrOutputView_,              // output (display res)
+            rtPipeline_->GetDlssDepthImage(),                // NDC depth
+            rtPipeline_->GetDlssDepthView(),
+            rtPipeline_->GetMotionVectorsImage(),            // MVs
+            rtPipeline_->GetMotionVectorsView(),
+            rtPipeline_->GetNormalRoughnessImage(),          // normals + roughness
+            rtPipeline_->GetNormalRoughnessView(),
+            rtPipeline_->GetAlbedoBufferImage(),             // albedo
+            rtPipeline_->GetAlbedoBufferView(),
+            jitterX_, jitterY_,
+            rrDeltaMs / 1000.0f,
+            rrReset);
+
+        // Barrier: RR writes → tonemap reads
+        VkMemoryBarrier rrBarrier{};
+        rrBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        rrBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        rrBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &rrBarrier, 0, nullptr, 0, nullptr);
+
+        // Tonemap: RR HDR output → LDR interop
+        PathTracerConfig* cfg = VK_GetConfig();
+        if (tonemapReady_ && cfg) {
+            UpdateTonemapDescriptors();
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, tonemapPipeline_);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                tonemapPipelineLayout_, 0, 1, &tonemapDescSet_, 0, nullptr);
+
+            struct { uint32_t mode; float exposure, saturation, contrast; } tonemapPush;
+            tonemapPush.mode = static_cast<uint32_t>(cfg->ptTonemapMode);
+            tonemapPush.exposure = cfg->ptAutoExposure ? computedExposure_ : cfg->ptExposure;
+            tonemapPush.saturation = cfg->ptSaturation;
+            tonemapPush.contrast = cfg->ptContrast;
+            vkCmdPushConstants(cmd, tonemapPipelineLayout_,
+                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapPush), &tonemapPush);
+
+            vkCmdDispatch(cmd, (width_ + 7) / 8, (height_ + 7) / 8, 1);
+
+            // Barrier: tonemap writes → ImGui/readback reads
+            VkMemoryBarrier tonemapBarrier{};
+            tonemapBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            tonemapBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            tonemapBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                0, 1, &tonemapBarrier, 0, nullptr, 0, nullptr);
+        }
+    }
+    // 2b. NRD denoise path (traditional pipeline)
+    else if (nrdInitialized_) {
         // Barrier: RT writes → NRD reads (G-buffers and output image)
         VkMemoryBarrier rtToNrd{};
         rtToNrd.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -789,12 +844,6 @@ void Renderer::RenderFrameRT() {
                 s_lastDlssTime = dlssNow;
                 if (dlssDeltaMs < 1.0f) dlssDeltaMs = 1.0f;
                 if (dlssDeltaMs > 100.0f) dlssDeltaMs = 100.0f;
-
-                // Log jitter values periodically for debugging
-                if (frameIndex_ < 5 || frameIndex_ % 60 == 0) {
-                    Log(L"[DLSS] Frame %u: jitter=(%.4f, %.4f) delta=%.1fms renderRes=%ux%u\n",
-                        frameIndex_, jitterX_, jitterY_, dlssDeltaMs, renderWidth_, renderHeight_);
-                }
 
                 dlss_->Evaluate(cmd,
                     dlssColorInput_, dlssColorInputView_,          // HDR color (RGBA16F, render res)
@@ -1106,9 +1155,27 @@ bool Renderer::InitNRD() {
     if (!rtPipeline_ || !context_) return false;
 
     // Create G-buffers first (at render resolution — may be < display when DLSS active)
+    // RR also needs G-buffers (normals, albedo, depth, MVs)
     if (!rtPipeline_->CreateGBuffers(renderWidth_, renderHeight_)) {
         Log(L"[VK Renderer] WARNING: Failed to create G-buffers\n");
         return false;
+    }
+
+    // When Ray Reconstruction is active, skip NRD and composite — RR replaces them.
+    // Still create G-buffers (done above) and tonemap pipeline (RR outputs HDR).
+    if (dlssRRActive_) {
+        Log(L"[VK Renderer] RR active — skipping NRD init, creating tonemap only\n");
+
+        // Create tonemap pipeline (RR outputs HDR to dlssHdrOutput_, needs tonemap to LDR)
+        if (dlssActive_ && dlssHdrOutput_) {
+            if (!CreateTonemapPipeline()) {
+                Log(L"[VK Renderer] WARNING: Tonemap pipeline creation failed\n");
+            }
+        }
+
+        // Mark as initialized so RenderFrameRT proceeds
+        nrdInitialized_ = false;  // NRD itself is NOT initialized
+        return true;
     }
 
     // Initialize NRD (at render resolution)
@@ -1946,6 +2013,7 @@ void Renderer::ShutdownDLSS() {
     }
 
     dlssActive_ = false;
+    dlssRRActive_ = false;
     Log(L"[VK Renderer] DLSS shutdown\n");
 }
 

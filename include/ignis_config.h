@@ -73,6 +73,7 @@ struct PathTracerConfig {
     // DLSS
     bool  dlssEnabled        = false;
     int   dlssQualityMode    = 0;       // maps to DLSSQualityMode enum
+    bool  dlssRREnabled      = false;   // Use Ray Reconstruction when available (replaces NRD)
 
     // Rain (kept for shader uniforms, but not driven by weather engine)
     bool  rainEnabled        = false;

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="icons/ignis_logo.png" width="128" alt="Ignis RT">
+</p>
+
 # Ignis RT
 
 Real-time Vulkan ray tracing renderer designed as a Blender viewport render engine. Built on top of hardware-accelerated ray tracing with NVIDIA NRD temporal denoising and DLSS upscaling.
@@ -16,7 +20,8 @@ Real-time Vulkan ray tracing renderer designed as a Blender viewport render engi
 - **PBR materials** (Cook-Torrance GGX microfacet BRDF)
 
 ### Denoising & Upscaling
-- **NVIDIA NRD** (ReLAX diffuse+specular denoiser + SIGMA shadow denoiser)
+- **NVIDIA DLSS Ray Reconstruction** (experimental — replaces NRD on RTX 40+ GPUs)
+- **NVIDIA NRD** (ReLAX diffuse+specular denoiser + SIGMA shadow denoiser, fallback for RTX 20/30)
 - **NVIDIA DLSS** upscaling (Ultra Performance to Ultra Quality)
 - **Auto-exposure** with GPU histogram and EMA smoothing
 - **Triangular dithering** to eliminate 8-bit banding
@@ -106,7 +111,7 @@ ignis-rt/
 - **No texture filtering** beyond hardware bilinear
 
 ### Future Plans
-- **NVIDIA Ray Reconstruction** (NRD replacement for cleaner reflections and faster convergence)
+- **Ray Reconstruction polish** (jitter tuning, specular MVs, hit distance inputs)
 - **ReSTIR DI** for many-light scenarios
 - **Area light** support
 - **Texture LOD / mipmap** streaming
@@ -121,7 +126,7 @@ Areas where contributions would be especially valuable:
 - Specular reflection quality and temporal stability
 - Additional Blender material node support
 - Performance optimization for complex scenes
-- Ray Reconstruction integration
+- Ray Reconstruction refinement (specular MVs, hit distance, jitter stability)
 
 ## License
 

@@ -159,11 +159,13 @@ public:
 
     // G-buffer image accessors (for NRD)
     VkImage GetNormalRoughnessImage() const { return normalRoughnessGBuffer_.image; }
+    VkImageView GetNormalRoughnessView() const { return normalRoughnessGBuffer_.view; }
     VkImage GetViewDepthImage() const { return viewDepthGBuffer_.image; }
     VkImage GetMotionVectorsImage() const { return motionVectorsGBuffer_.image; }
     VkImage GetDiffuseRadianceImage() const { return diffuseRadianceGBuffer_.image; }
     VkImage GetSpecularRadianceImage() const { return specularRadianceGBuffer_.image; }
     VkImage GetAlbedoBufferImage() const { return albedoGBuffer_.image; }
+    VkImageView GetAlbedoBufferView() const { return albedoGBuffer_.view; }
     VkImage GetPenumbraImage() const { return penumbraGBuffer_.image; }
     VkImageView GetViewDepthView() const { return viewDepthGBuffer_.view; }
     VkImageView GetMotionVectorsView() const { return motionVectorsGBuffer_.view; }

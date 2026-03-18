@@ -726,22 +726,31 @@ void main() {
                 );
 
                 if (bounce == 0) {
-                    // CP2077-style shadow separation:
-                    // Write UNSHADOWED direct light to NRD (RELAX sees stable signal).
-                    // SIGMA denoises the shadow separately; composite re-applies it.
-                    vec3 sunDiffContrib = diffContrib * sunRadiance * throughput;
-                    diffuseRadiance += sunDiffContrib;
-                    directSunDiffuse = sunDiffContrib;  // remember for sunFraction
-                    specularRadiance += specContrib * sunRadiance * throughput;
-
-                    // Store penumbra for SIGMA
-                    primaryNdotL = NdotL;
-                    if (inShadow) {
-                        // Penumbra radius = distToOccluder * tanAngle * 0.5
-                        float sigmaTanAngle = 0.04;  // smaller sun angular size → sharper contact shadows
-                        primaryPenumbra = min(shadowHitDist * sigmaTanAngle * 0.5, 32768.0);
+                    bool rrMode = (cam.parameters.w == 2u);
+                    if (rrMode) {
+                        // RR mode: apply shadow directly — no SIGMA separation needed.
+                        // Ray Reconstruction handles denoising of the shadowed signal.
+                        float shadow = inShadow ? 0.0 : 1.0;
+                        diffuseRadiance += diffContrib * sunRadiance * throughput * shadow;
+                        specularRadiance += specContrib * sunRadiance * throughput * shadow;
                     } else {
-                        primaryPenumbra = 65504.0;  // fully lit
+                        // CP2077-style shadow separation:
+                        // Write UNSHADOWED direct light to NRD (RELAX sees stable signal).
+                        // SIGMA denoises the shadow separately; composite re-applies it.
+                        vec3 sunDiffContrib = diffContrib * sunRadiance * throughput;
+                        diffuseRadiance += sunDiffContrib;
+                        directSunDiffuse = sunDiffContrib;  // remember for sunFraction
+                        specularRadiance += specContrib * sunRadiance * throughput;
+
+                        // Store penumbra for SIGMA
+                        primaryNdotL = NdotL;
+                        if (inShadow) {
+                            // Penumbra radius = distToOccluder * tanAngle * 0.5
+                            float sigmaTanAngle = 0.04;  // smaller sun angular size → sharper contact shadows
+                            primaryPenumbra = min(shadowHitDist * sigmaTanAngle * 0.5, 32768.0);
+                        } else {
+                            primaryPenumbra = 65504.0;  // fully lit
+                        }
                     }
                 } else {
                     // Indirect bounces: apply shadow directly (SIGMA only handles primary)
@@ -1312,8 +1321,8 @@ void main() {
         }
     }
 
-    // HDR output flag: when DLSS is active, skip tonemap in raygen (DLSS upscales HDR,
-    // then a dedicated tonemap pass converts to LDR)
+    // HDR output flag: when DLSS SR or RR is active, skip tonemap in raygen
+    // (DLSS/RR processes HDR; a dedicated tonemap pass converts to LDR)
     bool hdrOutput = (cam.parameters.w != 0u);
 
     if (!hdrOutput) {

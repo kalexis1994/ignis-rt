@@ -304,8 +304,10 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
         float jitterX = HaltonSeq((frameIndex % 256) + 1, 2) - 0.5f;
         float jitterY = HaltonSeq((frameIndex % 256) + 1, 3) - 0.5f;
 
-        cam.jitterData[0] = 0.0f;
-        cam.jitterData[1] = 0.0f;
+        // Pass pixel-space jitter to renderer for DLSS SR/RR
+        // Y is negated to match Vulkan's flipped Y convention (same as NDC transform)
+        cam.jitterData[0] = jitterX;
+        cam.jitterData[1] = -jitterY;
 
         float jitterNDC_X = 2.0f * jitterX / (float)rw;
         float jitterNDC_Y = -2.0f * jitterY / (float)rh;
@@ -341,7 +343,8 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
     cam.parameters[0] = frameIndex;
     cam.parameters[1] = static_cast<uint32_t>(cfg->debugView);
     cam.parameters[2] = static_cast<uint32_t>(cfg->maxBounces);
-    cam.parameters[3] = g_renderer->IsDLSSActive() ? 1 : 0;  // hdrOutput flag for raygen
+    cam.parameters[3] = g_renderer->IsDLSSRRActive() ? 2u :
+                         (g_renderer->IsDLSSActive() ? 1u : 0u);  // 0=LDR, 1=HDR(SR), 2=RR
 
     float sunDir[3];
     ComputeSunDirection(cfg->sunAzimuth, cfg->sunElevation, sunDir);
@@ -387,11 +390,6 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
     cam.lightPad[1] = cam.lightPad[2] = 0;
     if (s_lightCount > 0) {
         memcpy(cam.lights, s_lightData, s_lightCount * 16 * sizeof(float));
-    }
-
-    if (frameIndex < 3) {
-        Log(L"[Ignis] set_camera: frameIndex=%u hasPrevFrame=%d lights=%u\n",
-            frameIndex, (int)s_hasPrevFrame, s_lightCount);
     }
 
     g_renderer->UpdateCamera(cam);
@@ -504,12 +502,33 @@ IGNIS_API void ignis_set_int(const char* key, int value) {
     else if (strcmp(key, "auto_sky_colors") == 0)   cfg->autoSkyColors = (value != 0);
     else if (strcmp(key, "dlss_enabled") == 0)      cfg->dlssEnabled = (value != 0);
     else if (strcmp(key, "dlss_quality") == 0)      cfg->dlssQualityMode = value;
+    else if (strcmp(key, "dlss_rr_enabled") == 0)   cfg->dlssRREnabled = (value != 0);
     else if (strcmp(key, "nrd_enabled") == 0)       cfg->nrdEnabled = (value != 0);
     else if (strcmp(key, "nrd_atrous_iterations") == 0) cfg->nrdAtrousIterations = (value < 2 ? 2 : (value > 8 ? 8 : value));
     else if (strcmp(key, "nrd_anti_firefly") == 0)  cfg->nrdAntiFirefly = (value != 0);
     else if (strcmp(key, "nrd_history_fix_frames") == 0) cfg->nrdHistoryFixFrameNum = (value < 0 ? 0 : (value > 6 ? 6 : value));
     else if (strcmp(key, "max_bounces") == 0)       cfg->maxBounces = (value < 1 ? 1 : (value > 8 ? 8 : value));
     else if (strcmp(key, "shader_mode") == 0)       cfg->shaderMode = value;
+}
+
+IGNIS_API int ignis_get_int(const char* key) {
+    if (!key) return 0;
+
+    // Renderer state queries
+    if (strcmp(key, "dlss_active") == 0)      return g_renderer && g_renderer->IsDLSSActive() ? 1 : 0;
+    if (strcmp(key, "dlss_rr_active") == 0)    return g_renderer && g_renderer->IsDLSSRRActive() ? 1 : 0;
+    if (strcmp(key, "nrd_active") == 0)        return g_renderer && g_renderer->IsDLSSActive() && !g_renderer->IsDLSSRRActive() ? 1 : 0;
+
+    // Config queries
+    acpt::PathTracerConfig* cfg = &acpt::g_config;
+    if (strcmp(key, "dlss_enabled") == 0)      return cfg->dlssEnabled ? 1 : 0;
+    if (strcmp(key, "dlss_rr_enabled") == 0)   return cfg->dlssRREnabled ? 1 : 0;
+    if (strcmp(key, "nrd_enabled") == 0)       return cfg->nrdEnabled ? 1 : 0;
+    if (strcmp(key, "max_bounces") == 0)       return cfg->maxBounces;
+    if (strcmp(key, "debug_view") == 0)        return cfg->debugView;
+    if (strcmp(key, "shader_mode") == 0)       return cfg->shaderMode;
+
+    return 0;
 }
 
 IGNIS_API void* ignis_create_texture_manager(void) {
@@ -633,6 +652,7 @@ IGNIS_API bool ignis_save_config(const char* path) {
     fprintf(f, "\n[dlss]\n");
     fprintf(f, "enabled=%d\n", cfg->dlssEnabled ? 1 : 0);
     fprintf(f, "quality_mode=%d\n", cfg->dlssQualityMode);
+    fprintf(f, "dlss_rr_enabled=%d\n", cfg->dlssRREnabled ? 1 : 0);
 
     fclose(f);
     Log(L"[Ignis] Config saved to %S\n", path);

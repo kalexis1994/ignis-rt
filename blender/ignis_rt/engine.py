@@ -171,75 +171,175 @@ def _draw_fps_overlay(w, h):
     gpu.state.blend_set('NONE')
 
 
+_loading_logo_texture = None
+_loading_font_id = None
+
+
+def _get_logo_texture():
+    """Load the logo texture for the loading screen (cached)."""
+    global _loading_logo_texture
+    if _loading_logo_texture is not None:
+        return _loading_logo_texture
+    try:
+        icons_dir = os.path.join(os.path.dirname(__file__), "icons")
+        logo_path = os.path.join(icons_dir, "ignis_512.png")
+        if not os.path.isfile(logo_path):
+            return None
+        img = bpy.data.images.load(logo_path, check_existing=True)
+        img.gl_load()
+        _loading_logo_texture = gpu.texture.from_image(img)
+        return _loading_logo_texture
+    except Exception:
+        return None
+
+
+def _get_font_id():
+    """Load Nova Round font (cached). Returns blf font id."""
+    global _loading_font_id
+    if _loading_font_id is not None:
+        return _loading_font_id
+    try:
+        font_path = os.path.join(os.path.dirname(__file__), "icons", "NovaRound-Regular.ttf")
+        if os.path.isfile(font_path):
+            _loading_font_id = blf.load(font_path)
+        else:
+            _loading_font_id = 0
+    except Exception:
+        _loading_font_id = 0
+    return _loading_font_id
+
+
+def _draw_fire_ring(shader, cx, cy, t, radius=22, segments=48, ring_width=4.0):
+    """Draw a fire-colored spinning ring using many small arcs."""
+    for i in range(segments):
+        frac = i / segments
+        angle = 2 * math.pi * frac - t * 4.0  # clockwise rotation
+
+        # Fire color: head is bright yellow, tail fades to dark red
+        sweep = (frac + t * 4.0 / (2 * math.pi)) % 1.0
+        intensity = pow(1.0 - sweep, 2.0)  # bright head, fading tail
+
+        # RGB fire gradient: yellow -> orange -> red -> dark
+        r_col = min(1.0, 0.3 + intensity * 1.4)
+        g_col = max(0.0, intensity * 0.9 - 0.1)
+        b_col = max(0.0, intensity * 0.15 - 0.1)
+        alpha = max(0.0, min(1.0, intensity * 1.5))
+
+        # Dot size varies: bigger at head
+        dot_r = ring_width * (0.4 + 0.6 * intensity)
+
+        dx = cx + math.cos(angle) * radius
+        dy = cy + math.sin(angle) * radius
+
+        # Draw circle
+        verts = [(dx, dy)]
+        for s in range(13):
+            a = 2 * math.pi * s / 12
+            verts.append((dx + math.cos(a) * dot_r, dy + math.sin(a) * dot_r))
+        dot_batch = batch_for_shader(shader, 'TRI_FAN', {"pos": verts})
+        shader.bind()
+        shader.uniform_float("color", (r_col, g_col, b_col, alpha))
+        dot_batch.draw(shader)
+
+
+_loading_screen_start = 0.0
+
+
 def _draw_loading_screen(w, h, status="", progress=0.0):
-    """Draw the IGNIS RT loading screen with spinner."""
-    # Black background
+    """Draw the IGNIS RT loading screen with logo and glowing spinner."""
+    global _loading_screen_start
+
+    # Fade-in: track start time, alpha ramps 0→1 over 0.6s
+    now = time.perf_counter()
+    if _loading_screen_start <= 0.0:
+        _loading_screen_start = now
+    fade = min((now - _loading_screen_start) / 0.6, 1.0)
+
+    COL_FLAME = (1.0, 0.3, 0.0, fade)
+    COL_AMBER = (1.0, 0.72, 0.0, fade)
+    COL_BG = (0.08, 0.04, 0.02, 1.0)  # bg always opaque
+    COL_TEXT = (1.0, 1.0, 1.0, fade)
+    COL_TEXT_DIM = (0.7, 0.7, 0.7, fade)
+    COL_BAR_BG = (0.15, 0.10, 0.06, fade)
+
     gpu.state.blend_set('NONE')
     gpu.state.depth_test_set('NONE')
     gpu.state.depth_mask_set(False)
+
+    # Dark brown background
     shader = gpu.shader.from_builtin('UNIFORM_COLOR')
     bg = ((0, 0), (w, 0), (w, h), (0, h))
     batch = batch_for_shader(shader, 'TRI_FAN', {"pos": bg})
     shader.bind()
-    shader.uniform_float("color", (0.05, 0.05, 0.07, 1.0))
+    shader.uniform_float("color", COL_BG)
     batch.draw(shader)
 
     cx, cy = w / 2, h / 2
+    gpu.state.blend_set('ALPHA')
 
-    # "IGNIS RT" title
-    font_id = 0
-    blf.size(font_id, 36)
-    blf.color(font_id, 0.9, 0.55, 0.15, 1.0)  # warm orange
-    title = "IGNIS RT"
-    tw = blf.dimensions(font_id, title)[0]
-    blf.position(font_id, cx - tw / 2, cy + 30, 0)
+    # Logo image (full UVs, transparent PNG)
+    logo_tex = _get_logo_texture()
+    if logo_tex and fade > 0.01:
+        logo_size = 100
+        lx = cx - logo_size / 2
+        ly = cy + 25
+        img_shader = gpu.shader.from_builtin('IMAGE')
+        img_batch = batch_for_shader(img_shader, 'TRI_FAN', {
+            "pos": ((lx, ly), (lx + logo_size, ly), (lx + logo_size, ly + logo_size), (lx, ly + logo_size)),
+            "texCoord": ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)),
+        })
+        img_shader.bind()
+        img_shader.uniform_sampler("image", logo_tex)
+        img_batch.draw(img_shader)
+
+        # Fade-in overlay: cover logo with bg color at inverse alpha
+        if fade < 1.0:
+            shader.bind()
+            shader.uniform_float("color", (COL_BG[0], COL_BG[1], COL_BG[2], 1.0 - fade))
+            logo_cover = ((lx, ly), (lx + logo_size, ly), (lx + logo_size, ly + logo_size), (lx, ly + logo_size))
+            batch_for_shader(shader, 'TRI_FAN', {"pos": logo_cover}).draw(shader)
+
+        title_y = ly - 8
+    else:
+        title_y = cy + 30
+
+    # "Ignis RT" title
+    font_id = _get_font_id()
+    blf.size(font_id, 48)
+    blf.color(font_id, *COL_TEXT)
+    title = "Ignis RT"
+    tw, th = blf.dimensions(font_id, title)
+    blf.position(font_id, cx - tw / 2, title_y - 48, 0)
     blf.draw(font_id, title)
 
-    # Spinner (rotating dots)
-    gpu.state.blend_set('ALPHA')
-    t = time.perf_counter()
-    n_dots = 8
-    radius = 18
-    dot_radius = 3
-    for i in range(n_dots):
-        angle = (2 * math.pi * i / n_dots) + t * 3.0
-        dx = cx + math.cos(angle) * radius
-        dy = (cy - 30) + math.sin(angle) * radius
-        alpha = 0.2 + 0.8 * ((i / n_dots + t * 0.5) % 1.0)
-        # Draw dot as small quad
-        d = dot_radius
-        verts = ((dx - d, dy - d), (dx + d, dy - d), (dx + d, dy + d), (dx - d, dy + d))
-        dot_batch = batch_for_shader(shader, 'TRI_FAN', {"pos": verts})
-        shader.bind()
-        shader.uniform_float("color", (0.9, 0.55, 0.15, alpha))
-        dot_batch.draw(shader)
+    # Fire ring spinner
+    spinner_y = title_y - 100
+    _draw_fire_ring(shader, cx, spinner_y, time.perf_counter())
 
     # Status text
     if status:
-        blf.size(font_id, 14)
-        blf.color(font_id, 0.7, 0.7, 0.7, 1.0)
+        blf.size(font_id, 18)
+        blf.color(font_id, *COL_TEXT_DIM)
         sw = blf.dimensions(font_id, status)[0]
-        blf.position(font_id, cx - sw / 2, cy - 70, 0)
+        blf.position(font_id, cx - sw / 2, spinner_y - 55, 0)
         blf.draw(font_id, status)
 
     # Progress bar
     if progress > 0.0:
-        bar_w = 200
+        bar_w = 240
         bar_h = 4
         bx = cx - bar_w / 2
-        by = cy - 90
-        # Background
+        by = spinner_y - 75
         bg_verts = ((bx, by), (bx + bar_w, by), (bx + bar_w, by + bar_h), (bx, by + bar_h))
         bg_batch = batch_for_shader(shader, 'TRI_FAN', {"pos": bg_verts})
         shader.bind()
-        shader.uniform_float("color", (0.2, 0.2, 0.2, 1.0))
+        shader.uniform_float("color", COL_BAR_BG)
         bg_batch.draw(shader)
-        # Fill
         fill_w = bar_w * min(progress, 1.0)
         fill_verts = ((bx, by), (bx + fill_w, by), (bx + fill_w, by + bar_h), (bx, by + bar_h))
         fill_batch = batch_for_shader(shader, 'TRI_FAN', {"pos": fill_verts})
         shader.bind()
-        shader.uniform_float("color", (0.9, 0.55, 0.15, 1.0))
+        shader.uniform_float("color", COL_FLAME)
         fill_batch.draw(shader)
 
     gpu.state.blend_set('NONE')
@@ -320,7 +420,11 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             if props.dlss_enabled:
                 dll_wrapper.set_int("dlss_enabled", 1)
                 dll_wrapper.set_int("dlss_quality", props.dlss_quality)
-                _log(f" DLSS enabled, quality={props.dlss_quality}")
+                if props.dlss_rr_enabled:
+                    dll_wrapper.set_int("dlss_rr_enabled", 1)
+                    _log(f" DLSS enabled, quality={props.dlss_quality}, Ray Reconstruction=ON")
+                else:
+                    _log(f" DLSS enabled, quality={props.dlss_quality}")
         except Exception:
             pass
 
@@ -330,6 +434,20 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             return False
 
         _log("ignis_create OK")
+
+        # Report denoiser status
+        dlss_on = dll_wrapper.get_int("dlss_active")
+        rr_on = dll_wrapper.get_int("dlss_rr_active")
+        nrd_on = dll_wrapper.get_int("nrd_active")
+        if rr_on:
+            _log(" Denoiser: DLSS Ray Reconstruction")
+        elif nrd_on:
+            _log(" Denoiser: NRD (RELAX + SIGMA)")
+        elif dlss_on:
+            _log(" Denoiser: DLSS SR only (no denoiser)")
+        else:
+            _log(" Denoiser: None")
+
         _ignis_initialized = True
         _ignis_width = width
         _ignis_height = height
@@ -605,6 +723,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             _log(f" Staged load: COMPLETE ({dt:.2f}s total)")
             _load_stage = LOAD_IDLE
             _load_progress = 1.0
+            global _loading_screen_start
+            _loading_screen_start = 0.0  # reset for next fade-in
             return True
 
         return True  # unknown stage = done

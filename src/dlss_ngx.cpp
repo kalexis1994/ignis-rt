@@ -7,6 +7,8 @@
 #include "ngx/nvsdk_ngx_vk.h"
 #include "ngx/nvsdk_ngx_defs.h"
 #include "ngx/nvsdk_ngx_helpers_vk.h"
+#include "ngx/nvsdk_ngx_defs_dlssd.h"
+#include "ngx/nvsdk_ngx_helpers_dlssd_vk.h"
 #endif
 
 using namespace acpt;
@@ -14,7 +16,9 @@ using namespace acpt;
 DLSS_NGX::DLSS_NGX()
     : m_initialized(false)
     , m_dlssSupported(false)
+    , m_rrSupported(false)
     , m_qualityMode(DLSSQualityMode::Balanced)
+    , m_activeMode(DLSSMode::Off)
     , m_displayWidth(0)
     , m_displayHeight(0)
     , m_renderWidth(0)
@@ -23,8 +27,11 @@ DLSS_NGX::DLSS_NGX()
     , m_instance(VK_NULL_HANDLE)
     , m_device(VK_NULL_HANDLE)
     , m_physicalDevice(VK_NULL_HANDLE)
+    , m_commandPool(VK_NULL_HANDLE)
+    , m_queue(VK_NULL_HANDLE)
     , m_ngxParameters(nullptr)
     , m_ngxFeature(nullptr)
+    , m_ngxFeatureRR(nullptr)
 {
 }
 
@@ -81,6 +88,8 @@ bool DLSS_NGX::Initialize(
     m_instance = instance;
     m_device = device;
     m_physicalDevice = physicalDevice;
+    m_commandPool = commandPool;
+    m_queue = queue;
     m_displayWidth = displayWidth;
     m_displayHeight = displayHeight;
     m_qualityMode = qualityMode;
@@ -88,11 +97,8 @@ bool DLSS_NGX::Initialize(
     // Use proper render resolution for upscaling
     GetRenderResolution(displayWidth, displayHeight, qualityMode, &m_renderWidth, &m_renderHeight);
 
-    Log(L"[DLSS-NGX] Initializing NVIDIA DLSS via NGX SDK:\n");
-    Log(L"[DLSS-NGX]   Display: %ux%u\n", m_displayWidth, m_displayHeight);
-    Log(L"[DLSS-NGX]   Render:  %ux%u\n", m_renderWidth, m_renderHeight);
-    Log(L"[DLSS-NGX]   Quality: %d (1=UltraPerf, 2=Balanced, 3=Quality, 4=UltraQuality)\n",
-        static_cast<int>(m_qualityMode));
+    Log(L"[DLSS-NGX] Init: %ux%u -> %ux%u, quality=%d\n",
+        m_renderWidth, m_renderHeight, m_displayWidth, m_displayHeight, static_cast<int>(m_qualityMode));
 
     // Validate Vulkan handles
     if (m_device == VK_NULL_HANDLE) {
@@ -105,7 +111,6 @@ bool DLSS_NGX::Initialize(
     }
 
     // Initialize NGX
-    Log(L"[DLSS-NGX] Initializing NGX SDK...\n");
 
     wchar_t appDataPath[MAX_PATH];
     GetModuleFileNameW(NULL, appDataPath, MAX_PATH);
@@ -131,7 +136,6 @@ bool DLSS_NGX::Initialize(
         Log(L"[DLSS-NGX] ERROR: NVSDK_NGX_VULKAN_Init failed with error code %d\n", ngxResult);
         return false;
     }
-    Log(L"[DLSS-NGX] NGX SDK initialized successfully\n");
 
     // Allocate NGX parameters
     ngxResult = NVSDK_NGX_VULKAN_AllocateParameters((NVSDK_NGX_Parameter**)&m_ngxParameters);
@@ -142,34 +146,15 @@ bool DLSS_NGX::Initialize(
     }
 
     // Check DLSS support
-    Log(L"[DLSS-NGX] Checking DLSS support...\n");
     NVSDK_NGX_Parameter* capabilityParams = nullptr;
     ngxResult = NVSDK_NGX_VULKAN_GetCapabilityParameters(&capabilityParams);
     if ((ngxResult == NVSDK_NGX_Result_Success) && capabilityParams) {
         int dlssAvailable = 0;
         NVSDK_NGX_Result getResult = capabilityParams->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &dlssAvailable);
-        Log(L"[DLSS-NGX] SuperSampling_Available: result=%d, available=%d\n", getResult, dlssAvailable);
-
-        // Also check for detailed error info
-        int needsUpdatedDriver = 0;
-        capabilityParams->Get(NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needsUpdatedDriver);
-        unsigned int minDriverMajor = 0, minDriverMinor = 0;
-        capabilityParams->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMajor, &minDriverMajor);
-        capabilityParams->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor, &minDriverMinor);
-        int featureInitResult = 0;
-        capabilityParams->Get(NVSDK_NGX_Parameter_SuperSampling_FeatureInitResult, &featureInitResult);
-        Log(L"[DLSS-NGX] NeedsUpdatedDriver=%d, MinDriver=%u.%u, FeatureInitResult=%d\n",
-            needsUpdatedDriver, minDriverMajor, minDriverMinor, featureInitResult);
-
         if ((getResult == NVSDK_NGX_Result_Success) && dlssAvailable) {
-            Log(L"[DLSS-NGX] DLSS is supported on this GPU!\n");
             m_dlssSupported = true;
         } else {
-            Log(L"[DLSS-NGX] WARNING: DLSS not supported (result=%d, available=%d)\n", getResult, dlssAvailable);
-            Log(L"[DLSS-NGX]   Possible reasons:\n");
-            Log(L"[DLSS-NGX]     - nvngx_dlss.dll not found in app directory\n");
-            Log(L"[DLSS-NGX]     - GPU doesn't support DLSS (need RTX GPU)\n");
-            Log(L"[DLSS-NGX]     - NVIDIA drivers out of date (need %u.%u+)\n", minDriverMajor, minDriverMinor);
+            Log(L"[DLSS-NGX] DLSS not supported on this GPU\n");
             NVSDK_NGX_VULKAN_DestroyParameters((NVSDK_NGX_Parameter*)m_ngxParameters);
             NVSDK_NGX_VULKAN_Shutdown1(m_device);
             m_initialized = true;
@@ -181,7 +166,6 @@ bool DLSS_NGX::Initialize(
     }
 
     // Create DLSS feature (requires command buffer)
-    Log(L"[DLSS-NGX] Creating DLSS feature...\n");
 
     // Create temporary command buffer for DLSS feature creation
     VkCommandBufferAllocateInfo cmdBufAllocInfo = {};
@@ -224,7 +208,6 @@ bool DLSS_NGX::Initialize(
         case DLSSQualityMode::UltraQuality:   ngxQuality = NVSDK_NGX_PerfQuality_Value_UltraQuality; break;
         default:                              ngxQuality = NVSDK_NGX_PerfQuality_Value_Balanced; break;
     }
-    Log(L"[DLSS-NGX] Quality mapping: ours=%d -> NGX=%d\n", (int)m_qualityMode, (int)ngxQuality);
 
     NVSDK_NGX_DLSS_Create_Params dlssCreateParams = {};
     dlssCreateParams.Feature.InWidth = m_renderWidth;
@@ -289,15 +272,11 @@ bool DLSS_NGX::Initialize(
     vkFreeCommandBuffers(m_device, commandPool, 1, &tempCmdBuf);
     Log(L"[DLSS-NGX] DLSS feature created successfully\n");
 
-    Log(L"[DLSS-NGX] ========== INITIALIZATION COMPLETE ==========\n");
-    Log(L"[DLSS-NGX]   Display Resolution: %ux%u\n", m_displayWidth, m_displayHeight);
-    Log(L"[DLSS-NGX]   Render Resolution:  %ux%u (%.1f%% pixels)\n",
-        m_renderWidth, m_renderHeight,
-        (float)(m_renderWidth * m_renderHeight) / (m_displayWidth * m_displayHeight) * 100.0f);
-    Log(L"[DLSS-NGX]   Quality Mode: %d\n", static_cast<int>(m_qualityMode));
+    Log(L"[DLSS-NGX] DLSS SR initialized OK\n");
 
     m_initialized = true;
     m_dlssSupported = true;
+    m_activeMode = DLSSMode::SR;
 
     return true;
 #endif
@@ -311,6 +290,11 @@ void DLSS_NGX::Shutdown() {
     Log(L"[DLSS-NGX] Shutting down...\n");
 
 #ifdef ACPT_HAVE_NGX
+    if (m_ngxFeatureRR) {
+        NVSDK_NGX_VULKAN_ReleaseFeature((NVSDK_NGX_Handle*)m_ngxFeatureRR);
+        m_ngxFeatureRR = nullptr;
+    }
+
     if (m_ngxFeature) {
         NVSDK_NGX_VULKAN_ReleaseFeature((NVSDK_NGX_Handle*)m_ngxFeature);
         m_ngxFeature = nullptr;
@@ -330,6 +314,8 @@ void DLSS_NGX::Shutdown() {
 
     m_initialized = false;
     m_dlssSupported = false;
+    m_rrSupported = false;
+    m_activeMode = DLSSMode::Off;
 }
 
 void DLSS_NGX::Evaluate(
@@ -430,17 +416,6 @@ void DLSS_NGX::Evaluate(
         evalParams.pInBiasCurrentColorMask = &reactiveMaskResource;
     }
 
-    // DIAGNOSTIC: Log all DLSS parameters on first few frames
-    if (m_frameIndex <= 3) {
-        Log(L"[DLSS-Diag] Frame %u: jitter=(%.4f, %.4f) reset=%d deltaMs=%.1f\n",
-            m_frameIndex, jitterX, jitterY, evalParams.InReset, evalParams.InFrameTimeDeltaInMsec);
-        Log(L"[DLSS-Diag]   MVScale=(%.1f, %.1f) SubRect=%ux%u\n",
-            evalParams.InMVScaleX, evalParams.InMVScaleY,
-            evalParams.InRenderSubrectDimensions.Width, evalParams.InRenderSubrectDimensions.Height);
-        Log(L"[DLSS-Diag]   Color=%p Depth=%p MV=%p Output=%p\n",
-            evalParams.Feature.pInColor, evalParams.pInDepth,
-            evalParams.pInMotionVectors, evalParams.Feature.pInOutput);
-    }
 
     // Execute DLSS
     NVSDK_NGX_Result ngxResult = NGX_VULKAN_EVALUATE_DLSS_EXT(
@@ -452,6 +427,230 @@ void DLSS_NGX::Evaluate(
 
     if (ngxResult != NVSDK_NGX_Result_Success) {
         Log(L"[DLSS-NGX] ERROR: DLSS evaluation failed (error %d)\n", ngxResult);
+    }
+#endif
+}
+
+bool DLSS_NGX::InitializeRR() {
+#ifndef ACPT_HAVE_NGX
+    return false;
+#else
+    if (!m_initialized || !m_dlssSupported) {
+        Log(L"[DLSS-RR] Cannot init RR: DLSS not initialized\n");
+        return false;
+    }
+
+    Log(L"[DLSS-RR] Initializing Ray Reconstruction (%ux%u -> %ux%u)...\n",
+        m_renderWidth, m_renderHeight, m_displayWidth, m_displayHeight);
+
+    // Allocate fresh parameters for RR (don't reuse SR params — causes UnsupportedParameter)
+    NVSDK_NGX_Parameter* rrParams = nullptr;
+    NVSDK_NGX_Result allocResult = NVSDK_NGX_VULKAN_AllocateParameters(&rrParams);
+    if (allocResult != NVSDK_NGX_Result_Success || !rrParams) {
+        Log(L"[DLSS-RR] ERROR: Failed to allocate RR parameters (error %d)\n", allocResult);
+        m_rrSupported = false;
+        return false;
+    }
+
+    // Map quality mode
+    NVSDK_NGX_PerfQuality_Value ngxQuality;
+    switch (m_qualityMode) {
+        case DLSSQualityMode::MaxPerformance: ngxQuality = NVSDK_NGX_PerfQuality_Value_MaxPerf; break;
+        case DLSSQualityMode::Balanced:       ngxQuality = NVSDK_NGX_PerfQuality_Value_Balanced; break;
+        case DLSSQualityMode::MaxQuality:     ngxQuality = NVSDK_NGX_PerfQuality_Value_MaxQuality; break;
+        case DLSSQualityMode::UltraQuality:   ngxQuality = NVSDK_NGX_PerfQuality_Value_UltraQuality; break;
+        default:                              ngxQuality = NVSDK_NGX_PerfQuality_Value_Balanced; break;
+    }
+
+    // Set RR creation parameters on fresh parameter block
+    // RR uses the same parameter names as DLSS SR for creation
+    unsigned int flags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes
+                       | NVSDK_NGX_DLSS_Feature_Flags_IsHDR
+                       | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+
+    rrParams->Set(NVSDK_NGX_Parameter_Width, (unsigned int)m_renderWidth);
+    rrParams->Set(NVSDK_NGX_Parameter_Height, (unsigned int)m_renderHeight);
+    rrParams->Set(NVSDK_NGX_Parameter_OutWidth, (unsigned int)m_displayWidth);
+    rrParams->Set(NVSDK_NGX_Parameter_OutHeight, (unsigned int)m_displayHeight);
+    rrParams->Set(NVSDK_NGX_Parameter_PerfQualityValue, (unsigned int)ngxQuality);
+    rrParams->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, flags);
+    // Required for RR: tell NGX to use the DL unified denoiser
+    rrParams->Set(NVSDK_NGX_Parameter_DLSS_Denoise_Mode, (int)NVSDK_NGX_DLSS_Denoise_Mode_DLUnified);
+    // Roughness is packed in normalRoughness.a
+    rrParams->Set(NVSDK_NGX_Parameter_DLSS_Roughness_Mode, (unsigned int)NVSDK_NGX_DLSS_Roughness_Mode_Packed);
+    rrParams->Set(NVSDK_NGX_Parameter_Use_HW_Depth, (unsigned int)0);
+    // Output subrects (required by DLSSD)
+    rrParams->Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
+    // CreationNodeMask / VisibilityNodeMask
+    rrParams->Set(NVSDK_NGX_Parameter_CreationNodeMask, (unsigned int)1);
+    rrParams->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, (unsigned int)1);
+
+    // Create temporary command buffer for feature creation
+    VkCommandBufferAllocateInfo cmdBufAllocInfo{};
+    cmdBufAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmdBufAllocInfo.commandPool = m_commandPool;
+    cmdBufAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdBufAllocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer tempCmdBuf = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(m_device, &cmdBufAllocInfo, &tempCmdBuf) != VK_SUCCESS) {
+        Log(L"[DLSS-RR] ERROR: Failed to allocate command buffer\n");
+        NVSDK_NGX_VULKAN_DestroyParameters(rrParams);
+        m_rrSupported = false;
+        return false;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(tempCmdBuf, &beginInfo);
+
+    // Create Ray Reconstruction feature using generic API
+    NVSDK_NGX_Result ngxResult = NVSDK_NGX_VULKAN_CreateFeature1(
+        m_device,
+        tempCmdBuf,
+        NVSDK_NGX_Feature_RayReconstruction,
+        rrParams,
+        (NVSDK_NGX_Handle**)&m_ngxFeatureRR
+    );
+
+    vkEndCommandBuffer(tempCmdBuf);
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &tempCmdBuf;
+    vkQueueSubmit(m_queue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(m_queue);
+    vkFreeCommandBuffers(m_device, m_commandPool, 1, &tempCmdBuf);
+    NVSDK_NGX_VULKAN_DestroyParameters(rrParams);
+
+    if (ngxResult != NVSDK_NGX_Result_Success) {
+        const wchar_t* errName = L"Unknown";
+        uint32_t code = (uint32_t)ngxResult & 0xFF;
+        switch (code) {
+            case 1:  errName = L"FeatureNotSupported"; break;
+            case 2:  errName = L"PlatformError"; break;
+            case 3:  errName = L"FeatureAlreadyExists"; break;
+            case 4:  errName = L"FeatureNotFound"; break;
+            case 5:  errName = L"InvalidParameter"; break;
+            case 6:  errName = L"ScratchBufferTooSmall"; break;
+            case 7:  errName = L"NotInitialized"; break;
+            case 8:  errName = L"UnsupportedInputFormat"; break;
+            case 9:  errName = L"RWFlagMissing"; break;
+            case 10: errName = L"MissingInput"; break;
+            case 11: errName = L"UnableToInitializeFeature"; break;
+            case 12: errName = L"OutOfDate"; break;
+            case 13: errName = L"OutOfGPUMemory"; break;
+            case 14: errName = L"UnsupportedFormat"; break;
+            case 16: errName = L"UnsupportedParameter"; break;
+        }
+        Log(L"[DLSS-RR] Ray Reconstruction creation FAILED: %ls (0x%08X) — falling back to NRD + SR\n",
+            errName, (uint32_t)ngxResult);
+        m_ngxFeatureRR = nullptr;
+        m_rrSupported = false;
+        return false;
+    }
+
+    m_rrSupported = true;
+    m_activeMode = DLSSMode::RayReconstruction;
+    Log(L"[DLSS-RR] Ray Reconstruction initialized successfully\n");
+    return true;
+#endif
+}
+
+void DLSS_NGX::EvaluateRR(
+    VkCommandBuffer cmdBuf,
+    VkImage colorInputImage,
+    VkImageView colorInputView,
+    VkImage outputImage,
+    VkImageView outputView,
+    VkImage depthImage,
+    VkImageView depthView,
+    VkImage motionVectorsImage,
+    VkImageView motionVectorsView,
+    VkImage normalsImage,
+    VkImageView normalsView,
+    VkImage albedoImage,
+    VkImageView albedoView,
+    float jitterX,
+    float jitterY,
+    float deltaTime,
+    bool reset
+) {
+#ifdef ACPT_HAVE_NGX
+    if (!m_initialized || !m_rrSupported || !m_ngxFeatureRR) {
+        return;
+    }
+
+    m_frameIndex++;
+
+    VkImageSubresourceRange fullRange{};
+    fullRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    fullRange.baseMipLevel = 0;
+    fullRange.levelCount = 1;
+    fullRange.baseArrayLayer = 0;
+    fullRange.layerCount = 1;
+
+    // Create NGX resources for each input/output
+    NVSDK_NGX_Resource_VK colorResource = NVSDK_NGX_Create_ImageView_Resource_VK(
+        colorInputView, colorInputImage, fullRange, VK_FORMAT_R16G16B16A16_SFLOAT,
+        m_renderWidth, m_renderHeight, false);
+
+    NVSDK_NGX_Resource_VK outputResource = NVSDK_NGX_Create_ImageView_Resource_VK(
+        outputView, outputImage, fullRange, VK_FORMAT_R16G16B16A16_SFLOAT,
+        m_displayWidth, m_displayHeight, true);
+
+    NVSDK_NGX_Resource_VK depthResource = NVSDK_NGX_Create_ImageView_Resource_VK(
+        depthView, depthImage, fullRange, VK_FORMAT_R32_SFLOAT,
+        m_renderWidth, m_renderHeight, false);
+
+    NVSDK_NGX_Resource_VK mvResource = NVSDK_NGX_Create_ImageView_Resource_VK(
+        motionVectorsView, motionVectorsImage, fullRange, VK_FORMAT_R16G16B16A16_SFLOAT,
+        m_renderWidth, m_renderHeight, false);
+
+    NVSDK_NGX_Resource_VK normalsResource = NVSDK_NGX_Create_ImageView_Resource_VK(
+        normalsView, normalsImage, fullRange, VK_FORMAT_R16G16B16A16_SFLOAT,
+        m_renderWidth, m_renderHeight, false);
+
+    NVSDK_NGX_Resource_VK albedoResource = NVSDK_NGX_Create_ImageView_Resource_VK(
+        albedoView, albedoImage, fullRange, VK_FORMAT_R16G16B16A16_SFLOAT,
+        m_renderWidth, m_renderHeight, false);
+
+    // Use the official DLSSD eval params struct
+    NVSDK_NGX_VK_DLSSD_Eval_Params evalParams = {};
+    evalParams.pInColor = &colorResource;
+    evalParams.pInOutput = &outputResource;
+    evalParams.pInDepth = &depthResource;
+    evalParams.pInMotionVectors = &mvResource;
+    evalParams.pInNormals = &normalsResource;
+    evalParams.pInDiffuseAlbedo = &albedoResource;
+    evalParams.pInSpecularAlbedo = &albedoResource;  // use same albedo for specular
+    evalParams.pInRoughness = &normalsResource;  // roughness packed in normalRoughness.a
+    // GBufferSurface attribs (also required by the helper — sets GBuffer_Normals, _Roughness, _Albedo params)
+    evalParams.GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_ALBEDO] = &albedoResource;
+    evalParams.GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_NORMALS] = &normalsResource;
+    evalParams.GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_ROUGHNESS] = &normalsResource;
+    evalParams.InJitterOffsetX = jitterX;
+    evalParams.InJitterOffsetY = jitterY;
+    evalParams.InMVScaleX = (float)m_renderWidth;
+    evalParams.InMVScaleY = (float)m_renderHeight;
+    evalParams.InReset = (reset || m_frameIndex <= 1) ? 1 : 0;
+    evalParams.InFrameTimeDeltaInMsec = deltaTime * 1000.0f;
+    evalParams.InRenderSubrectDimensions.Width = m_renderWidth;
+    evalParams.InRenderSubrectDimensions.Height = m_renderHeight;
+    evalParams.InPreExposure = 1.0f;
+    evalParams.InExposureScale = 1.0f;
+
+    NVSDK_NGX_Result ngxResult = NGX_VULKAN_EVALUATE_DLSSD_EXT(
+        cmdBuf,
+        (NVSDK_NGX_Handle*)m_ngxFeatureRR,
+        (NVSDK_NGX_Parameter*)m_ngxParameters,
+        &evalParams
+    );
+
+    if (ngxResult != NVSDK_NGX_Result_Success && m_frameIndex <= 3) {
+        Log(L"[DLSS-RR] ERROR: Evaluation failed (error %d)\n", ngxResult);
     }
 #endif
 }

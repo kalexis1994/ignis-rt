@@ -11,10 +11,21 @@ bl_info = {
 
 import os
 import bpy
+import bpy.utils.previews
 from bpy.props import (
     BoolProperty, FloatProperty, FloatVectorProperty, IntProperty, StringProperty,
 )
 from . import engine
+
+# Custom icon collection
+_icon_previews = None
+
+
+def get_icon(name="ignis"):
+    """Get icon_id for a custom icon. Returns 0 if not loaded."""
+    if _icon_previews and name in _icon_previews:
+        return _icon_previews[name].icon_id
+    return 0
 
 
 class IgnisRTPreferences(bpy.types.AddonPreferences):
@@ -153,6 +164,11 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         name="DLSS Quality", default=2, min=0, max=4,
         description="0=Off, 1=Ultra Perf, 2=Balanced, 3=Quality, 4=DLAA",
     )
+    dlss_rr_enabled: BoolProperty(
+        name="Ray Reconstruction",
+        description="Use DLSS Ray Reconstruction (replaces NRD denoiser, requires RTX GPU + driver 535+)",
+        default=False,
+    )
 
     # -- Performance --
     fps_limit: IntProperty(
@@ -211,9 +227,49 @@ class IGNIS_PT_sampling(bpy.types.Panel):
         col = layout.column()
         col.active = props.dlss_enabled
         col.prop(props, "dlss_quality")
+        col.prop(props, "dlss_rr_enabled")
         layout.separator()
         layout.prop(props, "fps_limit")
         layout.prop(props, "show_fps")
+
+
+class IGNIS_PT_status(bpy.types.Panel):
+    bl_label = "Status"
+    bl_idname = "IGNIS_PT_status"
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = "render"
+    bl_options = {'DEFAULT_CLOSED'}
+    COMPAT_ENGINES = {'IGNIS_RT'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.engine in cls.COMPAT_ENGINES
+
+    def draw(self, context):
+        layout = self.layout
+        from . import dll_wrapper
+
+        if not dll_wrapper.load():
+            layout.label(text="DLL not loaded", icon='ERROR')
+            return
+
+        dlss = dll_wrapper.get_int("dlss_active")
+        rr = dll_wrapper.get_int("dlss_rr_active")
+        nrd = dll_wrapper.get_int("nrd_active")
+
+        col = layout.column(align=True)
+        if dlss:
+            col.label(text="DLSS: Active", icon='CHECKMARK')
+        else:
+            col.label(text="DLSS: Off", icon='X')
+
+        if rr:
+            col.label(text="Denoiser: Ray Reconstruction", icon='CHECKMARK')
+        elif nrd:
+            col.label(text="Denoiser: NRD (RELAX + SIGMA)", icon='CHECKMARK')
+        else:
+            col.label(text="Denoiser: None", icon='X')
 
 
 class IGNIS_PT_sky(bpy.types.Panel):
@@ -293,9 +349,17 @@ def _get_compatible_panels():
 
 
 def register():
+    global _icon_previews
+    _icon_previews = bpy.utils.previews.new()
+    icons_dir = os.path.join(os.path.dirname(__file__), "icons")
+    icon_file = os.path.join(icons_dir, "ignis_32.png")
+    if os.path.isfile(icon_file):
+        _icon_previews.load("ignis", icon_file, 'IMAGE')
+
     bpy.utils.register_class(IgnisRTPreferences)
     bpy.utils.register_class(IgnisRTSceneProperties)
     bpy.utils.register_class(IGNIS_PT_sampling)
+    bpy.utils.register_class(IGNIS_PT_status)
     bpy.utils.register_class(IGNIS_PT_sky)
     bpy.utils.register_class(IGNIS_PT_tonemap)
     bpy.utils.register_class(engine.IgnisRenderEngine)
@@ -305,6 +369,7 @@ def register():
 
 
 def unregister():
+    global _icon_previews
     try:
         engine._ignis_shutdown()
     except Exception:
@@ -314,7 +379,11 @@ def unregister():
     bpy.utils.unregister_class(engine.IgnisRenderEngine)
     bpy.utils.unregister_class(IGNIS_PT_tonemap)
     bpy.utils.unregister_class(IGNIS_PT_sky)
+    bpy.utils.unregister_class(IGNIS_PT_status)
     bpy.utils.unregister_class(IGNIS_PT_sampling)
     del bpy.types.Scene.ignis_rt
     bpy.utils.unregister_class(IgnisRTSceneProperties)
     bpy.utils.unregister_class(IgnisRTPreferences)
+    if _icon_previews:
+        bpy.utils.previews.remove(_icon_previews)
+        _icon_previews = None

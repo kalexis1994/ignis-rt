@@ -8,13 +8,14 @@
 namespace acpt {
 
 DLSS_NGX::DLSS_NGX()
-    : m_initialized(false), m_dlssSupported(false),
-      m_qualityMode(DLSSQualityMode::Off),
+    : m_initialized(false), m_dlssSupported(false), m_rrSupported(false),
+      m_qualityMode(DLSSQualityMode::Off), m_activeMode(DLSSMode::Off),
       m_displayWidth(0), m_displayHeight(0),
       m_renderWidth(0), m_renderHeight(0), m_frameIndex(0),
       m_instance(VK_NULL_HANDLE), m_device(VK_NULL_HANDLE),
       m_physicalDevice(VK_NULL_HANDLE),
-      m_ngxParameters(nullptr), m_ngxFeature(nullptr) {}
+      m_commandPool(VK_NULL_HANDLE), m_queue(VK_NULL_HANDLE),
+      m_ngxParameters(nullptr), m_ngxFeature(nullptr), m_ngxFeatureRR(nullptr) {}
 
 DLSS_NGX::~DLSS_NGX() {}
 
@@ -23,6 +24,10 @@ bool DLSS_NGX::Initialize(VkInstance instance, VkDevice device,
                            VkCommandPool commandPool, VkQueue queue,
                            uint32_t displayWidth, uint32_t displayHeight,
                            DLSSQualityMode quality) {
+    return false;
+}
+
+bool DLSS_NGX::InitializeRR() {
     return false;
 }
 
@@ -41,6 +46,18 @@ void DLSS_NGX::Evaluate(VkCommandBuffer cmd,
                           VkFormat colorFormat, VkFormat depthFormat, VkFormat mvFormat,
                           float jitterX, float jitterY,
                           float deltaTime, float sharpness, bool reset) {
+    // No-op
+}
+
+void DLSS_NGX::EvaluateRR(VkCommandBuffer cmd,
+                            VkImage colorInput, VkImageView colorInputView,
+                            VkImage output, VkImageView outputView,
+                            VkImage depth, VkImageView depthView,
+                            VkImage mv, VkImageView mvView,
+                            VkImage normals, VkImageView normalsView,
+                            VkImage albedo, VkImageView albedoView,
+                            float jitterX, float jitterY,
+                            float deltaTime, bool reset) {
     // No-op
 }
 

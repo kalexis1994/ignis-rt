@@ -17,6 +17,7 @@ shaders/fsr3/compiled/*.spv
 blender/ignis_rt/lib/ignis_rt.dll
 blender/ignis_rt/lib/NRD.dll
 blender/ignis_rt/lib/nvngx_dlss.dll
+blender/ignis_rt/lib/nvngx_dlssd.dll
 blender/ignis_rt/lib/nrd_composite.spv
 
 # --- Python bytecode ---
