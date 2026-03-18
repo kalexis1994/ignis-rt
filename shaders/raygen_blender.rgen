@@ -475,6 +475,8 @@ void main() {
     vec3 totalRadiance = vec3(0.0);
     vec3 diffuseRadiance = vec3(0.0);
     vec3 specularRadiance = vec3(0.0);
+    vec3 directSunDiffuse = vec3(0.0);  // track direct sun contribution for shadow separation
+    vec3 ambientDiffuse = vec3(0.0);    // track ambient for partial shadow application
 
     // Primary hit info for NRD
     vec3 primaryNormal = vec3(0, 0, 1);
@@ -727,14 +729,16 @@ void main() {
                     // CP2077-style shadow separation:
                     // Write UNSHADOWED direct light to NRD (RELAX sees stable signal).
                     // SIGMA denoises the shadow separately; composite re-applies it.
-                    diffuseRadiance += diffContrib * sunRadiance * throughput;
+                    vec3 sunDiffContrib = diffContrib * sunRadiance * throughput;
+                    diffuseRadiance += sunDiffContrib;
+                    directSunDiffuse = sunDiffContrib;  // remember for sunFraction
                     specularRadiance += specContrib * sunRadiance * throughput;
 
                     // Store penumbra for SIGMA
                     primaryNdotL = NdotL;
                     if (inShadow) {
                         // Penumbra radius = distToOccluder * tanAngle * 0.5
-                        float sigmaTanAngle = 0.12;
+                        float sigmaTanAngle = 0.04;  // smaller sun angular size → sharper contact shadows
                         primaryPenumbra = min(shadowHitDist * sigmaTanAngle * 0.5, 32768.0);
                     } else {
                         primaryPenumbra = 65504.0;  // fully lit
@@ -973,7 +977,8 @@ void main() {
             vec3 ambientColor = cam.ambientLight.rgb * cam.ambientLight.w;
             float NdotUp = max(dot(N, vec3(0, 1, 0)), 0.0);
             vec3 ambient = pbrHit.baseColor * ambientColor * NdotUp * ambientMax * (1.0 - pbrHit.metallic);
-            diffuseRadiance += ambient * throughput;
+            ambientDiffuse = ambient * throughput;
+            diffuseRadiance += ambientDiffuse;
         }
 
         // ---- ReSTIR GI: capture indirect hit as reservoir sample ----
@@ -1180,8 +1185,8 @@ void main() {
         // hitDist = actual primary hit distance for both lobes.
         // NRD uses it internally for spatial edge-stopping; 0.0 would disable
         // distance-based edge preservation and degrade temporal reprojection.
-        float diffHitDist = isDiffusePath ? primaryHitDist : 0.0;
-        float specHitDist = isDiffusePath ? 0.0 : primaryHitDist;
+        float diffHitDist = primaryHitDist;
+        float specHitDist = primaryHitDist;
 
         // Demodulate: divide diffuse radiance by albedo before NRD.
         // NRD works better with irradiance (albedo-free) — less noise in color channels.
@@ -1191,7 +1196,17 @@ void main() {
 
         imageStore(diffuseRadianceImg, pixel, NRD_PackRadiance(demodDiffuse, diffHitDist));
         imageStore(specularRadianceImg, pixel, NRD_PackRadiance(specularRadiance, specHitDist));
-        imageStore(albedoBufferImg, pixel, vec4(primaryAlbedo, 0.0));
+        // shadowableFraction: proportion of diffuse that should receive SIGMA shadow.
+        // This includes direct sun + ambient (both are "sky-visible" light that gets
+        // blocked by occluders). Only path-traced indirect GI is excluded since it
+        // was already correctly shadowed during bounces.
+        float shadowableFraction = 0.0;
+        float totalDiffLum = dot(diffuseRadiance, vec3(0.2126, 0.7152, 0.0722));
+        if (totalDiffLum > 1e-6) {
+            float shadowableLum = dot(directSunDiffuse + ambientDiffuse, vec3(0.2126, 0.7152, 0.0722));
+            shadowableFraction = clamp(shadowableLum / totalDiffLum, 0.0, 1.0);
+        }
+        imageStore(albedoBufferImg, pixel, vec4(primaryAlbedo, shadowableFraction));
 
         // DLSS NDC depth
         vec4 clipPos = cam.proj * vec4(0.0, 0.0, primaryViewZ, 1.0);

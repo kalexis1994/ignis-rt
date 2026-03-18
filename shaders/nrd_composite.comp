@@ -182,12 +182,21 @@ void main() {
         vec3 diffuseIrradiance = texture(denoisedDiffuse, uv).rgb;
         vec3 specularIrradiance = texture(denoisedSpecular, uv).rgb;
 
-        // SIGMA shadow separation: read denoised shadow and apply as modulation
+        // SIGMA shadow separation: apply shadow only to direct sun component.
+        // albedoSample.a = sunFraction (how much of diffuse is direct sun vs indirect GI).
+        // Indirect GI was already correctly shadowed during path tracing — don't double-shadow it.
         float raw = texture(denoisedShadow, uv).x;
         float sigmaShadowVal = raw * raw;  // SIGMA_BackEnd_UnpackShadow: sqrt-packed
-        float shadowMod = mix(0.25, 1.0, sigmaShadowVal);  // ambient floor of 0.25
+        float shadowMod = mix(0.15, 1.0, sigmaShadowVal);  // shadow floor balanced for contrast vs noise
 
-        combined = diffuseIrradiance * shadowMod * albedoSample.rgb + specularIrradiance * shadowMod;
+        // shadowableFraction = direct sun + ambient (sky-visible light).
+        // Only path-traced indirect GI is excluded from shadow modulation.
+        float shadowableFraction = albedoSample.a;
+        vec3 shadowablePart = diffuseIrradiance * shadowableFraction;
+        vec3 indirectPart = diffuseIrradiance * (1.0 - shadowableFraction);
+        vec3 shadedDiffuse = shadowablePart * shadowMod + indirectPart;
+
+        combined = shadedDiffuse * albedoSample.rgb + specularIrradiance * shadowMod;
     }
 
     // === Luminance accumulation (all threads participate, sky/OOB contribute 0) ===

@@ -62,13 +62,13 @@ struct PathTracerConfig {
     float nrdMinHitDistanceWeight = 0.05f;
     float nrdDisocclusionThreshold = 0.01f;
     float nrdDiffusePrepassBlur  = 0.0f;   // [0..75] pre-pass blur radius for diffuse (0=disabled, recommended)
-    float nrdSpecularPrepassBlur = 0.0f;   // [0..75] pre-pass blur radius for specular
+    float nrdSpecularPrepassBlur = 8.0f;   // [0..75] pre-pass blur radius for specular
     int   nrdAtrousIterations    = 5;      // [2..8] A-trous wavelet iterations (2^(N-1) pixel radius)
     bool  nrdAntiFirefly         = true;   // clamp outlier firefly pixels
     int   nrdHistoryFixFrameNum  = 1;      // [0..6] spatial reconstruction frames for disoccluded pixels (lower=faster recovery)
     float nrdDepthThreshold      = 0.004f; // [0.001..0.1] depth-based edge stopping
     float nrdDiffusePhiLuminance = 2.0f;   // [0.5..8.0] luminance edge stopping for diffuse A-trous
-    float nrdSpecularPhiLuminance= 2.0f;   // [0.5..8.0] luminance edge stopping for specular A-trous (higher = smoother reflections)
+    float nrdSpecularPhiLuminance= 1.0f;   // [0.5..8.0] luminance edge stopping for specular A-trous (lower = sharper reflections)
 
     // DLSS
     bool  dlssEnabled        = false;

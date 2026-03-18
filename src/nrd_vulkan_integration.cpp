@@ -1258,12 +1258,12 @@ void NRD_Vulkan_Denoise(VkCommandBuffer cmdBuffer, uint32_t frameIndex,
         if (fastAccum < 6u) fastAccum = 6u;
     }
     relaxSettings.diffuseMaxAccumulatedFrameNum = maxAccum;
-    // Specular needs equal or higher accumulation — 1spp reflections are very noisy
-    relaxSettings.specularMaxAccumulatedFrameNum = maxAccum;
+    // Specular needs more accumulation — 1spp reflections are very noisy
+    relaxSettings.specularMaxAccumulatedFrameNum = (uint32_t)(maxAccum * 1.5f);
 
     // Fast history (responsive to changes)
     relaxSettings.diffuseMaxFastAccumulatedFrameNum = fastAccum;
-    relaxSettings.specularMaxFastAccumulatedFrameNum = fastAccum;
+    relaxSettings.specularMaxFastAccumulatedFrameNum = fastAccum + 4;
 
     // History fix — spatial reconstruction for freshly disoccluded pixels
     // Lower frameNum = less time in the blurry spatial-only phase
@@ -1273,10 +1273,11 @@ void NRD_Vulkan_Denoise(VkCommandBuffer cmdBuffer, uint32_t frameIndex,
     relaxSettings.historyFixAlternatePixelStride = 6;
 
     // Pre-pass blur: stabilizes 1spp input before temporal accumulation.
-    // Specular needs equal or more blur than diffuse — reflections are noisier.
-    float minPrepass = useDlssTuning ? 20.0f : 15.0f;
-    relaxSettings.diffusePrepassBlurRadius = fmaxf(g_config.nrdDiffusePrepassBlur, minPrepass);
-    relaxSettings.specularPrepassBlurRadius = fmaxf(g_config.nrdSpecularPrepassBlur, minPrepass);
+    // Specular uses lower minimum to preserve detail in sharp/glossy reflections.
+    float minPrepassDiff = useDlssTuning ? 15.0f : 10.0f;
+    float minPrepassSpec = useDlssTuning ? 12.0f : 8.0f;
+    relaxSettings.diffusePrepassBlurRadius = fmaxf(g_config.nrdDiffusePrepassBlur, minPrepassDiff);
+    relaxSettings.specularPrepassBlurRadius = fmaxf(g_config.nrdSpecularPrepassBlur, minPrepassSpec);
 
     // A-trous wavelet iterations — 6 for good spatial coverage without over-blur
     relaxSettings.atrousIterationNum = (uint32_t)g_config.nrdAtrousIterations;
@@ -1294,7 +1295,7 @@ void NRD_Vulkan_Denoise(VkCommandBuffer cmdBuffer, uint32_t frameIndex,
     relaxSettings.depthThreshold = g_config.nrdDepthThreshold;
 
     // Hit distance weight
-    relaxSettings.minHitDistanceWeight = g_config.nrdMinHitDistanceWeight;
+    relaxSettings.minHitDistanceWeight = fmaxf(g_config.nrdMinHitDistanceWeight, 0.15f);  // stronger depth-based edge stopping
 
     // Hit distance reconstruction — AREA_3X3 for better edge preservation
     // (was OFF — AREA_3X3 improves shadow/edge quality with minimal cost)
@@ -1302,7 +1303,7 @@ void NRD_Vulkan_Denoise(VkCommandBuffer cmdBuffer, uint32_t frameIndex,
 
     // Temporal clamping sigma — [1; 3], NRD default=2.0
     // Higher = wider clamping = more temporal history preserved = smoother
-    relaxSettings.fastHistoryClampingSigmaScale = 2.5f;
+    relaxSettings.fastHistoryClampingSigmaScale = 3.0f;
 
     // Antilag — detect actual content changes (object moves, reveals new geometry)
     // and reduce temporal weight accordingly. Tuned to avoid false positives from
@@ -1312,10 +1313,10 @@ void NRD_Vulkan_Denoise(VkCommandBuffer cmdBuffer, uint32_t frameIndex,
     // real content changes (object/shadow movement).
     // Too aggressive → NRD resets specular history every frame → reflections never converge.
     // Too conservative → shadows ghost when objects move.
-    relaxSettings.antilagSettings.accelerationAmount = 0.3f;   // moderate temporal weight reduction
+    relaxSettings.antilagSettings.accelerationAmount = 0.15f;   // gentler temporal weight reduction → less jitter
     relaxSettings.antilagSettings.spatialSigmaScale = 4.0f;    // spatial: moderate sensitivity
-    relaxSettings.antilagSettings.temporalSigmaScale = 2.0f;   // temporal: tolerant of 1spp noise variance
-    relaxSettings.antilagSettings.resetAmount = 0.4f;           // partial reset on real changes
+    relaxSettings.antilagSettings.temporalSigmaScale = 3.0f;   // temporal: more tolerant of 1spp noise → fewer false resets
+    relaxSettings.antilagSettings.resetAmount = 0.15f;          // softer reset → reflections converge instead of flickering
 
     // Anti-firefly (configurable, default on for 1spp)
     relaxSettings.enableAntiFirefly = g_config.nrdAntiFirefly;
@@ -1343,8 +1344,8 @@ void NRD_Vulkan_Denoise(VkCommandBuffer cmdBuffer, uint32_t frameIndex,
 
     // SIGMA shadow settings — tuned for stable shadows during camera motion
     nrd::SigmaSettings sigmaSettings = {};
-    sigmaSettings.planeDistanceSensitivity = 0.005f;  // edge detection
-    sigmaSettings.maxStabilizedFrameNum = 4;           // moderate temporal — keeps shadows responsive to moving objects
+    sigmaSettings.planeDistanceSensitivity = 0.01f;   // stronger depth-based edge stopping → better near/far shadow separation
+    sigmaSettings.maxStabilizedFrameNum = 6;           // more temporal stability for cleaner shadow convergence
     // Normalize and pass sun direction (CRITICAL for directional shadow denoising)
     float len = sqrtf(g_sunDirection[0]*g_sunDirection[0] + g_sunDirection[1]*g_sunDirection[1] + g_sunDirection[2]*g_sunDirection[2]);
     if (len > 1e-6f) {
