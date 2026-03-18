@@ -6,6 +6,10 @@
 
 Real-time Vulkan ray tracing renderer designed as a Blender viewport render engine. Built on top of hardware-accelerated ray tracing with NVIDIA NRD temporal denoising and DLSS upscaling.
 
+<p align="center">
+  <img src="icons/ignis_rt_preview.png" alt="Ignis RT viewport render">
+</p>
+
 ![Vulkan](https://img.shields.io/badge/Vulkan-1.2-red) ![Platform](https://img.shields.io/badge/Platform-Windows-blue) ![Blender](https://img.shields.io/badge/Blender-4.0%2B-orange)
 
 ## Features
