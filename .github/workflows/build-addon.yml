@@ -1,0 +1,58 @@
+name: Build Blender Addon
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Vulkan SDK ──────────────────────────────────────────────
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.1.1
+        with:
+          version: 1.3.290.0
+          cache: true
+
+      # ── Build ignis_rt.dll ──────────────────────────────────────
+      - name: Configure CMake
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      # ── Package addon zip ───────────────────────────────────────
+      - name: Assemble addon directory
+        shell: bash
+        run: |
+          mkdir -p staging/ignis_rt/lib
+          mkdir -p staging/ignis_rt/shaders
+
+          # Python addon files
+          cp blender/ignis_rt/__init__.py  staging/ignis_rt/
+          cp blender/ignis_rt/dll_wrapper.py staging/ignis_rt/
+          cp blender/ignis_rt/engine.py      staging/ignis_rt/
+          cp blender/ignis_rt/scene_export.py staging/ignis_rt/
+
+          # DLL
+          cp build/Release/ignis_rt.dll staging/ignis_rt/lib/
+
+          # Compiled shaders
+          cp shaders/*.spv staging/ignis_rt/shaders/
+
+      - name: Create zip
+        shell: bash
+        run: |
+          cd staging
+          7z a -tzip ../ignis_rt_addon.zip ignis_rt/
+
+      # ── Upload artifact ─────────────────────────────────────────
+      - name: Upload addon zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ignis-rt-blender-addon
+          path: ignis_rt_addon.zip

@@ -1,0 +1,95 @@
+#version 460
+
+// SHARC Resolve Compute Shader
+// Merges write buffer into read buffer (exponential moving average),
+// ages out stale entries, and clears write buffer for next frame.
+
+#define SHARC_TABLE_SIZE 2097152u     // 2^21 entries
+#define SHARC_MAX_AGE 120u            // frames before eviction
+#define SHARC_BLEND_ALPHA 0.05        // exponential moving average blend (5% new)
+
+// 32 bytes per entry (8 uints), must match raygen_test.rgen layout
+struct SHARCEntry {
+    uint hashKey;        // 0 = empty sentinel
+    uint sampleCount;
+    float radianceR;
+    float radianceG;
+    float radianceB;
+    uint lastFrame;
+    float pad0;
+    float pad1;
+};
+
+// binding 0: write buffer (RT just wrote into this)
+layout(binding = 0, set = 0, std430) buffer SHARCWriteBuffer {
+    SHARCEntry writeEntries[];
+} sharcWrite;
+
+// binding 1: read buffer (temporal accumulation, what RT reads next frame)
+layout(binding = 1, set = 0, std430) buffer SHARCReadBuffer {
+    SHARCEntry readEntries[];
+} sharcRead;
+
+// Push constant: current frame index
+layout(push_constant) uniform PushConstants {
+    uint frameIndex;
+} pc;
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= SHARC_TABLE_SIZE) return;
+
+    SHARCEntry writeEntry = sharcWrite.writeEntries[idx];
+    SHARCEntry readEntry = sharcRead.readEntries[idx];
+
+    if (writeEntry.hashKey != 0u && writeEntry.sampleCount > 0u) {
+        // New data was written this frame
+        float invCount = 1.0 / float(writeEntry.sampleCount);
+        vec3 newRadiance = vec3(writeEntry.radianceR, writeEntry.radianceG, writeEntry.radianceB) * invCount;
+
+        if (readEntry.hashKey == writeEntry.hashKey && readEntry.sampleCount > 0u) {
+            // Same cell exists in read buffer — exponential moving average
+            float invReadCount = 1.0 / float(readEntry.sampleCount);
+            vec3 oldRadiance = vec3(readEntry.radianceR, readEntry.radianceG, readEntry.radianceB) * invReadCount;
+            vec3 blended = mix(oldRadiance, newRadiance, SHARC_BLEND_ALPHA);
+
+            // Store as accumulated (keep count at a reasonable cap for precision)
+            uint newCount = min(readEntry.sampleCount + writeEntry.sampleCount, 1024u);
+            sharcRead.readEntries[idx].radianceR = blended.r * float(newCount);
+            sharcRead.readEntries[idx].radianceG = blended.g * float(newCount);
+            sharcRead.readEntries[idx].radianceB = blended.b * float(newCount);
+            sharcRead.readEntries[idx].sampleCount = newCount;
+            sharcRead.readEntries[idx].lastFrame = pc.frameIndex;
+        } else {
+            // New cell or hash collision — overwrite
+            sharcRead.readEntries[idx].hashKey = writeEntry.hashKey;
+            sharcRead.readEntries[idx].radianceR = newRadiance.r;
+            sharcRead.readEntries[idx].radianceG = newRadiance.g;
+            sharcRead.readEntries[idx].radianceB = newRadiance.b;
+            sharcRead.readEntries[idx].sampleCount = 1u;
+            sharcRead.readEntries[idx].lastFrame = pc.frameIndex;
+        }
+    } else if (readEntry.hashKey != 0u) {
+        // No new data — age out old entries
+        if (pc.frameIndex - readEntry.lastFrame > SHARC_MAX_AGE) {
+            // Evict stale entry
+            sharcRead.readEntries[idx].hashKey = 0u;
+            sharcRead.readEntries[idx].sampleCount = 0u;
+            sharcRead.readEntries[idx].radianceR = 0.0;
+            sharcRead.readEntries[idx].radianceG = 0.0;
+            sharcRead.readEntries[idx].radianceB = 0.0;
+        }
+    }
+
+    // Clear write buffer for next frame
+    sharcWrite.writeEntries[idx].hashKey = 0u;
+    sharcWrite.writeEntries[idx].sampleCount = 0u;
+    sharcWrite.writeEntries[idx].radianceR = 0.0;
+    sharcWrite.writeEntries[idx].radianceG = 0.0;
+    sharcWrite.writeEntries[idx].radianceB = 0.0;
+    sharcWrite.writeEntries[idx].lastFrame = 0u;
+    sharcWrite.writeEntries[idx].pad0 = 0.0;
+    sharcWrite.writeEntries[idx].pad1 = 0.0;
+}

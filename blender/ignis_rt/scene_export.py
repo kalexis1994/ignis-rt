@@ -1,0 +1,819 @@
+"""Extract scene data from Blender depsgraph for ignis-rt."""
+
+import math
+import struct
+import numpy as np
+
+# Blender Z-up → Vulkan Y-up conversion (applied to positions, normals, transforms)
+# Swaps Y↔Z, negates new Z:  x' = x,  y' = z,  z' = -y
+COORD_CONV = np.array([
+    [1,  0,  0,  0],
+    [0,  0,  1,  0],
+    [0, -1,  0,  0],
+    [0,  0,  0,  1],
+], dtype=np.float32)
+
+
+def _convert_positions(arr):
+    """Convert Nx3 positions from Blender Z-up to Vulkan Y-up."""
+    out = np.empty_like(arr)
+    out[:, 0] = arr[:, 0]
+    out[:, 1] = arr[:, 2]
+    out[:, 2] = -arr[:, 1]
+    return out
+
+
+def _convert_normals(arr):
+    """Convert Nx3 normals from Blender Z-up to Vulkan Y-up."""
+    return _convert_positions(arr)  # same swizzle for direction vectors
+
+
+def _matrix_to_3x4_row_major(blender_matrix):
+    """Convert a Blender 4x4 Matrix to a 12-float row-major 3x4 array (Vulkan TLAS)."""
+    m = np.array(blender_matrix, dtype=np.float32)  # 4x4 column-major from Blender
+    # Apply coordinate conversion: COORD_CONV @ M
+    m = COORD_CONV @ m
+    # Extract top 3 rows (row-major), 4 columns → 12 floats
+    return m[:3, :].flatten().tolist()
+
+
+def export_meshes(depsgraph):
+    """Export mesh data with instancing and vertex deduplication.
+
+    Same mesh data shared by multiple instances is exported only once.
+    Identical vertices (same pos+normal+UV) are merged via np.unique.
+
+    Returns (unique_meshes, instances) where:
+        unique_meshes: dict of mesh_key → {
+            "positions": np.ndarray (float32, vertexCount*3),
+            "normals":   np.ndarray (float32, vertexCount*3),
+            "uvs":       np.ndarray (float32, vertexCount*2),
+            "indices":   np.ndarray (uint32,  indexCount),
+            "vertex_count": int,
+            "index_count": int,
+            "tri_count": int,
+            "raw_vert_count": int,  (before dedup, for diagnostics)
+            "tri_material_indices": np.ndarray (int32, triCount),
+        }
+        instances: list of {
+            "mesh_key": str,
+            "transform_3x4": list[float] (12 values, row-major),
+            "material_slots": list[Material | None],
+        }
+    """
+    unique_meshes = {}
+    instances = []
+    skipped_meshes = set()
+
+    for instance in depsgraph.object_instances:
+        obj = instance.object
+        if obj.type != 'MESH':
+            continue
+
+        mesh_key = obj.name
+
+        if mesh_key in skipped_meshes:
+            continue
+
+        if mesh_key not in unique_meshes:
+            # Get evaluated mesh (modifiers applied)
+            eval_obj = obj.evaluated_get(depsgraph)
+            mesh = eval_obj.to_mesh()
+            if mesh is None:
+                skipped_meshes.add(mesh_key)
+                continue
+
+            mesh.calc_loop_triangles()
+            if len(mesh.loop_triangles) == 0:
+                eval_obj.to_mesh_clear()
+                skipped_meshes.add(mesh_key)
+                continue
+
+            tri_count = len(mesh.loop_triangles)
+            raw_vert_count = tri_count * 3
+
+            # Loop indices (which mesh.loops form each triangle)
+            tri_loops = np.empty(raw_vert_count, dtype=np.int32)
+            mesh.loop_triangles.foreach_get("loops", tri_loops)
+
+            # Vertex indices (which mesh.vertices form each triangle)
+            tri_verts = np.empty(raw_vert_count, dtype=np.int32)
+            mesh.loop_triangles.foreach_get("vertices", tri_verts)
+
+            # --- All vertex positions (local space, Blender Z-up) ---
+            all_positions = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
+            mesh.vertices.foreach_get("co", all_positions)
+            all_positions = all_positions.reshape(-1, 3)
+
+            # --- Per-corner normals ---
+            all_loop_normals = np.empty(len(mesh.loops) * 3, dtype=np.float32)
+            try:
+                mesh.corner_normals.foreach_get("vector", all_loop_normals)
+            except (AttributeError, RuntimeError):
+                mesh.calc_normals_split()
+                mesh.loops.foreach_get("normal", all_loop_normals)
+            all_loop_normals = all_loop_normals.reshape(-1, 3)
+
+            # Unroll per triangle corner (positions stay in Blender local space;
+            # TLAS transform handles Z-up → Y-up conversion)
+            positions = all_positions[tri_verts]       # (raw_vert_count, 3)
+            normals = all_loop_normals[tri_loops]      # (raw_vert_count, 3)
+
+            # UVs
+            uvs = np.zeros((raw_vert_count, 2), dtype=np.float32)
+            if mesh.uv_layers.active is not None:
+                uv_data = mesh.uv_layers.active.data
+                all_loop_uvs = np.empty(len(uv_data) * 2, dtype=np.float32)
+                uv_data.foreach_get("uv", all_loop_uvs)
+                all_loop_uvs = all_loop_uvs.reshape(-1, 2)
+                uvs = all_loop_uvs[tri_loops]
+
+            # ---- Vertex deduplication ----
+            # Merge vertices with identical pos+normal+UV to reduce BLAS size
+            combined = np.ascontiguousarray(
+                np.hstack([positions, normals, uvs]), dtype=np.float32)
+            void_dt = np.dtype((np.void, combined.dtype.itemsize * combined.shape[1]))
+            _, unique_idx, inverse = np.unique(
+                combined.view(void_dt).ravel(),
+                return_index=True, return_inverse=True)
+
+            dedup_pos = combined[unique_idx, :3]
+            dedup_nrm = combined[unique_idx, 3:6]
+            dedup_uvs = combined[unique_idx, 6:8]
+            dedup_indices = inverse.astype(np.uint32)
+            dedup_vert_count = len(unique_idx)
+
+            # Per-triangle material indices
+            tri_mat_indices = np.empty(tri_count, dtype=np.int32)
+            mesh.loop_triangles.foreach_get("material_index", tri_mat_indices)
+
+            unique_meshes[mesh_key] = {
+                "name": mesh_key,
+                "positions": np.ascontiguousarray(dedup_pos.flatten(), dtype=np.float32),
+                "normals": np.ascontiguousarray(dedup_nrm.flatten(), dtype=np.float32),
+                "uvs": np.ascontiguousarray(dedup_uvs.flatten(), dtype=np.float32),
+                "indices": np.ascontiguousarray(dedup_indices, dtype=np.uint32),
+                "vertex_count": dedup_vert_count,
+                "index_count": len(dedup_indices),
+                "tri_count": tri_count,
+                "raw_vert_count": raw_vert_count,
+                "tri_material_indices": tri_mat_indices,
+            }
+            eval_obj.to_mesh_clear()
+
+        instances.append({
+            "mesh_key": mesh_key,
+            "transform_3x4": _matrix_to_3x4_row_major(instance.matrix_world),
+            "material_slots": [s.material for s in obj.material_slots],
+        })
+
+    return unique_meshes, instances
+
+
+def export_camera(context):
+    """Extract camera matrices from the 3D viewport.
+
+    Returns a dict with 16-float lists (column-major) for:
+        view, view_inv, proj, proj_inv
+    """
+    rv3d = context.region_data  # RegionView3D
+    region = context.region
+
+    view_matrix = rv3d.view_matrix.copy()        # 4x4
+    proj_matrix = rv3d.window_matrix.copy()       # 4x4 perspective
+
+    # Apply coordinate conversion to view matrix
+    # In Blender the view matrix transforms world→camera.
+    # We need: view_vk = view_blender @ COORD_CONV_INV
+    # Since COORD_CONV is orthogonal, its inverse is its transpose.
+    import mathutils
+    coord_conv_mat = mathutils.Matrix((
+        (1,  0,  0,  0),
+        (0,  0, -1,  0),
+        (0,  1,  0,  0),
+        (0,  0,  0,  1),
+    ))
+    view_matrix = view_matrix @ coord_conv_mat
+
+    # Convert OpenGL projection to D3D/Vulkan Z convention:
+    # OpenGL NDC Z is [-1, 1], D3D/Vulkan is [0, 1].
+    # NRD expects D3D convention.
+    # Y stays positive (D3D convention, shader handles Y-flip).
+    # Remap: new clip Z = 0.5 * old clip Z + 0.5 * old clip W
+    #   => row2 = 0.5 * row2 + 0.5 * row3
+    for col in range(4):
+        r2 = proj_matrix[2][col]
+        r3 = proj_matrix[3][col]
+        proj_matrix[2][col] = 0.5 * r2 + 0.5 * r3
+
+    view_inv = view_matrix.inverted()
+    proj_inv = proj_matrix.inverted()
+
+    def flatten(mat):
+        """Flatten Blender Matrix to 16 floats (column-major, matching Blender storage)."""
+        # Blender stores matrices column-major internally.
+        # mat[col][row] — but iterating via list() gives columns.
+        result = []
+        for col in range(4):
+            for row in range(4):
+                result.append(mat[row][col])
+        return result
+
+    return {
+        "view": flatten(view_matrix),
+        "view_inv": flatten(view_inv),
+        "proj": flatten(proj_matrix),
+        "proj_inv": flatten(proj_inv),
+        "width": region.width,
+        "height": region.height,
+    }
+
+
+def export_sun(depsgraph):
+    """Find the first SUN light and extract direction/intensity.
+
+    Returns a dict with sun_elevation, sun_azimuth (degrees), sun_intensity.
+    Falls back to defaults if no sun light exists.
+    """
+    defaults = {
+        "sun_elevation": 45.0,
+        "sun_azimuth": 180.0,
+        "sun_intensity": 1.8,
+    }
+
+    for obj in depsgraph.objects:
+        if obj.type != 'LIGHT':
+            continue
+        light = obj.data
+        if light.type != 'SUN':
+            continue
+
+        # Sun direction = -Z axis of the light's world matrix
+        mat = obj.matrix_world
+        # -Z axis is column 2, negated
+        direction = -mat.col[2].xyz.normalized()
+
+        # Convert to Vulkan Y-up: Blender Z → Vulkan Y, Blender -Y → Vulkan Z
+        dx = direction.x
+        dy = direction.z       # Blender Z → Vulkan Y
+        dz = -direction.y      # Blender -Y → Vulkan Z
+
+        # Elevation = angle from horizon (XZ plane) toward Y
+        elevation = math.degrees(math.asin(max(-1.0, min(1.0, dy))))
+        # Azimuth = angle around Y axis from +Z toward +X
+        azimuth = math.degrees(math.atan2(dx, dz))
+        if azimuth < 0:
+            azimuth += 360.0
+
+        return {
+            "sun_elevation": elevation,
+            "sun_azimuth": azimuth,
+            "sun_intensity": light.energy,
+        }
+
+    return defaults
+
+
+def export_lights(depsgraph):
+    """Export point/spot/area lights (max 8) for NEE direct sampling.
+
+    Returns a flat list of floats: [posX, posY, posZ, range, colR, colG, colB, intensity, ...]
+    Each light = 8 floats. Coordinate conversion: Blender Z-up -> Vulkan Y-up.
+    """
+    lights = []
+    for obj in depsgraph.objects:
+        if obj.type != 'LIGHT':
+            continue
+        light = obj.data
+        if light.type == 'SUN':
+            continue  # sun is handled separately
+        if len(lights) >= 64:  # 8 lights × 8 floats each
+            break
+
+        # World position (Blender Z-up -> Vulkan Y-up)
+        pos = obj.matrix_world.translation
+        vk_x = pos.x
+        vk_y = pos.z        # Blender Z -> Vulkan Y
+        vk_z = -pos.y       # Blender -Y -> Vulkan Z
+
+        # Range: Blender uses energy falloff, we derive range from energy
+        # For point/spot lights, use shadow_soft_size as physical radius
+        # Range = distance where attenuation drops to ~1%
+        energy = light.energy
+        color = light.color
+        # Blender energy is in Watts; convert to our intensity scale
+        # A reasonable range: sqrt(energy / 0.01) to capture 99% of light
+        estimated_range = max(math.sqrt(energy / 0.01), 1.0) if energy > 0 else 10.0
+        # Clamp to reasonable range
+        estimated_range = min(estimated_range, 100.0)
+
+        # Blender energy for point lights is in Watts.
+        # Blender uses a physically-based 1/(4*pi*r^2) model internally.
+        # Our shader uses raw inverse-square: radiance = color * intensity / (r^2).
+        # To match Blender's rendering: intensity = energy / (4*pi)
+        # This keeps the physical scale correct.
+        intensity = energy / (4.0 * math.pi)
+
+        print(f"[ignis_rt] export_light: '{obj.name}' type={light.type} "
+              f"pos=({vk_x:.2f},{vk_y:.2f},{vk_z:.2f}) "
+              f"energy={energy:.1f}W intensity={intensity:.2f} "
+              f"range={estimated_range:.1f} color=({color[0]:.2f},{color[1]:.2f},{color[2]:.2f})")
+
+        lights.extend([
+            vk_x, vk_y, vk_z, estimated_range,
+            color[0], color[1], color[2], intensity,
+        ])
+
+    return lights
+
+
+# ---- GPUMaterial struct layout (140 bytes, scalar) ----
+# Must match GPUMaterial in vk_rt_pipeline.h exactly.
+# 35 fields x 4 bytes = 140 bytes total.
+_GPU_MATERIAL_STRUCT = struct.Struct('<' + 'I' * 5 + 'f' * 3  # tex indices (4) + normalDetail + ks (3)
+                                    + 'f' * 4                  # ksSpecularEXP + emissive RGB
+                                    + 'f' * 4                  # fresnelC/EXP + detailUVMult + detailNBlend
+                                    + 'I' + 'f' + 'I' + 'f'   # flags + alphaRef + shaderType + fresnelMaxLevel
+                                    + 'I' * 6                  # multilayer tex indices (6)
+                                    + 'f' * 7                  # multilayer mults (7)
+                                    + 'f' * 2)                 # sunSpecular + sunSpecularEXP
+
+_NO_TEX = 0xFFFFFFFF
+
+
+def _pack_gpu_material(
+    base_color=(0.8, 0.8, 0.8),
+    roughness=0.5,
+    metallic=0.0,
+    specular_level=0.5,
+    emission=(0.0, 0.0, 0.0),
+    emission_strength=0.0,
+    normal_strength=1.0,
+    diffuse_tex=_NO_TEX,
+    normal_tex=_NO_TEX,
+    orm_tex=_NO_TEX,
+    emission_tex=_NO_TEX,
+    alpha=1.0,
+    ior=1.5,
+    transmission=0.0,
+    flags=0,
+    alpha_ref=0.5,
+):
+    """Pack one material into 140 bytes matching GPUMaterial."""
+    return _GPU_MATERIAL_STRUCT.pack(
+        # Texture indices
+        diffuse_tex,        # diffuseTexIndex
+        normal_tex,         # normalTexIndex
+        orm_tex,            # mapsTexIndex (ORM)
+        emission_tex,       # detailTexIndex → emission texture
+        # normalDetailTexIndex + ksAmbient/ksDiffuse/ksSpecular
+        _NO_TEX,
+        base_color[0], base_color[1], base_color[2],
+        # ksSpecularEXP (= roughness), emissive RGB
+        roughness,
+        emission[0], emission[1], emission[2],
+        # fresnelC (= metallic), fresnelEXP (= specularLevel), detailUVMult (= IOR), detailNormalBlend
+        metallic, specular_level, ior, normal_strength,
+        # flags, alphaRef, shaderType, fresnelMaxLevel (= emission strength)
+        flags,              # flags (bit0=alpha_test, bit1=transmission)
+        alpha_ref,          # alphaRef
+        100,                # shaderType = SHADER_BLENDER_PBR
+        emission_strength,  # fresnelMaxLevel
+        # Multilayer tex indices (6x NO_TEX)
+        _NO_TEX, _NO_TEX, _NO_TEX, _NO_TEX, _NO_TEX, _NO_TEX,
+        # multR=transmission, multG=alpha, rest unused
+        transmission, alpha, 1.0, 1.0, 1.0, 1.0, 1.0,
+        # sunSpecular, sunSpecularEXP
+        0.0, 0.0,
+    )
+
+
+def _blackbody_to_rgb(temperature):
+    """Convert blackbody temperature (Kelvin) to linear RGB.
+    Attempt to use Blender's built-in; fall back to Tanner Helland approximation."""
+    try:
+        from mathutils import Color
+        c = Color()
+        c.from_scene_linear_to_srgb = False
+        # Blender 4+ has blackbody_to_rgb
+        import _cycles
+        r, g, b = _cycles.blackbody_to_rgb(temperature)
+        return (r, g, b)
+    except Exception:
+        pass
+
+    # Tanner Helland approximation (sRGB, then linearize)
+    t = max(1000.0, min(temperature, 40000.0)) / 100.0
+    if t <= 66.0:
+        r = 1.0
+        g = max(0.0, 0.39008 * math.log(t) - 0.63184)
+        b = max(0.0, 0.54321 * math.log(t - 10.0) - 1.19625) if t > 20.0 else 0.0
+    else:
+        r = max(0.0, 1.292936 * ((t - 60.0) ** -0.1332))
+        g = max(0.0, 1.129891 * ((t - 60.0) ** -0.0755))
+        b = 1.0
+    # Clamp and linearize (approximate sRGB→linear)
+    r, g, b = min(r, 1.0), min(g, 1.0), min(b, 1.0)
+    r, g, b = r ** 2.2, g ** 2.2, b ** 2.2
+    return (r, g, b)
+
+
+def _resolve_color_input(socket, default=(0.8, 0.8, 0.8)):
+    """Resolve a color socket value, following links to Blackbody/RGB nodes."""
+    if socket is None:
+        return default
+    if socket.is_linked:
+        from_node = socket.links[0].from_node
+        # Blackbody node → convert temperature to RGB
+        if from_node.type == 'BLACKBODY':
+            temp_inp = from_node.inputs.get('Temperature')
+            temp = float(temp_inp.default_value) if temp_inp else 5000.0
+            return _blackbody_to_rgb(temp)
+        # RGB/Value node → read directly
+        if from_node.type == 'RGB':
+            out = from_node.outputs.get('Color')
+            if out:
+                c = out.default_value
+                return (c[0], c[1], c[2])
+    # Unlinked or unknown → use default_value
+    c = socket.default_value
+    if hasattr(c, '__len__') and len(c) >= 3:
+        return (c[0], c[1], c[2])
+    return default
+
+
+def _get_principled_input(node, input_name, default):
+    """Get a Principled BSDF input value (scalar or color)."""
+    inp = node.inputs.get(input_name)
+    if inp is None:
+        return default
+    return inp.default_value
+
+
+def _find_image_texture_node(socket):
+    """Follow links from a Principled BSDF input to find an Image Texture node.
+
+    Handles:
+      - Direct: Image Texture → input
+      - Normal: Image Texture → Normal Map → Normal input
+      - Separate: Image Texture → Separate RGB/Color → channel → input
+    """
+    if not socket or not socket.is_linked:
+        return None
+    from_node = socket.links[0].from_node
+
+    if from_node.type == 'TEX_IMAGE':
+        return from_node
+
+    # Image Texture → Normal Map → Principled Normal
+    if from_node.type == 'NORMAL_MAP':
+        color_inp = from_node.inputs.get('Color')
+        if color_inp and color_inp.is_linked:
+            nn = color_inp.links[0].from_node
+            if nn.type == 'TEX_IMAGE':
+                return nn
+
+    # Image Texture → Separate RGB/Color → channel (for ORM maps)
+    if from_node.type in ('SEPRGB', 'SEPARATE_XYZ', 'SEPARATE_COLOR'):
+        for inp_name in ('Image', 'Color', 'Vector'):
+            inp = from_node.inputs.get(inp_name)
+            if inp and inp.is_linked:
+                nn = inp.links[0].from_node
+                if nn.type == 'TEX_IMAGE':
+                    return nn
+
+    return None
+
+
+_image_bytes_cache = {}  # image.name → bytes (persists across export_materials calls)
+
+
+def _get_image_bytes(image):
+    """Extract file bytes from a Blender image for stb_image decoding.
+
+    Tries packed data first, then file on disk. Returns bytes or None.
+    Uses a persistent cache to avoid re-reading on material property tweaks.
+    """
+    if image.name in _image_bytes_cache:
+        return _image_bytes_cache[image.name]
+
+    import os
+    import bpy
+
+    data = None
+
+    # Packed in .blend: raw file bytes (PNG/JPG/etc.)
+    if image.packed_file:
+        data = bytes(image.packed_file.data)
+
+    # File on disk
+    if data is None:
+        filepath = bpy.path.abspath(image.filepath_from_user())
+        if filepath and os.path.isfile(filepath):
+            with open(filepath, 'rb') as f:
+                data = f.read()
+
+    # Generated/viewer images: extract pixels as raw RGBA8
+    if data is None and image.size[0] > 0 and image.size[1] > 0:
+        w, h = image.size[0], image.size[1]
+        px = np.empty(w * h * 4, dtype=np.float32)
+        image.pixels.foreach_get(px)
+        # float [0,1] → uint8 [0,255]
+        px_u8 = (np.clip(px, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+        # Encode as minimal BMP for stb_image
+        data = _encode_bmp(px_u8, w, h)
+
+    if data is not None:
+        _image_bytes_cache[image.name] = data
+    return data
+
+
+def _encode_bmp(rgba_u8, w, h):
+    """Encode RGBA8 pixels as a 32-bit BMP (stb_image compatible)."""
+    # BMP is bottom-up, so flip rows
+    row_size = w * 4
+    pixel_data = bytearray(row_size * h)
+    for y in range(h):
+        src_row = y * row_size
+        dst_row = (h - 1 - y) * row_size
+        row = rgba_u8[src_row:src_row + row_size]
+        # RGBA → BGRA for BMP
+        for x in range(w):
+            px_off = x * 4
+            pixel_data[dst_row + px_off + 0] = row[px_off + 2]  # B
+            pixel_data[dst_row + px_off + 1] = row[px_off + 1]  # G
+            pixel_data[dst_row + px_off + 2] = row[px_off + 0]  # R
+            pixel_data[dst_row + px_off + 3] = row[px_off + 3]  # A
+        pixel_data[dst_row:dst_row + row_size] = pixel_data[dst_row:dst_row + row_size]
+
+    header_size = 14 + 124  # BITMAPFILEHEADER + BITMAPV5HEADER
+    file_size = header_size + len(pixel_data)
+
+    hdr = bytearray(header_size)
+    # BITMAPFILEHEADER (14 bytes)
+    hdr[0:2] = b'BM'
+    struct.pack_into('<I', hdr, 2, file_size)
+    struct.pack_into('<I', hdr, 10, header_size)
+    # BITMAPV5HEADER (124 bytes)
+    struct.pack_into('<I', hdr, 14, 124)        # biSize
+    struct.pack_into('<i', hdr, 18, w)           # biWidth
+    struct.pack_into('<i', hdr, 22, -h)          # biHeight (negative = top-down)
+    struct.pack_into('<H', hdr, 26, 1)           # biPlanes
+    struct.pack_into('<H', hdr, 28, 32)          # biBitCount
+    struct.pack_into('<I', hdr, 30, 3)           # biCompression = BI_BITFIELDS
+    struct.pack_into('<I', hdr, 34, len(pixel_data))
+    # Color masks for RGBA
+    struct.pack_into('<I', hdr, 54, 0x00FF0000)  # R mask
+    struct.pack_into('<I', hdr, 58, 0x0000FF00)  # G mask
+    struct.pack_into('<I', hdr, 62, 0x000000FF)  # B mask
+    struct.pack_into('<I', hdr, 66, 0xFF000000)  # A mask
+
+    return bytes(hdr) + bytes(pixel_data)
+
+
+def export_materials(depsgraph):
+    """Export Blender Principled BSDF materials as GPUMaterial byte buffer.
+
+    Returns (ctypes byte array, name->global_index dict, textures list).
+    textures list = [{"name": str, "data": bytes, "width": int, "height": int}, ...]
+    """
+    import ctypes
+    import bpy
+
+    # Collect unique materials from all mesh objects (including linked/instanced)
+    mat_name_to_index = {}
+    mat_list = []
+
+    for inst in depsgraph.object_instances:
+        obj = inst.object
+        if obj.type != 'MESH':
+            continue
+        for slot in obj.material_slots:
+            mat = slot.material
+            if mat is None:
+                continue
+            if mat.name in mat_name_to_index:
+                continue
+            mat_name_to_index[mat.name] = len(mat_list)
+            mat_list.append(mat)
+
+    # Collect unique textures across all materials
+    # image_key → {"index": int, "data": bytes, "name": str, "width": int, "height": int}
+    texture_registry = {}
+    textures_list = []
+
+    def _register_image(image):
+        """Register an image and return its texture index, or _NO_TEX if unavailable."""
+        if image is None:
+            return _NO_TEX
+        key = image.name
+        if key in texture_registry:
+            return texture_registry[key]["index"]
+        data = _get_image_bytes(image)
+        if data is None:
+            return _NO_TEX
+        idx = len(textures_list)
+        entry = {
+            "index": idx,
+            "name": key,
+            "data": data,
+            "width": image.size[0],
+            "height": image.size[1],
+        }
+        texture_registry[key] = entry
+        textures_list.append(entry)
+        return idx
+
+    # Always have at least one default material (index 0)
+    if not mat_list:
+        data = _pack_gpu_material()
+        buf = (ctypes.c_uint8 * len(data))(*data)
+        return buf, {}, []
+
+    # Pack each material
+    all_bytes = bytearray()
+    for mat in mat_list:
+        base_color = (0.8, 0.8, 0.8)
+        roughness = 0.5
+        metallic = 0.0
+        specular_level = 0.5
+        emission = (0.0, 0.0, 0.0)
+        emission_strength = 0.0
+        normal_strength = 1.0
+        diffuse_tex = _NO_TEX
+        normal_tex = _NO_TEX
+        orm_tex = _NO_TEX
+        emission_tex = _NO_TEX
+        alpha = 1.0
+        ior = 1.5
+        transmission = 0.0
+        flags = 0
+        alpha_ref = 0.5
+
+        if mat.use_nodes and mat.node_tree:
+            # First try: find Principled BSDF directly
+            principled_node = None
+            for node in mat.node_tree.nodes:
+                if node.type == 'BSDF_PRINCIPLED':
+                    principled_node = node
+                    break
+
+            # Fallback: extract from Diffuse/Glossy/Glass/Emission nodes
+            if principled_node is None:
+                for node in mat.node_tree.nodes:
+                    if node.type == 'EMISSION':
+                        color_inp = node.inputs.get('Color')
+                        if color_inp:
+                            tex_node = _find_image_texture_node(color_inp)
+                            if tex_node and tex_node.image:
+                                emission_tex = _register_image(tex_node.image)
+                            # Resolve color (handles Blackbody, RGB nodes, or plain value)
+                            emission = _resolve_color_input(color_inp, (1.0, 1.0, 1.0))
+                        strength_inp = node.inputs.get('Strength')
+                        if strength_inp:
+                            emission_strength = float(strength_inp.default_value)
+                        # Emissive surfaces: base_color = emission color for visibility
+                        base_color = emission
+                        # Don't break — also check for a Diffuse/Glossy in the same mix
+                        continue
+                    if node.type in ('BSDF_DIFFUSE', 'BSDF_GLOSSY', 'BSDF_GLASS'):
+                        color_inp = node.inputs.get('Color')
+                        if color_inp:
+                            tex_node = _find_image_texture_node(color_inp)
+                            if tex_node and tex_node.image:
+                                diffuse_tex = _register_image(tex_node.image)
+                            c = color_inp.default_value
+                            base_color = (c[0], c[1], c[2])
+                        rough_inp = node.inputs.get('Roughness')
+                        if rough_inp:
+                            roughness = float(rough_inp.default_value)
+                        if node.type == 'BSDF_GLOSSY':
+                            metallic = 0.8
+                        if node.type == 'BSDF_GLASS':
+                            transmission = 1.0
+                            ior_inp = node.inputs.get('IOR')
+                            if ior_inp:
+                                ior = float(ior_inp.default_value)
+                        break
+
+            if principled_node is not None:
+                node = principled_node
+                # Base Color (scalar + texture)
+                bc = _get_principled_input(node, 'Base Color', (0.8, 0.8, 0.8, 1.0))
+                base_color = (bc[0], bc[1], bc[2])
+                bc_node = _find_image_texture_node(node.inputs.get('Base Color'))
+                if bc_node and bc_node.image:
+                    diffuse_tex = _register_image(bc_node.image)
+
+                # Roughness
+                roughness = float(_get_principled_input(node, 'Roughness', 0.5))
+
+                # Metallic
+                metallic = float(_get_principled_input(node, 'Metallic', 0.0))
+
+                # Check for ORM-style texture on Roughness or Metallic inputs
+                rough_node = _find_image_texture_node(node.inputs.get('Roughness'))
+                metal_node = _find_image_texture_node(node.inputs.get('Metallic'))
+                orm_image = None
+                if rough_node and rough_node.image:
+                    orm_image = rough_node.image
+                elif metal_node and metal_node.image:
+                    orm_image = metal_node.image
+                if orm_image:
+                    orm_tex = _register_image(orm_image)
+
+                # Specular IOR Level (Blender 4.0+) or fallback to Specular
+                spec_inp = node.inputs.get('Specular IOR Level')
+                if spec_inp is None:
+                    spec_inp = node.inputs.get('Specular')
+                specular_level = float(spec_inp.default_value) if spec_inp else 0.5
+
+                # Emission Color
+                ec = _get_principled_input(node, 'Emission Color', (0.0, 0.0, 0.0, 1.0))
+                emission = (ec[0], ec[1], ec[2])
+                emission_strength = float(_get_principled_input(node, 'Emission Strength', 0.0))
+
+                # Normal map texture
+                norm_inp = node.inputs.get('Normal')
+                if norm_inp and norm_inp.is_linked:
+                    for link in norm_inp.links:
+                        if link.from_node.type == 'NORMAL_MAP':
+                            normal_strength = float(link.from_node.inputs['Strength'].default_value)
+                            color_inp = link.from_node.inputs.get('Color')
+                            if color_inp and color_inp.is_linked:
+                                nn = color_inp.links[0].from_node
+                                if nn.type == 'TEX_IMAGE' and nn.image:
+                                    normal_tex = _register_image(nn.image)
+
+                # Alpha
+                alpha = float(_get_principled_input(node, 'Alpha', 1.0))
+
+                # IOR
+                ior = float(_get_principled_input(node, 'IOR', 1.5))
+
+                # Transmission Weight (Blender 4.0+) or Transmission (3.x)
+                trans_inp = node.inputs.get('Transmission Weight')
+                if trans_inp is None:
+                    trans_inp = node.inputs.get('Transmission')
+                transmission = float(trans_inp.default_value) if trans_inp else 0.0
+
+                # Emission texture
+                ec_node = _find_image_texture_node(node.inputs.get('Emission Color'))
+                if ec_node and ec_node.image:
+                    emission_tex = _register_image(ec_node.image)
+
+                # Detect alpha testing
+                alpha_test = alpha < 1.0
+                alpha_inp = node.inputs.get('Alpha')
+                if alpha_inp and alpha_inp.is_linked:
+                    alpha_test = True
+                try:
+                    if mat.blend_method in ('CLIP', 'HASHED', 'BLEND'):
+                        alpha_test = True
+                except AttributeError:
+                    pass
+                try:
+                    alpha_ref = mat.alpha_threshold
+                except AttributeError:
+                    alpha_ref = 0.5
+
+                flags = 0
+                if alpha_test:
+                    flags |= 1   # bit0 = alpha_test
+                if transmission > 0.0:
+                    flags |= 2   # bit1 = transmission
+
+        # Log material to file directly
+        import os
+        _mat_log_path = os.path.join(os.path.expanduser("~"), "ignis-rt.log")
+        try:
+            with open(_mat_log_path, "a") as _mf:
+                _mf.write(f"[ignis-mat] '{mat.name}': color=({base_color[0]:.3f},{base_color[1]:.3f},{base_color[2]:.3f}) "
+                          f"rough={roughness:.2f} metal={metallic:.2f} "
+                          f"emit=({emission[0]:.3f},{emission[1]:.3f},{emission[2]:.3f})*{emission_strength:.2f} "
+                          f"diffTex={diffuse_tex} emitTex={emission_tex}\n")
+                _mf.flush()
+        except Exception:
+            pass
+
+        all_bytes += _pack_gpu_material(
+            base_color=base_color,
+            roughness=roughness,
+            metallic=metallic,
+            specular_level=specular_level,
+            emission=emission,
+            emission_strength=emission_strength,
+            normal_strength=normal_strength,
+            diffuse_tex=diffuse_tex,
+            normal_tex=normal_tex,
+            orm_tex=orm_tex,
+            emission_tex=emission_tex,
+            alpha=alpha,
+            ior=ior,
+            transmission=transmission,
+            flags=flags,
+            alpha_ref=alpha_ref,
+        )
+
+    buf = (ctypes.c_uint8 * len(all_bytes))(*all_bytes)
+    return buf, mat_name_to_index, textures_list

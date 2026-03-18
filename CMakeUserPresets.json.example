@@ -1,0 +1,41 @@
+{
+  "version": 4,
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "Default (no NRD/DLSS)",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "IGNIS_USE_NRD": "OFF",
+        "IGNIS_USE_DLSS": "OFF",
+        "IGNIS_ENABLE_VALIDATION": "OFF"
+      }
+    },
+    {
+      "name": "full",
+      "displayName": "Full (NRD + DLSS)",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "IGNIS_USE_NRD": "ON",
+        "IGNIS_NRD_ROOT": "C:/path/to/NRD",
+        "IGNIS_USE_DLSS": "ON",
+        "IGNIS_NGX_ROOT": "C:/path/to/NGX_SDK",
+        "IGNIS_ENABLE_VALIDATION": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "release",
+      "configurePreset": "default",
+      "configuration": "Release"
+    },
+    {
+      "name": "release-full",
+      "configurePreset": "full",
+      "configuration": "Release"
+    }
+  ]
+}

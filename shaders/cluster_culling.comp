@@ -1,0 +1,156 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+// Configuration matches C++
+#define CLUSTER_GRID_X 16
+#define CLUSTER_GRID_Y 9
+#define CLUSTER_GRID_Z 24
+#define MAX_LIGHTS_PER_CLUSTER 256
+#define BITMASK_INTS (MAX_LIGHTS_PER_CLUSTER / 32)
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+struct GPULight {
+    vec4 positionAndRange;    // xyz=pos, w=range
+    vec4 colorAndIntensity;   // xyz=color, w=intensity
+    vec4 directionAndAngle;   // xyz=dir, w=spotAngleOuter
+    vec4 params;              // x=spotInner, y=type (as float), z=pad, w=pad
+};
+
+layout(std140, binding = 0) uniform ClusterState {
+    mat4 viewMatrix;
+    mat4 inverseProjection;
+    float screenWidth;
+    float screenHeight;
+    float zNear;
+    float zFar;
+} state;
+
+layout(std430, binding = 1) readonly buffer LightBuffer {
+    uint activeLightCount;
+    uint padding[3];
+    GPULight lights[];
+} lightBuffer;
+
+layout(std430, binding = 2) buffer ClusterBuffer {
+    uint masks[]; // Linear array: [ClusterIndex * 8 + IntIndex]
+} clusterBuffer;
+
+// Helper: View Space AABB for a Cluster
+struct AABB {
+    vec3 min;
+    vec3 max;
+};
+
+vec4 clipToView(vec4 clip) {
+    vec4 view = state.inverseProjection * clip;
+    return view / view.w;
+}
+
+// Simple Sphere-AABB intersection
+bool testSphereAABB(vec3 center, float radius, AABB aabb) {
+    vec3 closest = max(aabb.min, min(center, aabb.max));
+    vec3 dist = center - closest;
+    return dot(dist, dist) <= (radius * radius);
+}
+
+void main() {
+    uvec3 gid = gl_GlobalInvocationID;
+    if (gid.x >= CLUSTER_GRID_X || gid.y >= CLUSTER_GRID_Y || gid.z >= CLUSTER_GRID_Z) return;
+
+    uint clusterIndex = gid.x + 
+                        gid.y * CLUSTER_GRID_X + 
+                        gid.z * CLUSTER_GRID_X * CLUSTER_GRID_Y;
+
+    // Calculate Cluster AABB in View Space
+    float tileX = state.screenWidth / float(CLUSTER_GRID_X);
+    float tileY = state.screenHeight / float(CLUSTER_GRID_Y);
+    
+    vec2 minScreen = vec2(gid.x * tileX, gid.y * tileY);
+    vec2 maxScreen = vec2((gid.x + 1) * tileX, (gid.y + 1) * tileY);
+    
+    // Logarithmic Z-split
+    float zLogFactor = log(state.zFar / state.zNear);
+    float zMinLinear = state.zNear * exp(zLogFactor * (float(gid.z) / float(CLUSTER_GRID_Z)));
+    float zMaxLinear = state.zNear * exp(zLogFactor * (float(gid.z + 1) / float(CLUSTER_GRID_Z)));
+    
+    // Normalized Device Coordinates (-1 to 1)
+    float ndcMinX = (minScreen.x / state.screenWidth) * 2.0 - 1.0;
+    float ndcMaxX = (maxScreen.x / state.screenWidth) * 2.0 - 1.0;
+    float ndcMinY = (minScreen.y / state.screenHeight) * 2.0 - 1.0;
+    float ndcMaxY = (maxScreen.y / state.screenHeight) * 2.0 - 1.0;
+    
+    // Unproject corners at NDC z = 0.0 to get direction
+    vec4 rayBL = state.inverseProjection * vec4(ndcMinX, ndcMinY, 1.0, 1.0); rayBL /= rayBL.w;
+    vec4 rayTR = state.inverseProjection * vec4(ndcMaxX, ndcMaxY, 1.0, 1.0); rayTR /= rayTR.w;
+    vec4 rayBR = state.inverseProjection * vec4(ndcMaxX, ndcMinY, 1.0, 1.0); rayBR /= rayBR.w;
+    vec4 rayTL = state.inverseProjection * vec4(ndcMinX, ndcMaxY, 1.0, 1.0); rayTL /= rayTL.w;
+    
+    vec3 dirBL = rayBL.xyz / -rayBL.z;
+    vec3 dirTR = rayTR.xyz / -rayTR.z;
+    vec3 dirBR = rayBR.xyz / -rayBR.z;
+    vec3 dirTL = rayTL.xyz / -rayTL.z;
+    
+    // Construct AABB
+    AABB clusterAABB;
+    clusterAABB.min = vec3(1e20);
+    clusterAABB.max = vec3(-1e20);
+    
+    vec3 corners[8];
+    float dNear = zMinLinear;
+    corners[0] = dirBL * dNear;
+    corners[1] = dirTR * dNear;
+    corners[2] = dirBR * dNear;
+    corners[3] = dirTL * dNear;
+    
+    float dFar = zMaxLinear;
+    corners[4] = dirBL * dFar;
+    corners[5] = dirTR * dFar;
+    corners[6] = dirBR * dFar;
+    corners[7] = dirTL * dFar;
+    
+    for(int i=0; i<8; i++) {
+        clusterAABB.min = min(clusterAABB.min, corners[i]);
+        clusterAABB.max = max(clusterAABB.max, corners[i]);
+    }
+    
+    // --- Light Culling ---
+    
+    uint visibleLights[BITMASK_INTS];
+    for(int i=0; i<BITMASK_INTS; i++) visibleLights[i] = 0;
+    
+    uint count = lightBuffer.activeLightCount;
+    if(count > MAX_LIGHTS_PER_CLUSTER) count = MAX_LIGHTS_PER_CLUSTER; 
+    
+    for(uint i = 0; i < count; i++) {
+        GPULight light = lightBuffer.lights[i];
+        
+        vec3 pos = light.positionAndRange.xyz;
+        float range = light.positionAndRange.w;
+        uint type = uint(light.params.y);
+        
+        // Convert Light Position to View Space
+        vec4 viewPos = state.viewMatrix * vec4(pos, 1.0);
+        
+        bool intersects = false;
+        
+        if (type == 0) { // Omni
+            intersects = testSphereAABB(viewPos.xyz, range, clusterAABB);
+        } else if (type == 1) { // Spot
+            // Approximate Spot as Sphere
+            intersects = testSphereAABB(viewPos.xyz, range, clusterAABB);
+        }
+        
+        if (intersects) {
+            uint intIndex = i / 32;
+            uint bitIndex = i % 32;
+            visibleLights[intIndex] |= (1u << bitIndex);
+        }
+    }
+    
+    // Write to global buffer
+    uint baseOffset = clusterIndex * BITMASK_INTS;
+    for(int i=0; i<BITMASK_INTS; i++) {
+        clusterBuffer.masks[baseOffset + i] = visibleLights[i];
+    }
+}

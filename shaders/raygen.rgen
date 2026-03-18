@@ -1,0 +1,2554 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+layout(binding = 1, set = 0) writeonly uniform image2D image;
+
+layout(binding = 2, set = 0) uniform CameraProperties {
+    mat4 viewInverse;
+    mat4 projInverse;
+    mat4 view;
+    mat4 proj;
+    mat4 viewPrev;
+    mat4 projPrev;
+    uvec4 parameters;
+    vec4 jitterData;
+    vec4 sunLight;
+    vec4 ambientLight;
+    vec4 skyLight;
+    vec4 ptParams0;  // x=exposure, y=giIntensity, z=saturation, w=contrast
+    vec4 ptParams1;  // x=skyReflIntensity, y=ambientMax, z=sunMinIntensity, w=skyBounceIntensity
+    vec4 windParams; // x=windDirX, y=windDirZ, z=windSpeed(m/s), w=time(seconds)
+    vec4 rainParams; // x=wetness, y=waterLevel, z=rainIntensity, w=reserved
+    ivec4 jitterPattern[8];
+} cam;
+
+// Geometry metadata structure (matches C++ GPUGeometryMetadata)
+struct GeometryMetadata {
+    uint64_t vertexBufferAddress;
+    uint64_t indexBufferAddress;
+    uint64_t normalBufferAddress;
+    uint64_t uvBufferAddress;
+    uint64_t primMaterialBufferAddress;
+    uint64_t bitangentBufferAddress;
+    uint64_t primYBoundsAddress;
+    uint vertexCount;
+    uint indexCount;
+};
+
+// Storage buffer with geometry metadata
+layout(binding = 3, set = 0, scalar) buffer GeometryMetadataBuffer {
+    GeometryMetadata geometries[];
+} geometryMetadata;
+
+// Material buffer (binding 4) — matches C++ GPUMaterial (128 bytes)
+struct Material {
+    uint diffuseTexIndex;
+    uint normalTexIndex;
+    uint mapsTexIndex;
+    uint detailTexIndex;
+
+    uint normalDetailTexIndex;
+    float ksAmbient;
+    float ksDiffuse;
+    float ksSpecular;
+
+    float ksSpecularEXP;
+    float emissiveR, emissiveG, emissiveB;
+
+    float fresnelC;
+    float fresnelEXP;
+    float detailUVMultiplier;
+    float detailNormalBlend;
+
+    uint flags;     // bit 0: alphaTested, bit 1: useDetail, bit 2: isCarPaint, bit 3: hasNormalDetail, bit 4: blendTransparent, bit 5: noCastShadow
+    float alphaRef;
+    uint shaderType;        // ACShaderType enum
+    float fresnelMaxLevel;  // max fresnel reflection intensity
+
+    // Multilayer fields (48 bytes)
+    uint maskTexIndex;
+    uint detailRTexIndex;
+    uint detailGTexIndex;
+    uint detailBTexIndex;
+
+    uint detailATexIndex;
+    uint detailNMTexIndex;
+    float multR;
+    float multG;
+
+    float multB;
+    float multA;
+    float magicMult;
+    float detailNMMult;   // UV scale for detail normal map (U component)
+    float detailNMMultV;  // UV scale for detail normal map (V component)
+
+    // Sun specular (Maps shaders only)
+    float sunSpecular;
+    float sunSpecularEXP;
+};
+layout(binding = 4, set = 0, scalar) buffer MaterialBuffer {
+    Material materials[];
+} materialBuffer;
+
+// Texture array (binding 5)
+layout(binding = 5, set = 0) uniform sampler2D textures[];
+
+// NRD G-buffers (bindings 6-10, 16)
+layout(binding = 6, set = 0, rgba16f) uniform image2D normalRoughnessImg;
+layout(binding = 7, set = 0, r32f)    uniform image2D viewDepthImg;
+layout(binding = 8, set = 0, rgba16f) uniform image2D motionVectorsImg;
+layout(binding = 9, set = 0, rgba16f) uniform image2D diffuseRadianceImg;
+layout(binding = 10, set = 0, rgba16f) uniform image2D specularRadianceImg;
+layout(binding = 16, set = 0, rgba16f) uniform image2D albedoBufferImg;
+
+// Blue noise texture (binding 12) — 64x64 R8, used for temporally stratified sampling
+layout(binding = 12, set = 0) uniform sampler2D blueNoiseTexture;
+
+// Penumbra for NRD SIGMA shadow denoiser (binding 18)
+layout(binding = 18, set = 0, r16f) uniform image2D penumbraImg;  // NRD SIGMA input
+// binding 19: unused (was shadow accum previous, kept for descriptor compatibility)
+layout(binding = 19, set = 0) uniform sampler2D shadowAccumPrevious;
+
+// DLSS NDC depth (binding 22) — non-linear depth [0,1] for DLSS temporal accumulation
+layout(binding = 22, set = 0, r32f) uniform image2D dlssDepthImg;
+
+// Cloud shadow map (binding 23) — R16F transmittance, 512² centered on camera
+layout(binding = 23, set = 0) uniform sampler2D cloudShadowMap;
+
+// SHARC radiance cache (bindings 20-21) — hash grid SSBOs
+// SHARCEntry: hashKey(uint), sampleCount(uint), R(float), G(float), B(float), lastFrame(uint), pad0(float), pad1(float) = 32 bytes
+layout(binding = 20, set = 0, std430) buffer SHARCWriteBuffer {
+    uint sharcWriteData[];  // accessed as raw uint array (8 uints per entry)
+} sharcWrite;
+
+layout(binding = 21, set = 0, std430) buffer SHARCReadBuffer {
+    uint sharcReadData[];   // accessed as raw uint array (8 uints per entry)
+} sharcRead;
+
+// Pick result buffer (binding 17) — written when pick is active
+layout(binding = 17, set = 0, scalar) buffer PickBuffer {
+    uint pickCustomIndex;
+    uint pickPrimitiveId;
+    uint pickMaterialId;
+    uint pickValid;
+} pickResult;
+
+// Buffer references for accessing vertex/attribute data
+layout(buffer_reference, scalar) buffer Vertices { float v[]; };
+layout(buffer_reference, scalar) buffer Indices { uint i[]; };
+layout(buffer_reference, scalar) buffer Normals { float n[]; };
+layout(buffer_reference, scalar) buffer UVs { float uv[]; };
+layout(buffer_reference, scalar) buffer PrimMaterials { uint m[]; };
+layout(buffer_reference, scalar) buffer PrimYBounds { float yb[]; };  // [i*2]=minY, [i*2+1]=maxY
+
+// ============================================================
+// Shader type constants (must match ACShaderType in C++)
+// ============================================================
+const uint SHADER_STANDARD = 0u;
+const uint SHADER_NM = 1u;
+const uint SHADER_MULTIMAP = 2u;
+const uint SHADER_REFLECTION = 3u;
+const uint SHADER_AT = 4u;
+const uint SHADER_AT_NM = 5u;
+const uint SHADER_MULTIMAP_NMDETAIL = 6u;
+const uint SHADER_MULTIMAP_AT = 7u;
+const uint SHADER_MULTIMAP_DAMAGE = 8u;
+const uint SHADER_MULTIMAP_EMISSIVE = 9u;
+const uint SHADER_GLASS = 10u;
+const uint SHADER_CARPAINT = 11u;
+const uint SHADER_MULTILAYER = 12u;
+const uint SHADER_TREE = 13u;
+const uint SHADER_GRASS = 14u;
+const uint SHADER_TYRES = 15u;
+const uint SHADER_SKINNED = 16u;
+const uint SHADER_BRAKE_DISC = 17u;
+const uint SHADER_SKIDMARK = 18u;
+const uint SHADER_ALPHA = 19u;
+const uint SHADER_TREE_TRUNK = 20u;
+
+// Compute TBN from triangle positions and UVs
+// Returns tangent and bitangent; normal is the shading normal
+void computeTBN(vec3 v0, vec3 v1, vec3 v2, vec2 uv0, vec2 uv1, vec2 uv2,
+                vec3 N, out vec3 T, out vec3 B) {
+    vec3 e1 = v1 - v0;
+    vec3 e2 = v2 - v0;
+    vec2 duv1 = uv1 - uv0;
+    vec2 duv2 = uv2 - uv0;
+
+    float det = duv1.x * duv2.y - duv1.y * duv2.x;
+    if (abs(det) > 1e-6) {
+        float invDet = 1.0 / det;
+        T = normalize((e1 * duv2.y - e2 * duv1.y) * invDet);
+        B = normalize((e2 * duv1.x - e1 * duv2.x) * invDet);
+    } else {
+        // Degenerate UVs — build arbitrary basis
+        T = normalize(e1);
+        B = normalize(cross(N, T));
+    }
+    // Gram-Schmidt re-orthogonalize against shading normal
+    T = normalize(T - N * dot(N, T));
+    B = normalize(cross(N, T));
+}
+
+// Apply tangent-space normal map — matches actools DarkMaterial.Base.fx exactly:
+//   n = (2R-1, 1-2G, 2B-1)  with Y inverted (DX green channel convention)
+//   result = n.x*T + n.y*B + n.z*N  (standard TBN order)
+vec3 applyNormalMap(vec3 texNormal, vec3 T, vec3 N, vec3 B) {
+    vec3 n = vec3(texNormal.x * 2.0 - 1.0,
+                  1.0 - texNormal.y * 2.0,
+                  texNormal.z * 2.0 - 1.0);
+    return normalize(T * n.x + B * n.y + N * n.z);
+}
+
+// Compute triangle UV density (UV units per world unit)
+float triangleUVDensity(vec3 p0, vec3 p1, vec3 p2, vec2 uv0, vec2 uv1, vec2 uv2) {
+    vec3 dp1 = p1 - p0;
+    vec3 dp2 = p2 - p0;
+    vec2 duv1 = uv1 - uv0;
+    vec2 duv2 = uv2 - uv0;
+    float worldArea = length(cross(dp1, dp2));
+    float uvArea = abs(duv1.x * duv2.y - duv1.y * duv2.x);
+    return sqrt(uvArea / max(worldArea, 1e-10));
+}
+
+// Compute texture LOD for ray tracing (replaces hardware derivatives)
+// In rasterization, the GPU computes screen-space derivatives automatically.
+// In ray tracing we must estimate the pixel footprint manually:
+//   pixelWorldSize = world-space width of one pixel at hit distance
+//   uvDensity      = UV units per world unit (from triangle or world-space mult)
+//   texIdx         = texture index to query resolution
+float computeTexLOD(float pixelWorldSize, float uvDensity, uint texIdx) {
+    ivec2 sz = textureSize(textures[nonuniformEXT(texIdx)], 0);
+    float maxDim = float(max(sz.x, sz.y));
+    return max(0.0, log2(max(1.0, pixelWorldSize * uvDensity * maxDim)));
+}
+
+// Hash function for per-mesh coloring
+vec3 meshColor(uint id) {
+    uint h = id;
+    h ^= h >> 16; h *= 0x45d9f3bU; h ^= h >> 16; h *= 0x45d9f3bU; h ^= h >> 16;
+    float r = float((h >>  0) & 0xFF) / 255.0;
+    float g = float((h >>  8) & 0xFF) / 255.0;
+    float b = float((h >> 16) & 0xFF) / 255.0;
+    float maxC = max(r, max(g, b));
+    if (maxC < 0.3) { r += 0.4; g += 0.2; }
+    return clamp(vec3(r, g, b), 0.0, 1.0);
+}
+
+// ============================================================
+// Random Number Generation (PCG hash)
+// ============================================================
+uint pcg_hash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+uint hash2D(uvec2 v, uint frame) {
+    return pcg_hash(v.x + pcg_hash(v.y + pcg_hash(frame)));
+}
+
+float randomFloat(inout uint seed) {
+    seed = pcg_hash(seed);
+    return float(seed) / 4294967295.0;
+}
+
+vec2 randomFloat2(inout uint seed) {
+    float r1 = randomFloat(seed);
+    float r2 = randomFloat(seed);
+    return vec2(r1, r2);
+}
+
+// Cosine-weighted hemisphere sampling
+vec3 sampleHemisphereCosine(vec3 normal, inout uint seed) {
+    vec2 r = randomFloat2(seed);
+    float phi = 2.0 * 3.14159265 * r.x;
+    float cosTheta = sqrt(r.y);
+    float sinTheta = sqrt(1.0 - r.y);
+    vec3 tangent = abs(normal.y) < 0.999
+        ? normalize(cross(normal, vec3(0, 1, 0)))
+        : normalize(cross(normal, vec3(1, 0, 0)));
+    vec3 bitangent = cross(normal, tangent);
+    return normalize(tangent * (cos(phi) * sinTheta) +
+                     bitangent * (sin(phi) * sinTheta) +
+                     normal * cosTheta);
+}
+
+// Concentric disk sampling (for soft shadows)
+vec2 concentricDiskSample(vec2 u) {
+    vec2 uOffset = 2.0 * u - 1.0;
+    if (uOffset.x == 0.0 && uOffset.y == 0.0) return vec2(0.0);
+    float theta, r;
+    if (abs(uOffset.x) > abs(uOffset.y)) {
+        r = uOffset.x;
+        theta = 0.785398 * (uOffset.y / uOffset.x);
+    } else {
+        r = uOffset.y;
+        theta = 1.570796 - 0.785398 * (uOffset.x / uOffset.y);
+    }
+    return r * vec2(cos(theta), sin(theta));
+}
+
+// ============================================================
+// R2 Low-Discrepancy Sequence (per-pixel, temporal)
+// ============================================================
+// Each pixel gets a unique deterministic offset (spatial hash).
+// R2 quasi-random advances ensure uniform coverage over time.
+// Unlike PCG (white noise), R2 fills the unit square without gaps/clusters,
+// converging faster for Monte Carlo integration.
+const float R2_A1 = 0.7548776662; // 1/plastic_constant
+const float R2_A2 = 0.5698402910; // 1/plastic_constant^2
+
+float r2Sample(ivec2 pixel, uint frameIndex, int dim) {
+    // Per-pixel spatial offset (deterministic hash — each pixel starts at different R2 position)
+    uint h = uint(pixel.x) * 73856093u ^ uint(pixel.y) * 19349663u ^ uint(dim) * 83492791u;
+    h = (h ^ (h >> 16)) * 0x45d9f3bu;
+    h = (h ^ (h >> 16)) * 0x45d9f3bu;
+    float spatialOffset = float(h >> 8) / 16777215.0; // 24-bit precision
+    // R2 temporal progression
+    float temporal = fract(float(frameIndex) * R2_A1 + float(dim) * R2_A2);
+    return fract(spatialOffset + temporal);
+}
+
+vec2 r2Sample2D(ivec2 pixel, uint frameIndex, int baseDim) {
+    return vec2(
+        r2Sample(pixel, frameIndex, baseDim),
+        r2Sample(pixel, frameIndex, baseDim + 1)
+    );
+}
+
+// Cosine-weighted hemisphere sampling from explicit 2D random input
+vec3 sampleHemisphereCosineFromUV(vec3 normal, vec2 r) {
+    float phi = 2.0 * 3.14159265 * r.x;
+    float cosTheta = sqrt(r.y);
+    float sinTheta = sqrt(1.0 - r.y);
+    vec3 tangent = abs(normal.y) < 0.999
+        ? normalize(cross(normal, vec3(0, 1, 0)))
+        : normalize(cross(normal, vec3(1, 0, 0)));
+    vec3 bitangent = cross(normal, tangent);
+    return normalize(tangent * (cos(phi) * sinTheta) +
+                     bitangent * (sin(phi) * sinTheta) +
+                     normal * cosTheta);
+}
+
+// ============================================================
+// SHARC Radiance Cache helpers
+// ============================================================
+#define SHARC_GRID_SIZE 0.5
+#define SHARC_TABLE_SIZE 2097152u
+#define SHARC_TABLE_MASK (SHARC_TABLE_SIZE - 1u)
+#define SHARC_MIN_SAMPLES 4u
+
+uint sharcHash(vec3 worldPos) {
+    ivec3 cell = ivec3(floor(worldPos / SHARC_GRID_SIZE));
+    uint h = uint(cell.x) * 73856093u ^ uint(cell.y) * 19349663u ^ uint(cell.z) * 83492791u;
+    return max(h ^ (h >> 16), 1u);
+}
+
+// Read SHARC entry: returns radiance if valid, or negative sentinel
+vec3 sharcLookup(vec3 worldPos, out bool valid) {
+    uint key = sharcHash(worldPos);
+    uint idx = key & SHARC_TABLE_MASK;
+    uint base = idx * 8u;  // 8 uints per entry
+
+    uint storedKey = sharcRead.sharcReadData[base + 0u];
+    uint count = sharcRead.sharcReadData[base + 1u];
+
+    valid = (storedKey == key && count >= SHARC_MIN_SAMPLES);
+    if (!valid) return vec3(0.0);
+
+    float r = uintBitsToFloat(sharcRead.sharcReadData[base + 2u]);
+    float g = uintBitsToFloat(sharcRead.sharcReadData[base + 3u]);
+    float b = uintBitsToFloat(sharcRead.sharcReadData[base + 4u]);
+
+    float invCount = 1.0 / float(count);
+    return vec3(r, g, b) * invCount;
+}
+
+// Atomic float add via CAS loop (no GL_EXT_shader_atomic_float needed)
+void atomicAddFloat(uint bufferOffset, float value) {
+    uint expected = sharcWrite.sharcWriteData[bufferOffset];
+    for (int i = 0; i < 64; i++) {  // bounded loop to prevent GPU hang
+        uint desired = floatBitsToUint(uintBitsToFloat(expected) + value);
+        uint actual = atomicCompSwap(sharcWrite.sharcWriteData[bufferOffset], expected, desired);
+        if (actual == expected) break;  // CAS succeeded
+        expected = actual;              // retry with new value
+    }
+}
+
+// Write SHARC entry: atomically accumulate radiance
+void sharcAccumulate(vec3 worldPos, vec3 radiance, uint frameIdx) {
+    uint key = sharcHash(worldPos);
+    uint idx = key & SHARC_TABLE_MASK;
+    uint base = idx * 8u;
+
+    // Try to claim cell (CAS: if empty (0), write our key)
+    uint prev = atomicCompSwap(sharcWrite.sharcWriteData[base + 0u], 0u, key);
+    if (prev != 0u && prev != key) return;  // Collision with different key, skip
+
+    // Accumulate sample count
+    atomicAdd(sharcWrite.sharcWriteData[base + 1u], 1u);
+
+    // Accumulate radiance (CAS-based float atomic add)
+    atomicAddFloat(base + 2u, radiance.r);
+    atomicAddFloat(base + 3u, radiance.g);
+    atomicAddFloat(base + 4u, radiance.b);
+
+    // Store frame index (non-atomic, last writer wins is fine)
+    sharcWrite.sharcWriteData[base + 5u] = frameIdx;
+}
+
+// ============================================================
+// NRD encoding functions
+// ============================================================
+// Must match C++ reblurSettings.hitDistanceParameters (config_loader.h defaults)
+const vec4 NRD_HIT_DIST_PARAMS = vec4(3.0, 0.1, 20.0, -25.0);
+
+float REBLUR_FrontEnd_GetNormHitDist(float hitDist, float viewZ, float roughness) {
+    float scaleRough = clamp(exp2(NRD_HIT_DIST_PARAMS.w * roughness * roughness), 0.0, 1.0);
+    float f = (NRD_HIT_DIST_PARAMS.x + abs(viewZ) * NRD_HIT_DIST_PARAMS.y) *
+              mix(1.0, NRD_HIT_DIST_PARAMS.z, scaleRough);
+    return clamp(hitDist / max(f, 1e-6), 0.0, 1.0);
+}
+
+// YCoCg conversion (kept for reference, not used by ReLAX)
+// ReLAX expects linear RGB input directly
+vec3 NRD_LinearToYCoCg(vec3 color) {
+    float Y  = dot(color, vec3(0.25, 0.5, 0.25));
+    float Co = dot(color, vec3(0.5, 0.0, -0.5));
+    float Cg = dot(color, vec3(-0.25, 0.5, -0.25));
+    return vec3(Y, Co, Cg);
+}
+
+// NRD normal encoding: octahedral R10G10B10A2 (NRD_NORMAL_ENCODING = 2)
+// Packs normal + roughness into vec4 matching NRD_FrontEnd_PackNormalAndRoughness
+vec4 NRD_PackNormalRoughness(vec3 N, float roughness) {
+    // Octahedral projection
+    N /= (abs(N.x) + abs(N.y) + abs(N.z));
+    // Diamond mapping to [0,1]
+    vec3 r;
+    r.y = N.y * 0.5 + 0.5;
+    r.x = N.x * 0.5 + r.y;
+    r.y -= N.x * 0.5;
+    // Encode roughness and N.z sign into z-channel
+    roughness = max(roughness, 1.5 / 512.0); // can't be 0 to preserve N.z sign
+    float s = N.z < 0.0 ? -roughness : roughness;
+    r.z = s * 0.5 + 0.5;
+    return vec4(r, 0.0); // w = materialID (0)
+}
+
+// RELAX_FrontEnd_PackRadianceAndHitDist equivalent — sanitize + pack
+// RELAX expects raw hitDist (NOT REBLUR-normalized 0-1)
+// NRD docs: ReLAX input range [0; 250] recommended (x² must fit FP16)
+vec4 NRD_PackRadiance(vec3 radiance, float hitDist) {
+    radiance = max(radiance, vec3(0.0));
+    radiance = min(radiance, vec3(250.0)); // ReLAX recommended max (x² must fit FP16)
+    hitDist = max(hitDist, 0.0);
+    hitDist = min(hitDist, 65504.0);  // FP16 max
+    return vec4(radiance, hitDist);
+}
+
+// ============================================================
+// AC-style helper functions
+// ============================================================
+
+// Sky-based reflection (fallback without cubemap)
+// skyReflScale is set from ptSkyReflIntensity uniform in main()
+float g_skyReflScale = 0.5;
+vec3  g_ambientColor  = vec3(0.5, 0.6, 0.8);
+vec3  g_sunTint       = vec3(1.0, 0.92, 0.85);
+
+vec3 sampleSkyReflection(vec3 reflDir, float blur, vec3 sunDirL) {
+    float skyT = 0.5 * (reflDir.y + 1.0);
+    vec3 skyCol = mix(g_ambientColor * 0.9, g_ambientColor * 1.6, clamp(skyT, 0.0, 1.0));
+    // Darken below horizon
+    skyCol = mix(skyCol, vec3(0.03, 0.04, 0.03), clamp(-reflDir.y * 10.0, 0.0, 1.0));
+    // Blur reduces contrast
+    skyCol = mix(skyCol, vec3(dot(skyCol, vec3(0.333))), clamp(blur * 0.15, 0.0, 0.8));
+    // Sun highlight in reflection
+    float sunRefl = max(dot(reflDir, sunDirL), 0.0);
+    skyCol += g_sunTint * pow(sunRefl, 64.0) * 0.4;
+    return skyCol * g_skyReflScale;
+}
+
+// Hemisphere-integrated sky irradiance for a surface normal (pure ALU, no rays/textures).
+// Used at bounce hit points so shadowed surfaces get a natural blue tint from the sky.
+vec3 skyHemisphereIrradiance(vec3 normal) {
+    // y=1 (up) -> full blue sky, y=0 (side) -> horizon blend, y=-1 (down) -> ground reflection
+    float skyWeight = clamp(normal.y * 0.5 + 0.5, 0.0, 1.0);
+    // Colors driven by UBO ambient — brighter for energy-correct hemisphere integral.
+    vec3 skyColor = mix(g_ambientColor * 0.8, g_ambientColor * 1.5, skyWeight);
+    // Warm ground bounce for downward-facing normals (bounced earth light)
+    skyColor += vec3(0.15, 0.12, 0.07) * clamp(-normal.y, 0.0, 1.0) * 0.4;
+    return skyColor;
+}
+
+// smin (smooth clamp, matches AC's smin)
+float acSmin(float a, float b) {
+    float h = clamp(b - abs(a - b), 0.0, 1.0);
+    return min(a, b) - h * h / max(0.00001, b * 3.0) * (1.0 - b);
+}
+
+// Fresnel reflections (AC convention)
+vec3 calculateReflection(vec3 baseColor, vec3 N, vec3 V, vec3 albedo, vec3 sunDirL,
+                          float fresnelC, float fresnelEXP, float fresnelMaxLevel,
+                          float specularEXP, float metallicFix, bool coloredRefl) {
+    float NdotV = clamp(dot(N, -V), 0.0, 1.0);
+    float input_val = clamp(1.0 - NdotV, 0.0, 1.0);
+    float fresnel = pow(input_val, max(fresnelEXP, 1.0)) + fresnelC;
+    fresnel = acSmin(fresnel, fresnelMaxLevel);
+
+    // Reflection direction + sky sample
+    vec3 reflDir = reflect(V, N);
+    float reflBlur = pow(clamp(1.0 - specularEXP / 255.0, 0.0, 1.0), 2.0) * 6.0;
+    vec3 reflColor = sampleSkyReflection(reflDir, reflBlur, sunDirL);
+
+    // Colored reflections (car paint: tint by diffuse color)
+    if (coloredRefl) {
+        float maxC = max(albedo.r, max(albedo.g, max(albedo.b, 0.01)));
+        vec3 specColor = albedo / maxC;
+        reflColor *= specColor;
+    }
+
+    // Metallic fix: reduce base lighting by fresnel
+    vec3 result = baseColor * clamp(1.0 - metallicFix * fresnel, 0.0, 1.0);
+    result += reflColor * fresnel;
+    return result;
+}
+
+// Ambient calculation (AC: hemisphere gradient between ground and sky)
+// actools: gradient = gAmbientDown + saturate(N.y * 0.5 + 0.5) * gAmbientRange
+vec3 calculateAmbient(vec3 N, float ksAmbient, vec3 ambColor, float ambIntensity) {
+    float hemi = clamp(dot(N, vec3(0, 1, 0)) * 0.5 + 0.5, 0.0, 1.0);
+    // Two-color gradient: ground-facing surfaces get warmer/darker ambient,
+    // sky-facing surfaces get full ambient color (like actools gAmbientDown + hemi * gAmbientRange)
+    vec3 groundColor = ambColor * 0.6;  // darker/warmer ground bounce
+    vec3 skyColor = ambColor;           // full brightness for sky-facing
+    vec3 gradient = mix(groundColor, skyColor, hemi);
+    return gradient * ambIntensity * ksAmbient;
+}
+
+// ============================================================
+// Alpha test helper for ray query traversal
+// Returns true if the candidate intersection should be accepted
+// ============================================================
+bool alphaTestCandidate(rayQueryEXT rq) {
+    uint rawCI = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false);
+    uint ci = rawCI & 0xFFFFFu;           // geometry index (lower 20 bits)
+    uint fadeBits = (rawCI >> 20) & 0xFu; // LOD fade (upper 4 bits)
+    int pi = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+
+    // Stochastic LOD cross-fade: reject hits probabilistically based on fade level
+    if (fadeBits > 0u) {
+        float lodFade = 1.0 - float(fadeBits) / 15.0;
+        uint frameIdx = cam.parameters.x;
+        uint fh = (uint(gl_LaunchIDEXT.x) * 374761393u
+                 + uint(gl_LaunchIDEXT.y) * 668265263u
+                 + uint(pi) * 1103515245u + frameIdx * 12345u) & 0xFFFFu;
+        if (float(fh) / 65535.0 > lodFade) return false;
+    }
+
+    GeometryMetadata gmeta = geometryMetadata.geometries[ci];
+    if (gmeta.primMaterialBufferAddress == 0) return true;
+
+    PrimMaterials pm = PrimMaterials(gmeta.primMaterialBufferAddress);
+    uint mid = pm.m[pi];
+    if (mid == 0xFFFFFFFFu) return true;
+
+    Material m = materialBuffer.materials[mid];
+    bool needsAlphaTest = (m.flags & 1u) != 0u;
+    if (!needsAlphaTest) return true;
+    if (m.diffuseTexIndex == 0xFFFFFFFFu) return true;
+
+    // Need UVs to sample texture
+    if (gmeta.uvBufferAddress == 0 || gmeta.indexBufferAddress == 0) return true;
+
+    Indices idxB = Indices(gmeta.indexBufferAddress);
+    uint i0 = idxB.i[pi * 3];
+    uint i1 = idxB.i[pi * 3 + 1];
+    uint i2 = idxB.i[pi * 3 + 2];
+
+    float bw0 = 1.0 - bary.x - bary.y;
+    float bw1 = bary.x;
+    float bw2 = bary.y;
+
+    UVs uvB = UVs(gmeta.uvBufferAddress);
+    vec2 uv = vec2(uvB.uv[i0*2], uvB.uv[i0*2+1]) * bw0 +
+              vec2(uvB.uv[i1*2], uvB.uv[i1*2+1]) * bw1 +
+              vec2(uvB.uv[i2*2], uvB.uv[i2*2+1]) * bw2;
+
+    // Procedural grass: solid geometry, no texture alpha — always accept
+    if (m.shaderType == SHADER_GRASS && m.diffuseTexIndex == 0xFFFFFFFFu) {
+        return true;
+    }
+
+    // Vegetation: use distance-based LOD for stable alpha at distance (avoids mip0 aliasing)
+    float alphaLod = 0.0;
+    if (m.shaderType == SHADER_TREE || m.shaderType == SHADER_GRASS) {
+        float tCandidate = rayQueryGetIntersectionTEXT(rq, false);
+        alphaLod = clamp(log2(max(tCandidate * 0.05, 1.0)), 0.0, 4.0);
+    }
+    float alpha = textureLod(textures[nonuniformEXT(m.diffuseTexIndex)], uv, alphaLod).a;
+    float ref = m.alphaRef > 0.0 ? m.alphaRef : 0.5;
+    // Vegetation: stochastic alpha test (approximates A2C for ray tracing)
+    // AC uses A2C with ~0.12 threshold; we use stochastic test where alpha IS the probability
+    // of being opaque. NRD temporal accumulation converges this to smooth coverage.
+    if (m.shaderType == SHADER_TREE || m.shaderType == SHADER_GRASS) {
+        // Hash-based noise per pixel+primitive+frame for stochastic alpha (A2C approximation)
+        // Frame index included so NRD temporal accumulation converges to smooth coverage
+        uint frameIdx = cam.parameters.x;
+        uint h = (uint(gl_LaunchIDEXT.x) * 1103515245u + uint(gl_LaunchIDEXT.y) * 12345u
+                + uint(pi) * 2654435761u + frameIdx * 22695477u) & 0xFFFFu;
+        float noise = float(h) / 65535.0;
+        // Stochastic: accept if alpha > noise * scale. Scale < 1 biases toward accepting (denser foliage)
+        ref = noise * 0.6;  // 0.6 scale: alpha 0.6+ always passes, alpha 0.3 passes 50%, alpha 0 always fails
+    }
+    // Alpha blend (ksPerPixelAlpha): reject here — handled as overlay in main ray query.
+    // The main loop samples the groove diffuse during candidate processing and blends
+    // it over the committed road surface. Secondary rays (bounce, reflection) also reject.
+    if (m.shaderType == SHADER_ALPHA) {
+        return false;
+    }
+    return alpha >= ref;
+}
+
+// Sample diffuse albedo from a committed ray query hit (for alpha blend continuation rays).
+vec3 sampleDiffuseFromCommittedHit(rayQueryEXT rq) {
+    uint ci = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true) & 0xFFFFFu;
+    int pi = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+    float bw0 = 1.0 - bary.x - bary.y, bw1 = bary.x, bw2 = bary.y;
+
+    GeometryMetadata gmeta = geometryMetadata.geometries[ci];
+    if (gmeta.primMaterialBufferAddress == 0 || gmeta.uvBufferAddress == 0 || gmeta.indexBufferAddress == 0)
+        return vec3(0.15);
+
+    PrimMaterials pm = PrimMaterials(gmeta.primMaterialBufferAddress);
+    uint mid = pm.m[pi];
+    if (mid == 0xFFFFFFFFu) return vec3(0.15);
+
+    Material mat = materialBuffer.materials[mid];
+    if (mat.diffuseTexIndex == 0xFFFFFFFFu) return vec3(0.15);
+
+    Indices idxBuf = Indices(gmeta.indexBufferAddress);
+    uint i0 = idxBuf.i[pi * 3], i1 = idxBuf.i[pi * 3 + 1], i2 = idxBuf.i[pi * 3 + 2];
+
+    UVs uvB = UVs(gmeta.uvBufferAddress);
+    vec2 uv = vec2(uvB.uv[i0*2], uvB.uv[i0*2+1]) * bw0
+            + vec2(uvB.uv[i1*2], uvB.uv[i1*2+1]) * bw1
+            + vec2(uvB.uv[i2*2], uvB.uv[i2*2+1]) * bw2;
+
+    vec3 diff = textureLod(textures[nonuniformEXT(mat.diffuseTexIndex)], uv, 0.0).rgb;
+
+    // Apply detail textures for multilayer surfaces behind grooves
+    if (mat.shaderType == SHADER_MULTILAYER && mat.maskTexIndex != 0xFFFFFFFFu) {
+        vec4 mask = textureLod(textures[nonuniformEXT(mat.maskTexIndex)], uv, 0.0);
+        bool useModelUV = (mat.flags & 64u) != 0u;
+
+        // Get hit position for world-space UVs
+        float tCont = rayQueryGetIntersectionTEXT(rq, true);
+        vec3 contHitPos = rayQueryGetWorldRayOriginEXT(rq) + rayQueryGetWorldRayDirectionEXT(rq) * tCont;
+
+        vec4 combined = vec4(0.0);
+        if (mat.detailRTexIndex != 0xFFFFFFFFu) {
+            vec2 uvR = useModelUV ? uv * mat.multR : contHitPos.xz * mat.multR;
+            combined += textureLod(textures[nonuniformEXT(mat.detailRTexIndex)], uvR, 0.0) * mask.r;
+        }
+        if (mat.detailGTexIndex != 0xFFFFFFFFu) {
+            vec2 uvG = useModelUV ? uv * mat.multG : contHitPos.xz * mat.multG;
+            combined += textureLod(textures[nonuniformEXT(mat.detailGTexIndex)], uvG, 0.0) * mask.g;
+        }
+        if (mat.detailBTexIndex != 0xFFFFFFFFu) {
+            vec2 uvB2 = useModelUV ? uv * mat.multB : contHitPos.xz * mat.multB;
+            combined += textureLod(textures[nonuniformEXT(mat.detailBTexIndex)], uvB2, 0.0) * mask.b;
+        }
+        if (mat.detailATexIndex != 0xFFFFFFFFu) {
+            vec2 uvA = useModelUV ? uv * mat.multA : contHitPos.xz * mat.multA;
+            combined += textureLod(textures[nonuniformEXT(mat.detailATexIndex)], uvA, 0.0) * mask.a;
+        }
+        diff *= combined.rgb * mat.magicMult;
+        diff = min(diff, vec3(1.0));
+    }
+
+    return diff;
+}
+
+// Shadow ray candidate test: same as alphaTestCandidate but also rejects
+// geometry with noCastShadow flag (bit 5) — e.g. track grooves, decals.
+// receiverCellY: (minY, maxY) from primYBounds of the receiver pixel.
+// If non-zero, foliage occluders belonging to the SAME tree are rejected —
+// prevents billboard self-shadowing. Uses cell identity + distance fallback
+// (tree quads at cell boundary may land in different cells, but self-
+// intersecting quads always hit at < 2m).
+bool shadowTestCandidate(rayQueryEXT rq, vec2 receiverCellY) {
+    uint ci = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false) & 0xFFFFFu;
+    int pi = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+
+    GeometryMetadata gmeta = geometryMetadata.geometries[ci];
+    if (gmeta.primMaterialBufferAddress != 0) {
+        PrimMaterials pm = PrimMaterials(gmeta.primMaterialBufferAddress);
+        uint mid = pm.m[pi];
+        if (mid != 0xFFFFFFFFu) {
+            Material m = materialBuffer.materials[mid];
+            // bit 5: noCastShadow — KN5 node has castShadows=false
+            if ((m.flags & 32u) != 0u) return false;
+            // Same-tree foliage rejection for foliage receivers:
+            // Billboard quads of the same tree cross each other, causing
+            // permanent self-shadow. Two checks (either triggers rejection):
+            // 1) Same spatial cell (identical minY,maxY from XZ hash)
+            // 2) Distance < 2m (self-intersecting quads are always very close)
+            if (receiverCellY.x != receiverCellY.y &&
+                (m.shaderType == SHADER_TREE || m.shaderType == SHADER_GRASS)) {
+                float occDist = rayQueryGetIntersectionTEXT(rq, false);
+                // Close foliage = same tree's self-intersecting quads
+                if (occDist < 2.0) return false;
+                // Cell match = same tree even if slightly further
+                if (gmeta.primYBoundsAddress != 0) {
+                    PrimYBounds occPyb = PrimYBounds(gmeta.primYBoundsAddress);
+                    float occMinY = occPyb.yb[pi * 2];
+                    float occMaxY = occPyb.yb[pi * 2 + 1];
+                    if (occMinY == receiverCellY.x && occMaxY == receiverCellY.y)
+                        return false;
+                }
+            }
+        }
+    }
+    // Fall through to standard alpha test
+    return alphaTestCandidate(rq);
+}
+
+// --- Tonemap curves (reference implementations) ---
+// Sources: github.com/dmnsgn/glsl-tone-map, 64.github.io/tonemapping,
+//          Khronos PBR Neutral, Three.js AgX
+
+const mat3 LINEAR_SRGB_TO_LINEAR_REC2020 = mat3(
+    0.6274, 0.0691, 0.0164,
+    0.3293, 0.9195, 0.0880,
+    0.0433, 0.0113, 0.8956
+);
+const mat3 LINEAR_REC2020_TO_LINEAR_SRGB = mat3(
+    1.6605, -0.1246, -0.0182,
+   -0.5876,  1.1329, -0.1006,
+   -0.0728, -0.0083,  1.1187
+);
+const mat3 AgXInsetMatrix = mat3(
+    0.856627153315983, 0.137318972929847, 0.11189821299995,
+    0.0951212405381588, 0.761241990602591, 0.0767994186031903,
+    0.0482516061458583, 0.101439036467562, 0.811302368396859
+);
+const mat3 AgXOutsetMatrix = mat3(
+    1.1271005818144368, -0.1413297634984383, -0.14132976349843826,
+   -0.11060664309660323, 1.157823702216272, -0.11060664309660294,
+   -0.016493938717834573, -0.016493938717834257, 1.2519364065950405
+);
+
+vec3 agxTonemap(vec3 color) {
+    color = LINEAR_SRGB_TO_LINEAR_REC2020 * color;
+    color = AgXInsetMatrix * color;
+    color = max(color, vec3(1e-10));
+    color = clamp(log2(color), -12.47393, 4.026069);
+    color = (color - (-12.47393)) / (4.026069 - (-12.47393));
+    vec3 x2 = color * color;
+    vec3 x4 = x2 * x2;
+    color = 15.5 * x4 * x2 - 40.14 * x4 * color + 31.96 * x4
+          - 6.868 * x2 * color + 0.4298 * x2 + 0.1191 * color - 0.00232;
+    // AgX Punchy look: power=1.35, saturation=1.4
+    color = pow(max(vec3(0.0), color), vec3(1.35));
+    float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    color = luma + 1.4 * (color - luma);
+    // Outset + re-linearize
+    color = AgXOutsetMatrix * color;
+    color = pow(max(vec3(0.0), color), vec3(2.2));
+    color = LINEAR_REC2020_TO_LINEAR_SRGB * color;
+    return clamp(color, 0.0, 1.0);
+}
+
+vec3 acesTonemap(vec3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+vec3 reinhardTonemap(vec3 v) {
+    float l = dot(v, vec3(0.2126, 0.7152, 0.0722));
+    float lNew = l / (1.0 + l);
+    return v * (lNew / max(l, 1e-6));
+}
+
+vec3 hablePartial(vec3 x) {
+    const float A = 0.15, B = 0.50, C = 0.10, D = 0.20, E = 0.02, F = 0.30;
+    return ((x*(A*x+C*B)+D*E)/(x*(A*x+B)+D*F))-E/F;
+}
+vec3 hableTonemap(vec3 color) {
+    vec3 curr = hablePartial(color);
+    vec3 whiteScale = vec3(1.0) / hablePartial(vec3(11.2));
+    return curr * whiteScale;
+}
+
+vec3 neutralTonemap(vec3 color) {
+    const float startCompression = 0.8 - 0.04;
+    const float desaturation = 0.15;
+    float x = min(color.r, min(color.g, color.b));
+    float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
+    color -= offset;
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak < startCompression) return color;
+    float d = 1.0 - startCompression;
+    float newPeak = 1.0 - d * d / (peak + d - startCompression);
+    color *= newPeak / peak;
+    float g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+    return mix(color, vec3(newPeak), g);
+}
+
+vec3 applyTonemap(vec3 hdr, uint mode) {
+    if (mode == 1u) return acesTonemap(hdr);
+    if (mode == 2u) return reinhardTonemap(hdr);
+    if (mode == 3u) return hableTonemap(hdr);
+    if (mode == 4u) return neutralTonemap(hdr);
+    return agxTonemap(hdr);
+}
+
+void main() {
+    // Reset pick buffer if no pick is pending (only pixel 0,0 does this)
+    if (gl_LaunchIDEXT.x == 0u && gl_LaunchIDEXT.y == 0u) {
+        if (cam.parameters.z == 0u || cam.parameters.w == 0u) {
+            pickResult.pickValid = 0u;
+        }
+    }
+
+    // Sub-pixel jitter is baked into projInverse (projection-matrix jitter, NVIDIA RTXPT approach).
+    // The pixel center is always at the nominal position; projInverse encodes the sub-pixel offset.
+    const vec2 pixelCenter = vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
+    const vec2 inUV = pixelCenter / vec2(gl_LaunchSizeEXT.xy);
+    vec2 d = vec2(inUV.x, 1.0 - inUV.y) * 2.0 - 1.0;
+
+    vec4 origin = cam.viewInverse * vec4(0, 0, 0, 1);
+    vec4 target = cam.projInverse * vec4(d.x, d.y, -1, 1);  // projInverse includes jitter
+    target.xyz /= target.w;
+    vec4 direction = cam.viewInverse * vec4(normalize(target.xyz), 0);
+
+    vec3 rayOrigin = origin.xyz;
+    vec3 rayDir = normalize(direction.xyz);
+
+    // RNG seed for this pixel (varies per frame) — used as fallback for extra dimensions
+    uint rngSeed = hash2D(gl_LaunchIDEXT.xy, cam.parameters.x);
+    // Blue noise sampling coordinates (temporal R2 sequence)
+    ivec2 bnPixel = ivec2(gl_LaunchIDEXT.xy);
+    uint bnFrame = cam.parameters.x;
+
+    // Sun direction and lighting from camera UBO
+    vec3 sunDir = normalize(cam.sunLight.xyz);
+    // Fallback if sunLight is zero (not yet set by Lua/weather system)
+    if (dot(cam.sunLight.xyz, cam.sunLight.xyz) < 0.001)
+        sunDir = normalize(vec3(0.5, 0.8, 0.3));
+    // Read PT tuning params from UBO (editable via GUI)
+    float ptExposure         = cam.ptParams0.x;  // default 0.55
+    float ptGIIntensity      = cam.ptParams0.y;  // default 1.0
+    float ptSaturation       = cam.ptParams0.z;  // default 1.3
+    float ptContrast         = cam.ptParams0.w;  // default 1.0
+    float ptSkyReflIntensity = cam.ptParams1.x;  // default 0.5
+    g_skyReflScale = ptSkyReflIntensity;  // Pass to sampleSkyReflection()
+    g_sunTint = cam.skyLight.rgb;
+    if (dot(g_sunTint, g_sunTint) < 0.001) g_sunTint = vec3(1.0, 0.92, 0.85);
+    g_ambientColor = cam.ambientLight.rgb;
+    if (dot(g_ambientColor, g_ambientColor) < 0.001) g_ambientColor = vec3(0.5, 0.6, 0.8);
+    float ptAmbientMax       = cam.ptParams1.y;  // default 0.02
+    float ptSunMinIntensity  = cam.ptParams1.z;  // default 2.5
+    float ptSkyBounceInt     = cam.ptParams1.w;  // default 0.25
+    uint ptTonemapMode       = uint(cam.jitterData.z); // 0=AgX, 1=ACES, 2=Reinhard, 3=Hable, 4=Neutral
+    bool hdrOutput           = (cam.jitterData.w != 0.0); // DLSS HDR: skip tonemap, output linear
+
+    // Sun color = warm tint * HDR intensity
+    float sunIntensity = cam.sunLight.w > 0.001 ? cam.sunLight.w : 3.5;
+    sunIntensity = max(sunIntensity, ptSunMinIntensity);
+    vec3 sunTint = g_sunTint;
+    vec3 sunColor = sunTint * sunIntensity;
+    // Exposure for tonemapping
+    float exposure = ptExposure;
+    vec3 ambientColor = g_ambientColor;
+    float ambientIntensity = cam.ambientLight.w;
+    // Path tracing: GI bounces replace ambient — cap to tunable max (0 = fully off)
+    ambientIntensity = min(ambientIntensity, ptAmbientMax);
+
+    // Groove overlay state: SHADER_ALPHA candidates are NOT committed — their diffuse
+    // is sampled during traversal and deferred until after the loop so we can discard
+    // grooves that are BEHIND the committed opaque hit (depth test).
+    // Ray query traversal order is NOT guaranteed front-to-back for candidates, so
+    // compositing during traversal would let grooves bleed through walls.
+    bool hasGrooveOverlay = false;
+    vec3 grooveOverlayAlbedo = vec3(0.0);  // premultiplied
+    float grooveOverlayAlpha = 0.0;
+
+    // Deferred groove candidates — store color/alpha/T, composite after loop
+    const int MAX_GROOVE_CANDIDATES = 4;
+    vec3  grooveCandColor[MAX_GROOVE_CANDIDATES];
+    float grooveCandAlpha[MAX_GROOVE_CANDIDATES];
+    float grooveCandT[MAX_GROOVE_CANDIDATES];
+    int   grooveCandCount = 0;
+
+    // Primary ray query — backface culling on (double-sided meshes have real geometry both ways)
+    rayQueryEXT rayQuery;
+    rayQueryInitializeEXT(rayQuery, topLevelAS,
+        gl_RayFlagsCullBackFacingTrianglesEXT, 0xFF,
+        rayOrigin, 0.01, rayDir, 15000.0);
+
+    while(rayQueryProceedEXT(rayQuery)) {
+        if (rayQueryGetIntersectionTypeEXT(rayQuery, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+            // Check for SHADER_ALPHA overlay (groove/decal) — defer for depth-tested blending
+            uint aci = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, false) & 0xFFFFFu;
+            int api  = rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, false);
+            GeometryMetadata ameta = geometryMetadata.geometries[aci];
+            bool isAlphaOverlay = false;
+            if (ameta.primMaterialBufferAddress != 0) {
+                PrimMaterials apm = PrimMaterials(ameta.primMaterialBufferAddress);
+                uint amid = apm.m[api];
+                if (amid != 0xFFFFFFFFu && materialBuffer.materials[amid].shaderType == SHADER_ALPHA) {
+                    isAlphaOverlay = true;
+                    Material amat = materialBuffer.materials[amid];
+                    if (amat.diffuseTexIndex != 0xFFFFFFFFu && ameta.uvBufferAddress != 0 && ameta.indexBufferAddress != 0
+                        && grooveCandCount < MAX_GROOVE_CANDIDATES) {
+                        vec2 abary = rayQueryGetIntersectionBarycentricsEXT(rayQuery, false);
+                        float abw0 = 1.0 - abary.x - abary.y;
+                        Indices aidx = Indices(ameta.indexBufferAddress);
+                        uint ai0 = aidx.i[api * 3], ai1 = aidx.i[api * 3 + 1], ai2 = aidx.i[api * 3 + 2];
+                        UVs auvb = UVs(ameta.uvBufferAddress);
+                        vec2 auv = vec2(auvb.uv[ai0*2], auvb.uv[ai0*2+1]) * abw0
+                                 + vec2(auvb.uv[ai1*2], auvb.uv[ai1*2+1]) * abary.x
+                                 + vec2(auvb.uv[ai2*2], auvb.uv[ai2*2+1]) * abary.y;
+                        vec4 adiff = textureLod(textures[nonuniformEXT(amat.diffuseTexIndex)], auv, 0.0);
+                        // Save candidate for depth-tested compositing after traversal
+                        grooveCandColor[grooveCandCount] = adiff.rgb;
+                        grooveCandAlpha[grooveCandCount] = adiff.a;
+                        grooveCandT[grooveCandCount]     = rayQueryGetIntersectionTEXT(rayQuery, false);
+                        grooveCandCount++;
+                    }
+                }
+            }
+            if (!isAlphaOverlay) {
+                if (alphaTestCandidate(rayQuery))
+                    rayQueryConfirmIntersectionEXT(rayQuery);
+            }
+        }
+    }
+
+    // Depth-tested groove compositing: only apply grooves in front of committed hit
+    if (grooveCandCount > 0) {
+        float committedT = 2000.0;
+        if (rayQueryGetIntersectionTypeEXT(rayQuery, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+            committedT = rayQueryGetIntersectionTEXT(rayQuery, true);
+        }
+        // Sort candidates front-to-back by T (insertion sort, max 4 elements)
+        for (int i = 1; i < grooveCandCount; i++) {
+            float tKey = grooveCandT[i];
+            vec3  cKey = grooveCandColor[i];
+            float aKey = grooveCandAlpha[i];
+            int j = i - 1;
+            while (j >= 0 && grooveCandT[j] > tKey) {
+                grooveCandT[j + 1]     = grooveCandT[j];
+                grooveCandColor[j + 1] = grooveCandColor[j];
+                grooveCandAlpha[j + 1] = grooveCandAlpha[j];
+                j--;
+            }
+            grooveCandT[j + 1]     = tKey;
+            grooveCandColor[j + 1] = cKey;
+            grooveCandAlpha[j + 1] = aKey;
+        }
+        // Alpha-over compositing (front-to-back), discarding grooves behind opaque hit
+        for (int i = 0; i < grooveCandCount; i++) {
+            if (grooveCandT[i] < committedT) {
+                float layerAlpha = grooveCandAlpha[i];
+                float transmit = 1.0 - grooveOverlayAlpha;
+                grooveOverlayAlbedo += grooveCandColor[i] * layerAlpha * transmit;
+                grooveOverlayAlpha  += layerAlpha * transmit;
+                hasGrooveOverlay = true;
+            }
+        }
+    }
+
+    vec3 color;
+    bool hitGeometry = false;
+    // NRD separated signals (populated in shading, written to G-buffers at end)
+    vec3 nrdDiffuseSignal = vec3(0.0);
+    vec3 nrdSpecularSignal = vec3(0.0);
+    vec3 nrdAlbedo = vec3(0.0);
+    vec3 nrdNormal = vec3(0, 1, 0);
+    float nrdRoughness = 1.0;
+    float nrdViewZ = 10000.0;
+    float nrdHitDist = 0.0;
+    float nrdSurfaceDist = 0.0;  // actual surface distance (for motion vectors — NOT hitT-mixed)
+    float specHitDist = 0.0;  // reflection ray hit distance (for NRD specular packing)
+    float reflEnergyFactor = 1.0;  // energy conservation: reduces diffuse by reflection strength
+    float sunFraction = 0.0;  // fraction of diffuse that is sun direct (for SIGMA shadow composite)
+
+    if (rayQueryGetIntersectionTypeEXT(rayQuery, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+        hitGeometry = true;
+        float t = rayQueryGetIntersectionTEXT(rayQuery, true);
+        vec3 hitPos = rayOrigin + rayDir * t;
+
+        // Pixel footprint in world space for LOD computation
+        // proj[1][1] = 1/tan(fov_y/2), so pixel angular size = 2*tan(fov_y/2)/screenH
+        float pixelWorldSize = 2.0 * t / (cam.proj[1][1] * float(gl_LaunchSizeEXT.y));
+
+        uint customIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rayQuery, true) & 0xFFFFFu;
+        int primitiveId = rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true);
+        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
+
+        uint debugView = cam.parameters.y;  // 0=off, 1=normals, 2=albedo, 3=matID, 4=shaderType, 5=roughness
+        bool debugMeshColors = false;
+
+        // (Distance AO removed — NRD + GI handle ambient occlusion properly)
+
+        // Compute shading normal + UVs from geometry metadata
+        GeometryMetadata meta = geometryMetadata.geometries[customIndex];
+        vec3 shadingNormal;
+        vec2 hitUV = vec2(0.0);
+        bool hasUVs = false;
+
+        // Fetch triangle indices
+        uint idx0 = 0, idx1 = 0, idx2 = 0;
+        if (meta.indexBufferAddress != 0) {
+            Indices idxBuf = Indices(meta.indexBufferAddress);
+            idx0 = idxBuf.i[primitiveId * 3];
+            idx1 = idxBuf.i[primitiveId * 3 + 1];
+            idx2 = idxBuf.i[primitiveId * 3 + 2];
+        }
+
+        float w0 = 1.0 - bary.x - bary.y;
+        float w1 = bary.x;
+        float w2 = bary.y;
+
+        // Fetch vertex positions (needed for TBN computation)
+        vec3 pos0, pos1, pos2;
+        bool hasPositions = false;
+        if (meta.vertexBufferAddress != 0 && meta.indexBufferAddress != 0) {
+            Vertices vBuf = Vertices(meta.vertexBufferAddress);
+            pos0 = vec3(vBuf.v[idx0*3], vBuf.v[idx0*3+1], vBuf.v[idx0*3+2]);
+            pos1 = vec3(vBuf.v[idx1*3], vBuf.v[idx1*3+1], vBuf.v[idx1*3+2]);
+            pos2 = vec3(vBuf.v[idx2*3], vBuf.v[idx2*3+1], vBuf.v[idx2*3+2]);
+            hasPositions = true;
+        }
+
+        vec3 rawNormalInterp = vec3(0.0, 1.0, 0.0); // raw (un-normalized) for grass packed data
+        if (meta.normalBufferAddress != 0 && meta.indexBufferAddress != 0) {
+            Normals nBuf = Normals(meta.normalBufferAddress);
+            vec3 n0 = vec3(nBuf.n[idx0*3], nBuf.n[idx0*3+1], nBuf.n[idx0*3+2]);
+            vec3 n1 = vec3(nBuf.n[idx1*3], nBuf.n[idx1*3+1], nBuf.n[idx1*3+2]);
+            vec3 n2 = vec3(nBuf.n[idx2*3], nBuf.n[idx2*3+1], nBuf.n[idx2*3+2]);
+            rawNormalInterp = n0 * w0 + n1 * w1 + n2 * w2;
+            shadingNormal = normalize(rawNormalInterp);
+        } else if (hasPositions) {
+            shadingNormal = normalize(cross(pos1 - pos0, pos2 - pos0));
+        } else {
+            shadingNormal = -rayDir;
+        }
+
+        // Interpolate UVs
+        vec2 uv0 = vec2(0.0), uv1 = vec2(0.0), uv2 = vec2(0.0);
+        if (meta.uvBufferAddress != 0 && meta.indexBufferAddress != 0) {
+            UVs uvBuf = UVs(meta.uvBufferAddress);
+            uv0 = vec2(uvBuf.uv[idx0*2], uvBuf.uv[idx0*2+1]);
+            uv1 = vec2(uvBuf.uv[idx1*2], uvBuf.uv[idx1*2+1]);
+            uv2 = vec2(uvBuf.uv[idx2*2], uvBuf.uv[idx2*2+1]);
+            hitUV = uv0 * w0 + uv1 * w1 + uv2 * w2;
+            hasUVs = true;
+        }
+
+        // Triangle UV density for model-space LOD computation
+        float triUVDens = 0.0;
+        if (hasPositions && hasUVs) {
+            triUVDens = triangleUVDensity(pos0, pos1, pos2, uv0, uv1, uv2);
+        }
+
+        // No normal flip needed: backface culling (gl_RayFlagsCullBackFacingTrianglesEXT)
+        // guarantees all hits are front-facing. Smooth normals at silhouette edges may
+        // point slightly away from camera — that's correct (NdotL clamps to 0 = dark edge).
+
+        // Flat geometric face normal (before normal mapping/smoothing).
+        // For foliage: detects if this triangle face is sun-lit or backlit.
+        // Trees have double-sided geometry — front/back are separate triangles.
+        vec3 geoFaceNormal = shadingNormal;
+        if (hasPositions) {
+            geoFaceNormal = normalize(cross(pos1 - pos0, pos2 - pos0));
+        }
+
+        // Compute TBN basis from triangle (for normal mapping)
+        vec3 tangent = vec3(1.0, 0.0, 0.0);
+        vec3 bitangent = vec3(0.0, 0.0, 1.0);
+        bool hasTBN = false;
+        if (hasPositions && hasUVs) {
+            computeTBN(pos0, pos1, pos2, uv0, uv1, uv2, shadingNormal, tangent, bitangent);
+            hasTBN = true;
+        }
+
+        // G-buffer data for NRD (captured at primary hit, roughness updated after material lookup)
+        float firstHitRoughness = 0.5;  // default, updated after material lookup
+        float firstHitDistance = t;
+        nrdSurfaceDist = t;  // save actual surface distance for motion vectors
+        // AC column-vector matrices stored as XMFLOAT4X4 (row-major) are transposed to
+        // GLSL column-major in renderer_stub.cpp. GLSL mat4*vec4 = correct M*v result.
+        vec4 viewSpacePos = cam.view * vec4(hitPos, 1.0);
+        float viewZ = viewSpacePos.z;  // Negative for visible geometry (RH projection, camera looks along -Z)
+
+        // Receiver's spatial cell for same-tree shadow rejection.
+        // vec2(0) = not foliage or no data → shadowTestCandidate skips the check.
+        vec2 receiverCellY = vec2(0.0);
+        if (meta.primMaterialBufferAddress != 0 && meta.primYBoundsAddress != 0) {
+            PrimMaterials pmChk = PrimMaterials(meta.primMaterialBufferAddress);
+            uint midChk = pmChk.m[primitiveId];
+            if (midChk != 0xFFFFFFFFu) {
+                uint stChk = materialBuffer.materials[midChk].shaderType;
+                if (stChk == SHADER_TREE || stChk == SHADER_GRASS) {
+                    PrimYBounds pybChk = PrimYBounds(meta.primYBoundsAddress);
+                    receiverCellY = vec2(pybChk.yb[primitiveId * 2],
+                                         pybChk.yb[primitiveId * 2 + 1]);
+                }
+            }
+        }
+
+        // Multi-sample soft shadow — 2 rays with different R2 jitter, averaged
+        // Converts binary {0,1} to continuous {0, 0.5, 1.0} for much faster NRD convergence
+        float tanSunAngle = 0.015;  // tan(~0.86°) — artistic sun size, shared with SIGMA
+        vec3 sunT = abs(sunDir.y) < 0.999 ? normalize(cross(sunDir, vec3(0,1,0))) : normalize(cross(sunDir, vec3(1,0,0)));
+        vec3 sunB = cross(sunDir, sunT);
+
+        float shadowAccum = 0.0;
+        float shadowHitDist = 65504.0;
+        vec3 shadowOrigin = hitPos + shadingNormal * 0.01;
+
+        for (int si = 0; si < 2; si++) {
+            vec2 diskSample = concentricDiskSample(r2Sample2D(bnPixel, bnFrame, si * 2));
+            vec3 jitteredSunDir = normalize(sunDir + (sunT * diskSample.x + sunB * diskSample.y) * tanSunAngle);
+
+            rayQueryEXT shadowQuery;
+            rayQueryInitializeEXT(shadowQuery, topLevelAS,
+                gl_RayFlagsNoneEXT,
+                0xFF, shadowOrigin, 0.0, jitteredSunDir, 300.0);
+
+            while(rayQueryProceedEXT(shadowQuery)) {
+                if (rayQueryGetIntersectionTypeEXT(shadowQuery, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                    if (shadowTestCandidate(shadowQuery, receiverCellY))
+                        rayQueryConfirmIntersectionEXT(shadowQuery);
+                }
+            }
+
+            if (rayQueryGetIntersectionTypeEXT(shadowQuery, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+                shadowAccum += 1.0;
+            } else if (si == 0) {
+                // Use first hit distance for SIGMA penumbra
+                shadowHitDist = rayQueryGetIntersectionTEXT(shadowQuery, true);
+            }
+        }
+        float shadow = shadowAccum / 2.0;
+
+        // Cloud shadow: project hit point to shadow map UV and modulate shadow
+        {
+            float shadowMapSize = 20000.0; // must match compute dispatch (20km)
+            vec3 camPos = cam.viewInverse[3].xyz;
+            vec2 shadowUV = (hitPos.xz - camPos.xz) / shadowMapSize + 0.5;
+            if (shadowUV.x >= 0.0 && shadowUV.x <= 1.0 && shadowUV.y >= 0.0 && shadowUV.y <= 1.0) {
+                float cloudTransmittance = texture(cloudShadowMap, shadowUV).r;
+                shadow *= cloudTransmittance;
+            }
+        }
+
+        // Penumbra for SIGMA — inflated angle to give SIGMA enough spatial filter radius
+        // SIGMA_FrontEnd_PackPenumbra: penumbraRadius = distToOccluder * tanAngle * 0.5
+        // Use larger angle than ray jitter (0.015) so SIGMA gets 4-8 pixel blur radius
+        // instead of 1-2. Shadow ray jitter controls visual softness, this controls denoise quality.
+        float sigmaTanAngle = 0.06;
+        float penumbraRadius = (shadowHitDist >= 65504.0) ? 65504.0
+                             : min(shadowHitDist * sigmaTanAngle * 0.5, 32768.0);
+
+        // ========================================
+        // Material lookup and AC shader-type shading
+        // ========================================
+        vec3 albedo = vec3(0.7);
+        float matAmbient = 0.3;
+        float matDiffuse = 0.2;
+        float matSpecular = 0.0;
+        float matSpecularEXP = 16.0;
+        float matSunSpecular = 0.0;
+        float matSunSpecularEXP = 50.0;
+        vec3 emissive = vec3(0.0);
+        bool hasMaterial = false;
+        uint shaderType = SHADER_STANDARD;
+        float fresnelC = 0.0;
+        float fresnelEXP = 1.0;
+        float fresnelMaxLevel = 1.0;
+        vec3 txMapsValue = vec3(1.0);
+        bool usesTxMaps = false;
+        float tarmacSpecMult = 1.0;  // tarmacSpecularMultiplier (multilayer only)
+        float diffuseAlpha = 1.0;   // For alpha-blend materials (ksPerPixelAlpha)
+        bool isBlendTransparent = false;  // bit 4: material uses alpha blending (glass pass-through)
+
+        if (meta.primMaterialBufferAddress != 0) {
+            PrimMaterials primMat = PrimMaterials(meta.primMaterialBufferAddress);
+            uint materialId = primMat.m[primitiveId];
+
+            // Pick: if this pixel matches pick coordinates, write result
+            // parameters.z/w = pickX/pickY (1-based, 0 = no pick)
+            if (cam.parameters.z > 0u && cam.parameters.w > 0u) {
+                if (gl_LaunchIDEXT.x == cam.parameters.z - 1u &&
+                    gl_LaunchIDEXT.y == cam.parameters.w - 1u) {
+                    pickResult.pickCustomIndex = customIndex;
+                    pickResult.pickPrimitiveId = uint(primitiveId);
+                    pickResult.pickMaterialId = materialId;
+                    pickResult.pickValid = 1u;
+                }
+            }
+
+            if (materialId != 0xFFFFFFFFu) {
+                Material mat = materialBuffer.materials[materialId];
+                hasMaterial = true;
+                shaderType = mat.shaderType;
+                fresnelC = mat.fresnelC;
+                fresnelEXP = mat.fresnelEXP;
+                fresnelMaxLevel = mat.fresnelMaxLevel;
+                isBlendTransparent = (mat.flags & 16u) != 0u;
+
+                // Read material properties
+                matAmbient = mat.ksAmbient;
+                matDiffuse = mat.ksDiffuse;
+                matSpecular = mat.ksSpecular;
+                matSpecularEXP = mat.ksSpecularEXP;
+                matSunSpecular = mat.sunSpecular;
+                matSunSpecularEXP = mat.sunSpecularEXP;
+                emissive = vec3(mat.emissiveR, mat.emissiveG, mat.emissiveB);
+                firstHitRoughness = clamp(1.0 - matSpecularEXP / 255.0, 0.05, 1.0);
+
+                // SHADER_CARPAINT (smCarPaint): AC adds +400 to specularEXP → mirror-like roughness
+                if (mat.shaderType == SHADER_CARPAINT) {
+                    firstHitRoughness = clamp(1.0 - (matSpecularEXP + 400.0) / 255.0, 0.02, 1.0);
+                }
+                // Car body multimap shaders: glossy clearcoat but not a perfect mirror.
+                // Use moderate roughness so NRD RELAX blurs reflections slightly (realistic paint).
+                else if (mat.shaderType == SHADER_MULTIMAP || mat.shaderType == SHADER_MULTIMAP_NMDETAIL ||
+                         mat.shaderType == SHADER_MULTIMAP_AT || mat.shaderType == SHADER_MULTIMAP_DAMAGE ||
+                         mat.shaderType == SHADER_MULTIMAP_EMISSIVE) {
+                    firstHitRoughness = clamp(1.0 - (matSpecularEXP + 100.0) / 255.0, 0.05, 1.0);
+                }
+
+                // Sample diffuse texture + alpha
+                if (mat.diffuseTexIndex != 0xFFFFFFFFu && hasUVs) {
+                    float diffLod = computeTexLOD(pixelWorldSize, triUVDens, mat.diffuseTexIndex);
+                    vec4 diffSample = textureLod(textures[nonuniformEXT(mat.diffuseTexIndex)], hitUV, diffLod);
+                    albedo = diffSample.rgb;
+                    diffuseAlpha = diffSample.a;
+                }
+
+                // Procedural grass blades: sample terrain material's final color
+                // (diffuse + detail/multilayer blending, same as AC does for the ground)
+                // Normal buffer packs: x=terrainMatId (as float), y=bladeT, z=0
+                // UV buffer stores terrain UV at blade root position
+                if (shaderType == SHADER_GRASS && mat.diffuseTexIndex == 0xFFFFFFFFu) {
+                    uint terrainMatId = uint(rawNormalInterp.x + 0.5); // round to nearest (float cast, not bitwise)
+                    float bladeT = clamp(rawNormalInterp.y, 0.0, 1.0);
+
+                    // Compute terrain material's final rendered color (replicating AC shading)
+                    vec3 terrainColor = vec3(0.035, 0.060, 0.018); // fallback natural green
+                    if (terrainMatId < materialBuffer.materials.length()) {
+                        Material terrainMat = materialBuffer.materials[terrainMatId];
+                        uint terrainTexIdx = terrainMat.diffuseTexIndex;
+
+                        if (terrainTexIdx != 0xFFFFFFFFu && hasUVs) {
+                            vec4 diffSample = textureLod(textures[nonuniformEXT(terrainTexIdx)], hitUV, 2.0);
+                            terrainColor = diffSample.rgb;
+
+                            // Standard detail blending (MULTIMAP, MULTIMAP_NMDETAIL, etc.)
+                            // AC: blendFactor = 1 - diffuseAlpha; albedo = mix(diffuse, detail*diffuse, blend)
+                            if ((terrainMat.flags & 2u) != 0u && terrainMat.detailTexIndex != 0xFFFFFFFFu) {
+                                vec2 detUV = hitUV * terrainMat.detailUVMultiplier;
+                                vec3 detColor = textureLod(textures[nonuniformEXT(terrainMat.detailTexIndex)], detUV, 2.0).rgb;
+                                float detBlend = 1.0 - diffSample.a;
+                                terrainColor = mix(terrainColor, detColor * terrainColor, detBlend);
+                            }
+
+                            // Multilayer mask-based detail blending (ksMultilayer)
+                            // diffuse = mask RGBA, detail R/G/B/A are blended by mask channels
+                            if (terrainMat.shaderType == SHADER_MULTILAYER && terrainMat.maskTexIndex != 0xFFFFFFFFu) {
+                                float maskLod = 2.0;
+                                vec4 mask = textureLod(textures[nonuniformEXT(terrainMat.maskTexIndex)], hitUV, maskLod);
+                                bool useModelUV = (terrainMat.flags & 64u) != 0u;
+
+                                vec4 combined = vec4(0.0);
+                                if (terrainMat.detailRTexIndex != 0xFFFFFFFFu) {
+                                    vec2 uvR = useModelUV ? hitUV * terrainMat.multR : hitPos.xz * terrainMat.multR;
+                                    combined += textureLod(textures[nonuniformEXT(terrainMat.detailRTexIndex)], uvR, 2.0) * mask.r;
+                                }
+                                if (terrainMat.detailGTexIndex != 0xFFFFFFFFu) {
+                                    vec2 uvG = useModelUV ? hitUV * terrainMat.multG : hitPos.xz * terrainMat.multG;
+                                    combined += textureLod(textures[nonuniformEXT(terrainMat.detailGTexIndex)], uvG, 2.0) * mask.g;
+                                }
+                                if (terrainMat.detailBTexIndex != 0xFFFFFFFFu) {
+                                    vec2 uvB = useModelUV ? hitUV * terrainMat.multB : hitPos.xz * terrainMat.multB;
+                                    combined += textureLod(textures[nonuniformEXT(terrainMat.detailBTexIndex)], uvB, 2.0) * mask.b;
+                                }
+                                if (terrainMat.detailATexIndex != 0xFFFFFFFFu) {
+                                    vec2 uvA = useModelUV ? hitUV * terrainMat.multA : hitPos.xz * terrainMat.multA;
+                                    combined += textureLod(textures[nonuniformEXT(terrainMat.detailATexIndex)], uvA, 2.0) * mask.a;
+                                }
+                                terrainColor = min(terrainColor * combined.rgb * terrainMat.magicMult, vec3(1.0));
+                            }
+                        }
+                    }
+
+                    // Per-blade brightness variation
+                    uint bladeId = primitiveId / 4u;
+                    uint bh = ((bladeId >> 16u) ^ bladeId) * 0x45d9f3bu;
+                    bh = ((bh >> 16u) ^ bh) * 0x45d9f3bu;
+                    bh = (bh >> 16u) ^ bh;
+                    float brightVar = 0.85 + float(bh & 0xFFFFu) / 65535.0 * 0.30;
+
+                    // Base-to-tip gradient: darker at root, brighter at tip
+                    albedo = terrainColor * brightVar * mix(0.55, 1.15, bladeT);
+                }
+
+                // SHADER_ALPHA (ksPerPixelAlpha): groove overlay(s) were composited during
+                // ray query candidate processing (premultiplied alpha-over). The committed
+                // hit is the road underneath. Final composite: road shows through remaining
+                // transparency, groove layers are already premultiplied.
+                if (hasGrooveOverlay) {
+                    albedo = albedo * (1.0 - grooveOverlayAlpha) + grooveOverlayAlbedo;
+                }
+
+                // Normal mapping (exclude types that don't use it in AC)
+                bool hasNormalMap = shaderType != SHADER_STANDARD && shaderType != SHADER_AT &&
+                                   shaderType != SHADER_REFLECTION && shaderType != SHADER_SKIDMARK &&
+                                   shaderType != SHADER_ALPHA &&
+                                   shaderType != SHADER_GRASS;
+                if (hasNormalMap && mat.normalTexIndex != 0xFFFFFFFFu && hasUVs && hasTBN) {
+                    float nmLod = computeTexLOD(pixelWorldSize, triUVDens, mat.normalTexIndex);
+                    vec3 texN = textureLod(textures[nonuniformEXT(mat.normalTexIndex)], hitUV, nmLod).xyz;
+                    shadingNormal = applyNormalMap(texN, tangent, shadingNormal, bitangent);
+                }
+
+                // Detail texture (MULTIMAP variants, CARPAINT)
+                // AC considerDetails(): blendFactor = 1 - diffuseAlpha
+                //   alpha=1 → no detail (pure diffuse), alpha=0 → full detail (multiplicative)
+                if ((mat.flags & 2u) != 0u && mat.detailTexIndex != 0xFFFFFFFFu && hasUVs) {
+                    vec2 detailUV = hitUV * mat.detailUVMultiplier;
+                    float detLod = computeTexLOD(pixelWorldSize, triUVDens * mat.detailUVMultiplier, mat.detailTexIndex);
+                    vec4 detailColor = textureLod(textures[nonuniformEXT(mat.detailTexIndex)], detailUV, detLod);
+
+                    float blendFactor = 1.0 - diffuseAlpha;
+                    albedo = mix(albedo, detailColor.rgb * albedo, blendFactor);
+
+                    // AC: txMapsValue.x modulated by detail alpha where detail is active
+                    matSpecular *= mix(1.0, detailColor.a, blendFactor);
+
+                    // Detail normal map (txNormalDetail) — NMDetail variant
+                    if ((mat.flags & 8u) != 0u && mat.normalDetailTexIndex != 0xFFFFFFFFu && hasTBN) {
+                        float detNmLod = computeTexLOD(pixelWorldSize, triUVDens * mat.detailUVMultiplier, mat.normalDetailTexIndex);
+                        vec3 detailNormal = textureLod(textures[nonuniformEXT(mat.normalDetailTexIndex)], detailUV, detNmLod).xyz;
+                        vec3 detailNormalW = applyNormalMap(detailNormal, tangent, shadingNormal, bitangent);
+                        shadingNormal = normalize(mix(shadingNormal, detailNormalW, mat.detailNormalBlend * blendFactor));
+                    }
+                }
+
+                // txMaps (MULTIMAP variants, CARPAINT, SKINNED)
+                usesTxMaps = (shaderType == SHADER_MULTIMAP || shaderType == SHADER_MULTIMAP_NMDETAIL ||
+                              shaderType == SHADER_MULTIMAP_AT || shaderType == SHADER_MULTIMAP_DAMAGE ||
+                              shaderType == SHADER_MULTIMAP_EMISSIVE || shaderType == SHADER_CARPAINT ||
+                              shaderType == SHADER_SKINNED);
+                if (usesTxMaps && mat.mapsTexIndex != 0xFFFFFFFFu && hasUVs) {
+                    float mapsLod = computeTexLOD(pixelWorldSize, triUVDens, mat.mapsTexIndex);
+                    txMapsValue = textureLod(textures[nonuniformEXT(mat.mapsTexIndex)], hitUV, mapsLod).rgb;
+                    matSpecular *= txMapsValue.r;
+                    matSpecularEXP = txMapsValue.g * matSpecularEXP + 1.0;
+                }
+
+                // Bark specular map (TREE_TRUNK): R channel modulates specular intensity
+                if (shaderType == SHADER_TREE_TRUNK && mat.mapsTexIndex != 0xFFFFFFFFu && hasUVs) {
+                    float mapsLod = computeTexLOD(pixelWorldSize, triUVDens, mat.mapsTexIndex);
+                    float barkSpecMask = textureLod(textures[nonuniformEXT(mat.mapsTexIndex)], hitUV, mapsLod).r;
+                    matSpecular *= barkSpecMask;
+                }
+
+                // ksMultilayer: mask-based detail blending
+                // World-space UVs (ksMultilayer) or model UVs (ksMultilayer_objsp, flag bit 6)
+                if (shaderType == SHADER_MULTILAYER && mat.maskTexIndex != 0xFFFFFFFFu && hasUVs) {
+                    bool useModelUV = (mat.flags & 64u) != 0u;
+                    float maskLod = computeTexLOD(pixelWorldSize, triUVDens, mat.maskTexIndex);
+                    vec4 mask = textureLod(textures[nonuniformEXT(mat.maskTexIndex)], hitUV, maskLod);
+
+                    vec4 combined = vec4(0.0);
+
+                    if (mat.detailRTexIndex != 0xFFFFFFFFu) {
+                        vec2 uvR = useModelUV ? hitUV * mat.multR : hitPos.xz * mat.multR;
+                        float lodR = computeTexLOD(pixelWorldSize, useModelUV ? triUVDens * mat.multR : mat.multR, mat.detailRTexIndex);
+                        combined += textureLod(textures[nonuniformEXT(mat.detailRTexIndex)], uvR, lodR) * mask.r;
+                    }
+                    if (mat.detailGTexIndex != 0xFFFFFFFFu) {
+                        vec2 uvG = useModelUV ? hitUV * mat.multG : hitPos.xz * mat.multG;
+                        float lodG = computeTexLOD(pixelWorldSize, useModelUV ? triUVDens * mat.multG : mat.multG, mat.detailGTexIndex);
+                        combined += textureLod(textures[nonuniformEXT(mat.detailGTexIndex)], uvG, lodG) * mask.g;
+                    }
+                    if (mat.detailBTexIndex != 0xFFFFFFFFu) {
+                        vec2 uvB = useModelUV ? hitUV * mat.multB : hitPos.xz * mat.multB;
+                        float lodB = computeTexLOD(pixelWorldSize, useModelUV ? triUVDens * mat.multB : mat.multB, mat.detailBTexIndex);
+                        combined += textureLod(textures[nonuniformEXT(mat.detailBTexIndex)], uvB, lodB) * mask.b;
+                    }
+                    if (mat.detailATexIndex != 0xFFFFFFFFu) {
+                        vec2 uvA = useModelUV ? hitUV * mat.multA : hitPos.xz * mat.multA;
+                        float lodA = computeTexLOD(pixelWorldSize, useModelUV ? triUVDens * mat.multA : mat.multA, mat.detailATexIndex);
+                        combined += textureLod(textures[nonuniformEXT(mat.detailATexIndex)], uvA, lodA) * mask.a;
+                    }
+
+                    // AC formula: txDiffuse *= combined * magicMult (no normalization)
+                    albedo *= combined.rgb * mat.magicMult;
+                    albedo = min(albedo, vec3(1.0));
+
+                    // Alpha from combined detail modulates fresnel/specular (AC: intensity = txDiffuseValue.a * ...)
+                    float detailAlpha = combined.a * mat.magicMult;
+                    matSpecular *= detailAlpha;
+                    fresnelMaxLevel *= detailAlpha;
+
+                    // tarmacSpecularMultiplier (stored in detailNormalBlend for multilayer)
+                    tarmacSpecMult = mat.detailNormalBlend;
+
+                    // Multilayer detail normal map (txDetailNM)
+                    // AC uses float2 detailNMMult: pin.Tex * detailNMMult (model UVs, per-axis scale)
+                    if (mat.detailNMTexIndex != 0xFFFFFFFFu && hasTBN) {
+                        vec2 nmMultVec = vec2(mat.detailNMMult, mat.detailNMMultV);
+                        vec2 nmUV = hitUV * nmMultVec;
+                        float avgNmMult = (mat.detailNMMult + mat.detailNMMultV) * 0.5;
+                        float nmLodML = computeTexLOD(pixelWorldSize, triUVDens * avgNmMult, mat.detailNMTexIndex);
+                        vec3 detNorm = textureLod(textures[nonuniformEXT(mat.detailNMTexIndex)], nmUV, nmLodML).xyz;
+                        shadingNormal = applyNormalMap(detNorm, tangent, shadingNormal, bitangent);
+                    }
+                }
+            }
+        }
+
+        // Fallback for meshes without materials
+        if (!hasMaterial) {
+            if (debugMeshColors && !hasUVs) {
+                albedo = meshColor(customIndex);
+            } else if (hasUVs) {
+                float cx = mod(hitUV.x * 4.0, 1.0);
+                float cy = mod(hitUV.y * 4.0, 1.0);
+                float checker = mod(step(0.5, cx) + step(0.5, cy), 2.0);
+                albedo = mix(vec3(0.9, 0.15, 0.1), vec3(0.95, 0.95, 0.9), checker);
+            } else {
+                float checker = step(0.0, sin(hitPos.x * 0.5) * sin(hitPos.z * 0.5));
+                albedo = mix(vec3(0.4, 0.4, 0.45), vec3(0.7, 0.7, 0.65), checker);
+            }
+        }
+
+        // Grass: override with stable upward normal (no normal map, NRD stability).
+        // Trees keep their normal-mapped normal for visible surface detail.
+        if (shaderType == SHADER_GRASS) {
+            shadingNormal = vec3(0.0, 1.0, 0.0);
+        }
+
+        // Tree foliage: use texture albedo directly (PBR — no artificial tinting)
+        if (shaderType == SHADER_TREE) {
+            albedo = clamp(albedo, vec3(0.01), vec3(1.0));
+        }
+
+        // ========================================
+        // Wet Surface Modification (Lagarde PBR model)
+        // Rain wetness reduces roughness → RT reflections appear automatically
+        // ========================================
+        float rainWetness = cam.rainParams.x;   // 0-1 surface wetness
+        float rainWaterLevel = cam.rainParams.y; // 0-1 puddle water level
+
+        // Sky occlusion: trace ray upward to check if surface is exposed to rain
+        // Surfaces under roofs, bridges, overhangs etc. should stay dry
+        float skyExposure = 1.0;
+        if ((rainWetness > 0.01 || rainWaterLevel > 0.01) && hasMaterial) {
+            rayQueryEXT skyQuery;
+            vec3 skyOrigin = hitPos + vec3(0.0, 0.02, 0.0); // small offset above surface
+            rayQueryInitializeEXT(skyQuery, topLevelAS,
+                gl_RayFlagsTerminateOnFirstHitEXT,
+                0xFF, skyOrigin, 0.0, vec3(0.0, 1.0, 0.0), 100.0);
+            while (rayQueryProceedEXT(skyQuery)) {
+                if (rayQueryGetIntersectionTypeEXT(skyQuery, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                    rayQueryConfirmIntersectionEXT(skyQuery);
+                }
+            }
+            if (rayQueryGetIntersectionTypeEXT(skyQuery, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+                // Something above — surface is sheltered
+                float shelterDist = rayQueryGetIntersectionTEXT(skyQuery, true);
+                // Gradual fade: very close overhead = fully dry, far overhead = partial shelter
+                skyExposure = smoothstep(0.5, 15.0, shelterDist);
+            }
+
+            // Spatial noise for natural wet/dry transition (avoids hard boundary)
+            // Use world-space position to generate coherent noise at the shelter edge
+            float wTime = cam.windParams.w;
+            vec2 noiseUV1 = hitPos.xz * 0.15 + vec2(wTime * 0.01);
+            vec2 noiseUV2 = hitPos.xz * 0.4 + vec2(-wTime * 0.015, wTime * 0.008);
+            float edgeNoise = textureLod(blueNoiseTexture, fract(noiseUV1 / 64.0), 0.0).r;
+            edgeNoise += textureLod(blueNoiseTexture, fract(noiseUV2 / 64.0), 0.0).r;
+            edgeNoise = edgeNoise * 0.5;  // 0-1 range
+
+            // Blend noise into skyExposure at the transition zone (0.2-0.8 range)
+            // Fully exposed (1.0) or fully sheltered (0.0) are unaffected
+            float transitionWidth = 0.4;
+            float noisyExposure = skyExposure + (edgeNoise - 0.5) * transitionWidth;
+            skyExposure = clamp(noisyExposure, 0.0, 1.0);
+
+            rainWetness *= skyExposure;
+            rainWaterLevel *= skyExposure;
+        }
+
+        if (rainWetness > 0.01 && hasMaterial) {
+            // Skip foliage, glass, alpha — only affect opaque solid surfaces
+            bool isWettable = (shaderType != SHADER_TREE && shaderType != SHADER_GRASS &&
+                               shaderType != SHADER_GLASS && shaderType != SHADER_ALPHA &&
+                               shaderType != SHADER_SKIDMARK);
+            if (isWettable) {
+                // Porosity: rough surfaces are more porous and absorb water → darken
+                float porosity = clamp(firstHitRoughness - 0.5, 0.0, 0.5) * 2.0;
+                albedo = pow(albedo, vec3(1.0 + porosity * rainWetness * 0.8));
+
+                // Water layer: AO-like cavities retain more water
+                // Using matAmbient as a proxy for cavity (lower ambient = more sheltered = retains water)
+                float cavity = clamp(1.0 - matAmbient, 0.0, 1.0);
+                float waterLayer = rainWetness * mix(0.7, 1.0, cavity);
+
+                // Roughness: wet surfaces become smoother (Lagarde/ACC model)
+                firstHitRoughness = mix(firstHitRoughness, 0.1, waterLayer);
+
+                // Specular: boost for wet surface (water's F0 = 0.02-0.04)
+                // Increase matSpecularEXP to make specular tighter (smoother reflection)
+                matSpecularEXP = mix(matSpecularEXP, 200.0, waterLayer);
+                matSpecular = mix(matSpecular, 0.5, waterLayer * 0.5);
+
+                // Fresnel: water film adds Fresnel reflections to all surfaces
+                fresnelC = max(fresnelC, 0.02 * waterLayer);
+                fresnelMaxLevel = max(fresnelMaxLevel, waterLayer * 0.6);
+
+                // Multilayer (road/asphalt): raise the RT reflection cap
+                // Normally capped at 0.03 to prevent dry road looking wet.
+                // Rain wetness legitimately makes it wet, so raise the cap.
+                // (The cap is applied later in the reflection code using fresnelMaxAdj)
+            }
+        }
+
+        // ========================================
+        // Puddle Detection (Phase 3)
+        // Flat horizontal surfaces accumulate standing water → mirror reflections
+        // ========================================
+        if (rainWaterLevel > 0.01 && hasMaterial) {
+            bool isPuddleSurface = (shaderType != SHADER_TREE && shaderType != SHADER_GRASS &&
+                                    shaderType != SHADER_GLASS && shaderType != SHADER_ALPHA);
+            if (isPuddleSurface) {
+                // Detect flat horizontal surfaces (normal.y close to 1.0)
+                float isFlat = smoothstep(0.9, 0.98, shadingNormal.y);
+
+                // Low areas accumulate water (use matAmbient as cavity proxy)
+                float isLow = smoothstep(0.5, 0.2, matAmbient);
+
+                float puddleness = isFlat * isLow * rainWaterLevel;
+
+                if (puddleness > 0.05) {
+                    // Animated ripples from blue noise + time
+                    float wTime = cam.windParams.w;
+                    vec2 rippleUV1 = hitPos.xz * 0.8 + vec2(wTime * 0.3, wTime * 0.2);
+                    vec2 rippleUV2 = hitPos.xz * 1.5 + vec2(-wTime * 0.2, wTime * 0.4);
+
+                    // Sample blue noise for ripple perturbation
+                    float ripple1 = textureLod(blueNoiseTexture, fract(rippleUV1 / 64.0), 0.0).r;
+                    float ripple2 = textureLod(blueNoiseTexture, fract(rippleUV2 / 64.0), 0.0).r;
+                    float ripple = (ripple1 + ripple2) * 0.5 - 0.5;
+
+                    // Perturb normal slightly for ripple effect
+                    vec3 rippleNormal = normalize(vec3(
+                        ripple * 0.06 * puddleness * cam.rainParams.z, // stronger ripples when raining
+                        1.0,
+                        ripple * 0.06 * puddleness * cam.rainParams.z
+                    ));
+                    shadingNormal = normalize(mix(shadingNormal, rippleNormal, puddleness * 0.4));
+
+                    // Near-perfect mirror: very low roughness, water F0
+                    firstHitRoughness = mix(firstHitRoughness, 0.02, puddleness);
+                    matSpecularEXP = mix(matSpecularEXP, 250.0, puddleness);
+                    matSpecular = mix(matSpecular, 1.0, puddleness * 0.5);
+
+                    // Fresnel for puddle reflections
+                    fresnelC = mix(fresnelC, 0.04, puddleness);
+                    fresnelMaxLevel = mix(fresnelMaxLevel, 0.9, puddleness);
+
+                    // Darken: water absorbs some light
+                    albedo *= mix(1.0, 0.3, puddleness);
+                }
+            }
+        }
+
+        // Debug visualization modes (controlled by cam.parameters.y integer)
+        // 0=off, 1=normals, 2=albedo, 3=materialID, 4=shaderType, 5=roughness
+        if (debugView == 1u) {
+            // Normals: RGB = XYZ mapped [-1,1] → [0,1]
+            // Green = up (Y+), Red = right (X+), Blue = forward (Z+)
+            imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(shadingNormal * 0.5 + 0.5, 1.0));
+            return;
+        } else if (debugView == 2u) {
+            // Raw texture albedo (no lighting, no tonemap, no gamma)
+            imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(albedo, 1.0));
+            return;
+        } else if (debugView == 3u) {
+            // Material ID: R = diffuseTexIndex gradient, G = UV.x pattern, B = hasUVs
+            if (hasMaterial) {
+                PrimMaterials primMat2 = PrimMaterials(meta.primMaterialBufferAddress);
+                uint mid2 = primMat2.m[primitiveId];
+                Material dbgMat = materialBuffer.materials[mid2];
+                float texIdxGrad = (dbgMat.diffuseTexIndex != 0xFFFFFFFFu)
+                    ? float(dbgMat.diffuseTexIndex % 256) / 255.0 : 0.0;
+                float uvPattern = hasUVs ? fract(hitUV.x * 4.0) : 0.0;
+                float hasUVsF = hasUVs ? 1.0 : 0.0;
+                imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(texIdxGrad, uvPattern, hasUVsF, 1.0));
+            } else {
+                imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(1.0, 0.0, 0.0, 1.0));
+            }
+            return;
+        } else if (debugView == 4u) {
+            // Shader type: R = shaderType/20, G = hasDetail, B = detailUVMul/50
+            float st = hasMaterial ? float(shaderType) / 20.0 : 0.0;
+            float hasDet = 0.0;
+            float detUV = 0.0;
+            if (hasMaterial) {
+                PrimMaterials pm3 = PrimMaterials(meta.primMaterialBufferAddress);
+                uint mid3 = pm3.m[primitiveId];
+                Material m3 = materialBuffer.materials[mid3];
+                hasDet = (m3.flags & 2u) != 0u ? 1.0 : 0.0;
+                detUV = m3.detailUVMultiplier / 50.0;
+            }
+            imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(st, hasDet, detUV, 1.0));
+            return;
+        } else if (debugView == 5u) {
+            // Roughness: white = rough, black = smooth
+            float rough = hasMaterial ? clamp(1.0 - matSpecularEXP / 255.0, 0.0, 1.0) : 0.5;
+            imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(vec3(rough), 1.0));
+            return;
+        } else if (debugView == 6u) {
+            // Per-node height fraction: black=node bottom, white=node top
+            float hFrac = 0.5;
+            if (hasPositions && meta.primYBoundsAddress != 0) {
+                PrimYBounds pyb = PrimYBounds(meta.primYBoundsAddress);
+                float nodeMinY = pyb.yb[primitiveId * 2];
+                float nodeMaxY = pyb.yb[primitiveId * 2 + 1];
+                float localY = pos0.y * w0 + pos1.y * w1 + pos2.y * w2;
+                float meshH = nodeMaxY - nodeMinY;
+                hFrac = (meshH > 0.01) ? clamp((localY - nodeMinY) / meshH, 0.0, 1.0) : 0.5;
+            }
+            imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(vec3(hFrac), 1.0));
+            return;
+        } else {
+            // ========================================
+            // AC-style Blinn-Phong lighting
+            // Formula: (sunColor * ksDiffuse * NdotL * shadow + ambient * ksAmbient) * albedo + specular
+            // ========================================
+
+            // Skidmark: force flat up normal, no specular (AC convention)
+            if (shaderType == SHADER_SKIDMARK) {
+                shadingNormal = vec3(0.0, 1.0, 0.0);
+                matSpecular = 0.0;
+            }
+
+            // Bark desaturation: real bark is gray-brown, not orange
+            if (shaderType == SHADER_TREE_TRUNK) {
+                float barkLuma = dot(albedo, vec3(0.2126, 0.7152, 0.0722));
+                albedo = mix(vec3(barkLuma), albedo, 0.45);
+            }
+
+            // Foliage: normals are meaningless on thin leaf quads — use shadow-only lighting.
+            // Shadow rays determine sun visibility per leaf; GI provides indirect fill.
+            bool isFoliage = (shaderType == SHADER_TREE || shaderType == SHADER_GRASS);
+            if (isFoliage) {
+                matSpecular = 0.0;
+                // Real foliage is more muted than game textures — desaturate ~45%
+                float foliageLuma = dot(albedo, vec3(0.2126, 0.7152, 0.0722));
+                albedo = mix(vec3(foliageLuma), albedo, 0.55);
+
+                // Per-leaf color variation: position-based hash gives each leaf
+                // unique brightness and subtle hue shift, breaking canopy uniformity
+                float leafHash = fract(sin(dot(hitPos.xz, vec2(127.1, 311.7))) * 43758.5453);
+                float leafBright = mix(0.85, 1.15, leafHash);
+                albedo *= leafBright;
+                // Subtle hue variation: some leaves slightly warmer, others cooler
+                float leafHue = (leafHash - 0.5) * 0.03;
+                albedo += vec3(leafHue, -leafHue * 0.3, -leafHue);
+                albedo = max(albedo, vec3(0.0));
+            }
+
+            // Wind animation: perturb foliage shading normal to simulate sway + flutter
+            if (isFoliage && cam.windParams.z > 0.0) {
+                vec2 windDir = cam.windParams.xy;
+                float windSpeed = cam.windParams.z;
+                float wTime = cam.windParams.w;
+
+                // Tree-level sway (slow, each tree has unique phase)
+                float treeHash = fract(sin(dot(floor(hitPos.xz * 0.05), vec2(127.1, 311.7))) * 43758.5453);
+                float treeSway = sin(wTime * 1.5 + treeHash * 6.28318) * 0.2;
+
+                // Branch-level motion (medium frequency)
+                float branchHash = fract(sin(dot(hitPos.xz * 0.3, vec2(269.5, 183.3))) * 43758.5453);
+                float branchWave = sin(wTime * 3.0 + branchHash * 6.28318) * 0.15;
+
+                // Leaf flutter (high frequency, per-leaf)
+                float leafPhase = fract(sin(dot(hitPos.xz, vec2(12.9898, 78.233))) * 43758.5453);
+                float leafFlutter = sin(wTime * 8.0 + leafPhase * 6.28318) * 0.08;
+
+                // Height-based: top of tree sways more than base
+                float heightFactor = clamp(hitPos.y * 0.15, 0.0, 1.0);
+
+                // Main wind in wind direction, flutter perpendicular for chaotic look
+                vec3 windDir3 = vec3(windDir.x, 0.0, windDir.y);
+                vec3 crossWind = vec3(-windDir.y, 0.3, windDir.x);
+
+                vec3 normalPerturb = windDir3 * (treeSway + branchWave) * windSpeed * heightFactor
+                                   + crossWind * leafFlutter * windSpeed * heightFactor;
+
+                shadingNormal = normalize(shadingNormal + normalPerturb);
+            }
+
+            // Use canonical sunDir for shading (deterministic), jitteredSunDir only for shadow ray.
+            // Foliage face orientation: detect if the geometric face is sun-lit or backlit.
+            // Back face (sun hits the other side) gets no direct diffuse/specular — only ambient + translucency.
+            bool leafSunFacing = !isFoliage || dot(geoFaceNormal, sunDir) > 0.0;
+
+            float NdotL;
+            if (isFoliage) {
+                if (leafSunFacing) {
+                    // Sun-facing: squared half-Lambert for soft falloff with real contrast
+                    // Leaves facing sun ≈ 1.0, perpendicular ≈ 0.25, away ≈ 0.0
+                    float wrapNdotL = dot(shadingNormal, sunDir) * 0.5 + 0.5;
+                    NdotL = wrapNdotL * wrapNdotL;
+                } else {
+                    // Back face: sun doesn't reach this side — no direct lighting
+                    NdotL = 0.0;
+                }
+            } else {
+                NdotL = max(dot(shadingNormal, sunDir), 0.0);
+            }
+            vec3 halfVec = normalize(-rayDir + sunDir);
+            float NdotH = max(dot(shadingNormal, halfVec), 0.0);
+
+            // Ambient (hemisphere-based for materials, flat for no-material)
+            vec3 ambient;
+            if (hasMaterial) {
+                ambient = calculateAmbient(shadingNormal,
+                                           matAmbient, ambientColor, ambientIntensity);
+            } else {
+                ambient = ambientColor * ambientIntensity * 0.3;
+            }
+
+            // Write SIGMA penumbra — NRD rule: NoL<=0 MUST be 0 (very important!)
+            float rawNdotL = isFoliage ? 1.0 : dot(shadingNormal, sunDir);
+            if (rawNdotL <= 0.0) {
+                imageStore(penumbraImg, ivec2(gl_LaunchIDEXT.xy), vec4(0, 0, 0, 0));
+            } else {
+                imageStore(penumbraImg, ivec2(gl_LaunchIDEXT.xy), vec4(penumbraRadius, 0, 0, 0));
+            }
+
+            // Shadow baked into diffuse — RELAX denoises using hitT for edge preservation
+            float PI_VAL = 3.14159265359;
+
+            // Foliage: PBR Lambertian diffuse (albedo/π) with energy conservation
+            // Back-facing foliage (sun hits the other side) gets no direct sun — only ambient + translucency.
+            vec3 sunDiffuse;
+            vec3 specular;
+            if (isFoliage) {
+                if (leafSunFacing) {
+                    // Irradiance form: albedo NOT baked in (applied uniformly at the end).
+                    // This ensures NRD composite (denoisedDiffuse × albedo) applies albedo exactly once.
+                    float foliageDiffuse = matDiffuse / PI_VAL;
+
+                    // Fresnel for energy conservation (F0=0.04 dielectric)
+                    vec3 Hf = normalize(-rayDir + sunDir);
+                    float VdotHf = max(dot(-rayDir, Hf), 0.0);
+                    float mf = clamp(1.0 - VdotHf, 0.0, 1.0);
+                    float mf5 = mf * mf * mf * mf * mf;
+                    vec3 Ff = vec3(0.04) + vec3(0.96) * mf5;
+
+                    sunDiffuse = sunColor * foliageDiffuse * (vec3(1.0) - Ff) * NdotL * shadow;
+
+                    // Cook-Torrance GGX specular (subtle, rough dielectric)
+                    float roughness = 0.6;
+                    float a = roughness * roughness;
+                    float a2 = a * a;
+                    float NdotHf = max(dot(shadingNormal, Hf), 0.0);
+                    float NdotVf = max(dot(shadingNormal, -rayDir), 1e-4);
+                    float denom = NdotHf * NdotHf * (a2 - 1.0) + 1.0;
+                    float D = a2 / (PI_VAL * denom * denom);
+                    float gv = NdotL * sqrt(NdotVf * NdotVf * (1.0 - a2) + a2);
+                    float gl = NdotVf * sqrt(NdotL * NdotL * (1.0 - a2) + a2);
+                    float G2 = 0.5 / max(gv + gl, 1e-6);
+                    specular = sunColor * vec3(D * G2) * Ff * NdotL * shadow;
+                } else {
+                    // Back face: no direct sun contribution
+                    sunDiffuse = vec3(0.0);
+                    specular = vec3(0.0);
+                }
+            } else if (shaderType == SHADER_TREE_TRUNK) {
+                // Bark: Cook-Torrance GGX (rough dielectric)
+                float barkRoughness = 0.85;
+                float barkA = barkRoughness * barkRoughness;
+                float barkA2 = barkA * barkA;
+
+                vec3 Hb = normalize(-rayDir + sunDir);
+                float NdotHb = max(dot(shadingNormal, Hb), 0.0);
+                float NdotVb = max(dot(shadingNormal, -rayDir), 1e-4);
+                float VdotHb = max(dot(-rayDir, Hb), 0.0);
+
+                // Schlick Fresnel (F0=0.04 dielectric)
+                float mb = clamp(1.0 - VdotHb, 0.0, 1.0);
+                float mb5 = mb * mb * mb * mb * mb;
+                vec3 Fb = vec3(0.04) + vec3(0.96) * mb5;
+
+                // GGX NDF
+                float denomB = NdotHb * NdotHb * (barkA2 - 1.0) + 1.0;
+                float Db = barkA2 / (PI_VAL * denomB * denomB);
+
+                // Smith height-correlated geometry
+                float gvB = NdotL * sqrt(NdotVb * NdotVb * (1.0 - barkA2) + barkA2);
+                float glB = NdotVb * sqrt(NdotL * NdotL * (1.0 - barkA2) + barkA2);
+                float G2b = 0.5 / max(gvB + glB, 1e-6);
+
+                // Energy-conserving diffuse
+                sunDiffuse = sunColor * (matDiffuse / PI_VAL) * (vec3(1.0) - Fb) * NdotL * shadow;
+
+                // Specular
+                specular = sunColor * vec3(Db * G2b) * Fb * NdotL * shadow * matSpecular;
+
+                firstHitRoughness = barkRoughness;
+            } else {
+                sunDiffuse = sunColor * matDiffuse * NdotL * shadow;
+                float specHighlight = pow(NdotH, max(matSpecularEXP, 1.0)) * NdotL * shadow;
+                specular = sunColor * matSpecular * specHighlight;
+            }
+
+            // Sun specular: additional sun highlight for Maps shaders (actools: CalculateSpecularLight_Maps_Sun)
+            // AC: sunSpecularValue *= txMapsValue.z * txMapsValue.y
+            if (!isFoliage && matSunSpecular > 0.0 && usesTxMaps) {
+                float sunSpecMod = txMapsValue.b * txMapsValue.g;
+                float sunSpecHighlight = pow(NdotH, max(matSunSpecularEXP, 1.0)) * NdotL * shadow;
+                specular += sunColor * matSunSpecular * sunSpecMod * sunSpecHighlight;
+            }
+
+            // Foliage canopy depth: height within canopy (0=bottom, 1=top).
+            // Computed once, used for translucency attenuation and canopy AO.
+            float foliageHeightFrac = 0.0;
+            bool hasCanopyData = false;
+            if (isFoliage && hasPositions && meta.primYBoundsAddress != 0) {
+                PrimYBounds pyb = PrimYBounds(meta.primYBoundsAddress);
+                float nodeMinY = pyb.yb[primitiveId * 2];
+                float nodeMaxY = pyb.yb[primitiveId * 2 + 1];
+                float meshH = nodeMaxY - nodeMinY;
+                if (meshH > 0.01) {
+                    float localY = pos0.y * w0 + pos1.y * w1 + pos2.y * w2;
+                    foliageHeightFrac = clamp((localY - nodeMinY) / meshH, 0.0, 1.0);
+                    hasCanopyData = true;
+                }
+            }
+
+            // Foliage leaf-layer attenuation (Beer's law via raycast)
+            // Trace a short ray toward the sun and count leaf layers.
+            // Used for BOTH translucency AND ambient occlusion — replaces Y-height heuristic.
+            float leafTransmission = 1.0;  // 1.0 = fully exposed (non-foliage default)
+            vec3 translucency = vec3(0.0);
+            if (isFoliage) {
+                // Count leaf layers between this leaf and the sun (short ray, max ~3m)
+                int leafLayers = 0;
+                rayQueryEXT ltQuery;
+                rayQueryInitializeEXT(ltQuery, topLevelAS,
+                    gl_RayFlagsNoOpaqueEXT, 0xFF,
+                    hitPos + geoFaceNormal * 0.02, 0.01, sunDir, 3.0);
+                while (rayQueryProceedEXT(ltQuery)) {
+                    leafLayers++;
+                    if (leafLayers >= 6) break;
+                }
+
+                // Beer's law: ~30% transmission per layer
+                // 0 layers = 1.0, 1 = 0.30, 2 = 0.09, 3 = 0.027, 4+ ≈ 0
+                leafTransmission = exp(-float(leafLayers) * 1.2);
+
+                // Frostbite SSS view-dependent lobe (modulated by leaf transmission)
+                float ltDistortion = 0.3;
+                float ltPower      = 8.0;
+                float ltScale      = 0.5;
+                float ltAttenuation = 0.8;
+
+                vec3 ltH = normalize(sunDir + shadingNormal * ltDistortion);
+                float ltVdotH = pow(clamp(dot(-rayDir, -ltH), 0.0, 1.0), ltPower) * ltScale;
+                float ltIntensity = ltAttenuation * ltVdotH;
+
+                // Chlorophyll tint: red/blue absorbed, green transmitted
+                vec3 leafTint = vec3(0.4, 1.0, 0.3);
+                translucency = sunColor * leafTint * ltIntensity * leafTransmission;
+
+                // Modulate ambient for foliage: interior leaves get less sky light
+                ambient *= mix(0.15, 1.0, leafTransmission);
+
+                // Canopy color variation: exposed leaves are warmer/brighter (sun-bleached),
+                // interior leaves are cooler/darker (shade-adapted)
+                float warmShift = leafTransmission * 0.12;
+                albedo = albedo * mix(0.8, 1.0, leafTransmission)       // brightness: interior darker
+                       + vec3(warmShift, warmShift * 0.5, -warmShift * 0.3);  // hue: exposed = warmer yellow, interior = cooler
+                albedo = max(albedo, vec3(0.0));
+            }
+
+            // Unified color formula: albedo applied once to all irradiance terms.
+            // sunDiffuse is irradiance (no albedo baked in) for both foliage and non-foliage.
+            // NRD composite (denoisedDiffuse × albedo) also applies albedo exactly once.
+            color = (sunDiffuse + ambient + translucency) * albedo + specular + emissive;
+
+            // Glass-like shaders (used for fresnel defaults + transparency below)
+            // Note: SHADER_ALPHA (ksPerPixelAlpha) is NOT glass-like — it's a basic alpha
+            // transparency shader used for decals, grooves, etc. Actual glass uses ksGlass.
+            bool isGlassLike = hasMaterial && (shaderType == SHADER_GLASS || shaderType == SHADER_REFLECTION);
+
+            // ========================================
+            // Per-shader-type features
+            // ========================================
+            if (hasMaterial) {
+                // Reflections — only shaders that have CalculateReflection in AC
+                // (Standard, AT, Alpha, Tree, Grass, Skidmark do NOT have reflections in AC's DX11 renderer)
+                bool usesReflection = (shaderType != SHADER_STANDARD && shaderType != SHADER_AT &&
+                                       shaderType != SHADER_ALPHA &&
+                                       shaderType != SHADER_TREE && shaderType != SHADER_GRASS &&
+                                       shaderType != SHADER_SKIDMARK && shaderType != SHADER_TREE_TRUNK);
+                float reflFresnelC = fresnelC;
+                float reflFresnelEXP = fresnelEXP;
+                float reflFresnelMaxLevel = fresnelMaxLevel;
+                // Glass: physical Fresnel defaults (IOR 1.5 → F0 ≈ 0.04)
+                if (isGlassLike && reflFresnelC + reflFresnelMaxLevel <= 0.0) {
+                    reflFresnelC = 0.04;
+                    reflFresnelEXP = 5.0;
+                    reflFresnelMaxLevel = 1.0;
+                }
+                // Car paint: clearcoat Fresnel defaults (glossy painted surface)
+                // Only for CARPAINT — generic multimap materials (walls, barriers, track objects)
+                // should NOT get forced reflections if the artist set fresnelMaxLevel=0.
+                bool isCarBody = (shaderType == SHADER_MULTIMAP || shaderType == SHADER_MULTIMAP_NMDETAIL ||
+                                  shaderType == SHADER_MULTIMAP_AT || shaderType == SHADER_MULTIMAP_DAMAGE ||
+                                  shaderType == SHADER_MULTIMAP_EMISSIVE || shaderType == SHADER_CARPAINT);
+                if (shaderType == SHADER_CARPAINT && reflFresnelC + reflFresnelMaxLevel <= 0.0) {
+                    reflFresnelC = 0.05;
+                    reflFresnelEXP = 4.0;
+                    reflFresnelMaxLevel = 0.8;
+                }
+
+                if (usesReflection && reflFresnelC + reflFresnelMaxLevel > 0.0) {
+                    // txMaps.b = per-pixel reflection mask (AC: maps.z applied ONCE to final reflection)
+                    float reflMask = usesTxMaps ? txMapsValue.b : 1.0;
+                    bool coloredRefl = (shaderType == SHADER_MULTIMAP || shaderType == SHADER_MULTIMAP_NMDETAIL ||
+                                        shaderType == SHADER_MULTIMAP_AT || shaderType == SHADER_MULTIMAP_DAMAGE ||
+                                        shaderType == SHADER_MULTIMAP_EMISSIVE || shaderType == SHADER_CARPAINT);
+                    // AC: metallicFix=1 only for car paint shaders (reduces diffuse by fresnel for energy conservation)
+                    float metallicFix = (shaderType == SHADER_CARPAINT || shaderType == SHADER_MULTIMAP_DAMAGE) ? 1.0 : 0.0;
+                    // AC: FresnelMaxLevel NOT multiplied by maps.z — maps.z only applies to final output
+                    float fresnelMaxAdj = reflFresnelMaxLevel;
+                    // Multilayer: apply tarmacSpecularMultiplier but cap for raytraced reflections.
+                    // AC's cubemaps are blurry so high fresnel looks subtle there, but with sharp
+                    // geometry reflections it makes dry asphalt look wet/mirror-like.
+                    // Cap for dry asphalt, raised by rain wetness for realistic wet road reflections.
+                    if (shaderType == SHADER_MULTILAYER) {
+                        float dryCap = 0.03;
+                        float wetCap = mix(dryCap, 0.8, rainWetness);
+                        fresnelMaxAdj = min(fresnelMaxAdj * tarmacSpecMult, wetCap);
+                    }
+
+                    // Fresnel (Schlick approximation)
+                    float NdotV_refl = clamp(dot(shadingNormal, -rayDir), 0.0, 1.0);
+                    float fresnel = pow(1.0 - NdotV_refl, max(reflFresnelEXP, 1.0)) + reflFresnelC;
+                    fresnel = acSmin(fresnel, fresnelMaxAdj);
+
+                    // Reflection direction (sharp — NRD RELAX handles roughness blur)
+                    vec3 reflDir = reflect(rayDir, shadingNormal);
+
+                    // Trace reflection ray
+                    rayQueryEXT reflQuery;
+                    rayQueryInitializeEXT(reflQuery, topLevelAS,
+                        gl_RayFlagsCullBackFacingTrianglesEXT, 0xFF,
+                        hitPos + shadingNormal * 0.01, 0.01, reflDir, 500.0);
+                    while (rayQueryProceedEXT(reflQuery)) {
+                        if (rayQueryGetIntersectionTypeEXT(reflQuery, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                            if (alphaTestCandidate(reflQuery))
+                                rayQueryConfirmIntersectionEXT(reflQuery);
+                        }
+                    }
+
+                    vec3 reflRadiance;
+                    float reflHitDist;
+
+                    if (rayQueryGetIntersectionTypeEXT(reflQuery, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+                        // Sky miss — existing sky reflection as fallback
+                        float reflBlur = pow(clamp(1.0 - matSpecularEXP / 255.0, 0.0, 1.0), 2.0) * 6.0;
+                        reflRadiance = sampleSkyReflection(reflDir, reflBlur, sunDir);
+                        reflHitDist = 500.0;
+                    } else {
+                        // Hit geometry — compute lighting at reflection point
+                        float tRefl = rayQueryGetIntersectionTEXT(reflQuery, true);
+                        vec3 reflHitPos = hitPos + shadingNormal * 0.01 + reflDir * tRefl;
+                        reflHitDist = tRefl;
+
+                        uint reflCi = rayQueryGetIntersectionInstanceCustomIndexEXT(reflQuery, true) & 0xFFFFFu;
+                        int reflPi = rayQueryGetIntersectionPrimitiveIndexEXT(reflQuery, true);
+                        vec2 reflBary = rayQueryGetIntersectionBarycentricsEXT(reflQuery, true);
+
+                        vec3 reflAlbedo = vec3(0.5);
+                        vec3 reflNormal = vec3(0, 1, 0);
+                        GeometryMetadata reflMeta = geometryMetadata.geometries[reflCi];
+
+                        // Interpolate reflection hit normal
+                        if (reflMeta.normalBufferAddress != 0 && reflMeta.indexBufferAddress != 0) {
+                            Indices rIdxBuf = Indices(reflMeta.indexBufferAddress);
+                            uint ri0 = rIdxBuf.i[reflPi * 3];
+                            uint ri1 = rIdxBuf.i[reflPi * 3 + 1];
+                            uint ri2 = rIdxBuf.i[reflPi * 3 + 2];
+                            float rw0 = 1.0 - reflBary.x - reflBary.y;
+                            Normals rNBuf = Normals(reflMeta.normalBufferAddress);
+                            vec3 rn0 = vec3(rNBuf.n[ri0*3], rNBuf.n[ri0*3+1], rNBuf.n[ri0*3+2]);
+                            vec3 rn1 = vec3(rNBuf.n[ri1*3], rNBuf.n[ri1*3+1], rNBuf.n[ri1*3+2]);
+                            vec3 rn2 = vec3(rNBuf.n[ri2*3], rNBuf.n[ri2*3+1], rNBuf.n[ri2*3+2]);
+                            reflNormal = normalize(rn0 * rw0 + rn1 * reflBary.x + rn2 * reflBary.y);
+                        }
+
+                        // Get reflection hit material albedo
+                        if (reflMeta.primMaterialBufferAddress != 0) {
+                            PrimMaterials rpm = PrimMaterials(reflMeta.primMaterialBufferAddress);
+                            uint rmid = rpm.m[reflPi];
+                            if (rmid != 0xFFFFFFFFu) {
+                                Material rmat = materialBuffer.materials[rmid];
+                                if (rmat.diffuseTexIndex != 0xFFFFFFFFu && reflMeta.uvBufferAddress != 0 && reflMeta.indexBufferAddress != 0) {
+                                    Indices rIdxBuf2 = Indices(reflMeta.indexBufferAddress);
+                                    uint ri0b = rIdxBuf2.i[reflPi * 3];
+                                    uint ri1b = rIdxBuf2.i[reflPi * 3 + 1];
+                                    uint ri2b = rIdxBuf2.i[reflPi * 3 + 2];
+                                    float rw0b = 1.0 - reflBary.x - reflBary.y;
+                                    UVs rUvBuf = UVs(reflMeta.uvBufferAddress);
+                                    vec2 rUV = vec2(rUvBuf.uv[ri0b*2], rUvBuf.uv[ri0b*2+1]) * rw0b +
+                                               vec2(rUvBuf.uv[ri1b*2], rUvBuf.uv[ri1b*2+1]) * reflBary.x +
+                                               vec2(rUvBuf.uv[ri2b*2], rUvBuf.uv[ri2b*2+1]) * reflBary.y;
+                                    reflAlbedo = textureLod(textures[nonuniformEXT(rmat.diffuseTexIndex)], rUV, 4.0).rgb;
+                                } else {
+                                    reflAlbedo = vec3(rmat.ksDiffuse);
+                                }
+                            }
+                        }
+
+                        // Direct lighting at reflection hit point with real shadow ray
+                        // (SHaRC cache disabled for reflections — 0.5m grid creates visible checkerboard.
+                        //  NRD RELAX denoises the specular channel, so 1-sample direct lighting is sufficient.)
+                        float reflNdotL = max(dot(reflNormal, sunDir), 0.0);
+                        float reflShadow = 0.0;
+                        if (reflNdotL > 0.0) {
+                            vec3 reflShadowOrigin = reflHitPos + reflNormal * 0.01;
+                            rayQueryEXT reflShadowQuery;
+                            rayQueryInitializeEXT(reflShadowQuery, topLevelAS,
+                                gl_RayFlagsNoneEXT, 0xFF,
+                                reflShadowOrigin, 0.0, sunDir, 300.0);
+                            while (rayQueryProceedEXT(reflShadowQuery)) {
+                                if (rayQueryGetIntersectionTypeEXT(reflShadowQuery, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                                    if (shadowTestCandidate(reflShadowQuery, vec2(0.0)))
+                                        rayQueryConfirmIntersectionEXT(reflShadowQuery);
+                                }
+                            }
+                            if (rayQueryGetIntersectionTypeEXT(reflShadowQuery, true) == gl_RayQueryCommittedIntersectionNoneEXT)
+                                reflShadow = 1.0;
+                        }
+                        reflRadiance = reflAlbedo * sunColor * reflNdotL * reflShadow;
+                        // Ambient + sky irradiance (consistent with GI bounce hits)
+                        reflRadiance += reflAlbedo * calculateAmbient(reflNormal, 0.8, ambientColor, ambientIntensity);
+                        reflRadiance += reflAlbedo * skyHemisphereIrradiance(reflNormal) * ptSkyBounceInt;
+                    }
+
+                    // Car paint colored reflections
+                    if (coloredRefl) {
+                        float maxC = max(albedo.r, max(albedo.g, max(albedo.b, 0.01)));
+                        reflRadiance *= albedo / maxC;
+                    }
+
+                    // Route reflection through NRD specular (denoised separately)
+                    float reflStrength = fresnel * reflMask;
+                    nrdSpecularSignal += reflRadiance * reflStrength;
+                    specHitDist = reflHitDist;
+
+                    // Energy conservation (AC: lighted *= 1.0 - refl.a)
+                    // Applied to both color (raw PT output) and nrdDiffuseSignal (NRD path).
+                    // Glass/real carpaint: full metallic conservation
+                    // Car body (multimap_damage etc.): moderate — painted clearcoat, not bare metal
+                    // Other materials: soft
+                    float energyFactor;
+                    if (isGlassLike || shaderType == SHADER_CARPAINT) {
+                        energyFactor = (1.0 - reflStrength);
+                    } else if (coloredRefl) {
+                        energyFactor = (1.0 - reflStrength * 0.4);
+                    } else {
+                        energyFactor = (1.0 - reflStrength * 0.2);
+                    }
+                    color *= energyFactor;
+                    reflEnergyFactor = energyFactor;
+                }
+
+                // Emissive boost for MULTIMAP_EMISSIVE
+                if (shaderType == SHADER_MULTIMAP_EMISSIVE) {
+                    color += emissive * albedo;
+                }
+
+                // Skidmark: darken (AC uses txDiffuse.rgb *= 0.6 in gamma space)
+                if (shaderType == SHADER_SKIDMARK) {
+                    color *= 0.6;
+                }
+            }
+
+            // ========================================
+            // Indirect Diffuse GI — 1 bounce (SHARC provides multi-bounce via cache)
+            // ========================================
+            vec3 indirectGI = vec3(0.0);
+            float giFirstBounceHitDist = 200.0;  // GI first bounce distance for hitT mixing
+            if (hasMaterial && shaderType != SHADER_SKIDMARK) {
+                vec3 bounceOrigin = hitPos + shadingNormal * 0.01;
+                vec3 bounceNormalCur = shadingNormal;
+                vec3 throughput = vec3(1.0);
+
+                // Track first bounce hit for SHaRC writeback with total chain radiance
+                vec3 sharcWritePos;
+                bool sharcWritePending = false;
+
+                for (int bounce = 0; bounce < 1; bounce++) {
+                    // GI hemisphere: R2 quasi-random (uniform coverage, converges faster than PCG white noise)
+                    // dims 0-3 reserved for 2 shadow rays, so GI starts at dim 4
+                    vec2 giSample = r2Sample2D(bnPixel, bnFrame, 4 + bounce * 2);
+                    vec3 bounceDir = sampleHemisphereCosineFromUV(bounceNormalCur, giSample);
+
+                    rayQueryEXT bounceQuery;
+                    rayQueryInitializeEXT(bounceQuery, topLevelAS,
+                        gl_RayFlagsCullBackFacingTrianglesEXT, 0xFF,
+                        bounceOrigin, 0.01, bounceDir, 200.0);
+
+                    while(rayQueryProceedEXT(bounceQuery)) {
+                        if (rayQueryGetIntersectionTypeEXT(bounceQuery, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                            if (alphaTestCandidate(bounceQuery))
+                                rayQueryConfirmIntersectionEXT(bounceQuery);
+                        }
+                    }
+
+                    if (rayQueryGetIntersectionTypeEXT(bounceQuery, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+                        // Direct sky hit — stronger than surface irradiance (no surface occlusion)
+                        vec3 skyLight = skyHemisphereIrradiance(bounceDir) * ptSkyBounceInt * 2.0;
+                        indirectGI += throughput * skyLight;
+                        break;
+                    }
+
+                    // Bounce hit geometry
+                    float tBounce = rayQueryGetIntersectionTEXT(bounceQuery, true);
+                    if (bounce == 0) giFirstBounceHitDist = tBounce;
+                    vec3 bounceHitPos = bounceOrigin + bounceDir * tBounce;
+                    uint bounceCi = rayQueryGetIntersectionInstanceCustomIndexEXT(bounceQuery, true) & 0xFFFFFu;
+                    int bouncePi = rayQueryGetIntersectionPrimitiveIndexEXT(bounceQuery, true);
+                    vec2 bounceBary = rayQueryGetIntersectionBarycentricsEXT(bounceQuery, true);
+
+                    vec3 bounceAlbedo = vec3(0.5);
+                    vec3 bounceNormal = vec3(0, 1, 0);
+                    GeometryMetadata bounceMeta = geometryMetadata.geometries[bounceCi];
+
+                    // Interpolate bounce normal
+                    if (bounceMeta.normalBufferAddress != 0 && bounceMeta.indexBufferAddress != 0) {
+                        Indices bIdxBuf = Indices(bounceMeta.indexBufferAddress);
+                        uint bi0 = bIdxBuf.i[bouncePi * 3];
+                        uint bi1 = bIdxBuf.i[bouncePi * 3 + 1];
+                        uint bi2 = bIdxBuf.i[bouncePi * 3 + 2];
+                        float bw0 = 1.0 - bounceBary.x - bounceBary.y;
+                        Normals bNBuf = Normals(bounceMeta.normalBufferAddress);
+                        vec3 bn0 = vec3(bNBuf.n[bi0*3], bNBuf.n[bi0*3+1], bNBuf.n[bi0*3+2]);
+                        vec3 bn1 = vec3(bNBuf.n[bi1*3], bNBuf.n[bi1*3+1], bNBuf.n[bi1*3+2]);
+                        vec3 bn2 = vec3(bNBuf.n[bi2*3], bNBuf.n[bi2*3+1], bNBuf.n[bi2*3+2]);
+                        bounceNormal = normalize(bn0 * bw0 + bn1 * bounceBary.x + bn2 * bounceBary.y);
+                    }
+
+                    // Get bounce material albedo
+                    if (bounceMeta.primMaterialBufferAddress != 0) {
+                        PrimMaterials bpm = PrimMaterials(bounceMeta.primMaterialBufferAddress);
+                        uint bmid = bpm.m[bouncePi];
+                        if (bmid != 0xFFFFFFFFu) {
+                            Material bmat = materialBuffer.materials[bmid];
+                            if (bmat.diffuseTexIndex != 0xFFFFFFFFu && bounceMeta.uvBufferAddress != 0 && bounceMeta.indexBufferAddress != 0) {
+                                Indices bIdxBuf2 = Indices(bounceMeta.indexBufferAddress);
+                                uint bi0b = bIdxBuf2.i[bouncePi * 3];
+                                uint bi1b = bIdxBuf2.i[bouncePi * 3 + 1];
+                                uint bi2b = bIdxBuf2.i[bouncePi * 3 + 2];
+                                float bw0b = 1.0 - bounceBary.x - bounceBary.y;
+                                UVs bUvBuf = UVs(bounceMeta.uvBufferAddress);
+                                vec2 bUV = vec2(bUvBuf.uv[bi0b*2], bUvBuf.uv[bi0b*2+1]) * bw0b +
+                                           vec2(bUvBuf.uv[bi1b*2], bUvBuf.uv[bi1b*2+1]) * bounceBary.x +
+                                           vec2(bUvBuf.uv[bi2b*2], bUvBuf.uv[bi2b*2+1]) * bounceBary.y;
+                                bounceAlbedo = textureLod(textures[nonuniformEXT(bmat.diffuseTexIndex)], bUV, 4.0).rgb;
+                            } else {
+                                bounceAlbedo = vec3(bmat.ksDiffuse);
+                            }
+                        }
+                    }
+
+                    // Direct lighting at bounce point with real shadow ray
+                    float bounceNdotL = max(dot(bounceNormal, sunDir), 0.0);
+                    float bounceShadow = 0.0;
+                    if (bounceNdotL > 0.0) {
+                        vec3 bounceShadowOrigin = bounceHitPos + bounceNormal * 0.01;
+                        rayQueryEXT bounceShadowQuery;
+                        rayQueryInitializeEXT(bounceShadowQuery, topLevelAS,
+                            gl_RayFlagsNoneEXT, 0xFF,
+                            bounceShadowOrigin, 0.0, sunDir, 300.0);
+                        while (rayQueryProceedEXT(bounceShadowQuery)) {
+                            if (rayQueryGetIntersectionTypeEXT(bounceShadowQuery, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                                if (shadowTestCandidate(bounceShadowQuery, vec2(0.0)))
+                                    rayQueryConfirmIntersectionEXT(bounceShadowQuery);
+                            }
+                        }
+                        if (rayQueryGetIntersectionTypeEXT(bounceShadowQuery, true) == gl_RayQueryCommittedIntersectionNoneEXT)
+                            bounceShadow = 1.0;
+                    }
+                    vec3 bounceLighting = bounceAlbedo * sunColor * bounceNdotL * bounceShadow;
+
+                    // Ambient at bounce point (same hemisphere gradient as primary hit).
+                    // Uses default ksAmbient=0.8 since reading per-material value would cost extra fetches.
+                    bounceLighting += bounceAlbedo * calculateAmbient(bounceNormal, 0.8, ambientColor, ambientIntensity);
+
+                    // Sky hemisphere irradiance at bounce point — always present (not just in shadow).
+                    // In shadow (bounceShadow=0): dominant term -> natural blue tint.
+                    // In sun: small relative to sunColor -> barely affects lit areas.
+                    bounceLighting += bounceAlbedo * skyHemisphereIrradiance(bounceNormal) * ptSkyBounceInt;
+
+                    // SHaRC: try cached radiance at bounce hit point
+                    bool sharcValid;
+                    vec3 cachedRadiance = sharcLookup(bounceHitPos, sharcValid);
+
+                    if (sharcValid) {
+                        // Cache has total outgoing radiance (direct + multi-bounce from prev frames)
+                        indirectGI += throughput * cachedRadiance;
+                        break;
+                    }
+
+                    // No cache — use direct lighting, continue tracing
+                    indirectGI += throughput * bounceLighting;
+
+                    // Remember first bounce position for cache writeback
+                    if (bounce == 0) {
+                        sharcWritePos = bounceHitPos;
+                        sharcWritePending = true;
+                    }
+
+                    // Update throughput and prepare next bounce
+                    throughput *= bounceAlbedo;
+                    bounceOrigin = bounceHitPos + bounceNormal * 0.01;
+                    bounceNormalCur = bounceNormal;
+                }
+
+                // SHaRC writeback: store total chain radiance at first bounce hit.
+                // This includes direct + sky + deeper bounces, so the cache naturally
+                // builds up multi-bounce over frames via EMA in the resolve shader.
+                if (sharcWritePending) {
+                    sharcAccumulate(sharcWritePos, indirectGI, bnFrame);
+                }
+
+                // Add GI contribution (weighted by primary albedo)
+                // GI replaces ambient — this IS the indirect illumination
+                color += indirectGI * albedo * ptGIIntensity;
+            }
+
+            // Atmospheric perspective (Koschmieder's law)
+            // Visibility parameter controls fog density: β = 3.912 / V
+            // Same parameter used for cloud fade — unified atmospheric model
+            {
+                float dist = abs(viewZ);
+                float visibility_m = max(cam.skyLight.w, 1000.0);
+                float beta = 3.912 / visibility_m;
+                float hazeFactor = 1.0 - exp(-dist * beta);
+
+                // Horizon color derived from sky: mix of ambient (sky tint) and sun color
+                // This ensures fog color matches the actual sky, not a hardcoded value
+                vec3 skyHorizon = cam.ambientLight.rgb * 0.6 + cam.skyLight.rgb * 0.3 + vec3(0.1);
+                skyHorizon = mix(skyHorizon, vec3(dot(skyHorizon, vec3(0.33))), 0.3); // desaturate slightly
+
+                color = mix(color, skyHorizon, hazeFactor);
+            }
+
+            // Populate NRD separated signals for denoising
+            // Apply reflection energy conservation to diffuse (AC: lighted *= 1.0 - refl.a)
+            // This ensures reflections "replace" diffuse rather than just adding on top
+            // Shadow baked in sunDiffuse — RELAX uses hitT mixing for edge preservation
+            nrdDiffuseSignal = (sunDiffuse + ambient + indirectGI + translucency) * reflEnergyFactor;
+            // Direct specular → NRD specular channel.
+            // NRD RELAX blurs specular proportional to roughness. For rough materials
+            // (road, walls, track objects) this spreads the Blinn-Phong highlight over a
+            // huge area, making surfaces look wet. Scale by inverse roughness² so that
+            // only glossy materials (car paint, glass) keep full specular in the NRD channel.
+            {
+                float specNrdScale = 1.0 - firstHitRoughness * firstHitRoughness;
+                nrdSpecularSignal += specular * specNrdScale;
+            }
+
+            // Atmospheric haze in NRD signals (same Koschmieder model)
+            {
+                float dist = abs(viewZ);
+                float visibility_m = max(cam.skyLight.w, 1000.0);
+                float beta = 3.912 / visibility_m;
+                float hazeFactor = 1.0 - exp(-dist * beta);
+                vec3 skyHorizon = cam.ambientLight.rgb * 0.6 + cam.skyLight.rgb * 0.3 + vec3(0.1);
+                skyHorizon = mix(skyHorizon, vec3(dot(skyHorizon, vec3(0.33))), 0.3);
+                nrdDiffuseSignal *= (1.0 - hazeFactor);
+                nrdSpecularSignal = nrdSpecularSignal * (1.0 - hazeFactor) + skyHorizon * hazeFactor;
+            }
+
+            // Pre-NRD firefly clamping — clamp outlier luminance before denoiser sees it
+            // NRD docs: "the denoiser is not a replacement for firefly clamping"
+            {
+                const float maxLum = 5.0;  // aggressive cap — reduces GI variance for faster NRD convergence
+                float diffLum = dot(nrdDiffuseSignal, vec3(0.2126, 0.7152, 0.0722));
+                if (diffLum > maxLum)
+                    nrdDiffuseSignal *= maxLum / diffLum;
+                float specLum = dot(nrdSpecularSignal, vec3(0.2126, 0.7152, 0.0722));
+                if (specLum > maxLum)
+                    nrdSpecularSignal *= maxLum / specLum;
+            }
+
+            nrdAlbedo = albedo;
+            // Foliage: store stable (0,1,0) for NRD temporal accumulation (avoids bubble artifact)
+            // while keeping normal-mapped normals for lighting (visible detail).
+            nrdNormal = isFoliage ? vec3(0.0, 1.0, 0.0) : shadingNormal;
+            nrdRoughness = firstHitRoughness;
+            nrdViewZ = viewZ;
+
+            // RELAX hitDist: diffuse=0 (RTXPT approach), specular=raw reflection distance
+            // hitT mixing is for REBLUR only — RELAX uses hitDist only in prepass + specular tracking
+            // Diffuse hitDist=0 is standard for RELAX (confirmed by RTXPT reference)
+
+            // ========================================
+            // Glass transparency — trace pass-through ray
+            // ========================================
+            // Only blend-transparent glass materials (blendMode > 0) get pass-through.
+            // Opaque glass (e.g. "Glass") stays opaque — only gets reflections.
+            if (isGlassLike && isBlendTransparent) {
+                float glassOpacity = diffuseAlpha;  // texture alpha = glass opacity
+
+                // Trace continuation ray through glass
+                vec3 passOrigin = hitPos - shadingNormal * 0.02;  // offset behind glass surface
+                rayQueryEXT passQuery;
+                rayQueryInitializeEXT(passQuery, topLevelAS,
+                    gl_RayFlagsCullBackFacingTrianglesEXT, 0xFF,
+                    passOrigin, 0.01, rayDir, 500.0);
+                while (rayQueryProceedEXT(passQuery)) {
+                    if (rayQueryGetIntersectionTypeEXT(passQuery, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                        if (alphaTestCandidate(passQuery))
+                            rayQueryConfirmIntersectionEXT(passQuery);
+                    }
+                }
+
+                vec3 behindColor;
+                vec3 behindAlbedo = vec3(0.5);
+
+                if (rayQueryGetIntersectionTypeEXT(passQuery, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+                    // Sky behind glass
+                    float skyT = clamp(rayDir.y, 0.0, 1.0);
+                    behindColor = mix(vec3(0.7, 0.75, 0.85), vec3(0.25, 0.45, 0.9), pow(skyT, 0.4));
+                    float sunDotBehind = max(dot(rayDir, sunDir), 0.0);
+                    behindColor += vec3(1.0, 0.95, 0.8) * pow(sunDotBehind, 512.0) * 5.0;
+                    behindAlbedo = vec3(1.0);
+                } else {
+                    // Geometry behind glass — simplified shading (same as GI bounce)
+                    float tBehind = rayQueryGetIntersectionTEXT(passQuery, true);
+                    vec3 behindHitPos = passOrigin + rayDir * tBehind;
+                    uint behindCi = rayQueryGetIntersectionInstanceCustomIndexEXT(passQuery, true) & 0xFFFFFu;
+                    int behindPi = rayQueryGetIntersectionPrimitiveIndexEXT(passQuery, true);
+                    vec2 behindBary = rayQueryGetIntersectionBarycentricsEXT(passQuery, true);
+
+                    vec3 behindNormal = vec3(0, 1, 0);
+                    GeometryMetadata behindMeta = geometryMetadata.geometries[behindCi];
+
+                    // Interpolate behind-hit normal
+                    if (behindMeta.normalBufferAddress != 0 && behindMeta.indexBufferAddress != 0) {
+                        Indices bhIdxBuf = Indices(behindMeta.indexBufferAddress);
+                        uint bhi0 = bhIdxBuf.i[behindPi * 3];
+                        uint bhi1 = bhIdxBuf.i[behindPi * 3 + 1];
+                        uint bhi2 = bhIdxBuf.i[behindPi * 3 + 2];
+                        float bhw0 = 1.0 - behindBary.x - behindBary.y;
+                        Normals bhNBuf = Normals(behindMeta.normalBufferAddress);
+                        vec3 bhn0 = vec3(bhNBuf.n[bhi0*3], bhNBuf.n[bhi0*3+1], bhNBuf.n[bhi0*3+2]);
+                        vec3 bhn1 = vec3(bhNBuf.n[bhi1*3], bhNBuf.n[bhi1*3+1], bhNBuf.n[bhi1*3+2]);
+                        vec3 bhn2 = vec3(bhNBuf.n[bhi2*3], bhNBuf.n[bhi2*3+1], bhNBuf.n[bhi2*3+2]);
+                        behindNormal = normalize(bhn0 * bhw0 + bhn1 * behindBary.x + bhn2 * behindBary.y);
+                    }
+
+                    // Get behind-hit material albedo
+                    if (behindMeta.primMaterialBufferAddress != 0) {
+                        PrimMaterials bhpm = PrimMaterials(behindMeta.primMaterialBufferAddress);
+                        uint bhmid = bhpm.m[behindPi];
+                        if (bhmid != 0xFFFFFFFFu) {
+                            Material bhmat = materialBuffer.materials[bhmid];
+                            if (bhmat.diffuseTexIndex != 0xFFFFFFFFu && behindMeta.uvBufferAddress != 0 && behindMeta.indexBufferAddress != 0) {
+                                Indices bhIdxBuf2 = Indices(behindMeta.indexBufferAddress);
+                                uint bhi0b = bhIdxBuf2.i[behindPi * 3];
+                                uint bhi1b = bhIdxBuf2.i[behindPi * 3 + 1];
+                                uint bhi2b = bhIdxBuf2.i[behindPi * 3 + 2];
+                                float bhw0b = 1.0 - behindBary.x - behindBary.y;
+                                UVs bhUvBuf = UVs(behindMeta.uvBufferAddress);
+                                vec2 bhUV = vec2(bhUvBuf.uv[bhi0b*2], bhUvBuf.uv[bhi0b*2+1]) * bhw0b +
+                                            vec2(bhUvBuf.uv[bhi1b*2], bhUvBuf.uv[bhi1b*2+1]) * behindBary.x +
+                                            vec2(bhUvBuf.uv[bhi2b*2], bhUvBuf.uv[bhi2b*2+1]) * behindBary.y;
+                                behindAlbedo = textureLod(textures[nonuniformEXT(bhmat.diffuseTexIndex)], bhUV, 4.0).rgb;
+                            } else {
+                                behindAlbedo = vec3(bhmat.ksDiffuse);
+                            }
+                        }
+                    }
+
+                    // Direct lighting with shadow ray (no SHaRC — 0.5m grid creates visible checkerboard through glass)
+                    {
+                        float behindNdotL = max(dot(behindNormal, sunDir), 0.0);
+                        float behindShadow = 0.0;
+                        if (behindNdotL > 0.0) {
+                            vec3 behindShadowOrigin = behindHitPos + behindNormal * 0.01;
+                            rayQueryEXT behindShadowQuery;
+                            rayQueryInitializeEXT(behindShadowQuery, topLevelAS,
+                                gl_RayFlagsNoneEXT, 0xFF,
+                                behindShadowOrigin, 0.0, sunDir, 300.0);
+                            while (rayQueryProceedEXT(behindShadowQuery)) {
+                                if (rayQueryGetIntersectionTypeEXT(behindShadowQuery, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                                    if (shadowTestCandidate(behindShadowQuery, vec2(0.0)))
+                                        rayQueryConfirmIntersectionEXT(behindShadowQuery);
+                                }
+                            }
+                            if (rayQueryGetIntersectionTypeEXT(behindShadowQuery, true) == gl_RayQueryCommittedIntersectionNoneEXT)
+                                behindShadow = 1.0;
+                        }
+                        behindColor = behindAlbedo * sunColor * behindNdotL * behindShadow;
+                        behindColor += behindAlbedo * calculateAmbient(behindNormal, 0.8, ambientColor, ambientIntensity);
+                        behindColor += behindAlbedo * skyHemisphereIrradiance(behindNormal) * ptSkyBounceInt;
+                    }
+                }
+
+                // Glass tint: transparent glass still tints light passing through
+                vec3 glassTint = mix(vec3(1.0), albedo, glassOpacity);
+
+                // Blend: diffuse signal = behind-glass scene (tinted), specular = glass reflections (untouched)
+                nrdDiffuseSignal = mix(behindColor, nrdDiffuseSignal, glassOpacity);
+                nrdAlbedo = mix(behindAlbedo * glassTint, nrdAlbedo, glassOpacity);
+                color = mix(behindColor * glassTint, color, glassOpacity);
+            }
+
+
+        }
+
+    } else {
+        // Procedural sky
+        float sunDot = max(dot(rayDir, sunDir), 0.0);
+
+        // Atmospheric haze color — same formula as geometry fog for continuity
+        vec3 fogColor = ambientColor * 0.6 + sunTint * 0.3 + vec3(0.1);
+        fogColor = mix(fogColor, vec3(dot(fogColor, vec3(0.33))), 0.3); // desaturate
+
+        if (rayDir.y > 0.0) {
+            // Above horizon: sky gradient from UBO ambient color
+            float skyT = clamp(rayDir.y, 0.0, 1.0);
+            vec3 horizon = ambientColor * 0.8 + sunTint * 0.15;
+            vec3 zenith  = ambientColor * 1.8;
+            vec3 skyColor = mix(horizon, zenith, pow(skyT, 0.4));
+
+            // Sun disk + glow (tinted by sun color)
+            skyColor += sunTint * pow(sunDot, 512.0) * 5.0;
+            skyColor += sunTint * pow(sunDot, 16.0) * 0.4;
+            skyColor += sunTint * 0.7 * pow(sunDot, 4.0) * 0.1;
+
+            // Atmospheric haze near horizon — matches scene fog so clouds blend naturally
+            float hazeT = 1.0 - smoothstep(0.0, 0.25, rayDir.y);
+            skyColor = mix(skyColor, fogColor, hazeT * 0.8);
+
+            color = skyColor;
+        } else {
+            // Below horizon: ground blending to fog color at horizon
+            float groundT = clamp(-rayDir.y * 5.0, 0.0, 1.0);
+            vec3 groundColor = mix(fogColor, ambientColor * 0.15, groundT);
+            color = groundColor;
+        }
+
+        // Sky miss: penumbra = fully lit (no occluder)
+        imageStore(penumbraImg, ivec2(gl_LaunchIDEXT.xy), vec4(65504.0, 0, 0, 0));
+    }
+
+    // ========================================
+    // NRD G-buffer writes
+    // ========================================
+    {
+        ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+
+        if (hitGeometry) {
+            // Motion vectors in NRD UV space (y=0 at top, matching Vulkan framebuffer)
+            // NRD doc: "pixelUvPrev = pixelUv + mv.xy" where pixelUv is in [0,1]
+            // So MV = prevUV - currUV in NRD's convention
+            vec3 surfaceWorldPos = rayOrigin + rayDir * nrdSurfaceDist;
+
+            // Both currUV and prevUV are computed via projection of surfaceWorldPos.
+            // This ensures MV encodes ONLY camera motion, not jitter-induced surface variation.
+            // (projInverse is jittered for ray diversity, but proj/projPrev are unjittered.)
+            vec4 currClip = cam.proj * cam.view * vec4(surfaceWorldPos, 1.0);
+            vec2 currNDC = currClip.xy / currClip.w;
+            vec2 currUV = vec2(currNDC.x * 0.5 + 0.5, 0.5 - currNDC.y * 0.5);
+
+            vec4 prevClip = cam.projPrev * cam.viewPrev * vec4(surfaceWorldPos, 1.0);
+            vec2 prevNDC = prevClip.xy / prevClip.w;
+            vec2 prevUV = vec2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
+
+            vec2 motionVector = prevUV - currUV;
+
+            // 2.5D: viewZ delta for depth-aware reprojection
+            // NRD uses abs(viewZ) internally. Our RH viewZ is negative.
+            // motionVectorScale.z = -1 converts: stored * (-1) gives correct positive delta
+            float viewZprev = (cam.viewPrev * vec4(surfaceWorldPos, 1.0)).z;
+            float mvZ = viewZprev - nrdViewZ;
+
+            // RELAX packing: raw hitDist (NOT REBLUR-normalized)
+            // Diffuse hitDist = 0 (RTXPT standard for RELAX — hitDist only used in prepass + specular tracking)
+            // Specular hitDist = raw reflection distance (for specular tracking)
+            float rawSpecHitDist = specHitDist > 0.0 ? specHitDist : 0.0;
+
+            imageStore(normalRoughnessImg, pixel, NRD_PackNormalRoughness(nrdNormal, nrdRoughness));
+            imageStore(viewDepthImg, pixel, vec4(nrdViewZ, 0, 0, 0));
+            imageStore(motionVectorsImg, pixel, vec4(motionVector, mvZ, 0));
+            imageStore(diffuseRadianceImg, pixel, NRD_PackRadiance(nrdDiffuseSignal, 0.0));
+            imageStore(specularRadianceImg, pixel, NRD_PackRadiance(nrdSpecularSignal, rawSpecHitDist));
+            imageStore(albedoBufferImg, pixel, vec4(nrdAlbedo, sunFraction));
+
+            // DLSS NDC depth: convert linear viewZ to non-linear [0,1] depth
+            // Full matrix multiply handles any projection convention (D3D11 LH or Vulkan RH)
+            vec4 clipPos = cam.proj * vec4(0.0, 0.0, nrdViewZ, 1.0);
+            float ndcZ = clamp(clipPos.z / clipPos.w, 0.0, 1.0);
+            imageStore(dlssDepthImg, pixel, vec4(ndcZ, 0, 0, 0));
+        } else {
+            // Sky miss — write defaults so NRD ignores these pixels
+            // viewZ far beyond denoisingRange (10000) ensures NRD skips them
+            imageStore(normalRoughnessImg, pixel, NRD_PackNormalRoughness(vec3(0, 0, 1), 1.0));
+            imageStore(viewDepthImg, pixel, vec4(1e7, 0, 0, 0));
+            imageStore(motionVectorsImg, pixel, vec4(0, 0, 0, 0));
+            imageStore(diffuseRadianceImg, pixel, vec4(0, 0, 0, 0));
+            imageStore(specularRadianceImg, pixel, vec4(0, 0, 0, 0));
+            imageStore(albedoBufferImg, pixel, vec4(0, 0, 0, 0));
+            imageStore(dlssDepthImg, pixel, vec4(1.0, 0, 0, 0));  // far plane for sky
+        }
+    }
+
+    // Tonemap + gamma (skipped when DLSS HDR — post-DLSS tonemap pass handles it)
+    if (!hdrOutput) {
+        color *= ptExposure;
+        color = applyTonemap(color, ptTonemapMode);
+        float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        color = mix(vec3(luma), color, ptSaturation);
+        if (ptContrast > 0.01) {
+            vec3 curved = color * color * (3.0 - 2.0 * color);
+            color = mix(color, curved, ptContrast);
+        }
+        color = clamp(color, 0.0, 1.0);
+        color = pow(color, vec3(1.0/2.2));
+    }
+    // else: write raw linear HDR (no exposure, no tonemap, no gamma)
+
+    imageStore(image, ivec2(gl_LaunchIDEXT.xy), vec4(color, 1.0));
+}

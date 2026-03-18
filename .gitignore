@@ -1,0 +1,46 @@
+# ============================================================
+# ignis-rt .gitignore
+# ============================================================
+
+# --- Local configuration (copy from .example files) ---
+CMakeUserPresets.json
+deploy.config
+
+# --- CMake build directory ---
+build/
+
+# --- Compiled SPIR-V shaders (rebuilt from source) ---
+shaders/*.spv
+shaders/fsr3/compiled/*.spv
+
+# --- Deployed binaries in Blender addon ---
+blender/ignis_rt/lib/ignis_rt.dll
+blender/ignis_rt/lib/NRD.dll
+blender/ignis_rt/lib/nvngx_dlss.dll
+blender/ignis_rt/lib/nrd_composite.spv
+
+# --- Python bytecode ---
+__pycache__/
+*.pyc
+*.pyo
+
+# --- IDE / editor ---
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sdf
+*.opensdf
+
+# --- Test artifacts ---
+test_output.bmp
+
+# --- OS junk ---
+Thumbs.db
+Desktop.ini
+.DS_Store
+nul
+
+# --- Claude Code local config ---
+.claude/

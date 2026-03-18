@@ -1,0 +1,13 @@
+# deploy.config — Machine-specific settings for deploy_blender.ps1
+# Copy this file to deploy.config and adjust paths to match your setup.
+#
+# Usage:  .\deploy_blender.ps1 reads these values automatically.
+
+# Blender version to deploy to (leave empty to auto-detect latest)
+BLENDER_VER=
+
+# Path to NRD SDK (leave empty to skip)
+IGNIS_NRD_ROOT=C:/path/to/NRD
+
+# Path to NGX SDK (leave empty to skip)
+IGNIS_NGX_ROOT=C:/path/to/NGX_SDK

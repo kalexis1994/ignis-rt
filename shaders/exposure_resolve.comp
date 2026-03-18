@@ -1,0 +1,39 @@
+#version 460
+
+// Exposure Resolve — 1x1x1 dispatch
+// Reads accumulated log-luminance from composite shader,
+// computes EMA-smoothed exposure, resets accumulators for next frame.
+
+layout(local_size_x = 1) in;
+
+layout(binding = 0, std430) buffer ExposureBuffer {
+    uint luminanceSum;
+    uint pixelCount;
+    float currentExposure;
+} exposure;
+
+layout(push_constant) uniform Params {
+    float keyValue;      // target mid-gray (0.18)
+    float adaptSpeed;    // EMA speed per frame (already dt-scaled by CPU)
+    float minExposure;   // clamp low
+    float maxExposure;   // clamp high
+} push;
+
+void main() {
+    if (exposure.pixelCount == 0u) return;  // no geometry pixels this frame
+
+    // Decode average log2-luminance from fixed-point accumulator
+    float avgLogLum = float(exposure.luminanceSum) / (16.0 * float(exposure.pixelCount)) - 20.0;
+    float avgLum = exp2(avgLogLum);
+
+    // Target exposure: key / avgLuminance (classic Reinhard auto-exposure)
+    float targetExposure = push.keyValue / max(avgLum, 0.001);
+    targetExposure = clamp(targetExposure, push.minExposure, push.maxExposure);
+
+    // EMA temporal smoothing
+    exposure.currentExposure = mix(exposure.currentExposure, targetExposure, push.adaptSpeed);
+
+    // Reset accumulators for next frame
+    exposure.luminanceSum = 0u;
+    exposure.pixelCount = 0u;
+}
