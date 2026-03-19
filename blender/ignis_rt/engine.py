@@ -419,12 +419,16 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             props = bpy.context.scene.ignis_rt
             if props.dlss_enabled:
                 dll_wrapper.set_int("dlss_enabled", 1)
-                dll_wrapper.set_int("dlss_quality", int(props.dlss_quality))
-                if props.dlss_rr_enabled:
+                quality = int(props.dlss_quality)
+                dll_wrapper.set_int("dlss_quality", quality)
+                # RR works best with upscaling — at DLAA (native res) fall back to NRD
+                if props.dlss_rr_enabled and quality < 4:
                     dll_wrapper.set_int("dlss_rr_enabled", 1)
-                    _log(f" DLSS enabled, quality={props.dlss_quality}, Ray Reconstruction=ON")
+                    _log(f" DLSS {props.dlss_quality} + Ray Reconstruction")
+                elif props.dlss_rr_enabled and quality == 4:
+                    _log(f" DLSS DLAA + NRD (RR needs upscaling, falling back to NRD)")
                 else:
-                    _log(f" DLSS enabled, quality={props.dlss_quality}")
+                    _log(f" DLSS {props.dlss_quality} + NRD")
             if props.use_wavefront:
                 dll_wrapper.set_int("use_wavefront", 1)
                 _log(f" Wavefront path tracing enabled")
