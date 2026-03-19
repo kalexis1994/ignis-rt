@@ -1032,10 +1032,8 @@ void Renderer::RenderFrameRT() {
         return;
     }
 
-    // Wait for the OTHER frame's fence to ensure its readback buffer is complete.
-    // This is cheaper than vkQueueWaitIdle because it only blocks on 1 specific frame.
-    uint32_t otherFrame = (currentFrame_ + 1) % MAX_FRAMES_IN_FLIGHT;
-    vkWaitForFences(device, 1, &inFlightFences_[otherFrame], VK_TRUE, UINT64_MAX);
+    // Wait for GPU completion before readback
+    vkQueueWaitIdle(context_->GetGraphicsQueue());
 
     // After rendering, current transforms become previous for the next frame.
     // Without this, prevTransforms would stay stale after an object stops
