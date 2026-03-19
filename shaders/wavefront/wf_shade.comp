@@ -93,6 +93,11 @@ layout(binding = 4, set = 0, scalar) buffer MaterialBuffer {
 
 layout(binding = 5, set = 0) uniform sampler2D textures[];
 
+// Emissive triangles for MIS (16 floats per triangle)
+layout(binding = 26, set = 0, std430) buffer EmissiveTriBuf {
+    vec4 data[];
+} emissiveTris;
+
 // Per-instance previous-frame transforms
 layout(binding = 28, set = 0, std430) buffer PrevTransformBuf {
     vec4 data[];
@@ -131,6 +136,7 @@ layout(push_constant) uniform PushConst {
 #include "../include/pbr_brdf.glsl"
 #include "../include/sampling.glsl"
 #include "../include/nrd_encode.glsl"
+#include "../include/emissive_sampling.glsl"
 
 // Thread-safe float accumulation via uint CAS
 void atomicAddFloat(uint index, float value) {
@@ -431,6 +437,42 @@ void main() {
 
             appendShadowRay(worldPos + N * 0.002, L, dist - 0.004, idx, contrib,
                             isDiffusePath ? 0u : 1u);
+        }
+    }
+
+    // ---- NEE: Emissive triangle lights with MIS (bounce 0-1 only) ----
+    uint emissiveTriCount = cam.lightPad0;
+    if (!skipLocalNEE && emissiveTriCount > 0u) {
+        EmissiveSample eSample = sampleEmissiveTriangle(emissiveTriCount, rand01(), rand2());
+        if (eSample.pdf > 0.0) {
+            vec3 toEmissive = eSample.position - worldPos;
+            float eDist = length(toEmissive);
+            vec3 eDir = toEmissive / eDist;
+            float eNdotL = dot(N, eDir);
+            float eCosTheta = dot(-eDir, eSample.normal);
+
+            if (eNdotL > 0.0 && eCosTheta > 0.0 && eDist > 0.01) {
+                // BRDF evaluation
+                vec3 V = -rayDir;
+                vec3 eDiffC, eSpecC;
+                evaluateCookTorrance(N, V, eDir, baseColor, roughness, metallic, specularLevel, ior,
+                                     eDiffC, eSpecC);
+
+                // Geometric term
+                vec3 eRadiance = eSample.emission * eCosTheta / (eDist * eDist);
+
+                // MIS weight: power heuristic (lightPdf² / (lightPdf² + bsdfPdf²))
+                float bsdfPdf = eNdotL / PI;
+                float lightPdf = eSample.pdf * eDist * eDist / eCosTheta;
+                float misWeight = (lightPdf * lightPdf) / (lightPdf * lightPdf + bsdfPdf * bsdfPdf + 1e-8);
+
+                vec3 eContrib = (eDiffC + eSpecC) * eRadiance * misWeight / eSample.pdf * throughput;
+                if (bounce > 0u) eContrib *= cam.ptParams0.y;
+
+                // Shadow ray to emissive surface
+                appendShadowRay(worldPos + N * 0.002, eDir, eDist - 0.01, idx, eContrib,
+                                isDiffusePath ? 0u : 1u);
+            }
         }
     }
 
