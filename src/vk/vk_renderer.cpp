@@ -1011,7 +1011,7 @@ void Renderer::RenderFrameRT() {
 
     // 5. Readback
     if (!useDirectInterop_) {
-        interop_->RecordReadbackCopy(cmd);
+        interop_->RecordReadbackCopy(cmd, inFlightFences_[currentFrame_]);
     } else {
         interop_->TransitionForExternalRead(cmd);
     }
@@ -1032,8 +1032,7 @@ void Renderer::RenderFrameRT() {
         return;
     }
 
-    // Wait for GPU completion before readback
-    vkQueueWaitIdle(context_->GetGraphicsQueue());
+    // No WaitIdle — double-buffered readback with per-buffer fence sync
 
     // After rendering, current transforms become previous for the next frame.
     // Without this, prevTransforms would stay stale after an object stops
@@ -1058,7 +1057,8 @@ HANDLE Renderer::GetInteropNTHandle() const {
 bool Renderer::ReadbackPixels(void* outData, uint32_t bufferSize) {
     // Fast path: readback was already recorded in RenderFrameRT command buffer
     // After vkQueueWaitIdle, just copy from persistent mapped memory
-    return interop_ ? interop_->CopyReadbackResult(outData, bufferSize) : false;
+    VkDevice device = context_ ? context_->GetDevice() : VK_NULL_HANDLE;
+    return interop_ ? interop_->CopyReadbackResult(outData, bufferSize, device) : false;
 }
 
 bool Renderer::ImportD3D11Texture(HANDLE ntHandle, uint32_t width, uint32_t height) {

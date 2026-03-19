@@ -42,10 +42,11 @@ public:
     bool ReadbackPixels(void* outData, uint32_t bufferSize);
 
     // Record image→buffer copy into an existing command buffer (no separate submit)
-    void RecordReadbackCopy(VkCommandBuffer cmd);
+    // submitFence = the fence that will be signaled when this command buffer completes
+    void RecordReadbackCopy(VkCommandBuffer cmd, VkFence submitFence = VK_NULL_HANDLE);
 
-    // After queue submit + fence wait, copy from persistent mapped buffer to outData
-    bool CopyReadbackResult(void* outData, uint32_t bufferSize);
+    // Copy from completed readback buffer to outData (waits on fence if needed)
+    bool CopyReadbackResult(void* outData, uint32_t bufferSize, VkDevice device = VK_NULL_HANDLE);
 
     uint32_t GetWidth() const { return width_; }
     uint32_t GetHeight() const { return height_; }
@@ -63,11 +64,12 @@ private:
     HANDLE ntHandle_ = nullptr;
 
     // Double-buffered readback staging (persistent mapped)
-    // Write to readbackCurrent_, read from readbackCurrent_^1
     VkBuffer readbackBuffer_[2] = {};
     VkDeviceMemory readbackMemory_[2] = {};
     void* readbackMapped_[2] = {};
-    uint32_t readbackCurrent_ = 0;  // index of buffer being written this frame
+    VkFence readbackFence_[2] = {};   // fence protecting each buffer's GPU copy
+    uint32_t readbackWriteIdx_ = 0;   // index being written THIS frame
+    bool readbackFirstFrame_ = true;  // skip read on first frame
 
     PFN_vkGetMemoryWin32HandleKHR vkGetMemoryWin32HandleKHR_ = nullptr;
 

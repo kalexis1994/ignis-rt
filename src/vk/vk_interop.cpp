@@ -296,7 +296,7 @@ bool Interop::EnsureReadbackBuffer() {
     return true;
 }
 
-void Interop::RecordReadbackCopy(VkCommandBuffer cmd) {
+void Interop::RecordReadbackCopy(VkCommandBuffer cmd, VkFence submitFence) {
     if (!EnsureReadbackBuffer()) return;
 
     VkImageMemoryBarrier barrier{};
@@ -322,9 +322,8 @@ void Interop::RecordReadbackCopy(VkCommandBuffer cmd) {
     region.imageSubresource.layerCount = 1;
     region.imageExtent = {width_, height_, 1};
 
-    // Write to current buffer (read from previous)
     vkCmdCopyImageToBuffer(cmd, sharedImage_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                            readbackBuffer_[readbackCurrent_], 1, &region);
+                            readbackBuffer_[readbackWriteIdx_], 1, &region);
 
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -336,19 +335,29 @@ void Interop::RecordReadbackCopy(VkCommandBuffer cmd) {
         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 0, nullptr, 0, nullptr, 1, &barrier);
 
+    // Track which fence protects this buffer
+    readbackFence_[readbackWriteIdx_] = submitFence;
+
     // Swap for next frame
-    readbackCurrent_ = 1 - readbackCurrent_;
+    readbackWriteIdx_ = 1 - readbackWriteIdx_;
+    readbackFirstFrame_ = false;
 }
 
-bool Interop::CopyReadbackResult(void* outData, uint32_t bufferSize) {
-    // After RecordReadbackCopy: readbackCurrent_ = NEXT write target (swapped).
-    // The buffer just written THIS frame is at (1 - readbackCurrent_) → might not be complete.
-    // The buffer from the PREVIOUS frame is at readbackCurrent_ → guaranteed complete by fence.
-    uint32_t safeIdx = readbackCurrent_;
-    if (!readbackMapped_[safeIdx] || !outData) return false;
+bool Interop::CopyReadbackResult(void* outData, uint32_t bufferSize, VkDevice device) {
+    if (readbackFirstFrame_ || !outData) return false;
+
+    // Read from the buffer NOT being written (previous frame's data)
+    uint32_t readIdx = readbackWriteIdx_;  // after swap, this is the next write target = previous read
+    if (!readbackMapped_[readIdx]) return false;
+
+    // Wait for the fence that protects this buffer's GPU copy
+    if (device != VK_NULL_HANDLE && readbackFence_[readIdx] != VK_NULL_HANDLE) {
+        vkWaitForFences(device, 1, &readbackFence_[readIdx], VK_TRUE, UINT64_MAX);
+    }
+
     uint32_t imageSize = width_ * height_ * 4;
     if (bufferSize < imageSize) return false;
-    memcpy(outData, readbackMapped_[safeIdx], imageSize);
+    memcpy(outData, readbackMapped_[readIdx], imageSize);
     return true;
 }
 
