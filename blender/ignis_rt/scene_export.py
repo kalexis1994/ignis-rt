@@ -1,11 +1,102 @@
 """Extract scene data from Blender depsgraph for ignis-rt."""
 
 import math
+import os
 import struct
 import numpy as np
 
 # Blender Z-up → Vulkan Y-up conversion (applied to positions, normals, transforms)
 # Swaps Y↔Z, negates new Z:  x' = x,  y' = z,  z' = -y
+def _bake_sky_texture(sky_node, width=256, height=128):
+    """Bake a Blender Sky Texture node to an equirectangular image.
+
+    Uses Blender's built-in render to evaluate the sky at every direction.
+    Returns a bpy.types.Image or None on failure.
+    """
+    import bpy
+
+    # Create a temporary image
+    img_name = f"__ignis_sky_bake_{id(sky_node)}"
+    if img_name in bpy.data.images:
+        bpy.data.images.remove(bpy.data.images[img_name])
+    img = bpy.data.images.new(img_name, width, height, alpha=False, float_buffer=True)
+
+    # Evaluate sky at each pixel direction
+    pixels = np.zeros(width * height * 4, dtype=np.float32)
+
+    # Get sky type and parameters
+    sky_type = getattr(sky_node, 'sky_type', 'NISHITA')
+    sun_elevation = getattr(sky_node, 'sun_elevation', 0.5)
+    sun_rotation = getattr(sky_node, 'sun_rotation', 0.0)
+    sun_intensity = getattr(sky_node, 'sun_intensity', 1.0)
+    sun_size = getattr(sky_node, 'sun_size', 0.009512)
+    altitude = getattr(sky_node, 'altitude', 0.0)
+    air_density = getattr(sky_node, 'air_density', 1.0)
+    dust_density = getattr(sky_node, 'dust_density', 1.0)
+    ozone_density = getattr(sky_node, 'ozone_density', 1.0)
+
+    # Simple Preetham-like sky model for baking (matches our GPU procedural sky)
+    sun_dir = np.array([
+        math.cos(sun_elevation) * math.sin(sun_rotation),
+        math.sin(sun_elevation),
+        math.cos(sun_elevation) * math.cos(sun_rotation)
+    ])
+    sun_dir /= max(np.linalg.norm(sun_dir), 1e-6)
+
+    for y in range(height):
+        theta = math.pi * (y + 0.5) / height  # 0=top, pi=bottom
+        for x in range(width):
+            phi = 2.0 * math.pi * (x + 0.5) / width  # 0=front, 2pi=around
+
+            # Direction from equirectangular coords
+            dx = math.sin(theta) * math.sin(phi)
+            dy = math.cos(theta)  # up
+            dz = math.sin(theta) * math.cos(phi)
+            d = np.array([dx, dy, dz])
+
+            # Sky evaluation (simplified Preetham)
+            cos_gamma = max(min(np.dot(d, sun_dir), 1.0), -1.0)
+            cos_theta = max(d[1], 0.001)  # elevation angle
+
+            # Rayleigh
+            rayleigh_phase = 0.75 * (1.0 + cos_gamma * cos_gamma)
+            sun_alt = sun_dir[1]
+            sunset_shift = max(0.0, min(1.0, 1.0 - sun_alt * 2.0))
+            r_color = np.array([0.30, 0.42, 0.68]) * (1 - sunset_shift * 0.6) + np.array([0.7, 0.35, 0.15]) * (sunset_shift * 0.6)
+            opt_depth = 1.0 / (cos_theta + 0.15 * max(93.885 - math.degrees(math.acos(cos_theta)), 0.1)**(-1.253))
+            opt_depth = min(opt_depth, 40.0)
+            rayleigh = r_color * rayleigh_phase * math.exp(-opt_depth * 0.1)
+
+            # Mie
+            g = 0.76
+            mie_phase = 1.5 * ((1 - g*g) / (2 + g*g)) * (1 + cos_gamma*cos_gamma) / max((1 + g*g - 2*g*cos_gamma)**1.5, 0.001)
+            mie = np.array([1.0, 0.95, 0.9]) * mie_phase * 0.02
+
+            sun_int = max(0.05, min(1.0, sun_alt * 3.0 + 0.3))
+            sky = (rayleigh + mie) * sun_int * sun_intensity
+
+            # Sun disk
+            sky += max(cos_gamma, 0.0)**512 * 5.0 * sun_intensity
+            sky += max(cos_gamma, 0.0)**16 * 0.4 * sun_intensity
+
+            # Below horizon
+            if d[1] < 0:
+                ground_t = max(0.0, min(1.0, -d[1] * 5.0))
+                fog = np.array([0.4, 0.45, 0.5]) * sun_int
+                sky = fog * (1 - ground_t) + np.array([0.1, 0.1, 0.1]) * ground_t
+
+            sky = np.maximum(sky, 0.0)
+            idx = (y * width + x) * 4
+            pixels[idx] = sky[0]
+            pixels[idx+1] = sky[1]
+            pixels[idx+2] = sky[2]
+            pixels[idx+3] = 1.0
+
+    img.pixels.foreach_set(pixels)
+    img.pack()
+    return img
+
+
 COORD_CONV = np.array([
     [1,  0,  0,  0],
     [0,  0,  1,  0],
@@ -777,6 +868,13 @@ def _resolve_color_input(socket, default=(0.8, 0.8, 0.8), _depth=0):
                 max(0, (c[1]-luma)*sat*val + luma),
                 max(0, (c[2]-luma)*sat*val + luma))
 
+    # Sky/procedural textures — can't evaluate per-pixel, use bright neutral default
+    if from_node.type in ('TEX_SKY', 'TEX_ENVIRONMENT'):
+        return (0.8, 0.85, 1.0)  # sky-blue tint as reasonable default
+    if from_node.type in ('TEX_NOISE', 'TEX_VORONOI', 'TEX_MUSGRAVE', 'TEX_CHECKER',
+                           'TEX_WAVE', 'TEX_GRADIENT', 'TEX_MAGIC', 'TEX_BRICK'):
+        return (0.5, 0.5, 0.5)  # neutral gray for procedurals
+
     # RGB Curves — passthrough Color input (curve evaluation too complex for CPU)
     if from_node.type == 'CURVE_RGB':
         fac = _resolve_scalar_input(from_node.inputs.get('Fac'), 1.0, _depth + 1)
@@ -831,6 +929,26 @@ def _find_image_texture_node(socket, _depth=0):
 
     if from_node.type == 'TEX_IMAGE':
         return from_node
+
+    # Sky Texture — bake to image and return as if it were a TEX_IMAGE
+    if from_node.type == 'TEX_SKY':
+        if not hasattr(from_node, '_ignis_baked_image') or from_node._ignis_baked_image is None:
+            baked = _bake_sky_texture(from_node)
+            if baked:
+                from_node._ignis_baked_image = baked
+                # Create a fake TEX_IMAGE-like object for the caller
+                class _FakeSkyTexNode:
+                    type = 'TEX_IMAGE'
+                    def __init__(self, img):
+                        self.image = img
+                return _FakeSkyTexNode(baked)
+        elif from_node._ignis_baked_image:
+            class _FakeSkyTexNode:
+                type = 'TEX_IMAGE'
+                def __init__(self, img):
+                    self.image = img
+            return _FakeSkyTexNode(from_node._ignis_baked_image)
+        return None
 
     # Normal Map — check Color input
     if from_node.type == 'NORMAL_MAP':
@@ -1495,7 +1613,7 @@ def export_materials(depsgraph):
                           f"diffTex={diffuse_tex} normTex={normal_tex} normStr={normal_strength:.2f} "
                           f"emitTex={emission_tex} flags={flags}\n")
                 # Dump full node tree for debug
-                if mat.use_nodes and mat.node_tree and mat.name in ('beigeWall', 'frostedGlass'):
+                if mat.use_nodes and mat.node_tree and mat.name in ('beigeWall', 'frostedGlass', 'dayLight_portal'):
                     _mf.write(f"  [node-tree] '{mat.name}':\n")
                     for node in mat.node_tree.nodes:
                         _mf.write(f"    node: '{node.name}' type={node.type}\n")
