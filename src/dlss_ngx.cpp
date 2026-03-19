@@ -576,6 +576,8 @@ void DLSS_NGX::EvaluateRR(
     float jitterX,
     float jitterY,
     float deltaTime,
+    const float* viewMatrix,
+    const float* projMatrix,
     bool reset
 ) {
 #ifdef ACPT_HAVE_NGX
@@ -641,6 +643,11 @@ void DLSS_NGX::EvaluateRR(
     evalParams.InRenderSubrectDimensions.Height = m_renderHeight;
     evalParams.InPreExposure = 1.0f;
     evalParams.InExposureScale = 1.0f;
+    evalParams.InToneMapperType = NVSDK_NGX_TONEMAPPER_ACES;
+
+    // Pass world-to-view and view-to-clip matrices for better temporal reprojection
+    if (viewMatrix) evalParams.pInWorldToViewMatrix = const_cast<float*>(viewMatrix);
+    if (projMatrix) evalParams.pInViewToClipMatrix = const_cast<float*>(projMatrix);
 
     NVSDK_NGX_Result ngxResult = NGX_VULKAN_EVALUATE_DLSSD_EXT(
         cmdBuf,

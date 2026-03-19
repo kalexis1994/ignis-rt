@@ -57,7 +57,9 @@ void DLSS_NGX::EvaluateRR(VkCommandBuffer cmd,
                             VkImage normals, VkImageView normalsView,
                             VkImage albedo, VkImageView albedoView,
                             float jitterX, float jitterY,
-                            float deltaTime, bool reset) {
+                            float deltaTime,
+                            const float* viewMatrix, const float* projMatrix,
+                            bool reset) {
     // No-op
 }
 

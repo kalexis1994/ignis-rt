@@ -722,6 +722,7 @@ void Renderer::RenderFrameRT() {
             rtPipeline_->GetAlbedoBufferView(),
             jitterX_, jitterY_,
             rrDeltaMs / 1000.0f,
+            lastView_, lastProj_,                            // world-to-view + view-to-clip
             rrReset);
 
         // Barrier: RR writes → tonemap reads

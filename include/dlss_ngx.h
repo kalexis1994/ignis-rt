@@ -90,6 +90,8 @@ public:
         float jitterX,
         float jitterY,
         float deltaTime,                 // Frame time in seconds
+        const float* viewMatrix = nullptr,  // 4x4 world-to-view (column-major)
+        const float* projMatrix = nullptr,  // 4x4 view-to-clip (column-major)
         bool reset = false
     );
 
