@@ -289,6 +289,8 @@ bool Interop::EnsureReadbackBuffer() {
             readbackMapped_[i] = nullptr;
             return false;
         }
+        // Zero-fill so first-frame readback doesn't show garbage
+        memset(readbackMapped_[i], 0, imageSize);
     }
 
     return true;
@@ -339,14 +341,10 @@ void Interop::RecordReadbackCopy(VkCommandBuffer cmd) {
 }
 
 bool Interop::CopyReadbackResult(void* outData, uint32_t bufferSize) {
-    // Read from the buffer that is NOT being written to (previous frame, already complete)
-    uint32_t readIdx = readbackCurrent_;  // after swap, readbackCurrent_ points to the next write buffer
-    // So the just-completed write is at (readbackCurrent_), and the previous completed is at (1 - readbackCurrent_)
-    // Actually: RecordReadbackCopy writes to [old readbackCurrent_], then swaps.
-    // After swap, readbackCurrent_ is the NEW write target. The just-written data is at [1 - readbackCurrent_].
-    // But that data is from the CURRENT frame which might not be complete yet.
-    // The SAFE read is [readbackCurrent_] — the buffer that was written 2 frames ago (definitely complete).
-    uint32_t safeIdx = readbackCurrent_;  // this was the write target LAST frame, completed by fence
+    // After RecordReadbackCopy: readbackCurrent_ = NEXT write target (swapped).
+    // The buffer just written THIS frame is at (1 - readbackCurrent_) → might not be complete.
+    // The buffer from the PREVIOUS frame is at readbackCurrent_ → guaranteed complete by fence.
+    uint32_t safeIdx = readbackCurrent_;
     if (!readbackMapped_[safeIdx] || !outData) return false;
     uint32_t imageSize = width_ * height_ * 4;
     if (bufferSize < imageSize) return false;
