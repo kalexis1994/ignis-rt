@@ -652,6 +652,7 @@ def _pack_gpu_material(
     transmission=0.0,
     flags=0,
     alpha_ref=0.5,
+    transparent_prob=0.0,
 ):
     """Pack one material into 140 bytes matching GPUMaterial."""
     return _GPU_MATERIAL_STRUCT.pack(
@@ -675,8 +676,8 @@ def _pack_gpu_material(
         emission_strength,  # fresnelMaxLevel
         # Multilayer tex indices (6x NO_TEX)
         _NO_TEX, _NO_TEX, _NO_TEX, _NO_TEX, _NO_TEX, _NO_TEX,
-        # multR=transmission, multG=alpha, rest unused
-        transmission, alpha, 1.0, 1.0, 1.0, 1.0, 1.0,
+        # multR=transmission, multG=alpha, multB=transparentProb, rest unused
+        transmission, alpha, transparent_prob, 1.0, 1.0, 1.0, 1.0,
         # sunSpecular, sunSpecularEXP
         0.0, 0.0,
     )
@@ -1151,6 +1152,7 @@ def _extract_shader_props(node, register_image_fn):
         'emission_tex': _NO_TEX,
         'transmission': 0.0,
         'ior': 1.5,
+        'transparent_prob': 0.0,
     }
     if node is None:
         return props
@@ -1199,12 +1201,14 @@ def _extract_shader_props(node, register_image_fn):
             props['ior'] = float(ior_inp.default_value)
         props['transmission'] = 1.0
     elif node.type == 'BSDF_TRANSPARENT':
-        # Fully transparent — invisible to camera, shadow rays pass through
-        props['base_color'] = (1.0, 1.0, 1.0)
-        props['alpha'] = 0.0
-        props['transmission'] = 1.0
+        # Fully transparent — stochastic passthrough like Cycles
+        tc = node.inputs.get('Color')
+        if tc:
+            props['base_color'] = (tc.default_value[0], tc.default_value[1], tc.default_value[2])
+        else:
+            props['base_color'] = (1.0, 1.0, 1.0)
+        props['transparent_prob'] = 1.0
         props['roughness'] = 0.0
-        props['ior'] = 1.0
     elif node.type == 'EMISSION':
         color_inp = node.inputs.get('Color')
         if color_inp:
@@ -1219,6 +1223,40 @@ def _extract_shader_props(node, register_image_fn):
     elif node.type == 'MIX_SHADER':
         # Nested Mix Shader — recurse
         props = _resolve_mix_shader(node, register_image_fn)
+    elif node.type == 'ADD_SHADER':
+        # Add Shader = both shaders contribute. Cycles samples one stochastically (50/50).
+        s1 = node.inputs[0].links[0].from_node if len(node.inputs) > 0 and node.inputs[0].is_linked else None
+        s2 = node.inputs[1].links[0].from_node if len(node.inputs) > 1 and node.inputs[1].is_linked else None
+        p1 = _extract_shader_props(s1, register_image_fn)
+        p2 = _extract_shader_props(s2, register_image_fn)
+        # Combine transparent_prob: Add Shader averages both sides' probability
+        tp1 = p1.get('transparent_prob', 0.0)
+        tp2 = p2.get('transparent_prob', 0.0)
+        combined_tp = (tp1 + tp2) * 0.5
+        # Use the non-transparent side's visual properties
+        if tp1 > tp2:
+            props = dict(p2)  # use p2's visual props (the visible BSDF)
+        elif tp2 > tp1:
+            props = dict(p1)
+        else:
+            # Both equal (both opaque or both transparent) — blend
+            props = {
+                'base_color': _lerp_color(p1['base_color'], p2['base_color'], 0.5),
+                'roughness': (p1['roughness'] + p2['roughness']) * 0.5,
+                'metallic': (p1['metallic'] + p2['metallic']) * 0.5,
+                'emission': _lerp_color(p1['emission'], p2['emission'], 0.5),
+                'emission_strength': (p1['emission_strength'] + p2['emission_strength']) * 0.5,
+                'transmission': max(p1['transmission'], p2['transmission']),
+                'ior': p1['ior'] if p1['transmission'] >= p2['transmission'] else p2['ior'],
+                'diffuse_tex': p1['diffuse_tex'] if p1['diffuse_tex'] != _NO_TEX else p2['diffuse_tex'],
+                'emission_tex': p1['emission_tex'] if p1['emission_tex'] != _NO_TEX else p2['emission_tex'],
+                'normal_tex': p1.get('normal_tex', _NO_TEX),
+                'normal_strength': p1.get('normal_strength', 1.0),
+                'transparent_prob': 0.0,
+            }
+        props['transparent_prob'] = combined_tp
+        if combined_tp > 0.0:
+            props['flags'] = props.get('flags', 0) | 2  # shadow rays pass through too
 
     # Extract normal/bump texture for all BSDF types
     if node.type in ('BSDF_DIFFUSE', 'BSDF_GLOSSY', 'BSDF_GLASS', 'BSDF_PRINCIPLED'):
@@ -1226,6 +1264,20 @@ def _extract_shader_props(node, register_image_fn):
         props['normal_tex'] = ntex
         # Negative strength signals bump/height map to the shader
         props['normal_strength'] = -nstr if is_bump else nstr
+
+        # Glass + bump: convert bump intensity to GGX roughness.
+        # With low SPP, bump alone can't scatter refraction enough (needs 100+ samples
+        # to converge like Cycles). GGX roughness disperses rays analytically in 1 sample.
+        if node.type == 'BSDF_GLASS' and is_bump and props['roughness'] < 0.01:
+            # nstr is packed as: strength + distance * 100
+            # e.g. Strength=0.06, Distance=0.1 → nstr = 10.06
+            bump_strength = nstr - int(nstr)  # fractional part = strength
+            bump_distance = int(nstr) / 100.0
+            # Empirical mapping: roughness that produces similar scatter as
+            # Cycles' bump averaging over many samples.
+            equiv_roughness = min(bump_strength * bump_distance * 25.0, 0.4)
+            equiv_roughness = max(equiv_roughness, 0.05)
+            props['roughness'] = equiv_roughness
 
     return props
 
@@ -1259,18 +1311,76 @@ def _resolve_mix_shader(mix_node, register_image_fn):
     p1 = _extract_shader_props(shader1_node, register_image_fn)
     p2 = _extract_shader_props(shader2_node, register_image_fn)
 
-    # Special case: Mix with Transparent BSDF
-    # Use the non-transparent shader's properties but mark as partially transparent
-    # so shadow rays pass through (light portal behavior).
+    # ---- Alpha cutout detection (fence, leaf, wireframe materials) ----
+    # When Mix Shader Factor is linked to an Image Texture Alpha and one side
+    # is Transparent BSDF, this is a texture-driven alpha cutout — NOT stochastic.
+    # The texture alpha determines per-pixel visibility (like Cycles).
+    s1_type = shader1_node.type if shader1_node else None
+    s2_type = shader2_node.type if shader2_node else None
+    if fac_inp and fac_inp.is_linked and (s1_type == 'BSDF_TRANSPARENT' or s2_type == 'BSDF_TRANSPARENT'):
+        # Trace factor link to find an Image Texture
+        fac_source = fac_inp.links[0].from_node
+        fac_socket = fac_inp.links[0].from_socket.name
+        # Follow through reroute/math nodes
+        _depth = 0
+        while fac_source and fac_source.type in ('REROUTE', 'MATH', 'MAP_RANGE', 'CLAMP') and _depth < 4:
+            for inp in fac_source.inputs:
+                if inp.is_linked:
+                    fac_source = inp.links[0].from_node
+                    fac_socket = inp.links[0].from_socket.name
+                    break
+            else:
+                fac_source = None
+            _depth += 1
+
+        if fac_source and fac_source.type == 'TEX_IMAGE' and fac_source.image:
+            # Alpha cutout: use the non-transparent shader's props + the texture for alpha test
+            if s1_type == 'BSDF_TRANSPARENT':
+                result = dict(p2)
+            else:
+                result = dict(p1)
+            # Register the texture so the shader reads both color and alpha
+            tex_idx = register_image_fn(fac_source.image)
+            if result.get('diffuse_tex', _NO_TEX) == _NO_TEX:
+                result['diffuse_tex'] = tex_idx
+            result['flags'] = result.get('flags', 0) | 1 | 2  # alpha_test + transmission
+            result['alpha'] = 1.0  # texture alpha will be read per-pixel
+            result['alpha_ref'] = 0.5
+            result['transparent_prob'] = 0.0  # NOT stochastic — texture-driven
+            return result
+
+    # Stochastic transparency (like Cycles): compute transparent_prob through the mix.
+    # Mix Shader blends transparent_prob by factor, just like any other property.
+    tp1 = p1.get('transparent_prob', 0.0)
+    tp2 = p2.get('transparent_prob', 0.0)
+
+    # If one side is fully transparent (direct Transparent BSDF), use the other side's
+    # visual properties but set transparent_prob from the mix factor.
     s1_type = shader1_node.type if shader1_node else None
     s2_type = shader2_node.type if shader2_node else None
     if s1_type == 'BSDF_TRANSPARENT':
-        # flags bit1 = transmission (shadow rays pass through)
-        p2['flags'] = p2.get('flags', 0) | 2
-        return p2
+        result = dict(p2)
+        result['transparent_prob'] = (1.0 - fac)  # fac=0 → all transparent, fac=1 → all p2
+        result['flags'] = result.get('flags', 0) | 2
+        return result
     if s2_type == 'BSDF_TRANSPARENT':
-        p1['flags'] = p1.get('flags', 0) | 2
-        return p1
+        result = dict(p1)
+        result['transparent_prob'] = fac  # fac=0 → all p1, fac=1 → all transparent
+        result['flags'] = result.get('flags', 0) | 2
+        return result
+
+    # General case: blend transparent_prob with mix factor, use non-transparent side's BRDF.
+    blended_tp = tp1 * (1.0 - fac) + tp2 * fac
+
+    if blended_tp > 0.0 and (tp1 > 0.0) != (tp2 > 0.0):
+        # One side has transparency, the other doesn't — use opaque side's visual props
+        if tp1 > 0.0:
+            result = dict(p2)
+        else:
+            result = dict(p1)
+        result['transparent_prob'] = blended_tp
+        result['flags'] = result.get('flags', 0) | 2
+        return result
 
     # Blend properties by mix factor
     blended = {
@@ -1279,12 +1389,15 @@ def _resolve_mix_shader(mix_node, register_image_fn):
         'metallic': p1['metallic'] * (1 - fac) + p2['metallic'] * fac,
         'emission': _lerp_color(p1['emission'], p2['emission'], fac),
         'emission_strength': p1['emission_strength'] * (1 - fac) + p2['emission_strength'] * fac,
-        'transmission': p1['transmission'] * (1 - fac) + p2['transmission'] * fac,
+        'transmission': p1.get('transmission', 0.0) * (1 - fac) + p2.get('transmission', 0.0) * fac,
         'ior': p1['ior'] * (1 - fac) + p2['ior'] * fac,
+        'transparent_prob': blended_tp,
         # Texture: prefer the dominant shader's texture
         'diffuse_tex': p1['diffuse_tex'] if fac <= 0.5 else p2['diffuse_tex'],
         'emission_tex': p1['emission_tex'] if p1['emission_tex'] != _NO_TEX else p2['emission_tex'],
     }
+    if blended_tp > 0.0:
+        blended['flags'] = p1.get('flags', 0) | p2.get('flags', 0) | 2
 
     # If dominant texture is missing, fallback to the other
     if blended['diffuse_tex'] == _NO_TEX:
@@ -1387,6 +1500,7 @@ def export_materials(depsgraph):
         alpha = 1.0
         ior = 1.5
         transmission = 0.0
+        transparent_prob = 0.0
         flags = 0
         alpha_ref = 0.5
 
@@ -1466,6 +1580,10 @@ def export_materials(depsgraph):
                         normal_strength = props['normal_strength']
                     if 'flags' in props:
                         flags = props['flags']
+                    if 'transparent_prob' in props:
+                        transparent_prob = props['transparent_prob']
+                    if 'alpha_ref' in props:
+                        alpha_ref = props['alpha_ref']
                 else:
                     # No Mix Shader — scan individual nodes
                     for node in mat.node_tree.nodes:
@@ -1590,19 +1708,29 @@ def export_materials(depsgraph):
         if transmission > 0.0:
             flags |= 2  # bit1 = transmission
 
-        # Log material to file directly
+        # Log material to file — dump full node tree for the selected object's material
         import os
         _mat_log_path = os.path.join(os.path.expanduser("~"), "ignis-rt.log")
         try:
+            # Get the active object's material name for detailed logging
+            _selected_mat = None
+            try:
+                import bpy
+                _sel_obj = bpy.context.active_object
+                if _sel_obj and _sel_obj.active_material:
+                    _selected_mat = _sel_obj.active_material.name
+            except Exception:
+                pass
+
             with open(_mat_log_path, "a") as _mf:
                 _mf.write(f"[ignis-mat] '{mat.name}': color=({base_color[0]:.3f},{base_color[1]:.3f},{base_color[2]:.3f}) "
                           f"rough={roughness:.2f} metal={metallic:.2f} trans={transmission:.2f} ior={ior:.2f} "
                           f"emit=({emission[0]:.3f},{emission[1]:.3f},{emission[2]:.3f})*{emission_strength:.2f} "
                           f"diffTex={diffuse_tex} normTex={normal_tex} normStr={normal_strength:.2f} "
-                          f"emitTex={emission_tex} flags={flags}\n")
-                # Dump full node tree for debug
-                if mat.use_nodes and mat.node_tree and mat.name in ('beigeWall', 'frostedGlass', 'dayLight_portal'):
-                    _mf.write(f"  [node-tree] '{mat.name}':\n")
+                          f"emitTex={emission_tex} flags={flags} tp={transparent_prob:.2f}\n")
+                # Dump full node tree only for the selected material
+                if mat.use_nodes and mat.node_tree and _selected_mat and mat.name == _selected_mat:
+                    _mf.write(f"  [node-tree] '{mat.name}' (selected):\n")
                     for node in mat.node_tree.nodes:
                         _mf.write(f"    node: '{node.name}' type={node.type}\n")
                         for inp in node.inputs:
@@ -1639,6 +1767,7 @@ def export_materials(depsgraph):
             transmission=transmission,
             flags=flags,
             alpha_ref=alpha_ref,
+            transparent_prob=transparent_prob,
         )
 
     buf = (ctypes.c_uint8 * len(all_bytes))(*all_bytes)

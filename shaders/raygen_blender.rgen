@@ -539,6 +539,8 @@ void main() {
 
     int alphaSkips = 0;
     const int MAX_ALPHA_SKIPS = 8;
+    int glassBounces = 0;
+    const int MAX_GLASS_BOUNCES = 16;
 
     // ReSTIR GI reservoir for indirect lighting reuse
     // TODO: disabled for stability investigation on complex scenes
@@ -658,6 +660,17 @@ void main() {
             }
         }
 
+        // ---- Stochastic transparent passthrough (Cycles-style) ----
+        // mat.multB = transparent_prob: probability that the ray passes straight through.
+        // This handles Transparent BSDF in Mix/Add Shader without refraction.
+        float transparentProb = mat.multB;
+        if (transparentProb > 0.0 && rand01() < transparentProb) {
+            // Ray passes through — no refraction, no absorption (like Cycles Transparent BSDF)
+            rayOrigin = worldPos + rayDir * 0.002;
+            bounce--;  // doesn't count as a bounce
+            continue;
+        }
+
         // ---- Bounce 0: capture primary hit info (first sample only) ----
         if (bounce == 0 && sampleIdx == 0) {
             primaryHit = true;
@@ -712,6 +725,15 @@ void main() {
         float maxThroughput = max(throughput.r, max(throughput.g, throughput.b));
         bool skipSunNEE = (bounce >= 2 && maxThroughput < 0.01);
         bool skipLocalNEE = (bounce >= 2);  // point/spot/emissive only on bounce 0-1
+
+        // Glass/transmission surfaces don't scatter light — skip NEE entirely.
+        // Light reaches through glass via refraction paths, not direct illumination.
+        // This matches Cycles behavior where Glass BSDF has no diffuse lobe for NEE.
+        bool isGlass = (pbrHit.transmission > 0.5);
+        if (isGlass) {
+            skipSunNEE = true;
+            skipLocalNEE = true;
+        }
 
         // ---- NEE: Direct sun light ----
         vec3 sunDir = normalize(cam.sunLight.xyz);
@@ -1095,7 +1117,12 @@ void main() {
         }
 
         // ---- Transmission / Glass (GGX Microfacet, like Cycles) ----
+        // Glass bounces have a separate budget (like Cycles' transmission bounce limit)
+        // so they don't steal bounces from scene illumination.
         if (pbrHit.transmission > 0.5) {
+            glassBounces++;
+            if (glassBounces >= MAX_GLASS_BOUNCES) break;
+
             float eta = frontFace ? (1.0 / pbrHit.ior) : pbrHit.ior;
             float alpha = max(pbrHit.roughness * pbrHit.roughness, 0.001);
 
@@ -1117,7 +1144,7 @@ void main() {
                 H = N;
             }
 
-            // Fresnel at microfacet
+            // Fresnel at microfacet (use full IOR for correct reflections)
             float cosI = abs(dot(V, H));
             float f0 = (pbrHit.ior - 1.0) / (pbrHit.ior + 1.0);
             f0 = f0 * f0;
@@ -1138,6 +1165,7 @@ void main() {
             }
             throughput *= pbrHit.baseColor;
             if (bounce == 0) { isDiffusePath = false; captureSpecularMV = true; }
+            bounce--;  // glass doesn't count against main bounce budget
             continue;
         }
 
