@@ -1156,6 +1156,15 @@ def _resolve_mix_shader(mix_node, register_image_fn):
     p1 = _extract_shader_props(shader1_node, register_image_fn)
     p2 = _extract_shader_props(shader2_node, register_image_fn)
 
+    # Special case: Transparent + Emission (common light portal pattern)
+    # Use the non-transparent shader's properties at full strength
+    s1_type = shader1_node.type if shader1_node else None
+    s2_type = shader2_node.type if shader2_node else None
+    if s1_type == 'BSDF_TRANSPARENT' and s2_type in ('EMISSION', 'BSDF_PRINCIPLED'):
+        return p2  # use emissive shader at full strength
+    if s2_type == 'BSDF_TRANSPARENT' and s1_type in ('EMISSION', 'BSDF_PRINCIPLED'):
+        return p1
+
     # Blend properties by mix factor
     blended = {
         'base_color': _lerp_color(p1['base_color'], p2['base_color'], fac),
