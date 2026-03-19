@@ -43,7 +43,7 @@ layout(binding = 30, set = 0, r8) uniform image2D diffConfidenceImg;
 layout(binding = 31, set = 0, r8) uniform image2D specConfidenceImg;
 
 // Wavefront buffers (set 1)
-layout(binding = 3, set = 1, scalar) buffer PixelRadianceBuffer { float radData[]; } pixelRadiance;
+layout(binding = 3, set = 1, scalar) buffer PixelRadianceBuffer { uint radDataU[]; } pixelRadiance;
 layout(binding = 4, set = 1, scalar) buffer PrimaryGBufBuffer { float gbufData[]; } primaryGBuf;
 
 layout(push_constant) uniform PushConst {
@@ -64,15 +64,15 @@ void main() {
 
     uint pixelIndex = pixel.y * pc.width + pixel.x;
 
-    // Read accumulated radiance (8 floats per pixel)
+    // Read accumulated radiance (8 uints per pixel, reinterpret as float)
     uint rBase = pixelIndex * 8u;
-    vec3 diffuse = vec3(pixelRadiance.radData[rBase+0],
-                        pixelRadiance.radData[rBase+1],
-                        pixelRadiance.radData[rBase+2]);
-    float hitDist = pixelRadiance.radData[rBase+3];
-    vec3 specular = vec3(pixelRadiance.radData[rBase+4],
-                         pixelRadiance.radData[rBase+5],
-                         pixelRadiance.radData[rBase+6]);
+    vec3 diffuse = vec3(uintBitsToFloat(pixelRadiance.radDataU[rBase+0]),
+                        uintBitsToFloat(pixelRadiance.radDataU[rBase+1]),
+                        uintBitsToFloat(pixelRadiance.radDataU[rBase+2]));
+    float hitDist = uintBitsToFloat(pixelRadiance.radDataU[rBase+3]);
+    vec3 specular = vec3(uintBitsToFloat(pixelRadiance.radDataU[rBase+4]),
+                         uintBitsToFloat(pixelRadiance.radDataU[rBase+5]),
+                         uintBitsToFloat(pixelRadiance.radDataU[rBase+6]));
 
     // Read primary G-buffer (16 floats per pixel)
     // TODO: use PrimaryGBuffer struct layout when K2 (shade) is implemented

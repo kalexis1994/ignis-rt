@@ -145,8 +145,8 @@ bool WavefrontPipeline::CreateBuffers(uint32_t pixelCount) {
     // PathState: 48 bytes per pixel
     if (!CreateSSBO(device, physDevice, pixelCount * 48, &pathStateBuffer_, &pathStateMemory_)) return false;
 
-    // HitResult: 32 bytes per pixel
-    if (!CreateSSBO(device, physDevice, pixelCount * 32, &hitResultBuffer_, &hitResultMemory_)) return false;
+    // HitResult: 80 bytes per pixel (20 floats: 8 base + 12 objToWorld)
+    if (!CreateSSBO(device, physDevice, pixelCount * 80, &hitResultBuffer_, &hitResultMemory_)) return false;
 
     // ShadowRay: 48 bytes, max pixelCount * MAX_SHADOW_RAYS_PER_PATH
     // Limit to 2x pixelCount to save memory (most pixels generate 1-3 shadow rays)

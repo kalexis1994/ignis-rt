@@ -120,8 +120,8 @@ void main() {
                           0xFF, origin, MIN_HIT_DIST, dir, 10000.0);
     while (rayQueryProceedEXT(rq)) {}
 
-    // Write HitResult (8 floats)
-    uint hBase = idx * 8u;
+    // Write HitResult (20 floats: 8 base + 12 objToWorld)
+    uint hBase = idx * 20u;
 
     if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
         // Sky miss — accumulate sky radiance and terminate
@@ -164,6 +164,7 @@ void main() {
     int instanceId = rayQueryGetIntersectionInstanceIdEXT(rq, true);
     int primitiveId = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
     vec2 bary2 = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+    mat4x3 objToWorld = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
 
     hitResults.hitData[hBase+0] = hitT;
     hitResults.hitData[hBase+1] = uintBitsToFloat(customIndex);
@@ -173,4 +174,11 @@ void main() {
     hitResults.hitData[hBase+5] = bary2.y;
     hitResults.hitData[hBase+6] = uintBitsToFloat(1u); // hitType = hit
     hitResults.hitData[hBase+7] = 0.0; // pad
+    // objToWorld 3x4 matrix (12 floats) — row-major storage
+    hitResults.hitData[hBase+8]  = objToWorld[0][0]; hitResults.hitData[hBase+9]  = objToWorld[1][0];
+    hitResults.hitData[hBase+10] = objToWorld[2][0]; hitResults.hitData[hBase+11] = objToWorld[3][0];
+    hitResults.hitData[hBase+12] = objToWorld[0][1]; hitResults.hitData[hBase+13] = objToWorld[1][1];
+    hitResults.hitData[hBase+14] = objToWorld[2][1]; hitResults.hitData[hBase+15] = objToWorld[3][1];
+    hitResults.hitData[hBase+16] = objToWorld[0][2]; hitResults.hitData[hBase+17] = objToWorld[1][2];
+    hitResults.hitData[hBase+18] = objToWorld[2][2]; hitResults.hitData[hBase+19] = objToWorld[3][2];
 }

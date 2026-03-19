@@ -109,7 +109,7 @@ layout(buffer_reference, scalar) buffer PrimMaterials { uint m[]; };
 layout(binding = 0, set = 1, scalar) buffer PathStateBuffer { float pathData[]; } pathStates;
 layout(binding = 1, set = 1, scalar) buffer HitResultBuffer { float hitData[]; } hitResults;
 layout(binding = 2, set = 1, scalar) buffer ShadowRayBuffer { float shadowData[]; } shadowRays;
-layout(binding = 3, set = 1, scalar) buffer PixelRadianceBuffer { float radData[]; } pixelRadiance;
+layout(binding = 3, set = 1, scalar) buffer PixelRadianceBuffer { uint radDataU[]; } pixelRadiance;
 layout(binding = 4, set = 1, scalar) buffer PrimaryGBufBuffer { float gbufData[]; } primaryGBuf;
 layout(binding = 5, set = 1, scalar) buffer CountersBuffer {
     uint activeRayCount;
@@ -130,6 +130,16 @@ layout(push_constant) uniform PushConst {
 #include "../include/pbr_brdf.glsl"
 #include "../include/sampling.glsl"
 #include "../include/nrd_encode.glsl"
+
+// Thread-safe float accumulation via uint CAS
+void atomicAddFloat(uint index, float value) {
+    if (value == 0.0) return;
+    uint oldVal, newVal;
+    do {
+        oldVal = pixelRadiance.radDataU[index];
+        newVal = floatBitsToUint(uintBitsToFloat(oldVal) + value);
+    } while (atomicCompSwap(pixelRadiance.radDataU[index], oldVal, newVal) != oldVal);
+}
 
 // Append a shadow ray atomically
 void appendShadowRay(vec3 origin, vec3 dir, float maxDist, uint pathIdx,
@@ -171,8 +181,8 @@ void main() {
     uint bounce = flags & 0xFu;
     bool isDiffusePath = (flags & 0x10u) != 0u;
 
-    // Read HitResult
-    uint hBase = idx * 8u;
+    // Read HitResult (20 floats: 8 base + 12 objToWorld)
+    uint hBase = idx * 20u;
     uint hitType = floatBitsToUint(hitResults.hitData[hBase+6]);
     if (hitType == 0u) return; // miss — already handled by K1
 
@@ -182,6 +192,13 @@ void main() {
     int primitiveId = floatBitsToInt(hitResults.hitData[hBase+3]);
     vec2 bary2 = vec2(hitResults.hitData[hBase+4], hitResults.hitData[hBase+5]);
     vec3 bary = vec3(1.0 - bary2.x - bary2.y, bary2.x, bary2.y);
+
+    // Read objToWorld 3x4 matrix
+    mat4x3 objToWorld;
+    objToWorld[0] = vec3(hitResults.hitData[hBase+8],  hitResults.hitData[hBase+12], hitResults.hitData[hBase+16]);
+    objToWorld[1] = vec3(hitResults.hitData[hBase+9],  hitResults.hitData[hBase+13], hitResults.hitData[hBase+17]);
+    objToWorld[2] = vec3(hitResults.hitData[hBase+10], hitResults.hitData[hBase+14], hitResults.hitData[hBase+18]);
+    objToWorld[3] = vec3(hitResults.hitData[hBase+11], hitResults.hitData[hBase+15], hitResults.hitData[hBase+19]);
 
     // Fetch geometry data via buffer references
     GeometryMetadata geo = geometryMetadata.geometries[customIndex];
@@ -198,17 +215,21 @@ void main() {
     vec3 p1 = vec3(vertices.v[i1*3+0], vertices.v[i1*3+1], vertices.v[i1*3+2]);
     vec3 p2 = vec3(vertices.v[i2*3+0], vertices.v[i2*3+1], vertices.v[i2*3+2]);
 
-    // We need objToWorld but ray queries in compute don't give it.
-    // Reconstruct world pos from ray: origin + dir * hitT
-    vec3 worldPos = rayOrigin + rayDir * hitT;
+    // World position from objToWorld matrix
+    vec3 localPos = p0 * bary.x + p1 * bary.y + p2 * bary.z;
+    vec3 worldPos = objToWorld * vec4(localPos, 1.0);
 
-    // Normals in local space
+    // World-space vertex positions (for TBN / normal mapping)
+    vec3 wp0 = objToWorld * vec4(p0, 1.0);
+    vec3 wp1 = objToWorld * vec4(p1, 1.0);
+    vec3 wp2 = objToWorld * vec4(p2, 1.0);
+
+    // Normals — transform to world space via objToWorld 3x3
     vec3 n0 = vec3(normals.n[i0*3+0], normals.n[i0*3+1], normals.n[i0*3+2]);
     vec3 n1 = vec3(normals.n[i1*3+0], normals.n[i1*3+1], normals.n[i1*3+2]);
     vec3 n2 = vec3(normals.n[i2*3+0], normals.n[i2*3+1], normals.n[i2*3+2]);
-    // TODO: proper world-space normal transform requires objToWorld matrix
-    // For now use local normal directly (works for identity transforms)
-    vec3 worldN = normalize(n0 * bary.x + n1 * bary.y + n2 * bary.z);
+    vec3 localN = normalize(n0 * bary.x + n1 * bary.y + n2 * bary.z);
+    vec3 worldN = normalize(mat3(objToWorld) * localN);
 
     // UVs
     vec2 uv0_ = vec2(uvData.uv[i0*2+0], 1.0 - uvData.uv[i0*2+1]);
@@ -248,14 +269,44 @@ void main() {
         metallic = clamp(orm.b, 0.0, 1.0);
     }
 
+    // Normal mapping
     vec3 N = worldN;
+    if (mat.normalTexIndex != 0xFFFFFFFFu) {
+        float rawStrength = mat.detailNormalBlend;
+        if (rawStrength >= 0.0) {
+            // RGB normal map — compute TBN from world-space triangle
+            vec3 T, B;
+            computeTBN(wp0, wp1, wp2, uv0_, uv1_, uv2_, N, T, B);
+            vec3 texN = texture(textures[nonuniformEXT(mat.normalTexIndex)], hitUV).rgb;
+            float strength = rawStrength > 0.0 ? rawStrength : 1.0;
+            N = applyNormalMap(texN, T, N, B, strength);
+        }
+        // Bump mapping omitted for compute path (minor quality difference)
+    }
+
     bool frontFace = dot(N, -rayDir) >= 0.0;
     if (!frontFace) N = -N;
 
-    // Alpha cutout — terminate and re-queue ray (simplified: just terminate for now)
+    // Alpha cutout — advance ray and re-queue
     if ((mat.flags & 1u) != 0u && alpha < mat.alphaRef) {
-        // Mark as terminated (proper alpha skip would re-queue with advanced origin)
-        pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
+        // Re-queue with advanced origin, same bounce
+        uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
+        uint nBase = nextIdx * 12u;
+        vec3 skipOrigin = worldPos + rayDir * 0.002;
+        pathStates.pathData[nBase+0] = skipOrigin.x;
+        pathStates.pathData[nBase+1] = skipOrigin.y;
+        pathStates.pathData[nBase+2] = skipOrigin.z;
+        pathStates.pathData[nBase+3] = uintBitsToFloat(pixelIndex);
+        pathStates.pathData[nBase+4] = rayDir.x;
+        pathStates.pathData[nBase+5] = rayDir.y;
+        pathStates.pathData[nBase+6] = rayDir.z;
+        pathStates.pathData[nBase+7] = uintBitsToFloat(rngState);
+        pathStates.pathData[nBase+8] = throughput.x;
+        pathStates.pathData[nBase+9] = throughput.y;
+        pathStates.pathData[nBase+10] = throughput.z;
+        // Same bounce (not incremented) — will re-trace from behind alpha surface
+        pathStates.pathData[nBase+11] = uintBitsToFloat(flags);
+        pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u); // mark original terminated
         return;
     }
 
@@ -266,21 +317,21 @@ void main() {
     }
     vec3 emissionContrib = emission * throughput;
 
-    // Accumulate emission
+    // Accumulate emission (atomic for thread safety across bounces)
     uint rBase = pixelIndex * 8u;
     if (bounce == 0u) {
-        pixelRadiance.radData[rBase+0] += emissionContrib.x;
-        pixelRadiance.radData[rBase+1] += emissionContrib.y;
-        pixelRadiance.radData[rBase+2] += emissionContrib.z;
+        atomicAddFloat(rBase+0, emissionContrib.x);
+        atomicAddFloat(rBase+1, emissionContrib.y);
+        atomicAddFloat(rBase+2, emissionContrib.z);
     } else {
         if (isDiffusePath) {
-            pixelRadiance.radData[rBase+0] += emissionContrib.x;
-            pixelRadiance.radData[rBase+1] += emissionContrib.y;
-            pixelRadiance.radData[rBase+2] += emissionContrib.z;
+            atomicAddFloat(rBase+0, emissionContrib.x);
+            atomicAddFloat(rBase+1, emissionContrib.y);
+            atomicAddFloat(rBase+2, emissionContrib.z);
         } else {
-            pixelRadiance.radData[rBase+4] += emissionContrib.x;
-            pixelRadiance.radData[rBase+5] += emissionContrib.y;
-            pixelRadiance.radData[rBase+6] += emissionContrib.z;
+            atomicAddFloat(rBase+4, emissionContrib.x);
+            atomicAddFloat(rBase+5, emissionContrib.y);
+            atomicAddFloat(rBase+6, emissionContrib.z);
         }
     }
 
@@ -300,14 +351,14 @@ void main() {
         primaryGBuf.gbufData[gBase+9] = baseColor.y;
         primaryGBuf.gbufData[gBase+10] = baseColor.z;
         primaryGBuf.gbufData[gBase+11] = hitT; // hitDist
-        // localPos for motion vectors — approximate with worldPos (no objToWorld inverse)
-        primaryGBuf.gbufData[gBase+12] = worldPos.x;
-        primaryGBuf.gbufData[gBase+13] = worldPos.y;
-        primaryGBuf.gbufData[gBase+14] = worldPos.z;
+        // localPos for motion vectors
+        primaryGBuf.gbufData[gBase+12] = localPos.x;
+        primaryGBuf.gbufData[gBase+13] = localPos.y;
+        primaryGBuf.gbufData[gBase+14] = localPos.z;
         primaryGBuf.gbufData[gBase+15] = uintBitsToFloat(uint(instanceId));
 
-        // Store hitDist in pixel radiance
-        pixelRadiance.radData[rBase+3] = hitT;
+        // Store hitDist in pixel radiance (bounce 0 only, no contention)
+        pixelRadiance.radDataU[rBase+3] = floatBitsToUint(hitT);
     }
 
     // ---- NEE: Direct sun light ----
@@ -388,9 +439,9 @@ void main() {
         vec3 ambientColor = cam.ambientLight.rgb * cam.ambientLight.w;
         float NdotUp = max(dot(N, vec3(0, 1, 0)), 0.0);
         vec3 ambient = baseColor * ambientColor * NdotUp * ambientMax * (1.0 - metallic) * throughput;
-        pixelRadiance.radData[rBase+0] += ambient.x;
-        pixelRadiance.radData[rBase+1] += ambient.y;
-        pixelRadiance.radData[rBase+2] += ambient.z;
+        atomicAddFloat(rBase+0, ambient.x);
+        atomicAddFloat(rBase+1, ambient.y);
+        atomicAddFloat(rBase+2, ambient.z);
     }
 
     // ---- Russian roulette (bounce >= 1) ----
