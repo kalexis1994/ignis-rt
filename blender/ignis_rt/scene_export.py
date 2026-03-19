@@ -1136,7 +1136,12 @@ def _lerp_color(a, b, t):
 def _resolve_mix_shader(mix_node, register_image_fn):
     """Resolve a Mix Shader node into blended PBR properties."""
     fac_inp = mix_node.inputs.get('Fac')
-    fac = float(fac_inp.default_value) if fac_inp else 0.5
+    if fac_inp and fac_inp.is_linked:
+        # Dynamic factor (Fresnel, Layer Weight, Geometry, etc.)
+        # Can't evaluate per-pixel on CPU — use 0.5 as neutral blend
+        fac = 0.5
+    else:
+        fac = float(fac_inp.default_value) if fac_inp else 0.5
 
     # Get the two input shaders (Shader inputs at index 1 and 2)
     shader1_node = None
