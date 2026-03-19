@@ -611,8 +611,18 @@ void main() {
         vec3 n1 = vec3(normals.n[i1*3+0], normals.n[i1*3+1], normals.n[i1*3+2]);
         vec3 n2 = vec3(normals.n[i2*3+0], normals.n[i2*3+1], normals.n[i2*3+2]);
         vec3 localN = normalize(n0 * bary.x + n1 * bary.y + n2 * bary.z);
-        // Transform normal to world space (use transpose of inverse = normalMatrix)
         vec3 worldN = normalize(mat3(objToWorld) * localN);
+
+        // Shadow terminator fix (Appleseed/Cycles approach):
+        // Compute geometric face normal to detect when smooth normal diverges too far
+        vec3 geoNormal = normalize(cross(wp1 - wp0, wp2 - wp0));
+        // Ensure geoNormal faces the ray
+        if (dot(geoNormal, -rayDir) < 0.0) geoNormal = -geoNormal;
+        // Clamp interpolated normal to geometric hemisphere
+        float NdotNg = dot(worldN, geoNormal);
+        if (NdotNg < 0.01) {
+            worldN = normalize(mix(geoNormal, worldN, max(NdotNg, 0.0) / 0.01));
+        }
 
         // UVs (flip V: Blender V=0 bottom, stb_image/Vulkan V=0 top)
         vec2 uv0_ = vec2(uvData.uv[i0*2+0], 1.0 - uvData.uv[i0*2+1]);

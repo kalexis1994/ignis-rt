@@ -53,6 +53,15 @@ vec3 clampRadiance(vec3 r) {
     return min(r, vec3(MAX_RADIANCE));
 }
 
+// Shadow terminator fix (Appleseed/Cycles):
+// Smoothly reduces shading near the terminator line where interpolated
+// normals diverge from geometric normals, preventing dark edges.
+float shadowTerminatorFactor(float cosIn, float frequencyMult) {
+    if (frequencyMult <= 1.0 || cosIn >= 1.0) return 1.0;
+    float angle = acos(clamp(cosIn, -1.0, 1.0));
+    return max(cos(angle * frequencyMult), 0.0) / max(cosIn, 0.001);
+}
+
 // ============================================================
 // TBN computation
 // ============================================================
