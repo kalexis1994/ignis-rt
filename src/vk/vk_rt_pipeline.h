@@ -171,6 +171,8 @@ public:
     VkImageView GetSpecularRadianceView() const { return specularRadianceGBuffer_.view; }
     VkImage GetSpecularAlbedoImage() const { return specularAlbedoGBuffer_.image; }
     VkImageView GetSpecularAlbedoView() const { return specularAlbedoGBuffer_.view; }
+    VkImage GetSpecularMVImage() const { return specularMVGBuffer_.image; }
+    VkImageView GetSpecularMVView() const { return specularMVGBuffer_.view; }
     VkImage GetAlbedoBufferImage() const { return albedoGBuffer_.image; }
     VkImageView GetAlbedoBufferView() const { return albedoGBuffer_.view; }
     VkImage GetPenumbraImage() const { return penumbraGBuffer_.image; }
@@ -242,6 +244,7 @@ private:
     GBufferImage motionVectorsGBuffer_;      // binding 8, RGBA16F
     GBufferImage diffuseRadianceGBuffer_;    // binding 9, RGBA16F
     GBufferImage specularRadianceGBuffer_;   // binding 10, RGBA16F
+    GBufferImage specularMVGBuffer_;          // binding 13, RGBA16F — specular motion vectors for RR
     GBufferImage specularAlbedoGBuffer_;     // binding 15, RGBA16F — EnvBRDFApprox for RR
     GBufferImage albedoGBuffer_;             // binding 16, RGBA16F
     GBufferImage penumbraGBuffer_;           // binding 18, R16F — SIGMA shadow input

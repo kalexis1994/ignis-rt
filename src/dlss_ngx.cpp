@@ -580,6 +580,8 @@ void DLSS_NGX::EvaluateRR(
     const float* projMatrix,
     VkImage specularAlbedoImage,
     VkImageView specularAlbedoView,
+    VkImage specularMVImage,
+    VkImageView specularMVView,
     VkImage diffuseHitDistImage,
     VkImageView diffuseHitDistView,
     VkImage specularHitDistImage,
@@ -663,6 +665,15 @@ void DLSS_NGX::EvaluateRR(
     // Pass world-to-view and view-to-clip matrices for better temporal reprojection
     if (viewMatrix) evalParams.pInWorldToViewMatrix = const_cast<float*>(viewMatrix);
     if (projMatrix) evalParams.pInViewToClipMatrix = const_cast<float*>(projMatrix);
+
+    // Specular motion vectors (reflection MVs for temporal reprojection of reflections)
+    NVSDK_NGX_Resource_VK specMVResource = {};
+    if (specularMVView != VK_NULL_HANDLE) {
+        specMVResource = NVSDK_NGX_Create_ImageView_Resource_VK(
+            specularMVView, specularMVImage, fullRange, VK_FORMAT_R16G16B16A16_SFLOAT,
+            m_renderWidth, m_renderHeight, false);
+        evalParams.pInMotionVectorsReflections = &specMVResource;
+    }
 
     // Hit distance for better temporal stability (stored in radiance .a channel)
     NVSDK_NGX_Resource_VK diffHitDistResource = {};

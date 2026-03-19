@@ -725,6 +725,8 @@ void Renderer::RenderFrameRT() {
             lastView_, lastProj_,
             rtPipeline_->GetSpecularAlbedoImage(),           // EnvBRDFApprox specular albedo
             rtPipeline_->GetSpecularAlbedoView(),
+            rtPipeline_->GetSpecularMVImage(),               // specular motion vectors
+            rtPipeline_->GetSpecularMVView(),
             rtPipeline_->GetDiffuseRadianceImage(),          // diffuse hit distance (.a)
             rtPipeline_->GetDiffuseRadianceView(),
             rtPipeline_->GetSpecularRadianceImage(),         // specular hit distance (.a)

@@ -112,6 +112,7 @@ layout(binding = 7, set = 0, r32f)    uniform image2D viewDepthImg;
 layout(binding = 8, set = 0, rgba16f) uniform image2D motionVectorsImg;
 layout(binding = 9, set = 0, rgba16f) uniform image2D diffuseRadianceImg;
 layout(binding = 10, set = 0, rgba16f) uniform image2D specularRadianceImg;
+layout(binding = 13, set = 0, rgba16f) uniform image2D specularMVImg;
 layout(binding = 15, set = 0, rgba16f) uniform image2D specularAlbedoImg;
 layout(binding = 16, set = 0, rgba16f) uniform image2D albedoBufferImg;
 
@@ -509,6 +510,10 @@ void main() {
     float primaryPenumbra = 65504.0;  // 65504 = fully lit (no occluder)
     float primaryNdotL = 0.0;
 
+    // Specular motion vectors: capture reflected object MV at bounce 1
+    bool captureSpecularMV = false;
+    vec2 specularMV = vec2(0.0);
+
     float exposure = cam.ptParams0.x;
     float giIntensity = cam.ptParams0.y;
 
@@ -639,6 +644,26 @@ void main() {
             // View-space Z (negative in RH convention)
             vec4 viewPos = cam.view * vec4(pbrHit.worldPos, 1.0);
             primaryViewZ = viewPos.z;
+        }
+
+        // ---- Capture specular motion vector (bounce 1 hit of reflected object) ----
+        if (bounce == 1 && captureSpecularMV) {
+            captureSpecularMV = false;
+            // Compute MV of the reflected hit point
+            uint rBase = uint(instanceId) * 3u;
+            vec4 rRow0 = prevTransforms.data[rBase + 0u];
+            vec4 rRow1 = prevTransforms.data[rBase + 1u];
+            vec4 rRow2 = prevTransforms.data[rBase + 2u];
+            vec4 rLp = vec4(localPos, 1.0);
+            vec3 reflPrevWorldPos = vec3(dot(rRow0, rLp), dot(rRow1, rLp), dot(rRow2, rLp));
+
+            vec4 rcClip = cam.proj * cam.view * vec4(pbrHit.worldPos, 1.0);
+            vec2 rcNDC = rcClip.xy / rcClip.w;
+            vec2 rcUV = vec2(rcNDC.x * 0.5 + 0.5, 0.5 - rcNDC.y * 0.5);
+            vec4 rpClip = cam.projPrev * cam.viewPrev * vec4(reflPrevWorldPos, 1.0);
+            vec2 rpNDC = rpClip.xy / rpClip.w;
+            vec2 rpUV = vec2(rpNDC.x * 0.5 + 0.5, 0.5 - rpNDC.y * 0.5);
+            specularMV = rpUV - rcUV;
         }
 
         // ---- Accumulate emission ----
@@ -1083,7 +1108,7 @@ void main() {
                 rayOrigin = pbrHit.worldPos + rayDir * 0.01;
             }
             throughput *= pbrHit.baseColor;
-            if (bounce == 0) isDiffusePath = false;
+            if (bounce == 0) { isDiffusePath = false; captureSpecularMV = true; }
             continue;
         }
 
@@ -1132,7 +1157,7 @@ void main() {
             throughput *= (Fw / max(specWeight, 0.001)) * (G2 / max(G1, 0.001));
 
             rayDir = newDir;
-            if (bounce == 0) isDiffusePath = false;
+            if (bounce == 0) { isDiffusePath = false; captureSpecularMV = true; }
         }
 
         // Update ray origin (offset along geometric normal to avoid self-intersection)
@@ -1244,6 +1269,9 @@ void main() {
         }
         imageStore(albedoBufferImg, pixel, vec4(primaryAlbedo, shadowableFraction));
 
+        // Specular motion vectors (reflection MV from bounce 1 hit)
+        imageStore(specularMVImg, pixel, vec4(specularMV, 0, 0));
+
         // Specular albedo (EnvBRDFApprox) for DLSS Ray Reconstruction
         {
             float NdotV = max(dot(primaryNormal, normalize((cam.viewInverse * vec4(0,0,0,1)).xyz - primaryWorldPos)), 0.001);
@@ -1281,6 +1309,7 @@ void main() {
         imageStore(specularRadianceImg, pixel, vec4(0, 0, 0, 0));
         imageStore(albedoBufferImg, pixel, vec4(0, 0, 0, 0));
         imageStore(specularAlbedoImg, pixel, vec4(0, 0, 0, 0));
+        imageStore(specularMVImg, pixel, vec4(0, 0, 0, 0));
         imageStore(dlssDepthImg, pixel, vec4(1.0, 0, 0, 0));
     }
 
