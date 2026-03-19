@@ -998,6 +998,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         # Sync scene properties
         props = context.scene.ignis_rt
         dll_wrapper.set_int("max_bounces", props.max_bounces)
+        dll_wrapper.set_int("spp", props.samples_per_pixel)
         dll_wrapper.set_int("auto_sky_colors", 1 if props.auto_sky_colors else 0)
         if not props.auto_sky_colors:
             dll_wrapper.set_float("ambient_intensity", props.ambient_intensity)
