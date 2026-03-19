@@ -777,6 +777,25 @@ def _resolve_color_input(socket, default=(0.8, 0.8, 0.8), _depth=0):
                 max(0, (c[1]-luma)*sat*val + luma),
                 max(0, (c[2]-luma)*sat*val + luma))
 
+    # RGB Curves — passthrough Color input (curve evaluation too complex for CPU)
+    if from_node.type == 'CURVE_RGB':
+        fac = _resolve_scalar_input(from_node.inputs.get('Fac'), 1.0, _depth + 1)
+        c = _resolve_color_input(from_node.inputs.get('Color'), default, _depth + 1)
+        return c  # return unmodified (curve not evaluated, but at least not black)
+
+    # Passthrough for other color-producing nodes
+    _COLOR_PASSTHROUGH = {'CURVE_VEC', 'SEPRGB', 'SEPARATE_XYZ', 'SEPARATE_COLOR',
+                          'COMBRGB', 'COMBINE_COLOR', 'COMBINE_XYZ', 'RGBTOBW',
+                          'VECT_MATH', 'NORMAL', 'NORMAL_MAP'}
+    if from_node.type in _COLOR_PASSTHROUGH:
+        for inp_name in ('Color', 'Color1', 'Vector', 'Image', 'A'):
+            inp = from_node.inputs.get(inp_name)
+            if inp:
+                result = _resolve_color_input(inp, default, _depth + 1)
+                if result != default:
+                    return result
+        return default
+
     # Follow any other linked node — try Color output
     for out_name in ('Color', 'Result', 'Value', 'Vector'):
         out = from_node.outputs.get(out_name)
