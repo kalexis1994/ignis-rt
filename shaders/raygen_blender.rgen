@@ -470,10 +470,15 @@ void main() {
     float blueNoise = texelFetch(blueNoiseTexture, bnCoord, 0).r;
     rngState += uint(blueNoise * 4294967295.0);
 
-    // Sub-pixel jitter: DLSS/RR jitter is already applied to projInverse by the CPU.
-    // Only add a small anti-aliasing offset — NO additional stratified jitter here,
-    // as it would desync from what RR/NRD expect and cause ghosting at distance.
-    vec2 pixelCenter = vec2(pixel) + 0.5 + vec2(rand01() - 0.5, rand01() - 0.5);
+    // Sub-pixel jitter: DLSS/RR already applies Halton jitter via projInverse.
+    // Adding random offset on top doubles the per-frame variation, causing
+    // visible jitter that the denoiser can't fully smooth.
+    bool dlssActive = (cam.jitterData.w != 0.0);
+    vec2 pixelCenter = vec2(pixel) + 0.5;
+    if (!dlssActive) {
+        // No DLSS — add random AA jitter for non-upscaled path
+        pixelCenter += vec2(rand01() - 0.5, rand01() - 0.5);
+    }
     vec2 uv = pixelCenter / vec2(launchSize);
     vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
 
@@ -851,14 +856,14 @@ void main() {
 
                 // Sample a random point on the area light rectangle
                 vec3 lightBitangent = cross(lightNormal, lightTangent);
-                vec2 areaRnd = stratifiedSample(frameIndex * 8u + li, vec2(rand01(), rand01())) * 2.0 - 1.0;
+                vec2 areaRnd = rand2() * 2.0 - 1.0;
                 jitteredTarget = lightPos
                     + lightTangent * (areaRnd.x * sizeX * 0.5)
                     + lightBitangent * (areaRnd.y * sizeY * 0.5);
             } else {
-                // Point/spot light: stratified jitter for temporally stable soft shadows
+                // Point/spot light: small jitter for soft shadows
                 float softRadius = clamp(dist * 0.015, 0.01, 0.3);
-                vec2 diskSample = stratifiedSample(frameIndex * 8u + li, vec2(rand01(), rand01()));
+                vec2 diskSample = rand2();
                 float diskR = sqrt(diskSample.x) * softRadius;
                 float diskAngle = diskSample.y * 2.0 * PI;
                 vec3 lTangent = abs(L.y) < 0.999 ? normalize(cross(L, vec3(0,1,0))) : normalize(cross(L, vec3(1,0,0)));

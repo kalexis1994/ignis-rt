@@ -10,7 +10,7 @@ const float PI = 3.14159265359;
 const float INV_PI = 1.0 / PI;
 const int MAX_BOUNCES_LIMIT = 8;
 const float MIN_HIT_DIST = 0.001;
-const float MAX_RADIANCE = 10.0;  // aggressive clamp — prevents fireflies from destroying denoiser
+const float MAX_RADIANCE = 30.0;  // clamp fireflies but allow HDR headroom for bright lights
 
 // ============================================================
 // RNG — PCG hash + R2 quasi-random sequence for low-discrepancy sampling

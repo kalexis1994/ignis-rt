@@ -662,20 +662,11 @@ void DLSS_NGX::EvaluateRR(
     evalParams.InExposureScale = 1.0f;
     evalParams.InToneMapperType = NVSDK_NGX_TONEMAPPER_ACES;
 
-    // Pass world-to-view and view-to-clip matrices for better temporal reprojection
+    // Camera matrices for temporal reprojection
     if (viewMatrix) evalParams.pInWorldToViewMatrix = const_cast<float*>(viewMatrix);
     if (projMatrix) evalParams.pInViewToClipMatrix = const_cast<float*>(projMatrix);
 
-    // Specular motion vectors (reflection MVs for temporal reprojection of reflections)
-    NVSDK_NGX_Resource_VK specMVResource = {};
-    if (specularMVView != VK_NULL_HANDLE) {
-        specMVResource = NVSDK_NGX_Create_ImageView_Resource_VK(
-            specularMVView, specularMVImage, fullRange, VK_FORMAT_R16G16B16A16_SFLOAT,
-            m_renderWidth, m_renderHeight, false);
-        evalParams.pInMotionVectorsReflections = &specMVResource;
-    }
-
-    // Hit distance for better temporal stability (stored in radiance .a channel)
+    // Hit distance for edge-stopping
     NVSDK_NGX_Resource_VK diffHitDistResource = {};
     NVSDK_NGX_Resource_VK specHitDistResource = {};
     if (diffuseHitDistView != VK_NULL_HANDLE) {
@@ -690,6 +681,8 @@ void DLSS_NGX::EvaluateRR(
             m_renderWidth, m_renderHeight, false);
         evalParams.pInSpecularHitDistance = &specHitDistResource;
     }
+    // Specular MVs disabled — need correct convention investigation
+    // evalParams.pInMotionVectorsReflections = nullptr;
 
     NVSDK_NGX_Result ngxResult = NGX_VULKAN_EVALUATE_DLSSD_EXT(
         cmdBuf,
