@@ -1032,9 +1032,10 @@ void Renderer::RenderFrameRT() {
         return;
     }
 
-    // Double-buffered readback: no WaitIdle needed.
-    // Frame N writes to readback[current], reads from readback[previous] (completed by fence).
-    // 1 frame readback latency, imperceptible at 30+ FPS.
+    // Wait for the OTHER frame's fence to ensure its readback buffer is complete.
+    // This is cheaper than vkQueueWaitIdle because it only blocks on 1 specific frame.
+    uint32_t otherFrame = (currentFrame_ + 1) % MAX_FRAMES_IN_FLIGHT;
+    vkWaitForFences(device, 1, &inFlightFences_[otherFrame], VK_TRUE, UINT64_MAX);
 
     // After rendering, current transforms become previous for the next frame.
     // Without this, prevTransforms would stay stale after an object stops
