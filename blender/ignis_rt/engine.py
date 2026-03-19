@@ -419,7 +419,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             props = bpy.context.scene.ignis_rt
             if props.dlss_enabled:
                 dll_wrapper.set_int("dlss_enabled", 1)
-                dll_wrapper.set_int("dlss_quality", props.dlss_quality)
+                dll_wrapper.set_int("dlss_quality", int(props.dlss_quality))
                 if props.dlss_rr_enabled:
                     dll_wrapper.set_int("dlss_rr_enabled", 1)
                     _log(f" DLSS enabled, quality={props.dlss_quality}, Ray Reconstruction=ON")

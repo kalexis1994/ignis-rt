@@ -13,7 +13,7 @@ import os
 import bpy
 import bpy.utils.previews
 from bpy.props import (
-    BoolProperty, FloatProperty, FloatVectorProperty, IntProperty, StringProperty,
+    BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty, IntProperty, StringProperty,
 )
 from . import engine
 
@@ -160,9 +160,16 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         description="Enable NVIDIA DLSS upscaling (requires RTX GPU, restarts renderer)",
         default=False,
     )
-    dlss_quality: IntProperty(
-        name="DLSS Quality", default=2, min=0, max=4,
-        description="0=Off, 1=Ultra Perf, 2=Balanced, 3=Quality, 4=DLAA",
+    dlss_quality: EnumProperty(
+        name="DLSS Quality",
+        description="Upscaling quality preset (higher = sharper but slower)",
+        items=[
+            ('1', "Ultra Performance", "3x upscaling — maximum FPS, lowest quality"),
+            ('2', "Balanced", "1.7x upscaling — good balance of quality and performance"),
+            ('3', "Quality", "1.5x upscaling — high quality, moderate performance cost"),
+            ('4', "DLAA", "No upscaling (native resolution) — maximum quality, full AA"),
+        ],
+        default='3',
     )
     dlss_rr_enabled: BoolProperty(
         name="Ray Reconstruction",
