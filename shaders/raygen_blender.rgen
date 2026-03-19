@@ -1021,6 +1021,8 @@ void main() {
             float p = min(sqrt(maxC), 1.0);
             if (rand01() > p) break;
             throughput /= p;
+            // Clamp throughput to prevent firefly explosion from RR compensation
+            throughput = min(throughput, vec3(MAX_RADIANCE));
         }
 
         // ---- Transmission / Glass (GGX Microfacet, like Cycles) ----

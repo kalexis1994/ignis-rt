@@ -488,9 +488,8 @@ void main() {
     }
 
     // ---- Russian roulette (Cycles-style: sqrt perceptual, min bounce guard) ----
-    uint minBounces = 2u;  // force full contribution for first N bounces
+    uint minBounces = 2u;
     if (bounce >= minBounces) {
-        // sqrt of max channel matches perceptual luminance better than linear max
         float maxC = max(throughput.r, max(throughput.g, throughput.b));
         float p = min(sqrt(maxC), 1.0);
         if (rand01() > p) {
@@ -498,6 +497,7 @@ void main() {
             return;
         }
         throughput /= p;
+        throughput = min(throughput, vec3(MAX_RADIANCE));
     }
 
     // ---- BRDF sampling for next bounce ----

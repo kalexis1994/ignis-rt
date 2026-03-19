@@ -10,10 +10,10 @@ const float PI = 3.14159265359;
 const float INV_PI = 1.0 / PI;
 const int MAX_BOUNCES_LIMIT = 8;
 const float MIN_HIT_DIST = 0.001;
-const float MAX_RADIANCE = 250.0;
+const float MAX_RADIANCE = 10.0;  // aggressive clamp — prevents fireflies from destroying denoiser
 
 // ============================================================
-// RNG — PCG hash
+// RNG — PCG hash + R2 quasi-random sequence for low-discrepancy sampling
 // ============================================================
 
 uint rngState;
@@ -30,6 +30,27 @@ float rand01() {
 
 vec2 rand2() {
     return vec2(rand01(), rand01());
+}
+
+// R2 quasi-random sequence (Robertstheta) — better stratification than PCG
+// for importance sampling. Based on generalized golden ratio.
+// Use: r2Sample(sampleIndex) returns vec2 in [0,1)²
+const float R2_G = 1.32471795724;  // plastic constant
+const float R2_A1 = 1.0 / R2_G;
+const float R2_A2 = 1.0 / (R2_G * R2_G);
+
+vec2 r2Sample(uint idx) {
+    return fract(vec2(R2_A1 * float(idx), R2_A2 * float(idx)));
+}
+
+// Cranley-Patterson rotation: combine R2 with random offset for each pixel
+vec2 stratifiedSample(uint sampleIdx, vec2 randomOffset) {
+    return fract(r2Sample(sampleIdx) + randomOffset);
+}
+
+// Clamp contribution to prevent fireflies
+vec3 clampRadiance(vec3 r) {
+    return min(r, vec3(MAX_RADIANCE));
 }
 
 // ============================================================
