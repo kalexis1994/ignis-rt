@@ -106,7 +106,8 @@ layout(buffer_reference, scalar) buffer UVs { float uv[]; };
 layout(buffer_reference, scalar) buffer PrimMaterials { uint m[]; };
 
 // Wavefront buffers (set 1)
-layout(binding = 0, set = 1, scalar) buffer PathStateBuffer { float pathData[]; } pathStates;
+layout(binding = 0, set = 1, scalar) buffer PathStateReadBuffer { float pathData[]; } pathStates;
+layout(binding = 7, set = 1, scalar) buffer PathStateWriteBuffer { float nextPathData[]; } nextPathStates;
 layout(binding = 1, set = 1, scalar) buffer HitResultBuffer { float hitData[]; } hitResults;
 layout(binding = 2, set = 1, scalar) buffer ShadowRayBuffer { float shadowData[]; } shadowRays;
 layout(binding = 3, set = 1, scalar) buffer PixelRadianceBuffer { uint radDataU[]; } pixelRadiance;
@@ -293,19 +294,19 @@ void main() {
         uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
         uint nBase = nextIdx * 12u;
         vec3 skipOrigin = worldPos + rayDir * 0.002;
-        pathStates.pathData[nBase+0] = skipOrigin.x;
-        pathStates.pathData[nBase+1] = skipOrigin.y;
-        pathStates.pathData[nBase+2] = skipOrigin.z;
-        pathStates.pathData[nBase+3] = uintBitsToFloat(pixelIndex);
-        pathStates.pathData[nBase+4] = rayDir.x;
-        pathStates.pathData[nBase+5] = rayDir.y;
-        pathStates.pathData[nBase+6] = rayDir.z;
-        pathStates.pathData[nBase+7] = uintBitsToFloat(rngState);
-        pathStates.pathData[nBase+8] = throughput.x;
-        pathStates.pathData[nBase+9] = throughput.y;
-        pathStates.pathData[nBase+10] = throughput.z;
+        nextPathStates.nextPathData[nBase+0] = skipOrigin.x;
+        nextPathStates.nextPathData[nBase+1] = skipOrigin.y;
+        nextPathStates.nextPathData[nBase+2] = skipOrigin.z;
+        nextPathStates.nextPathData[nBase+3] = uintBitsToFloat(pixelIndex);
+        nextPathStates.nextPathData[nBase+4] = rayDir.x;
+        nextPathStates.nextPathData[nBase+5] = rayDir.y;
+        nextPathStates.nextPathData[nBase+6] = rayDir.z;
+        nextPathStates.nextPathData[nBase+7] = uintBitsToFloat(rngState);
+        nextPathStates.nextPathData[nBase+8] = throughput.x;
+        nextPathStates.nextPathData[nBase+9] = throughput.y;
+        nextPathStates.nextPathData[nBase+10] = throughput.z;
         // Same bounce (not incremented) — will re-trace from behind alpha surface
-        pathStates.pathData[nBase+11] = uintBitsToFloat(flags);
+        nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(flags);
         pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u); // mark original terminated
         return;
     }
@@ -509,19 +510,19 @@ void main() {
     if (nextBounce < pc.maxBounces) {
         uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
         uint nBase = nextIdx * 12u;
-        pathStates.pathData[nBase+0] = rayOrigin.x;
-        pathStates.pathData[nBase+1] = rayOrigin.y;
-        pathStates.pathData[nBase+2] = rayOrigin.z;
-        pathStates.pathData[nBase+3] = uintBitsToFloat(pixelIndex);
-        pathStates.pathData[nBase+4] = rayDir.x;
-        pathStates.pathData[nBase+5] = rayDir.y;
-        pathStates.pathData[nBase+6] = rayDir.z;
-        pathStates.pathData[nBase+7] = uintBitsToFloat(rngState);
-        pathStates.pathData[nBase+8] = throughput.x;
-        pathStates.pathData[nBase+9] = throughput.y;
-        pathStates.pathData[nBase+10] = throughput.z;
+        nextPathStates.nextPathData[nBase+0] = rayOrigin.x;
+        nextPathStates.nextPathData[nBase+1] = rayOrigin.y;
+        nextPathStates.nextPathData[nBase+2] = rayOrigin.z;
+        nextPathStates.nextPathData[nBase+3] = uintBitsToFloat(pixelIndex);
+        nextPathStates.nextPathData[nBase+4] = rayDir.x;
+        nextPathStates.nextPathData[nBase+5] = rayDir.y;
+        nextPathStates.nextPathData[nBase+6] = rayDir.z;
+        nextPathStates.nextPathData[nBase+7] = uintBitsToFloat(rngState);
+        nextPathStates.nextPathData[nBase+8] = throughput.x;
+        nextPathStates.nextPathData[nBase+9] = throughput.y;
+        nextPathStates.nextPathData[nBase+10] = throughput.z;
         uint newFlags = nextBounce | (isDiffusePath ? 0x10u : 0u);
-        pathStates.pathData[nBase+11] = uintBitsToFloat(newFlags);
+        nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(newFlags);
     }
 
     // Mark current path as processed (not terminated — it continues via nextActiveRayCount)

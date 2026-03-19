@@ -40,9 +40,10 @@ private:
     uint32_t maxPixels_ = 0;
     uint32_t frameIndex_ = 0;
 
-    // Wavefront SSBO buffers
-    VkBuffer pathStateBuffer_ = VK_NULL_HANDLE;       // PathState[]
-    VkDeviceMemory pathStateMemory_ = VK_NULL_HANDLE;
+    // Wavefront SSBO buffers (PathState is double-buffered to avoid read/write race)
+    VkBuffer pathStateBuffer_[2] = {};                 // PathState[] ping-pong
+    VkDeviceMemory pathStateMemory_[2] = {};
+    uint32_t pathStateCurrent_ = 0;                    // index of current read buffer
     VkBuffer hitResultBuffer_ = VK_NULL_HANDLE;        // HitResult[]
     VkDeviceMemory hitResultMemory_ = VK_NULL_HANDLE;
     VkBuffer shadowRayBuffer_ = VK_NULL_HANDLE;        // ShadowRay[]
