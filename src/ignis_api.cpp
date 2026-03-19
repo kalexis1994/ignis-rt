@@ -173,6 +173,15 @@ IGNIS_API void ignis_set_log_path(const char* path) {
 }
 
 IGNIS_API bool ignis_create(uint32_t width, uint32_t height) {
+    // Enforce minimum 1920px horizontal resolution — preserve aspect ratio
+    const uint32_t MIN_WIDTH = 1920;
+    if (width < MIN_WIDTH) {
+        float aspect = (float)height / (float)width;
+        width = MIN_WIDTH;
+        height = (uint32_t)(MIN_WIDTH * aspect);
+        // Align to 2 pixels (DLSS requirement)
+        height = (height + 1) & ~1;
+    }
     Log(L"[Ignis] ignis_create(%u, %u) called\n", width, height);
     if (g_renderer) {
         Log(L"[Ignis] WARNING: Renderer already created\n");
