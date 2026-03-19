@@ -930,24 +930,8 @@ def _find_image_texture_node(socket, _depth=0):
     if from_node.type == 'TEX_IMAGE':
         return from_node
 
-    # Sky Texture — bake to image and return as if it were a TEX_IMAGE
+    # Sky Texture — can't evaluate per-pixel, handled by _resolve_color_input fallback
     if from_node.type == 'TEX_SKY':
-        if not hasattr(from_node, '_ignis_baked_image') or from_node._ignis_baked_image is None:
-            baked = _bake_sky_texture(from_node)
-            if baked:
-                from_node._ignis_baked_image = baked
-                # Create a fake TEX_IMAGE-like object for the caller
-                class _FakeSkyTexNode:
-                    type = 'TEX_IMAGE'
-                    def __init__(self, img):
-                        self.image = img
-                return _FakeSkyTexNode(baked)
-        elif from_node._ignis_baked_image:
-            class _FakeSkyTexNode:
-                type = 'TEX_IMAGE'
-                def __init__(self, img):
-                    self.image = img
-            return _FakeSkyTexNode(from_node._ignis_baked_image)
         return None
 
     # Normal Map — check Color input
