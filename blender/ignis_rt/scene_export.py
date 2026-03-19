@@ -871,7 +871,7 @@ def _resolve_color_input(socket, default=(0.8, 0.8, 0.8), _depth=0):
     # Sky/procedural textures — can't evaluate per-pixel, use subdued default
     # Sky textures produce varied colors; average is much dimmer than pure sky blue
     if from_node.type in ('TEX_SKY', 'TEX_ENVIRONMENT'):
-        return (0.15, 0.18, 0.25)  # subdued sky average (Cycles sky average is dim)
+        return (0.03, 0.035, 0.05)  # dim sky average
     if from_node.type in ('TEX_NOISE', 'TEX_VORONOI', 'TEX_MUSGRAVE', 'TEX_CHECKER',
                            'TEX_WAVE', 'TEX_GRADIENT', 'TEX_MAGIC', 'TEX_BRICK'):
         return (0.5, 0.5, 0.5)  # neutral gray for procedurals
@@ -1260,15 +1260,16 @@ def _resolve_mix_shader(mix_node, register_image_fn):
     p2 = _extract_shader_props(shader2_node, register_image_fn)
 
     # Special case: Mix with Transparent BSDF
-    # Transparent doesn't contribute visible shading — use the other shader's properties.
-    # This handles light portals, backface-transparent emissives, etc.
+    # Use the non-transparent shader's properties but mark as partially transparent
+    # so shadow rays pass through (light portal behavior).
     s1_type = shader1_node.type if shader1_node else None
     s2_type = shader2_node.type if shader2_node else None
     if s1_type == 'BSDF_TRANSPARENT':
-        p2['transmission'] = p2.get('transmission', 0.0)  # keep any existing transmission
+        # flags bit1 = transmission (shadow rays pass through)
+        p2['flags'] = p2.get('flags', 0) | 2
         return p2
     if s2_type == 'BSDF_TRANSPARENT':
-        p1['transmission'] = p1.get('transmission', 0.0)
+        p1['flags'] = p1.get('flags', 0) | 2
         return p1
 
     # Blend properties by mix factor
@@ -1463,6 +1464,8 @@ def export_materials(depsgraph):
                         normal_tex = props['normal_tex']
                     if 'normal_strength' in props:
                         normal_strength = props['normal_strength']
+                    if 'flags' in props:
+                        flags = props['flags']
                 else:
                     # No Mix Shader — scan individual nodes
                     for node in mat.node_tree.nodes:
