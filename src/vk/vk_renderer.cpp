@@ -613,8 +613,11 @@ void Renderer::RenderFrameRT() {
 
     // (SHARC diag flush removed — SHARC is disabled)
 
+    // Wavefront path: skip NRD/RR — K5 already wrote final output + G-buffers
+    bool wavefrontActive = wavefrontPipeline_ && wavefrontPipeline_->IsReady();
+
     // 2. Ray Reconstruction path (replaces NRD + composite + DLSS SR)
-    if (dlssRRActive_ && dlss_ && dlss_->IsRRActive()) {
+    if (!wavefrontActive && dlssRRActive_ && dlss_ && dlss_->IsRRActive()) {
         // Barrier: RT writes → RR reads (G-buffers and noisy color)
         VkMemoryBarrier rtToRR{};
         rtToRR.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -690,7 +693,7 @@ void Renderer::RenderFrameRT() {
         }
     }
     // 2b. NRD denoise path (traditional pipeline)
-    else if (nrdInitialized_) {
+    else if (!wavefrontActive && nrdInitialized_) {
         // Barrier: RT writes → NRD reads (G-buffers and output image)
         VkMemoryBarrier rtToNrd{};
         rtToNrd.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
