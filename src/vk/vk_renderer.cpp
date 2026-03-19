@@ -1032,8 +1032,10 @@ void Renderer::RenderFrameRT() {
         return;
     }
 
-    // Wait for completion (needed for readback)
-    vkQueueWaitIdle(context_->GetGraphicsQueue());
+    // No vkQueueWaitIdle — fence-based pipelining:
+    // Frame N submits with inFlightFences_[currentFrame_]
+    // Frame N+1 waits on inFlightFences_[(currentFrame_+1)%2] at the top
+    // Readback reads data from the previous frame (1 frame latency, unnoticeable at 30+ FPS)
 
     // After rendering, current transforms become previous for the next frame.
     // Without this, prevTransforms would stay stale after an object stops
