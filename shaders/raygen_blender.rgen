@@ -112,6 +112,7 @@ layout(binding = 7, set = 0, r32f)    uniform image2D viewDepthImg;
 layout(binding = 8, set = 0, rgba16f) uniform image2D motionVectorsImg;
 layout(binding = 9, set = 0, rgba16f) uniform image2D diffuseRadianceImg;
 layout(binding = 10, set = 0, rgba16f) uniform image2D specularRadianceImg;
+layout(binding = 15, set = 0, rgba16f) uniform image2D specularAlbedoImg;
 layout(binding = 16, set = 0, rgba16f) uniform image2D albedoBufferImg;
 
 // Blue noise
@@ -178,6 +179,17 @@ layout(buffer_reference, scalar) buffer PrimMaterials { uint m[]; };
 #include "include/gi_reservoir.glsl"
 
 const uint SHADER_BLENDER_PBR = 100u;
+
+// EnvBRDFApprox — Epic/Karis approximation for split-sum specular albedo
+// Returns the specular color that RR needs for correct denoising
+vec3 EnvBRDFApprox(vec3 F0, float roughness, float NdotV) {
+    const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+    const vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
+    vec4 r = roughness * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * NdotV)) * r.x + r.y;
+    vec2 AB = vec2(-1.04, 1.04) * a004 + r.zw;
+    return F0 * AB.x + vec3(AB.y);
+}
 
 // ============================================================
 // Sky Environment — Procedural Preetham/Rayleigh+Mie scattering
@@ -1232,6 +1244,19 @@ void main() {
         }
         imageStore(albedoBufferImg, pixel, vec4(primaryAlbedo, shadowableFraction));
 
+        // Specular albedo (EnvBRDFApprox) for DLSS Ray Reconstruction
+        {
+            float NdotV = max(dot(primaryNormal, normalize((cam.viewInverse * vec4(0,0,0,1)).xyz - primaryWorldPos)), 0.001);
+            float f0_d = (1.5 - 1.0) / (1.5 + 1.0); // default IOR 1.5
+            f0_d = f0_d * f0_d;
+            vec3 F0 = mix(vec3(f0_d * 0.5 * 2.0), primaryAlbedo, clamp(primaryRoughness, 0.0, 1.0) > 0.99 ? 0.0 : 0.0);
+            // For metals, F0 = baseColor. For dielectrics, F0 = 0.04 (standard)
+            float metallic = 0.0; // TODO: store metallic in G-buffer for accurate F0
+            F0 = mix(vec3(0.04), primaryAlbedo, metallic);
+            vec3 specAlbedo = EnvBRDFApprox(F0, primaryRoughness, NdotV);
+            imageStore(specularAlbedoImg, pixel, vec4(specAlbedo, 0.0));
+        }
+
         // DLSS NDC depth
         vec4 clipPos = cam.proj * vec4(0.0, 0.0, primaryViewZ, 1.0);
         float ndcZ = clamp(clipPos.z / clipPos.w, 0.0, 1.0);
@@ -1255,6 +1280,7 @@ void main() {
         imageStore(diffuseRadianceImg, pixel, vec4(0, 0, 0, 0));
         imageStore(specularRadianceImg, pixel, vec4(0, 0, 0, 0));
         imageStore(albedoBufferImg, pixel, vec4(0, 0, 0, 0));
+        imageStore(specularAlbedoImg, pixel, vec4(0, 0, 0, 0));
         imageStore(dlssDepthImg, pixel, vec4(1.0, 0, 0, 0));
     }
 

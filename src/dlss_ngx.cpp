@@ -578,6 +578,8 @@ void DLSS_NGX::EvaluateRR(
     float deltaTime,
     const float* viewMatrix,
     const float* projMatrix,
+    VkImage specularAlbedoImage,
+    VkImageView specularAlbedoView,
     VkImage diffuseHitDistImage,
     VkImageView diffuseHitDistView,
     VkImage specularHitDistImage,
@@ -631,7 +633,16 @@ void DLSS_NGX::EvaluateRR(
     evalParams.pInMotionVectors = &mvResource;
     evalParams.pInNormals = &normalsResource;
     evalParams.pInDiffuseAlbedo = &albedoResource;
-    evalParams.pInSpecularAlbedo = &albedoResource;  // use same albedo for specular
+    // Specular albedo: use EnvBRDFApprox if available, fallback to diffuse albedo
+    NVSDK_NGX_Resource_VK specAlbedoResource = {};
+    if (specularAlbedoView != VK_NULL_HANDLE) {
+        specAlbedoResource = NVSDK_NGX_Create_ImageView_Resource_VK(
+            specularAlbedoView, specularAlbedoImage, fullRange, VK_FORMAT_R16G16B16A16_SFLOAT,
+            m_renderWidth, m_renderHeight, false);
+        evalParams.pInSpecularAlbedo = &specAlbedoResource;
+    } else {
+        evalParams.pInSpecularAlbedo = &albedoResource;
+    }
     evalParams.pInRoughness = &normalsResource;  // roughness packed in normalRoughness.a
     // GBufferSurface attribs (also required by the helper — sets GBuffer_Normals, _Roughness, _Albedo params)
     evalParams.GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_ALBEDO] = &albedoResource;

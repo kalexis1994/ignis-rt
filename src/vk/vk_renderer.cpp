@@ -723,6 +723,8 @@ void Renderer::RenderFrameRT() {
             jitterX_, jitterY_,
             rrDeltaMs / 1000.0f,
             lastView_, lastProj_,
+            rtPipeline_->GetSpecularAlbedoImage(),           // EnvBRDFApprox specular albedo
+            rtPipeline_->GetSpecularAlbedoView(),
             rtPipeline_->GetDiffuseRadianceImage(),          // diffuse hit distance (.a)
             rtPipeline_->GetDiffuseRadianceView(),
             rtPipeline_->GetSpecularRadianceImage(),         // specular hit distance (.a)

@@ -92,6 +92,8 @@ public:
         float deltaTime,                 // Frame time in seconds
         const float* viewMatrix = nullptr,  // 4x4 world-to-view (column-major)
         const float* projMatrix = nullptr,  // 4x4 view-to-clip (column-major)
+        VkImage specularAlbedoImage = VK_NULL_HANDLE,    // EnvBRDFApprox specular albedo
+        VkImageView specularAlbedoView = VK_NULL_HANDLE,
         VkImage diffuseHitDistImage = VK_NULL_HANDLE,   // diffuse hit distance (RGBA16F, .a = hitDist)
         VkImageView diffuseHitDistView = VK_NULL_HANDLE,
         VkImage specularHitDistImage = VK_NULL_HANDLE,  // specular hit distance (RGBA16F, .a = hitDist)

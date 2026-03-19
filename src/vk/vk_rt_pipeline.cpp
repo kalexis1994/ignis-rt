@@ -410,6 +410,7 @@ void RTPipeline::Shutdown() {
         DestroyGBufferImage(motionVectorsGBuffer_);
         DestroyGBufferImage(diffuseRadianceGBuffer_);
         DestroyGBufferImage(specularRadianceGBuffer_);
+        DestroyGBufferImage(specularAlbedoGBuffer_);
         DestroyGBufferImage(albedoGBuffer_);
         DestroyGBufferImage(penumbraGBuffer_);
         DestroyGBufferImage(dlssDepthGBuffer_);
@@ -525,6 +526,7 @@ bool RTPipeline::CreateGBuffers(uint32_t width, uint32_t height) {
         DestroyGBufferImage(motionVectorsGBuffer_);
         DestroyGBufferImage(diffuseRadianceGBuffer_);
         DestroyGBufferImage(specularRadianceGBuffer_);
+        DestroyGBufferImage(specularAlbedoGBuffer_);
         DestroyGBufferImage(albedoGBuffer_);
         DestroyGBufferImage(penumbraGBuffer_);
         DestroyGBufferImage(dlssDepthGBuffer_);
@@ -538,6 +540,7 @@ bool RTPipeline::CreateGBuffers(uint32_t width, uint32_t height) {
     if (!CreateGBufferImage(motionVectorsGBuffer_, VK_FORMAT_R16G16B16A16_SFLOAT, width, height, "motionVectors")) return false;
     if (!CreateGBufferImage(diffuseRadianceGBuffer_, VK_FORMAT_R16G16B16A16_SFLOAT, width, height, "diffuseRadiance")) return false;
     if (!CreateGBufferImage(specularRadianceGBuffer_, VK_FORMAT_R16G16B16A16_SFLOAT, width, height, "specularRadiance")) return false;
+    if (!CreateGBufferImage(specularAlbedoGBuffer_, VK_FORMAT_R16G16B16A16_SFLOAT, width, height, "specularAlbedo")) return false;
     if (!CreateGBufferImage(albedoGBuffer_, VK_FORMAT_R16G16B16A16_SFLOAT, width, height, "albedoBuffer")) return false;
     if (!CreateGBufferImage(penumbraGBuffer_, VK_FORMAT_R16_SFLOAT, width, height, "penumbra")) return false;
     if (!CreateGBufferImage(dlssDepthGBuffer_, VK_FORMAT_R32_SFLOAT, width, height, "dlssDepth")) return false;
@@ -561,22 +564,23 @@ bool RTPipeline::CreateGBuffers(uint32_t width, uint32_t height) {
     // Update descriptor set with real G-buffer images
     VkDevice device = context_->GetDevice();
 
-    VkDescriptorImageInfo gbufferInfos[11];
+    VkDescriptorImageInfo gbufferInfos[12];
     gbufferInfos[0] = {VK_NULL_HANDLE, normalRoughnessGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
     gbufferInfos[1] = {VK_NULL_HANDLE, viewDepthGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
     gbufferInfos[2] = {VK_NULL_HANDLE, motionVectorsGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
     gbufferInfos[3] = {VK_NULL_HANDLE, diffuseRadianceGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
     gbufferInfos[4] = {VK_NULL_HANDLE, specularRadianceGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
-    gbufferInfos[5] = {VK_NULL_HANDLE, albedoGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
-    gbufferInfos[6] = {VK_NULL_HANDLE, penumbraGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
-    gbufferInfos[7] = {VK_NULL_HANDLE, dlssDepthGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
-    gbufferInfos[8] = {VK_NULL_HANDLE, reactiveMaskGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
-    gbufferInfos[9] = {VK_NULL_HANDLE, diffConfidenceGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
-    gbufferInfos[10] = {VK_NULL_HANDLE, specConfidenceGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
+    gbufferInfos[5] = {VK_NULL_HANDLE, specularAlbedoGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
+    gbufferInfos[6] = {VK_NULL_HANDLE, albedoGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
+    gbufferInfos[7] = {VK_NULL_HANDLE, penumbraGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
+    gbufferInfos[8] = {VK_NULL_HANDLE, dlssDepthGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
+    gbufferInfos[9] = {VK_NULL_HANDLE, reactiveMaskGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
+    gbufferInfos[10] = {VK_NULL_HANDLE, diffConfidenceGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
+    gbufferInfos[11] = {VK_NULL_HANDLE, specConfidenceGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
 
-    int bindings[] = {6, 7, 8, 9, 10, 16, 18, 22, 29, 30, 31};
-    std::vector<VkWriteDescriptorSet> writes(11);
-    for (int i = 0; i < 11; i++) {
+    int bindings[] = {6, 7, 8, 9, 10, 15, 16, 18, 22, 29, 30, 31};
+    std::vector<VkWriteDescriptorSet> writes(12);
+    for (int i = 0; i < 12; i++) {
         writes[i] = {};
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = descriptorSet_;

@@ -59,6 +59,7 @@ void DLSS_NGX::EvaluateRR(VkCommandBuffer cmd,
                             float jitterX, float jitterY,
                             float deltaTime,
                             const float* viewMatrix, const float* projMatrix,
+                            VkImage specAlb, VkImageView specAlbV,
                             VkImage diffHD, VkImageView diffHDV,
                             VkImage specHD, VkImageView specHDV,
                             bool reset) {
