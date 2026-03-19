@@ -567,6 +567,10 @@ void Renderer::RenderFrameRT() {
     interop_->TransitionForRTWrite(cmd);
     if (wavefrontPipeline_ && wavefrontPipeline_->IsReady()) {
         PathTracerConfig* wfCfg = VK_GetConfig();
+        if (frameIndex_ < 3) {
+            Log(L"[WF] frame %u: dispatch %ux%u dlssActive=%d dlssRR=%d tonemapReady=%d\n",
+                frameIndex_, renderWidth_, renderHeight_, (int)dlssActive_, (int)dlssRRActive_, (int)tonemapReady_);
+        }
         wavefrontPipeline_->RecordDispatch(cmd, renderWidth_, renderHeight_,
             rtPipeline_->GetDescriptorSet(), wfCfg ? wfCfg->maxBounces : 2);
     } else {
@@ -618,6 +622,7 @@ void Renderer::RenderFrameRT() {
     bool wavefrontActive = wavefrontPipeline_ && wavefrontPipeline_->IsReady();
 
     if (wavefrontActive && dlssActive_ && dlss_ && dlss_->IsInitialized() && dlss_->IsSupported() && !dlssRRActive_) {
+        if (frameIndex_ < 3) Log(L"[WF] frame %u: running DLSS SR + tonemap path\n", frameIndex_);
         // Barrier: K5 compute writes → DLSS reads
         VkMemoryBarrier wfBarrier{};
         wfBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -673,14 +678,17 @@ void Renderer::RenderFrameRT() {
     }
 
     // 2. Ray Reconstruction path (replaces NRD + composite + DLSS SR)
-    if (!wavefrontActive && dlssRRActive_ && dlss_ && dlss_->IsRRActive()) {
-        // Barrier: RT writes → RR reads (G-buffers and noisy color)
+    // RR still runs with wavefront — it denoises + upscales K5's noisy output
+    if (dlssRRActive_ && dlss_ && dlss_->IsRRActive()) {
+        // Barrier: RT/compute writes → RR reads (G-buffers and noisy color)
         VkMemoryBarrier rtToRR{};
         rtToRR.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         rtToRR.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         rtToRR.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+        VkPipelineStageFlags srcStage = wavefrontActive ?
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT :
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+        vkCmdPipelineBarrier(cmd, srcStage,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0, 1, &rtToRR, 0, nullptr, 0, nullptr);
 
