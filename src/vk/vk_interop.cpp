@@ -219,17 +219,19 @@ void Interop::Shutdown() {
     VkDevice device = context_ ? context_->GetDevice() : VK_NULL_HANDLE;
     if (device == VK_NULL_HANDLE) return;
 
-    if (readbackMapped_ && readbackMemory_ != VK_NULL_HANDLE) {
-        vkUnmapMemory(device, readbackMemory_);
-        readbackMapped_ = nullptr;
-    }
-    if (readbackBuffer_ != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device, readbackBuffer_, nullptr);
-        readbackBuffer_ = VK_NULL_HANDLE;
-    }
-    if (readbackMemory_ != VK_NULL_HANDLE) {
-        vkFreeMemory(device, readbackMemory_, nullptr);
-        readbackMemory_ = VK_NULL_HANDLE;
+    for (int i = 0; i < 2; i++) {
+        if (readbackMapped_[i] && readbackMemory_[i] != VK_NULL_HANDLE) {
+            vkUnmapMemory(device, readbackMemory_[i]);
+            readbackMapped_[i] = nullptr;
+        }
+        if (readbackBuffer_[i] != VK_NULL_HANDLE) {
+            vkDestroyBuffer(device, readbackBuffer_[i], nullptr);
+            readbackBuffer_[i] = VK_NULL_HANDLE;
+        }
+        if (readbackMemory_[i] != VK_NULL_HANDLE) {
+            vkFreeMemory(device, readbackMemory_[i], nullptr);
+            readbackMemory_[i] = VK_NULL_HANDLE;
+        }
     }
     if (sharedImageView_ != VK_NULL_HANDLE) {
         vkDestroyImageView(device, sharedImageView_, nullptr);
@@ -252,40 +254,41 @@ void Interop::Shutdown() {
 }
 
 bool Interop::EnsureReadbackBuffer() {
-    if (readbackBuffer_ != VK_NULL_HANDLE) return true;
+    if (readbackBuffer_[0] != VK_NULL_HANDLE) return true;
 
     VkDevice device = context_->GetDevice();
     uint32_t imageSize = width_ * height_ * 4;
 
-    VkBufferCreateInfo bufInfo{};
-    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufInfo.size = imageSize;
-    bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    for (int i = 0; i < 2; i++) {
+        VkBufferCreateInfo bufInfo{};
+        bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufInfo.size = imageSize;
+        bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    if (vkCreateBuffer(device, &bufInfo, nullptr, &readbackBuffer_) != VK_SUCCESS)
-        return false;
+        if (vkCreateBuffer(device, &bufInfo, nullptr, &readbackBuffer_[i]) != VK_SUCCESS)
+            return false;
 
-    VkMemoryRequirements memReqs;
-    vkGetBufferMemoryRequirements(device, readbackBuffer_, &memReqs);
+        VkMemoryRequirements memReqs;
+        vkGetBufferMemoryRequirements(device, readbackBuffer_[i], &memReqs);
 
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = memReqs.size;
-    allocInfo.memoryTypeIndex = context_->FindMemoryType(memReqs.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memReqs.size;
+        allocInfo.memoryTypeIndex = context_->FindMemoryType(memReqs.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-    if (vkAllocateMemory(device, &allocInfo, nullptr, &readbackMemory_) != VK_SUCCESS) {
-        vkDestroyBuffer(device, readbackBuffer_, nullptr);
-        readbackBuffer_ = VK_NULL_HANDLE;
-        return false;
-    }
-    vkBindBufferMemory(device, readbackBuffer_, readbackMemory_, 0);
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &readbackMemory_[i]) != VK_SUCCESS) {
+            vkDestroyBuffer(device, readbackBuffer_[i], nullptr);
+            readbackBuffer_[i] = VK_NULL_HANDLE;
+            return false;
+        }
+        vkBindBufferMemory(device, readbackBuffer_[i], readbackMemory_[i], 0);
 
-    // Persistent map — keep mapped for the lifetime of the buffer
-    if (vkMapMemory(device, readbackMemory_, 0, imageSize, 0, &readbackMapped_) != VK_SUCCESS) {
-        readbackMapped_ = nullptr;
-        return false;
+        if (vkMapMemory(device, readbackMemory_[i], 0, imageSize, 0, &readbackMapped_[i]) != VK_SUCCESS) {
+            readbackMapped_[i] = nullptr;
+            return false;
+        }
     }
 
     return true;
@@ -294,9 +297,6 @@ bool Interop::EnsureReadbackBuffer() {
 void Interop::RecordReadbackCopy(VkCommandBuffer cmd) {
     if (!EnsureReadbackBuffer()) return;
 
-    // Image is already in GENERAL; transition to TRANSFER_SRC.
-    // srcStageMask covers both RT (raygen writes) and COMPUTE (NRD composite writes)
-    // so the layout transition correctly synchronises with all prior writers.
     VkImageMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -320,10 +320,10 @@ void Interop::RecordReadbackCopy(VkCommandBuffer cmd) {
     region.imageSubresource.layerCount = 1;
     region.imageExtent = {width_, height_, 1};
 
+    // Write to current buffer (read from previous)
     vkCmdCopyImageToBuffer(cmd, sharedImage_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                            readbackBuffer_, 1, &region);
+                            readbackBuffer_[readbackCurrent_], 1, &region);
 
-    // Transition back to GENERAL for next frame (both RT and compute may write)
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -333,13 +333,24 @@ void Interop::RecordReadbackCopy(VkCommandBuffer cmd) {
         VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    // Swap for next frame
+    readbackCurrent_ = 1 - readbackCurrent_;
 }
 
 bool Interop::CopyReadbackResult(void* outData, uint32_t bufferSize) {
-    if (!readbackMapped_ || !outData) return false;
+    // Read from the buffer that is NOT being written to (previous frame, already complete)
+    uint32_t readIdx = readbackCurrent_;  // after swap, readbackCurrent_ points to the next write buffer
+    // So the just-completed write is at (readbackCurrent_), and the previous completed is at (1 - readbackCurrent_)
+    // Actually: RecordReadbackCopy writes to [old readbackCurrent_], then swaps.
+    // After swap, readbackCurrent_ is the NEW write target. The just-written data is at [1 - readbackCurrent_].
+    // But that data is from the CURRENT frame which might not be complete yet.
+    // The SAFE read is [readbackCurrent_] — the buffer that was written 2 frames ago (definitely complete).
+    uint32_t safeIdx = readbackCurrent_;  // this was the write target LAST frame, completed by fence
+    if (!readbackMapped_[safeIdx] || !outData) return false;
     uint32_t imageSize = width_ * height_ * 4;
     if (bufferSize < imageSize) return false;
-    memcpy(outData, readbackMapped_, imageSize);
+    memcpy(outData, readbackMapped_[safeIdx], imageSize);
     return true;
 }
 

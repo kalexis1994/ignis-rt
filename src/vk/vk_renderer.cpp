@@ -1032,8 +1032,9 @@ void Renderer::RenderFrameRT() {
         return;
     }
 
-    // Wait for completion (needed for readback — single readback buffer)
-    vkQueueWaitIdle(context_->GetGraphicsQueue());
+    // Double-buffered readback: no WaitIdle needed.
+    // Frame N writes to readback[current], reads from readback[previous] (completed by fence).
+    // 1 frame readback latency, imperceptible at 30+ FPS.
 
     // After rendering, current transforms become previous for the next frame.
     // Without this, prevTransforms would stay stale after an object stops

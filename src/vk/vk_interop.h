@@ -62,10 +62,12 @@ private:
     VkImageView sharedImageView_ = VK_NULL_HANDLE;
     HANDLE ntHandle_ = nullptr;
 
-    // Readback staging buffer (persistent mapped)
-    VkBuffer readbackBuffer_ = VK_NULL_HANDLE;
-    VkDeviceMemory readbackMemory_ = VK_NULL_HANDLE;
-    void* readbackMapped_ = nullptr;  // Persistently mapped pointer
+    // Double-buffered readback staging (persistent mapped)
+    // Write to readbackCurrent_, read from readbackCurrent_^1
+    VkBuffer readbackBuffer_[2] = {};
+    VkDeviceMemory readbackMemory_[2] = {};
+    void* readbackMapped_[2] = {};
+    uint32_t readbackCurrent_ = 0;  // index of buffer being written this frame
 
     PFN_vkGetMemoryWin32HandleKHR vkGetMemoryWin32HandleKHR_ = nullptr;
 
