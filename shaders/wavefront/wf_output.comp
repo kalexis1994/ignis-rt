@@ -98,7 +98,8 @@ void main() {
                                  primaryGBuf.gbufData[gBase+14]);
     uint primaryInstanceId = floatBitsToUint(primaryGBuf.gbufData[gBase+15]);
 
-    bool primaryHit = (abs(primaryViewZ) < 1e6);
+    // viewZ < 0 for visible geometry (RH convention), 0 for sky (buffer cleared to 0)
+    bool primaryHit = (primaryViewZ < -0.001);
 
     // Write G-buffers for NRD
     if (primaryHit) {
