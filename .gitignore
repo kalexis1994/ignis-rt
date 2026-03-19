@@ -12,6 +12,13 @@ build/
 # --- Compiled SPIR-V shaders (rebuilt from source) ---
 shaders/*.spv
 shaders/fsr3/compiled/*.spv
+shaders/wavefront/*.spv
+
+# --- Deployed shaders in addon (copies for zip install) ---
+blender/ignis_rt/shaders/
+
+# --- Addon zip (build artifact) ---
+ignis_rt_addon.zip
 
 # --- Deployed binaries in Blender addon ---
 blender/ignis_rt/lib/ignis_rt.dll
