@@ -445,9 +445,12 @@ void main() {
         atomicAddFloat(rBase+2, ambient.z);
     }
 
-    // ---- Russian roulette (bounce >= 1) ----
-    if (bounce >= 1u) {
-        float p = min(max(throughput.r, max(throughput.g, throughput.b)), 0.95);
+    // ---- Russian roulette (Cycles-style: sqrt perceptual, min bounce guard) ----
+    uint minBounces = 2u;  // force full contribution for first N bounces
+    if (bounce >= minBounces) {
+        // sqrt of max channel matches perceptual luminance better than linear max
+        float maxC = max(throughput.r, max(throughput.g, throughput.b));
+        float p = min(sqrt(maxC), 1.0);
         if (rand01() > p) {
             pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
             return;
