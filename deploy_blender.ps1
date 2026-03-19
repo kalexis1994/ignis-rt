@@ -30,13 +30,26 @@ $blenderInstallBases = @(
 )
 
 # Collect all known versions from user config dirs
+# Blender 5.x uses extensions/user_default/ instead of scripts/addons/
 $allVersions = @()
 if (Test-Path $blenderUserBase) {
     Get-ChildItem $blenderUserBase -Directory | ForEach-Object {
-        $allVersions += @{
-            Name = $_.Name
-            AddonsDir = Join-Path $_.FullName "scripts\addons"
-            Source = "user"
+        $ver = $_.Name
+        # Blender 5.x: prefer extensions/user_default/ (extension system)
+        $extDir = Join-Path $_.FullName "extensions\user_default"
+        $legacyDir = Join-Path $_.FullName "scripts\addons"
+        if ([version]$ver -ge [version]"5.0" -and (Test-Path (Split-Path $extDir -Parent))) {
+            $allVersions += @{
+                Name = $ver
+                AddonsDir = $extDir
+                Source = "user-ext"
+            }
+        } else {
+            $allVersions += @{
+                Name = $ver
+                AddonsDir = $legacyDir
+                Source = "user"
+            }
         }
     }
 }
@@ -128,6 +141,23 @@ if (-not (Test-Path $libDir)) {
 Copy-Item $dllRelease -Destination $libDir -Force
 $dllSize = (Get-Item (Join-Path $libDir "ignis_rt.dll")).Length / 1KB
 Write-Host "  ignis_rt.dll -> lib/ ($([math]::Round($dllSize)) KB)" -ForegroundColor Green
+
+# Copy compiled shaders (.spv) into addon for standalone zip installs
+$shaderDest = Join-Path $addonSrc "shaders"
+if (-not (Test-Path $shaderDest)) { New-Item -ItemType Directory -Path $shaderDest -Force | Out-Null }
+$spvCount = 0
+Get-ChildItem (Join-Path $repoRoot "shaders") -Filter "*.spv" | ForEach-Object {
+    Copy-Item $_.FullName -Destination $shaderDest -Force; $spvCount++
+}
+$wfSrc = Join-Path $repoRoot "shaders\wavefront"
+if (Test-Path $wfSrc) {
+    $wfDest = Join-Path $shaderDest "wavefront"
+    if (-not (Test-Path $wfDest)) { New-Item -ItemType Directory -Path $wfDest -Force | Out-Null }
+    Get-ChildItem $wfSrc -Filter "*.spv" | ForEach-Object {
+        Copy-Item $_.FullName -Destination $wfDest -Force; $spvCount++
+    }
+}
+Write-Host "  $spvCount shader SPVs -> shaders/" -ForegroundColor Green
 
 # Copy NRD.dll if NRD is enabled (check for it in NRD SDK path)
 $nrdDll = ""

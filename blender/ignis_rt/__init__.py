@@ -72,7 +72,10 @@ def get_base_path():
     prefs = bpy.context.preferences.addons.get(__package__)
     root = ""
     if prefs:
-        root = prefs.preferences.ignis_root
+        try:
+            root = prefs.preferences.ignis_root
+        except Exception:
+            pass
     if root:
         return bpy.path.abspath(root)
 
@@ -95,7 +98,12 @@ def get_base_path():
     if os.path.isdir(os.path.join(candidate, "shaders")):
         return candidate
 
-    # 4. Fallback: empty (CWD)
+    # 4. Fallback: use DLL directory (lib/ is sibling to shaders/)
+    lib_dir = os.path.join(addon_dir, "lib")
+    if os.path.isdir(lib_dir):
+        return addon_dir
+
+    # 5. Fallback: empty (CWD)
     return ""
 
 

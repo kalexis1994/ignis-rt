@@ -408,6 +408,25 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
         from . import get_log_path, get_base_path
         log_path = get_log_path()
+
+        # Write diagnostics to separate file BEFORE anything else
+        import os as _os
+        _diag_path = _os.path.join(_os.path.expanduser("~"), "ignis-diag.txt")
+        try:
+            _adir = _os.path.dirname(_os.path.abspath(__file__))
+            with open(_diag_path, "w") as _df:
+                _df.write(f"addon_dir={_adir}\n")
+                _bcrumb = _os.path.join(_adir, "_deploy_root.txt")
+                _df.write(f"breadcrumb_exists={_os.path.isfile(_bcrumb)}\n")
+                if _os.path.isfile(_bcrumb):
+                    with open(_bcrumb) as _bf:
+                        _bc = _bf.read().strip()
+                    _df.write(f"breadcrumb={_bc}\n")
+                    _df.write(f"shaders_there={_os.path.isdir(_os.path.join(_bc, 'shaders'))}\n")
+                _df.write(f"shaders_in_addon={_os.path.isdir(_os.path.join(_adir, 'shaders'))}\n")
+        except Exception as _e:
+            pass
+
         base_path = get_base_path()
         dll_wrapper.set_log_path(log_path)
         dll_wrapper.set_base_path(base_path)

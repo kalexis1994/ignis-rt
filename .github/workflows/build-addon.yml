@@ -45,11 +45,10 @@ jobs:
           mkdir -p staging/ignis_rt/lib
           mkdir -p staging/ignis_rt/shaders
 
-          # Python addon files
-          cp blender/ignis_rt/__init__.py   staging/ignis_rt/
-          cp blender/ignis_rt/dll_wrapper.py staging/ignis_rt/
-          cp blender/ignis_rt/engine.py      staging/ignis_rt/
-          cp blender/ignis_rt/scene_export.py staging/ignis_rt/
+          # Python addon files + manifest + assets
+          cp blender/ignis_rt/*.py   staging/ignis_rt/
+          cp blender/ignis_rt/blender_manifest.toml staging/ignis_rt/ 2>/dev/null || true
+          cp -r blender/ignis_rt/icons staging/ignis_rt/ 2>/dev/null || true
 
           # DLL (built)
           cp build/Release/ignis_rt.dll staging/ignis_rt/lib/
@@ -64,6 +63,8 @@ jobs:
 
           # Compiled shaders
           cp shaders/*.spv staging/ignis_rt/shaders/
+          mkdir -p staging/ignis_rt/shaders/wavefront
+          cp shaders/wavefront/*.spv staging/ignis_rt/shaders/wavefront/ 2>/dev/null || true
 
       - name: Create zip
         shell: bash
