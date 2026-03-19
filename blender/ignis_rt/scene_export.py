@@ -621,24 +621,171 @@ def _blackbody_to_rgb(temperature):
     return (r, g, b)
 
 
-def _resolve_color_input(socket, default=(0.8, 0.8, 0.8)):
-    """Resolve a color socket value, following links to Blackbody/RGB nodes."""
-    if socket is None:
+def _resolve_scalar_input(socket, default=0.5, _depth=0):
+    """Resolve a scalar socket value, following links recursively."""
+    if socket is None or _depth > 8:
         return default
-    if socket.is_linked:
-        from_node = socket.links[0].from_node
-        # Blackbody node → convert temperature to RGB
-        if from_node.type == 'BLACKBODY':
-            temp_inp = from_node.inputs.get('Temperature')
-            temp = float(temp_inp.default_value) if temp_inp else 5000.0
-            return _blackbody_to_rgb(temp)
-        # RGB/Value node → read directly
-        if from_node.type == 'RGB':
-            out = from_node.outputs.get('Color')
-            if out:
-                c = out.default_value
+    if not socket.is_linked:
+        val = socket.default_value
+        return float(val) if not hasattr(val, '__len__') else float(val[0]) if len(val) > 0 else default
+    from_node = socket.links[0].from_node
+
+    if from_node.type == 'VALUE':
+        out = from_node.outputs.get('Value')
+        return float(out.default_value) if out else default
+
+    if from_node.type == 'MATH':
+        op = from_node.operation
+        a = _resolve_scalar_input(from_node.inputs[0], 0.0, _depth + 1) if len(from_node.inputs) > 0 else 0.0
+        b = _resolve_scalar_input(from_node.inputs[1], 0.0, _depth + 1) if len(from_node.inputs) > 1 else 0.0
+        import math as _m
+        if op == 'ADD': return a + b
+        elif op == 'SUBTRACT': return a - b
+        elif op == 'MULTIPLY': return a * b
+        elif op == 'DIVIDE': return a / b if b != 0 else 0.0
+        elif op == 'POWER': return _m.pow(max(a, 0), b) if a >= 0 else 0.0
+        elif op == 'MINIMUM': return min(a, b)
+        elif op == 'MAXIMUM': return max(a, b)
+        elif op == 'ABSOLUTE': return abs(a)
+        elif op == 'SQRT': return _m.sqrt(max(a, 0))
+        return a
+
+    if from_node.type == 'CLAMP':
+        val = _resolve_scalar_input(from_node.inputs.get('Value'), 0.5, _depth + 1)
+        mn = _resolve_scalar_input(from_node.inputs.get('Min'), 0.0, _depth + 1)
+        mx = _resolve_scalar_input(from_node.inputs.get('Max'), 1.0, _depth + 1)
+        return max(mn, min(val, mx))
+
+    if from_node.type == 'MAP_RANGE':
+        val = _resolve_scalar_input(from_node.inputs[0], 0.5, _depth + 1)
+        from_min = _resolve_scalar_input(from_node.inputs[1], 0.0, _depth + 1)
+        from_max = _resolve_scalar_input(from_node.inputs[2], 1.0, _depth + 1)
+        to_min = _resolve_scalar_input(from_node.inputs[3], 0.0, _depth + 1)
+        to_max = _resolve_scalar_input(from_node.inputs[4], 1.0, _depth + 1)
+        if from_max - from_min != 0:
+            t = (val - from_min) / (from_max - from_min)
+            return to_min + t * (to_max - to_min)
+        return to_min
+
+    return default
+
+
+def _eval_color_ramp(ramp_node, fac):
+    """Evaluate a ColorRamp node at a given factor value."""
+    elements = ramp_node.color_ramp.elements
+    if len(elements) == 0:
+        return (0.5, 0.5, 0.5)
+    if fac <= elements[0].position:
+        c = elements[0].color
+        return (c[0], c[1], c[2])
+    if fac >= elements[-1].position:
+        c = elements[-1].color
+        return (c[0], c[1], c[2])
+    # Find surrounding stops and interpolate
+    for i in range(len(elements) - 1):
+        if elements[i].position <= fac <= elements[i + 1].position:
+            t = (fac - elements[i].position) / max(elements[i + 1].position - elements[i].position, 1e-6)
+            c0, c1 = elements[i].color, elements[i + 1].color
+            return (c0[0] + (c1[0] - c0[0]) * t,
+                    c0[1] + (c1[1] - c0[1]) * t,
+                    c0[2] + (c1[2] - c0[2]) * t)
+    c = elements[-1].color
+    return (c[0], c[1], c[2])
+
+
+def _resolve_color_input(socket, default=(0.8, 0.8, 0.8), _depth=0):
+    """Resolve a color socket value, following links recursively."""
+    if socket is None or _depth > 8:
+        return default
+    if not socket.is_linked:
+        c = socket.default_value
+        if hasattr(c, '__len__') and len(c) >= 3:
+            return (c[0], c[1], c[2])
+        return default
+    from_node = socket.links[0].from_node
+
+    # Blackbody → RGB
+    if from_node.type == 'BLACKBODY':
+        temp_inp = from_node.inputs.get('Temperature')
+        temp = float(temp_inp.default_value) if temp_inp else 5000.0
+        return _blackbody_to_rgb(temp)
+
+    # RGB constant
+    if from_node.type == 'RGB':
+        out = from_node.outputs.get('Color')
+        if out:
+            c = out.default_value
+            return (c[0], c[1], c[2])
+
+    # ColorRamp — evaluate the ramp at the input factor
+    if from_node.type == 'VALTORGB':
+        fac = _resolve_scalar_input(from_node.inputs.get('Fac'), 0.5, _depth + 1)
+        return _eval_color_ramp(from_node, fac)
+
+    # MixRGB / Mix — blend two colors
+    if from_node.type in ('MIX_RGB', 'MIX'):
+        fac = _resolve_scalar_input(from_node.inputs.get('Fac') or from_node.inputs.get('Factor'), 0.5, _depth + 1)
+        c1 = _resolve_color_input(from_node.inputs.get('Color1') or from_node.inputs.get('A'), default, _depth + 1)
+        c2 = _resolve_color_input(from_node.inputs.get('Color2') or from_node.inputs.get('B'), default, _depth + 1)
+        blend_type = getattr(from_node, 'blend_type', 'MIX')
+        if blend_type == 'MIX':
+            return _lerp_color(c1, c2, fac)
+        elif blend_type == 'MULTIPLY':
+            return (c1[0] * c2[0], c1[1] * c2[1], c1[2] * c2[2])
+        elif blend_type == 'ADD':
+            return (c1[0] + c2[0] * fac, c1[1] + c2[1] * fac, c1[2] + c2[2] * fac)
+        elif blend_type == 'SUBTRACT':
+            return (c1[0] - c2[0] * fac, c1[1] - c2[1] * fac, c1[2] - c2[2] * fac)
+        elif blend_type == 'SCREEN':
+            return (1-(1-c1[0])*(1-c2[0]*fac), 1-(1-c1[1])*(1-c2[1]*fac), 1-(1-c1[2])*(1-c2[2]*fac))
+        elif blend_type == 'OVERLAY':
+            def _ov(a, b): return 2*a*b if a < 0.5 else 1-2*(1-a)*(1-b)
+            return (_ov(c1[0], c2[0]), _ov(c1[1], c2[1]), _ov(c1[2], c2[2]))
+        return _lerp_color(c1, c2, fac)
+
+    # Gamma
+    if from_node.type == 'GAMMA':
+        c = _resolve_color_input(from_node.inputs.get('Color'), default, _depth + 1)
+        gamma = _resolve_scalar_input(from_node.inputs.get('Gamma'), 1.0, _depth + 1)
+        if gamma > 0:
+            return (pow(max(c[0],0), gamma), pow(max(c[1],0), gamma), pow(max(c[2],0), gamma))
+        return c
+
+    # Invert
+    if from_node.type == 'INVERT':
+        fac = _resolve_scalar_input(from_node.inputs.get('Fac'), 1.0, _depth + 1)
+        c = _resolve_color_input(from_node.inputs.get('Color'), default, _depth + 1)
+        inv = (1-c[0], 1-c[1], 1-c[2])
+        return _lerp_color(c, inv, fac)
+
+    # Bright/Contrast
+    if from_node.type == 'BRIGHTCONTRAST':
+        c = _resolve_color_input(from_node.inputs.get('Color'), default, _depth + 1)
+        bright = _resolve_scalar_input(from_node.inputs.get('Bright'), 0.0, _depth + 1)
+        contrast = _resolve_scalar_input(from_node.inputs.get('Contrast'), 0.0, _depth + 1)
+        return (max(0, (c[0]-0.5)*max(1+contrast,0)+0.5+bright),
+                max(0, (c[1]-0.5)*max(1+contrast,0)+0.5+bright),
+                max(0, (c[2]-0.5)*max(1+contrast,0)+0.5+bright))
+
+    # Hue/Saturation/Value
+    if from_node.type == 'HUE_SAT':
+        c = _resolve_color_input(from_node.inputs.get('Color'), default, _depth + 1)
+        sat = _resolve_scalar_input(from_node.inputs.get('Saturation'), 1.0, _depth + 1)
+        val = _resolve_scalar_input(from_node.inputs.get('Value'), 1.0, _depth + 1)
+        luma = 0.2126*c[0] + 0.7152*c[1] + 0.0722*c[2]
+        return (max(0, (c[0]-luma)*sat*val + luma),
+                max(0, (c[1]-luma)*sat*val + luma),
+                max(0, (c[2]-luma)*sat*val + luma))
+
+    # Follow any other linked node — try Color output
+    for out_name in ('Color', 'Result', 'Value', 'Vector'):
+        out = from_node.outputs.get(out_name)
+        if out and hasattr(out, 'default_value'):
+            c = out.default_value
+            if hasattr(c, '__len__') and len(c) >= 3:
                 return (c[0], c[1], c[2])
-    # Unlinked or unknown → use default_value
+
+    # Unlinked or unknown
     c = socket.default_value
     if hasattr(c, '__len__') and len(c) >= 3:
         return (c[0], c[1], c[2])
