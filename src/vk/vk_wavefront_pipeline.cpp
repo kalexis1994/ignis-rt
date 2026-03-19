@@ -342,7 +342,7 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
     } push;
     push.width = width;
     push.height = height;
-    push.frameIndex = 0; // TODO: pass from renderer
+    push.frameIndex = frameIndex_++;
     push.maxBounces = maxBounces;
     push.currentBounce = 0;
 

@@ -38,6 +38,7 @@ private:
     RTPipeline* rtPipeline_ = nullptr;
     bool ready_ = false;
     uint32_t maxPixels_ = 0;
+    uint32_t frameIndex_ = 0;
 
     // Wavefront SSBO buffers
     VkBuffer pathStateBuffer_ = VK_NULL_HANDLE;       // PathState[]
