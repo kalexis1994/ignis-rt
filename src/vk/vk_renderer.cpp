@@ -613,8 +613,64 @@ void Renderer::RenderFrameRT() {
 
     // (SHARC diag flush removed — SHARC is disabled)
 
-    // Wavefront path: skip NRD/RR — K5 already wrote final output + G-buffers
+    // Wavefront path: skip NRD denoise + composite — K5 wrote G-buffers + output
+    // But DLSS SR + tonemap still need to run if DLSS is active
     bool wavefrontActive = wavefrontPipeline_ && wavefrontPipeline_->IsReady();
+
+    if (wavefrontActive && dlssActive_ && dlss_ && dlss_->IsInitialized() && dlss_->IsSupported() && !dlssRRActive_) {
+        // Barrier: K5 compute writes → DLSS reads
+        VkMemoryBarrier wfBarrier{};
+        wfBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        wfBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        wfBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &wfBarrier, 0, nullptr, 0, nullptr);
+
+        // DLSS SR upscaling (K5 wrote to dlssColorInput in HDR)
+        static auto s_lastWfDlssTime = std::chrono::high_resolution_clock::now();
+        auto wfDlssNow = std::chrono::high_resolution_clock::now();
+        float wfDlssDelta = std::chrono::duration<float, std::milli>(wfDlssNow - s_lastWfDlssTime).count();
+        s_lastWfDlssTime = wfDlssNow;
+        if (wfDlssDelta < 1.0f) wfDlssDelta = 1.0f;
+        if (wfDlssDelta > 100.0f) wfDlssDelta = 100.0f;
+
+        dlss_->Evaluate(cmd,
+            dlssColorInput_, dlssColorInputView_,
+            rtPipeline_->GetDlssDepthImage(), rtPipeline_->GetDlssDepthView(),
+            rtPipeline_->GetMotionVectorsImage(), rtPipeline_->GetMotionVectorsView(),
+            dlssHdrOutput_, dlssHdrOutputView_,
+            VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT,
+            jitterX_, jitterY_, wfDlssDelta / 1000.0f, 0.0f, false,
+            rtPipeline_->GetReactiveMaskImage(), rtPipeline_->GetReactiveMaskView());
+
+        // Barrier: DLSS → tonemap
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &wfBarrier, 0, nullptr, 0, nullptr);
+
+        // Tonemap: DLSS HDR → LDR interop
+        PathTracerConfig* wfCfg2 = VK_GetConfig();
+        if (tonemapReady_ && wfCfg2) {
+            UpdateTonemapDescriptors();
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, tonemapPipeline_);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                tonemapPipelineLayout_, 0, 1, &tonemapDescSet_, 0, nullptr);
+            struct { uint32_t mode; float exposure, saturation, contrast; } tp;
+            tp.mode = static_cast<uint32_t>(wfCfg2->ptTonemapMode);
+            tp.exposure = wfCfg2->ptAutoExposure ? computedExposure_ : wfCfg2->ptExposure;
+            tp.saturation = wfCfg2->ptSaturation;
+            tp.contrast = wfCfg2->ptContrast;
+            vkCmdPushConstants(cmd, tonemapPipelineLayout_,
+                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tp), &tp);
+            vkCmdDispatch(cmd, (width_ + 7) / 8, (height_ + 7) / 8, 1);
+
+            VkMemoryBarrier tmBarrier{};
+            tmBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            tmBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            tmBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &tmBarrier, 0, nullptr, 0, nullptr);
+        }
+    }
 
     // 2. Ray Reconstruction path (replaces NRD + composite + DLSS SR)
     if (!wavefrontActive && dlssRRActive_ && dlss_ && dlss_->IsRRActive()) {
