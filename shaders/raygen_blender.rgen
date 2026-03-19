@@ -457,10 +457,10 @@ void main() {
     float blueNoise = texelFetch(blueNoiseTexture, bnCoord, 0).r;
     rngState += uint(blueNoise * 4294967295.0);
 
-    // R2 stratified sub-pixel jitter — better temporal convergence than pure random
-    // Each frame gets a different R2 sample, Cranley-Patterson rotated by per-pixel random
-    vec2 r2Jitter = stratifiedSample(frameIndex, vec2(blueNoise, fract(blueNoise * 1.618)));
-    vec2 pixelCenter = vec2(pixel) + r2Jitter;
+    // Sub-pixel jitter: DLSS/RR jitter is already applied to projInverse by the CPU.
+    // Only add a small anti-aliasing offset — NO additional stratified jitter here,
+    // as it would desync from what RR/NRD expect and cause ghosting at distance.
+    vec2 pixelCenter = vec2(pixel) + 0.5 + vec2(rand01() - 0.5, rand01() - 0.5);
     vec2 uv = pixelCenter / vec2(launchSize);
     vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
 
