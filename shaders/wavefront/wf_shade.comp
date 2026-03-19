@@ -146,8 +146,8 @@ void atomicAddFloat(uint index, float value) {
 void appendShadowRay(vec3 origin, vec3 dir, float maxDist, uint pathIdx,
                      vec3 radiance, uint channel) {
     uint slot = atomicAdd(counters.shadowRayCount, 1u);
-    // Limit to avoid buffer overflow (2x pixel count)
-    if (slot >= pc.width * pc.height * 2u) return;
+    // Limit to avoid buffer overflow (10x pixel count = MAX_SHADOW_RAYS_PER_PATH)
+    if (slot >= pc.width * pc.height * 10u) return;
     uint base = slot * 12u; // 12 floats per ShadowRay
     shadowRays.shadowData[base+0] = origin.x;
     shadowRays.shadowData[base+1] = origin.y;
