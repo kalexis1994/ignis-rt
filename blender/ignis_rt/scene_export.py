@@ -868,9 +868,10 @@ def _resolve_color_input(socket, default=(0.8, 0.8, 0.8), _depth=0):
                 max(0, (c[1]-luma)*sat*val + luma),
                 max(0, (c[2]-luma)*sat*val + luma))
 
-    # Sky/procedural textures — can't evaluate per-pixel, use bright neutral default
+    # Sky/procedural textures — can't evaluate per-pixel, use subdued default
+    # Sky textures produce varied colors; average is much dimmer than pure sky blue
     if from_node.type in ('TEX_SKY', 'TEX_ENVIRONMENT'):
-        return (0.8, 0.85, 1.0)  # sky-blue tint as reasonable default
+        return (0.15, 0.18, 0.25)  # subdued sky average (Cycles sky average is dim)
     if from_node.type in ('TEX_NOISE', 'TEX_VORONOI', 'TEX_MUSGRAVE', 'TEX_CHECKER',
                            'TEX_WAVE', 'TEX_GRADIENT', 'TEX_MAGIC', 'TEX_BRICK'):
         return (0.5, 0.5, 0.5)  # neutral gray for procedurals
