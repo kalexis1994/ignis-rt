@@ -7,7 +7,7 @@
 
 namespace acpt {
 
-// GPU-side light tree node (32 bytes — fits in 2 vec4s)
+// GPU-side light tree node (48 bytes = 12 floats = 3 vec4s)
 struct LightTreeNode {
     float bboxMin[3];      // AABB min
     float energy;          // total energy of subtree

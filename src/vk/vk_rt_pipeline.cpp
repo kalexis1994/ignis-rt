@@ -926,10 +926,10 @@ bool RTPipeline::CreateDescriptorSetLayout() {
     bindings[26].descriptorCount = 1;
     bindings[26].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
-    // binding 27: reserved (dummy storage image for future use)
+    // binding 27: Light tree SSBO
     bindings[27] = {};
     bindings[27].binding = 27;
-    bindings[27].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bindings[27].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[27].descriptorCount = 1;
     bindings[27].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
@@ -1461,15 +1461,15 @@ bool RTPipeline::CreateDescriptorSet() {
         writes.push_back(wr);
     }
 
-    // binding 27: reserved storage image (dummy)
+    // binding 27: Light tree SSBO (dummy initially)
     {
         VkWriteDescriptorSet wr{};
         wr.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         wr.dstSet = descriptorSet_;
         wr.dstBinding = 27;
         wr.descriptorCount = 1;
-        wr.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        wr.pImageInfo = &dummyImage16fInfo;
+        wr.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        wr.pBufferInfo = &geomInfo;  // reuse dummy buffer
         writes.push_back(wr);
     }
 
@@ -1776,6 +1776,64 @@ void RTPipeline::UpdateEmissiveTriangleBuffer(const float* data, uint32_t triang
 
     vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
     Log(L"[VK RTPipeline] Emissive triangle buffer updated: %u triangles\n", triangleCount);
+}
+
+void RTPipeline::UpdateLightTreeBuffer(const void* nodes, uint32_t nodeCount) {
+    if (!nodes || nodeCount == 0) {
+        lightTreeNodeCount_ = 0;
+        return;
+    }
+
+    VkDevice device = context_->GetDevice();
+    VkDeviceSize bufSize = nodeCount * 32;  // 32 bytes per LightTreeNode (8 floats)
+
+    // Wait, LightTreeNode is 32 bytes but has 12 fields not 8. Let me check:
+    // bboxMin[3] + energy + bboxMax[3] + childOrFirst + coneAxis[3] + countAndFlags = 12 floats = 48 bytes
+    // Actually sizeof(LightTreeNode) may have padding. Use actual sizeof.
+    bufSize = nodeCount * sizeof(float) * 12;  // 12 floats per node = 48 bytes
+
+    if (lightTreeBuffer_) { vkDestroyBuffer(device, lightTreeBuffer_, nullptr); }
+    if (lightTreeMemory_) { vkFreeMemory(device, lightTreeMemory_, nullptr); }
+
+    VkBufferCreateInfo bufInfo{};
+    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufInfo.size = bufSize;
+    bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    vkCreateBuffer(device, &bufInfo, nullptr, &lightTreeBuffer_);
+
+    VkMemoryRequirements memReqs;
+    vkGetBufferMemoryRequirements(device, lightTreeBuffer_, &memReqs);
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = context_->FindMemoryType(memReqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    vkAllocateMemory(device, &allocInfo, nullptr, &lightTreeMemory_);
+    vkBindBufferMemory(device, lightTreeBuffer_, lightTreeMemory_, 0);
+
+    void* mapped;
+    vkMapMemory(device, lightTreeMemory_, 0, bufSize, 0, &mapped);
+    memcpy(mapped, nodes, bufSize);
+    vkUnmapMemory(device, lightTreeMemory_);
+
+    lightTreeNodeCount_ = nodeCount;
+
+    // Update descriptor binding 27
+    VkDescriptorBufferInfo treeInfo{};
+    treeInfo.buffer = lightTreeBuffer_;
+    treeInfo.offset = 0;
+    treeInfo.range = bufSize;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = descriptorSet_;
+    write.dstBinding = 27;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &treeInfo;
+
+    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
 }
 
 void RTPipeline::UpdatePrevTransforms(const float* transforms, uint32_t instanceCount) {

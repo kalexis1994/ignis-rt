@@ -41,6 +41,8 @@ public:
     void UploadMaterialBuffer(const void* materials, uint32_t count);
     void UploadEmissiveTriangles(const float* data, uint32_t triangleCount);
     void UpdateTextureDescriptors(void* texManager);
+    void UploadLightTree(const void* nodes, uint32_t nodeCount,
+                         const void* emitters, uint32_t emitterCount);
     bool BuildTLASInstanced(const std::vector<vk::TLASInstance>& instances);
     void UpdateCamera(const CameraUBO& camera);
     void RenderFrameRT();

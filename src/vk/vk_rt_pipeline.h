@@ -154,6 +154,9 @@ public:
     // Emissive triangle buffer for MIS (binding 26)
     void UpdateEmissiveTriangleBuffer(const float* data, uint32_t triangleCount);
 
+    // Light tree buffer (binding 27)
+    void UpdateLightTreeBuffer(const void* nodes, uint32_t nodeCount);
+
     // Create full-resolution G-buffer images and update descriptors
     bool CreateGBuffers(uint32_t width, uint32_t height);
 
@@ -308,6 +311,11 @@ private:
     // Emissive triangle SSBO (binding 26)
     VkBuffer emissiveTriBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory emissiveTriMemory_ = VK_NULL_HANDLE;
+
+    // Light tree SSBO (binding 27)
+    VkBuffer lightTreeBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory lightTreeMemory_ = VK_NULL_HANDLE;
+    uint32_t lightTreeNodeCount_ = 0;
     uint32_t emissiveTriCount_ = 0;
 
     // Previous-frame instance transforms SSBO (binding 28)

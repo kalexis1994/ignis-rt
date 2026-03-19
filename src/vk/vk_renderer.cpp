@@ -449,6 +449,13 @@ void Renderer::UploadEmissiveTriangles(const float* data, uint32_t triangleCount
     }
 }
 
+void Renderer::UploadLightTree(const void* nodes, uint32_t nodeCount,
+                                const void* emitters, uint32_t emitterCount) {
+    if (rtPipeline_) {
+        rtPipeline_->UpdateLightTreeBuffer(nodes, nodeCount);
+    }
+}
+
 void Renderer::UpdateTextureDescriptors(void* texManager) {
     if (rtPipeline_) {
         rtPipeline_->UpdateTextureDescriptors(static_cast<vk::TextureManager*>(texManager));

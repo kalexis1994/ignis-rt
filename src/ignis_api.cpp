@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <chrono>
+#include "light_tree.h"
 
 // ============================================================================
 // Global state
@@ -264,9 +265,12 @@ static float s_viewPrev[16] = {0};
 static float s_projPrev[16] = {0};
 static bool s_hasPrevFrame = false;
 
-// Point/spot lights
-static float s_lightData[128] = {0};  // 8 lights × 16 floats
+// Point/spot lights (expanded for light tree — up to 256 lights)
+static float s_lightData[4096] = {0};  // 256 lights × 16 floats
 static uint32_t s_lightCount = 0;
+
+static std::vector<acpt::LightTreeNode> s_lightTreeNodes;
+static std::vector<acpt::LightEmitter> s_lightEmitters;
 
 // Emissive triangles for MIS
 static float s_emissiveTriData[4096] = {0};  // 256 triangles × 16 floats
@@ -401,9 +405,39 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
 }
 
 IGNIS_API void ignis_upload_lights(const float* lightData, uint32_t lightCount) {
-    s_lightCount = (lightCount > 8) ? 8 : lightCount;
+    s_lightCount = (lightCount > 256) ? 256 : lightCount;
     if (lightData && s_lightCount > 0) {
         memcpy(s_lightData, lightData, s_lightCount * 16 * sizeof(float));
+    }
+
+    // Build light tree from uploaded lights
+    s_lightEmitters.clear();
+    s_lightEmitters.resize(s_lightCount);
+    for (uint32_t i = 0; i < s_lightCount; i++) {
+        const float* ld = lightData + i * 16;
+        acpt::LightEmitter& e = s_lightEmitters[i];
+        e.position[0] = ld[0]; e.position[1] = ld[1]; e.position[2] = ld[2];
+        e.range = ld[3];
+        e.color[0] = ld[4]; e.color[1] = ld[5]; e.color[2] = ld[6];
+        e.intensity = ld[7] * (ld[4] + ld[5] + ld[6]); // power = intensity × sum(RGB)
+        e.direction[0] = ld[8]; e.direction[1] = ld[9]; e.direction[2] = ld[10];
+        e.sizeX = ld[11];
+        e.tangent[0] = ld[12]; e.tangent[1] = ld[13]; e.tangent[2] = ld[14];
+        e.sizeY = ld[15];
+        e.originalIndex = i;
+    }
+    if (s_lightCount > 0) {
+        s_lightTreeNodes = acpt::BuildLightTree(s_lightEmitters);
+    } else {
+        s_lightTreeNodes.clear();
+    }
+
+    // Upload tree to renderer
+    if (g_renderer && !s_lightTreeNodes.empty()) {
+        g_renderer->UploadLightTree(s_lightTreeNodes.data(),
+                                     (uint32_t)s_lightTreeNodes.size(),
+                                     s_lightEmitters.data(),
+                                     (uint32_t)s_lightEmitters.size());
     }
 }
 
