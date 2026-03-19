@@ -402,7 +402,7 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
-    // Bounce loop: K1 → K2 → K3 → K4 → compact
+    // Bounce loop: K1 → K2 → compact(shadow args) → K3 → K4 → compact(swap+active args)
     for (uint32_t bounce = 0; bounce < maxBounces; bounce++) {
         push.currentBounce = bounce;
 
@@ -411,7 +411,11 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
             0, 2, sets, 0, nullptr);
         vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-        vkCmdDispatch(cmd, groupsAll, 1, 1);
+        if (bounce == 0) {
+            vkCmdDispatch(cmd, groupsAll, 1, 1);  // bounce 0: all pixels
+        } else {
+            vkCmdDispatchIndirect(cmd, indirectDispatchBuffer_, 0);  // bounce 1+: only active rays
+        }
 
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
@@ -421,37 +425,47 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
             0, 2, sets, 0, nullptr);
         vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-        vkCmdDispatch(cmd, groupsAll, 1, 1);
+        if (bounce == 0) {
+            vkCmdDispatch(cmd, groupsAll, 1, 1);
+        } else {
+            vkCmdDispatchIndirect(cmd, indirectDispatchBuffer_, 0);
+        }
 
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
-        // K3: Shadow ray intersection (dispatch covers max shadow rays, not just pixels)
-        uint32_t groupsShadow = (totalPixels * MAX_SHADOW_RAYS_PER_PATH + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+        // Compact: write shadow dispatch args + swap counters + write active dispatch args
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineCompact_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+            0, 2, sets, 0, nullptr);
+        vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, 1, 1, 1);
+
+        // Barrier: compact writes indirect args → K3 reads them
+        VkMemoryBarrier indirectBarrier{};
+        indirectBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        indirectBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        indirectBarrier.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &indirectBarrier, 0, nullptr, 0, nullptr);
+
+        // K3: Shadow ray intersection (indirect dispatch based on actual shadowRayCount)
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK3_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
             0, 2, sets, 0, nullptr);
         vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-        vkCmdDispatch(cmd, groupsShadow, 1, 1);
+        vkCmdDispatchIndirect(cmd, indirectDispatchBuffer_, 3 * sizeof(uint32_t));  // offset to shadow args
 
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
-        // K4: Accumulate radiance from shadow results (same dispatch size as K3)
+        // K4: Accumulate radiance (indirect, same dispatch size as K3)
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK4_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
             0, 2, sets, 0, nullptr);
         vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-        vkCmdDispatch(cmd, groupsShadow, 1, 1);
-
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
-
-        // Compact: swap counters for next bounce
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineCompact_);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
-            0, 2, sets, 0, nullptr);
-        vkCmdDispatch(cmd, 1, 1, 1);
+        vkCmdDispatchIndirect(cmd, indirectDispatchBuffer_, 3 * sizeof(uint32_t));
 
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);

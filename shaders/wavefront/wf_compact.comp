@@ -11,9 +11,35 @@ layout(binding = 5, set = 1, scalar) buffer CountersBuffer {
     uint pad0;
 } counters;
 
+// Indirect dispatch args (set 1, binding 6)
+// Layout: [activeGroups, 1, 1, shadowGroups, 1, 1]
+layout(binding = 6, set = 1, scalar) buffer IndirectDispatchBuffer {
+    uint args[];
+} indirect;
+
+layout(push_constant) uniform PushConst {
+    uint width;
+    uint height;
+    uint frameIndex;
+    uint maxBounces;
+    uint currentBounce;
+} pc;
+
 void main() {
+    // Write indirect dispatch args for K3/K4 (shadow rays this bounce)
+    uint shadowGroups = (counters.shadowRayCount + 255u) / 256u;
+    indirect.args[3] = max(shadowGroups, 1u);
+    indirect.args[4] = 1u;
+    indirect.args[5] = 1u;
+
     // Swap: active = next, reset next and shadow counters
     counters.activeRayCount = counters.nextActiveRayCount;
     counters.nextActiveRayCount = 0u;
     counters.shadowRayCount = 0u;
+
+    // Write indirect dispatch args for K1/K2 (active rays next bounce)
+    uint activeGroups = (counters.activeRayCount + 255u) / 256u;
+    indirect.args[0] = max(activeGroups, 1u);
+    indirect.args[1] = 1u;
+    indirect.args[2] = 1u;
 }
