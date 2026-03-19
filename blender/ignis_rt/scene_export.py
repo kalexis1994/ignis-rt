@@ -670,6 +670,14 @@ def _find_image_texture_node(socket, _depth=0):
     if from_node.type == 'NORMAL_MAP':
         return _find_image_texture_node(from_node.inputs.get('Color'), _depth + 1)
 
+    # Mapping node — follow the Vector input (UV transforms don't affect texture identity)
+    if from_node.type == 'MAPPING':
+        return _find_image_texture_node(from_node.inputs.get('Vector'), _depth + 1)
+
+    # Texture Coordinate — not a texture, stop
+    if from_node.type == 'TEX_COORD':
+        return None
+
     # Separate RGB/Color/XYZ — check common input names
     if from_node.type in ('SEPRGB', 'SEPARATE_XYZ', 'SEPARATE_COLOR'):
         for inp_name in ('Image', 'Color', 'Vector'):
@@ -688,6 +696,18 @@ def _find_image_texture_node(socket, _depth=0):
         'INVERT',           # Invert
         'CURVE_RGB',        # RGB Curves
         'MAP_RANGE',        # Map Range
+        'MATH',             # Math node
+        'VECT_MATH',        # Vector Math
+        'CLAMP',            # Clamp
+        'COMBINE_XYZ',      # Combine XYZ
+        'COMBRGB', 'COMBINE_COLOR',  # Combine Color
+        'RGBTOBW',          # RGB to BW
+        'TEX_NOISE',        # Noise texture (passthrough to find source texture)
+        'TEX_VORONOI',      # Voronoi texture
+        'TEX_MUSGRAVE',     # Musgrave texture
+        'TEX_CHECKER',      # Checker texture
+        'TEX_WAVE',         # Wave texture
+        'TEX_GRADIENT',     # Gradient texture
     }
     if from_node.type in _PASSTHROUGH_TYPES:
         # Try common color input names
@@ -1091,11 +1111,53 @@ def export_materials(depsgraph):
                     principled_node = node
                     break
 
-            # Fallback: trace from Material Output to resolve Mix Shader
-            # and individual Diffuse/Glossy/Glass/Emission nodes
+            # Fallback: trace from Material Output to resolve any shader node
             if principled_node is None:
                 surface_node = _find_surface_shader(mat.node_tree)
-                if surface_node is not None and surface_node.type in ('MIX_SHADER', 'BSDF_DIFFUSE', 'BSDF_GLOSSY', 'BSDF_GLASS', 'BSDF_TRANSPARENT', 'EMISSION'):
+                # Follow Group nodes and passthrough nodes to find the actual BSDF
+                _follow_depth = 0
+                while surface_node is not None and _follow_depth < 8:
+                    if surface_node.type in ('MIX_SHADER', 'BSDF_DIFFUSE', 'BSDF_GLOSSY',
+                                              'BSDF_GLASS', 'BSDF_TRANSPARENT', 'EMISSION',
+                                              'BSDF_PRINCIPLED'):
+                        break  # found a shader node
+                    elif surface_node.type == 'GROUP':
+                        # Follow group's internal output → find what's connected
+                        inner_tree = surface_node.node_tree
+                        if inner_tree:
+                            for inode in inner_tree.nodes:
+                                if inode.type == 'GROUP_OUTPUT':
+                                    inp = inode.inputs.get('Surface') or (inode.inputs[0] if inode.inputs else None)
+                                    if inp and inp.is_linked:
+                                        surface_node = inp.links[0].from_node
+                                        break
+                            else:
+                                surface_node = None
+                        else:
+                            surface_node = None
+                    elif surface_node.type in ('ADD_SHADER',):
+                        # Add Shader — treat like mix at 0.5
+                        surface_node.type  # just use first input
+                        inp = surface_node.inputs[0] if surface_node.inputs else None
+                        if inp and inp.is_linked:
+                            surface_node = inp.links[0].from_node
+                        else:
+                            surface_node = None
+                    else:
+                        # Unknown node type between Output and BSDF — try first linked input
+                        found = False
+                        for inp in surface_node.inputs:
+                            if inp.is_linked:
+                                surface_node = inp.links[0].from_node
+                                found = True
+                                break
+                        if not found:
+                            surface_node = None
+                    _follow_depth += 1
+
+                if surface_node is not None and surface_node.type == 'BSDF_PRINCIPLED':
+                    principled_node = surface_node  # found it through chain!
+                elif surface_node is not None and surface_node.type in ('MIX_SHADER', 'BSDF_DIFFUSE', 'BSDF_GLOSSY', 'BSDF_GLASS', 'BSDF_TRANSPARENT', 'EMISSION'):
                     if surface_node.type == 'MIX_SHADER':
                         props = _resolve_mix_shader(surface_node, _register_image)
                     else:
