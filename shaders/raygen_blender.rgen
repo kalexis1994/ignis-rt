@@ -754,7 +754,8 @@ void main() {
                         primaryNdotL = NdotL;
                         if (inShadow) {
                             // Penumbra radius = distToOccluder * tanAngle * 0.5
-                            float sigmaTanAngle = 0.04;  // smaller sun angular size → sharper contact shadows
+                            // Larger tan angle = softer penumbra = less noise for SIGMA to handle
+                            float sigmaTanAngle = 0.08;
                             primaryPenumbra = min(shadowHitDist * sigmaTanAngle * 0.5, 32768.0);
                         } else {
                             primaryPenumbra = 65504.0;  // fully lit
@@ -813,14 +814,14 @@ void main() {
 
                 // Sample a random point on the area light rectangle
                 vec3 lightBitangent = cross(lightNormal, lightTangent);
-                vec2 areaRnd = rand2() * 2.0 - 1.0;  // [-1, 1]
+                vec2 areaRnd = stratifiedSample(frameIndex * 8u + li, vec2(rand01(), rand01())) * 2.0 - 1.0;
                 jitteredTarget = lightPos
                     + lightTangent * (areaRnd.x * sizeX * 0.5)
                     + lightBitangent * (areaRnd.y * sizeY * 0.5);
             } else {
-                // Point/spot light: small jitter for soft shadows
+                // Point/spot light: stratified jitter for temporally stable soft shadows
                 float softRadius = clamp(dist * 0.015, 0.01, 0.3);
-                vec2 diskSample = rand2();
+                vec2 diskSample = stratifiedSample(frameIndex * 8u + li, vec2(rand01(), rand01()));
                 float diskR = sqrt(diskSample.x) * softRadius;
                 float diskAngle = diskSample.y * 2.0 * PI;
                 vec3 lTangent = abs(L.y) < 0.999 ? normalize(cross(L, vec3(0,1,0))) : normalize(cross(L, vec3(1,0,0)));
