@@ -153,6 +153,11 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         description="Path tracing bounces (1=direct only, higher=better GI, slower)",
         update=_tag_redraw,
     )
+    samples_per_pixel: IntProperty(
+        name="Samples/Pixel", default=1, min=1, max=4,
+        description="Samples per pixel per frame (higher = cleaner but slower, 1=realtime, 2+=quality)",
+        update=_tag_redraw,
+    )
 
     # -- DLSS --
     dlss_enabled: BoolProperty(
@@ -236,6 +241,7 @@ class IGNIS_PT_sampling(bpy.types.Panel):
         layout.use_property_split = True
         layout.use_property_decorate = False
         layout.prop(props, "max_bounces")
+        layout.prop(props, "samples_per_pixel")
         layout.separator()
         layout.prop(props, "dlss_enabled")
         col = layout.column()

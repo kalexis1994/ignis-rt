@@ -400,7 +400,8 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
     // Point/spot lights
     cam.lightCount = s_lightCount;
     cam.lightPad[0] = s_emissiveTriCount;
-    cam.lightPad[1] = cam.lightPad[2] = 0;
+    cam.lightPad[1] = static_cast<uint32_t>(acpt::g_config.samplesPerPixel);
+    cam.lightPad[2] = 0;
     if (s_lightCount > 0) {
         memcpy(cam.lights, s_lightData, s_lightCount * 16 * sizeof(float));
     }
@@ -551,6 +552,7 @@ IGNIS_API void ignis_set_int(const char* key, int value) {
     else if (strcmp(key, "nrd_anti_firefly") == 0)  cfg->nrdAntiFirefly = (value != 0);
     else if (strcmp(key, "nrd_history_fix_frames") == 0) cfg->nrdHistoryFixFrameNum = (value < 0 ? 0 : (value > 6 ? 6 : value));
     else if (strcmp(key, "max_bounces") == 0)       cfg->maxBounces = (value < 1 ? 1 : (value > 8 ? 8 : value));
+    else if (strcmp(key, "spp") == 0)              cfg->samplesPerPixel = (value < 1 ? 1 : (value > 4 ? 4 : value));
     else if (strcmp(key, "shader_mode") == 0)       cfg->shaderMode = value;
     else if (strcmp(key, "use_wavefront") == 0)    cfg->useWavefront = (value != 0);
 }

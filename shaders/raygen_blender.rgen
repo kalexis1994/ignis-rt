@@ -461,44 +461,18 @@ void main() {
     uint frameIndex = cam.parameters.x;
     int maxBounces = clamp(int(cam.parameters.z), 1, MAX_BOUNCES_LIMIT);
 
-    // Initialize RNG: hash pixel + frame + blue noise
-    rngState = pixel.x * 1973u + pixel.y * 9277u + frameIndex * 26699u;
-    pcg(rngState);
+    // Multi-SPP: configurable samples per pixel (lightPad1 from CPU)
+    int spp = clamp(int(cam.lightPad1), 1, 4);
+    bool rrModeGlobal = (cam.parameters.w == 2u);
 
-    // Blue noise temporal offset
-    ivec2 bnCoord = ivec2(pixel.x & 63, pixel.y & 63);
-    float blueNoise = texelFetch(blueNoiseTexture, bnCoord, 0).r;
-    rngState += uint(blueNoise * 4294967295.0);
+    // Accumulators across SPP samples
+    vec3 accumDiffuse = vec3(0.0);
+    vec3 accumSpecular = vec3(0.0);
+    vec3 accumTotalRadiance = vec3(0.0);
+    vec3 accumDirectSunDiffuse = vec3(0.0);
+    vec3 accumAmbientDiffuse = vec3(0.0);
 
-    // Sub-pixel jitter: DLSS/RR already applies Halton jitter via projInverse.
-    // Adding random offset on top doubles the per-frame variation, causing
-    // visible jitter that the denoiser can't fully smooth.
-    bool dlssActive = (cam.jitterData.w != 0.0);
-    vec2 pixelCenter = vec2(pixel) + 0.5;
-    if (!dlssActive) {
-        // No DLSS — add random AA jitter for non-upscaled path
-        pixelCenter += vec2(rand01() - 0.5, rand01() - 0.5);
-    }
-    vec2 uv = pixelCenter / vec2(launchSize);
-    vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-
-    vec4 origin4 = cam.viewInverse * vec4(0, 0, 0, 1);
-    vec4 target4 = cam.projInverse * vec4(ndc.x, ndc.y, 1, 1);
-    target4.xyz /= target4.w;  // perspective divide (required for correct ray directions)
-    vec4 dir4 = cam.viewInverse * vec4(normalize(target4.xyz), 0);
-
-    vec3 rayOrigin = origin4.xyz;
-    vec3 rayDir = normalize(dir4.xyz);
-
-    // Path tracing state
-    vec3 throughput = vec3(1.0);
-    vec3 totalRadiance = vec3(0.0);
-    vec3 diffuseRadiance = vec3(0.0);
-    vec3 specularRadiance = vec3(0.0);
-    vec3 directSunDiffuse = vec3(0.0);  // track direct sun contribution for shadow separation
-    vec3 ambientDiffuse = vec3(0.0);    // track ambient for partial shadow application
-
-    // Primary hit info for NRD
+    // Primary hit info (from first sample only — used for G-buffers)
     vec3 primaryNormal = vec3(0, 0, 1);
     float primaryRoughness = 1.0;
     float primaryViewZ = 1e7;
@@ -506,14 +480,55 @@ void main() {
     vec3 primaryWorldPos = vec3(0.0);
     float primaryHitDist = 0.0;
     bool primaryHit = false;
-    bool isDiffusePath = true;
     vec3 primaryLocalPos = vec3(0.0);
-    uint primaryCustomIndex = 0u;  // BLAS index (for geometry metadata)
-    int  primaryInstanceId = 0;    // instance index (for prevTransforms)
-
-    // SIGMA shadow separation: penumbra for primary hit
-    float primaryPenumbra = 65504.0;  // 65504 = fully lit (no occluder)
+    uint primaryCustomIndex = 0u;
+    int  primaryInstanceId = 0;
+    float primaryPenumbra = 65504.0;
     float primaryNdotL = 0.0;
+    bool captureSpecularMV = false;
+    vec2 specularMV = vec2(0.0);
+    vec3 savedRayOrigin = (cam.viewInverse * vec4(0, 0, 0, 1)).xyz;
+    vec3 savedRayDir = vec3(0, 0, -1);  // updated by first sample
+    float exposure = cam.ptParams0.x;
+    float giIntensity = cam.ptParams0.y;
+
+    for (int sampleIdx = 0; sampleIdx < spp; sampleIdx++) {
+
+    // Initialize RNG: hash pixel + frame + sample index + blue noise
+    rngState = pixel.x * 1973u + pixel.y * 9277u + frameIndex * 26699u + uint(sampleIdx) * 12347u;
+    pcg(rngState);
+
+    ivec2 bnCoord = ivec2(pixel.x & 63, pixel.y & 63);
+    float blueNoise = texelFetch(blueNoiseTexture, bnCoord, 0).r;
+    rngState += uint(blueNoise * 4294967295.0);
+
+    // Sub-pixel jitter
+    vec2 pixelCenter = vec2(pixel) + 0.5;
+    if (!rrModeGlobal) {
+        pixelCenter += vec2(rand01() - 0.5, rand01() - 0.5);
+    }
+    vec2 uv = pixelCenter / vec2(launchSize);
+    vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+
+    vec4 origin4 = cam.viewInverse * vec4(0, 0, 0, 1);
+    vec4 target4 = cam.projInverse * vec4(ndc.x, ndc.y, 1, 1);
+    target4.xyz /= target4.w;
+    vec4 dir4 = cam.viewInverse * vec4(normalize(target4.xyz), 0);
+
+    vec3 rayOrigin = origin4.xyz;
+    vec3 rayDir = normalize(dir4.xyz);
+    if (sampleIdx == 0) savedRayDir = rayDir;
+
+    // Per-sample state
+    vec3 throughput = vec3(1.0);
+    vec3 totalRadiance = vec3(0.0);
+    vec3 diffuseRadiance = vec3(0.0);
+    vec3 specularRadiance = vec3(0.0);
+    vec3 directSunDiffuse = vec3(0.0);
+    vec3 ambientDiffuse = vec3(0.0);
+    bool isDiffusePath = true;
+    float primaryPenumbraSample = 65504.0;
+    float primaryNdotLSample = 0.0;
 
     // Specular motion vectors: capture reflected object MV at bounce 1
     bool captureSpecularMV = false;
@@ -634,8 +649,8 @@ void main() {
             }
         }
 
-        // ---- Bounce 0: write NRD G-buffers ----
-        if (bounce == 0) {
+        // ---- Bounce 0: capture primary hit info (first sample only) ----
+        if (bounce == 0 && sampleIdx == 0) {
             primaryHit = true;
             primaryNormal = N;
             primaryRoughness = pbrHit.roughness;
@@ -793,14 +808,13 @@ void main() {
                         specularRadiance += specContrib * sunRadiance * throughput;
 
                         // Store penumbra for SIGMA
-                        primaryNdotL = NdotL;
+                        primaryNdotLSample = NdotL;
                         if (inShadow) {
                             // Penumbra radius = distToOccluder * tanAngle * 0.5
-                            // Larger tan angle = softer penumbra = less noise for SIGMA to handle
-                            float sigmaTanAngle = 0.08;
-                            primaryPenumbra = min(shadowHitDist * sigmaTanAngle * 0.5, 32768.0);
+                            float sigmaTanAngle = 0.04;
+                            primaryPenumbraSample = min(shadowHitDist * sigmaTanAngle * 0.5, 32768.0);
                         } else {
-                            primaryPenumbra = 65504.0;  // fully lit
+                            primaryPenumbraSample = 65504.0;  // fully lit
                         }
                     }
                 } else {
@@ -1211,13 +1225,27 @@ void main() {
         writeReservoir(pixelLinearIdx, reservoir);
     }
 
-    // ---- Combine radiance ----
-    // For bounce 0 direct hit, diffuse+specular are already split
-    // totalRadiance has emission from bounce 0 + sky
+    // ---- Accumulate this sample ----
     totalRadiance += diffuseRadiance + specularRadiance;
+    accumDiffuse += diffuseRadiance;
+    accumSpecular += specularRadiance;
+    accumTotalRadiance += totalRadiance;
+    accumDirectSunDiffuse += directSunDiffuse;
+    accumAmbientDiffuse += ambientDiffuse;
+    if (sampleIdx == 0) {
+        primaryPenumbra = primaryPenumbraSample;
+        primaryNdotL = primaryNdotLSample;
+    }
 
-    // Combine radiance
-    vec3 color = totalRadiance;
+    } // end SPP loop
+
+    // Average across samples
+    float invSPP = 1.0 / float(spp);
+    vec3 diffuseRadiance = accumDiffuse * invSPP;
+    vec3 specularRadiance = accumSpecular * invSPP;
+    vec3 directSunDiffuse = accumDirectSunDiffuse * invSPP;
+    vec3 ambientDiffuse = accumAmbientDiffuse * invSPP;
+    vec3 color = accumTotalRadiance * invSPP;
 
     // ---- Write outputs ----
 
@@ -1301,7 +1329,7 @@ void main() {
 
         // Sky motion vectors: use a virtual point far along the ray direction.
         // Without this, sky pixels get MV=0 and NRD ghosting occurs on camera rotation.
-        vec3 skyFarPos = rayOrigin + rayDir * 50000.0;
+        vec3 skyFarPos = savedRayOrigin + savedRayDir * 50000.0;
         vec4 skyCurrClip = cam.proj * cam.view * vec4(skyFarPos, 1.0);
         vec2 skyCurrNDC = skyCurrClip.xy / skyCurrClip.w;
         vec2 skyCurrUV = vec2(skyCurrNDC.x * 0.5 + 0.5, 0.5 - skyCurrNDC.y * 0.5);

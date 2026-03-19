@@ -429,6 +429,9 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                     _log(f" DLSS DLAA + NRD (RR needs upscaling, falling back to NRD)")
                 else:
                     _log(f" DLSS {props.dlss_quality} + NRD")
+            if hasattr(props, 'samples_per_pixel') and props.samples_per_pixel > 1:
+                dll_wrapper.set_int("spp", props.samples_per_pixel)
+                _log(f" SPP: {props.samples_per_pixel}")
             if props.use_wavefront:
                 dll_wrapper.set_int("use_wavefront", 1)
                 _log(f" Wavefront path tracing enabled")

@@ -49,14 +49,15 @@ struct PathTracerConfig {
 
     // Path tracing quality
     int   maxBounces         = 2;       // 1-8 bounces (default 2)
+    int   samplesPerPixel    = 1;       // 1-4 SPP (higher = cleaner but slower)
 
     // Debug
     int   debugView          = 0;       // 0 = off, >0 = debug view mode
 
     // NRD
     bool  nrdEnabled         = true;
-    float nrdMaxAccumFrames  = 24.0f;    // higher = smoother shadows when static
-    float nrdFastAccumFrames = 4.0f;    // fast history for disoccluded regions
+    float nrdMaxAccumFrames  = 32.0f;    // higher = smoother when static (was 24)
+    float nrdFastAccumFrames = 6.0f;    // fast history for disoccluded regions (was 4)
     float nrdLobeAngleFraction  = 0.85f;  // [0..1] higher = more permissive lobe matching (smoother reflections)
     float nrdRoughnessFraction  = 0.5f;   // [0..1] higher = more permissive roughness matching
     float nrdMinHitDistanceWeight = 0.05f;
