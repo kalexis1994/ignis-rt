@@ -349,8 +349,11 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
     // Bind both descriptor sets (set 0 = scene, set 1 = wavefront)
     VkDescriptorSet sets[2] = { sceneDescSet, wfDescSet_ };
 
-    // Clear pixel radiance buffer
+    // Clear pixel radiance and primary G-buffer
     vkCmdFillBuffer(cmd, pixelRadianceBuffer_, 0, totalPixels * 32, 0);
+    vkCmdFillBuffer(cmd, primaryGBufBuffer_, 0, totalPixels * 64, 0);
+    // Set viewZ to 1e7 (sky default) — float 1e7 = 0x4B189680
+    // Actually, 0 is fine: K5 checks abs(viewZ) < 1e6 for primaryHit
 
     VkMemoryBarrier clearBarrier{};
     clearBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;

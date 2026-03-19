@@ -42,6 +42,11 @@ layout(binding = 29, set = 0, r8) uniform image2D reactiveMaskImg;
 layout(binding = 30, set = 0, r8) uniform image2D diffConfidenceImg;
 layout(binding = 31, set = 0, r8) uniform image2D specConfidenceImg;
 
+// Per-instance previous-frame transforms
+layout(binding = 28, set = 0, std430) buffer PrevTransformBuf {
+    vec4 data[];
+} prevTransforms;
+
 // Wavefront buffers (set 1)
 layout(binding = 3, set = 1, scalar) buffer PixelRadianceBuffer { uint radDataU[]; } pixelRadiance;
 layout(binding = 4, set = 1, scalar) buffer PrimaryGBufBuffer { float gbufData[]; } primaryGBuf;
@@ -74,30 +79,86 @@ void main() {
                          uintBitsToFloat(pixelRadiance.radDataU[rBase+5]),
                          uintBitsToFloat(pixelRadiance.radDataU[rBase+6]));
 
-    // Read primary G-buffer (16 floats per pixel)
-    // TODO: use PrimaryGBuffer struct layout when K2 (shade) is implemented
-    // For now, write defaults for sky-only rendering
-    vec3 primaryNormal = vec3(0, 0, 1);
-    float primaryRoughness = 1.0;
-    float primaryViewZ = 1e7;
-    vec3 primaryAlbedo = vec3(0.0);
-    bool primaryHit = false;
+    // Read primary G-buffer (16 floats per pixel, written by K2)
+    uint gBase = pixelIndex * 16u;
+    vec3 primaryNormal = vec3(primaryGBuf.gbufData[gBase+0],
+                               primaryGBuf.gbufData[gBase+1],
+                               primaryGBuf.gbufData[gBase+2]);
+    float primaryRoughness = primaryGBuf.gbufData[gBase+3];
+    vec3 primaryWorldPos = vec3(primaryGBuf.gbufData[gBase+4],
+                                 primaryGBuf.gbufData[gBase+5],
+                                 primaryGBuf.gbufData[gBase+6]);
+    float primaryViewZ = primaryGBuf.gbufData[gBase+7];
+    vec3 primaryAlbedo = vec3(primaryGBuf.gbufData[gBase+8],
+                               primaryGBuf.gbufData[gBase+9],
+                               primaryGBuf.gbufData[gBase+10]);
+    float primaryHitDist = primaryGBuf.gbufData[gBase+11];
+    vec3 primaryLocalPos = vec3(primaryGBuf.gbufData[gBase+12],
+                                 primaryGBuf.gbufData[gBase+13],
+                                 primaryGBuf.gbufData[gBase+14]);
+    uint primaryInstanceId = floatBitsToUint(primaryGBuf.gbufData[gBase+15]);
 
-    // Combined radiance
+    bool primaryHit = (abs(primaryViewZ) < 1e6);
+
+    // Write G-buffers for NRD
+    if (primaryHit) {
+        imageStore(normalRoughnessImg, pixel, NRD_PackNormalRoughness(primaryNormal, primaryRoughness));
+        imageStore(viewDepthImg, pixel, vec4(primaryViewZ, 0, 0, 0));
+
+        // Motion vectors from previous-frame transforms
+        uint tBase = primaryInstanceId * 3u;
+        vec4 prevRow0 = prevTransforms.data[tBase + 0u];
+        vec4 prevRow1 = prevTransforms.data[tBase + 1u];
+        vec4 prevRow2 = prevTransforms.data[tBase + 2u];
+        vec4 lp = vec4(primaryLocalPos, 1.0);
+        vec3 prevWorldPos = vec3(dot(prevRow0, lp), dot(prevRow1, lp), dot(prevRow2, lp));
+
+        vec4 currClip = cam.proj * cam.view * vec4(primaryWorldPos, 1.0);
+        vec2 currNDC = currClip.xy / currClip.w;
+        vec2 currUV = vec2(currNDC.x * 0.5 + 0.5, 0.5 - currNDC.y * 0.5);
+        vec4 prevClip = cam.projPrev * cam.viewPrev * vec4(prevWorldPos, 1.0);
+        vec2 prevNDC = prevClip.xy / prevClip.w;
+        vec2 prevUV = vec2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
+        vec2 motionVector = prevUV - currUV;
+        float mvZ = (cam.viewPrev * vec4(prevWorldPos, 1.0)).z - primaryViewZ;
+        imageStore(motionVectorsImg, pixel, vec4(motionVector, mvZ, 0));
+
+        // Demodulate diffuse by albedo for NRD
+        vec3 albedo = max(primaryAlbedo, vec3(0.01));
+        vec3 demodDiffuse = diffuse / albedo;
+        imageStore(diffuseRadianceImg, pixel, NRD_PackRadiance(demodDiffuse, primaryHitDist));
+        imageStore(specularRadianceImg, pixel, NRD_PackRadiance(specular, primaryHitDist));
+        imageStore(albedoBufferImg, pixel, vec4(primaryAlbedo, 0.5));
+
+        // DLSS NDC depth
+        vec4 clipPos = cam.proj * vec4(0.0, 0.0, primaryViewZ, 1.0);
+        float ndcZ = clamp(clipPos.z / clipPos.w, 0.0, 1.0);
+        imageStore(dlssDepthImg, pixel, vec4(ndcZ, 0, 0, 0));
+
+        // Penumbra, reactive, confidence — simplified
+        imageStore(penumbraImg, pixel, vec4(65504.0));
+        float transformDelta = distance(primaryWorldPos, prevWorldPos);
+        imageStore(reactiveMaskImg, pixel, vec4(clamp(transformDelta * 50.0, 0.0, 1.0)));
+        float confidence = (transformDelta > 0.001) ? 0.3 : 1.0;
+        imageStore(diffConfidenceImg, pixel, vec4(confidence));
+        imageStore(specConfidenceImg, pixel, vec4(confidence));
+    } else {
+        // Sky miss — write defaults
+        imageStore(normalRoughnessImg, pixel, NRD_PackNormalRoughness(vec3(0, 0, 1), 1.0));
+        imageStore(viewDepthImg, pixel, vec4(1e7, 0, 0, 0));
+        imageStore(motionVectorsImg, pixel, vec4(0, 0, 0, 0));
+        imageStore(diffuseRadianceImg, pixel, vec4(0, 0, 0, 0));
+        imageStore(specularRadianceImg, pixel, vec4(0, 0, 0, 0));
+        imageStore(albedoBufferImg, pixel, vec4(0, 0, 0, 0));
+        imageStore(dlssDepthImg, pixel, vec4(1.0, 0, 0, 0));
+        imageStore(penumbraImg, pixel, vec4(0.0));
+        imageStore(reactiveMaskImg, pixel, vec4(0.0));
+        imageStore(diffConfidenceImg, pixel, vec4(1.0));
+        imageStore(specConfidenceImg, pixel, vec4(1.0));
+    }
+
+    // Combined radiance for direct output
     vec3 color = diffuse + specular;
-
-    // Write G-buffers (defaults for now — will be filled by K2 in Phase 4)
-    imageStore(normalRoughnessImg, pixel, NRD_PackNormalRoughness(primaryNormal, primaryRoughness));
-    imageStore(viewDepthImg, pixel, vec4(primaryViewZ, 0, 0, 0));
-    imageStore(motionVectorsImg, pixel, vec4(0, 0, 0, 0));
-    imageStore(diffuseRadianceImg, pixel, vec4(0, 0, 0, 0));
-    imageStore(specularRadianceImg, pixel, vec4(0, 0, 0, 0));
-    imageStore(albedoBufferImg, pixel, vec4(0, 0, 0, 0));
-    imageStore(dlssDepthImg, pixel, vec4(1.0, 0, 0, 0));
-    imageStore(penumbraImg, pixel, vec4(0.0));
-    imageStore(reactiveMaskImg, pixel, vec4(0.0));
-    imageStore(diffConfidenceImg, pixel, vec4(1.0));
-    imageStore(specConfidenceImg, pixel, vec4(1.0));
 
     // HDR output flag
     bool hdrOutput = (cam.parameters.w != 0u);
