@@ -49,6 +49,7 @@ endif()
 # ============================================================================
 set(IGNIS_CORE_SOURCES
     src/ignis_api.cpp
+    src/light_tree.cpp
     src/ignis_log.cpp
     src/imgui_stub.cpp
     src/sky_nishita.cpp
