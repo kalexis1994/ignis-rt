@@ -144,10 +144,28 @@ void main() {
         imageStore(diffConfidenceImg, pixel, vec4(confidence));
         imageStore(specConfidenceImg, pixel, vec4(confidence));
     } else {
-        // Sky miss — write defaults
+        // Sky miss — write defaults with proper sky motion vectors
         imageStore(normalRoughnessImg, pixel, NRD_PackNormalRoughness(vec3(0, 0, 1), 1.0));
         imageStore(viewDepthImg, pixel, vec4(1e7, 0, 0, 0));
-        imageStore(motionVectorsImg, pixel, vec4(0, 0, 0, 0));
+
+        // Reconstruct ray direction for sky motion vectors
+        vec2 pixUV = (vec2(pixel) + 0.5) / vec2(pc.width, pc.height);
+        vec2 pixNDC = vec2(pixUV.x * 2.0 - 1.0, 1.0 - pixUV.y * 2.0);
+        vec4 tgt = cam.projInverse * vec4(pixNDC, 1, 1);
+        tgt.xyz /= tgt.w;
+        vec3 rayDir = normalize((cam.viewInverse * vec4(normalize(tgt.xyz), 0)).xyz);
+        vec3 camOrigin = (cam.viewInverse * vec4(0, 0, 0, 1)).xyz;
+
+        // Sky motion vector: virtual point far along ray direction
+        vec3 skyFarPos = camOrigin + rayDir * 50000.0;
+        vec4 skyCurrClip = cam.proj * cam.view * vec4(skyFarPos, 1.0);
+        vec2 skyCurrNDC = skyCurrClip.xy / skyCurrClip.w;
+        vec2 skyCurrUV = vec2(skyCurrNDC.x * 0.5 + 0.5, 0.5 - skyCurrNDC.y * 0.5);
+        vec4 skyPrevClip = cam.projPrev * cam.viewPrev * vec4(skyFarPos, 1.0);
+        vec2 skyPrevNDC = skyPrevClip.xy / skyPrevClip.w;
+        vec2 skyPrevUV = vec2(skyPrevNDC.x * 0.5 + 0.5, 0.5 - skyPrevNDC.y * 0.5);
+        imageStore(motionVectorsImg, pixel, vec4(skyPrevUV - skyCurrUV, 0, 0));
+
         imageStore(diffuseRadianceImg, pixel, vec4(0, 0, 0, 0));
         imageStore(specularRadianceImg, pixel, vec4(0, 0, 0, 0));
         imageStore(albedoBufferImg, pixel, vec4(0, 0, 0, 0));
