@@ -344,11 +344,18 @@ void Interop::RecordReadbackCopy(VkCommandBuffer cmd, VkFence submitFence) {
 }
 
 bool Interop::CopyReadbackResult(void* outData, uint32_t bufferSize, VkDevice device) {
-    if (readbackFirstFrame_ || !outData) return false;
+    if (readbackFirstFrame_) {
+        Log(L"[VK Interop] CopyReadback: firstFrame=true\n");
+        return false;
+    }
+    if (!outData) return false;
 
     // Read from the buffer NOT being written (previous frame's data)
     uint32_t readIdx = readbackWriteIdx_;  // after swap, this is the next write target = previous read
-    if (!readbackMapped_[readIdx]) return false;
+    if (!readbackMapped_[readIdx]) {
+        Log(L"[VK Interop] CopyReadback: mapped[%u]=null\n", readIdx);
+        return false;
+    }
 
     // Wait for the fence that protects this buffer's GPU copy
     if (device != VK_NULL_HANDLE && readbackFence_[readIdx] != VK_NULL_HANDLE) {
@@ -356,7 +363,11 @@ bool Interop::CopyReadbackResult(void* outData, uint32_t bufferSize, VkDevice de
     }
 
     uint32_t imageSize = width_ * height_ * 4;
-    if (bufferSize < imageSize) return false;
+    if (bufferSize < imageSize) {
+        Log(L"[VK Interop] CopyReadback: bufSize=%u < imgSize=%u (%ux%u)\n",
+            bufferSize, imageSize, width_, height_);
+        return false;
+    }
     memcpy(outData, readbackMapped_[readIdx], imageSize);
     return true;
 }
@@ -664,6 +675,16 @@ bool Interop::InitGLInterop() {
         glMemoryObject_ = 0;
         return false;
     }
+
+    // Query GL context info for diagnostics
+    GLint glMajor = 0, glMinor = 0;
+    gl.GetIntegerv(0x821B, &glMajor);  // GL_MAJOR_VERSION
+    gl.GetIntegerv(0x821C, &glMinor);  // GL_MINOR_VERSION
+    Log(L"[GL Interop] GL context: %d.%d, memObj=%u, allocSize=%llu, handle=%p\n",
+        glMajor, glMinor, glMemoryObject_, (unsigned long long)allocationSize_, dupHandle);
+
+    // Clear any pre-existing GL error before import
+    while (gl.GetError()) {}
 
     gl.ImportMemoryWin32HandleEXT(glMemoryObject_, (GLuint64)allocationSize_,
                                   GL_HANDLE_TYPE_OPAQUE_WIN32_EXT, dupHandle);

@@ -154,8 +154,14 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         update=_tag_redraw,
     )
     samples_per_pixel: IntProperty(
-        name="Samples/Pixel", default=1, min=1, max=4,
-        description="Samples per pixel per frame (higher = cleaner but slower, 1=realtime, 2+=quality)",
+        name="Samples/Pixel", default=1, min=1, max=128,
+        description="Samples per pixel per frame (1-4=realtime, 8-16=quality, 32+=offline)",
+        update=_tag_redraw,
+    )
+    backface_culling: BoolProperty(
+        name="Backface Culling",
+        default=False,
+        description="Cull back-facing triangles (skip geometry facing away from camera)",
         update=_tag_redraw,
     )
 
@@ -223,6 +229,21 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
     )
 
 
+class IGNIS_OT_reload_scene(bpy.types.Operator):
+    bl_idname = "ignis.reload_scene"
+    bl_label = "Reload Scene"
+    bl_description = "Force full scene reload (geometry + materials + textures)"
+
+    def execute(self, context):
+        from . import engine
+        engine._ignis_full_dirty = True
+        # Tag viewport for redraw so it picks up the flag
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+        return {'FINISHED'}
+
+
 class IGNIS_PT_sampling(bpy.types.Panel):
     bl_label = "Sampling"
     bl_idname = "IGNIS_PT_sampling"
@@ -242,6 +263,7 @@ class IGNIS_PT_sampling(bpy.types.Panel):
         layout.use_property_decorate = False
         layout.prop(props, "max_bounces")
         layout.prop(props, "samples_per_pixel")
+        layout.prop(props, "backface_culling")
         layout.separator()
         layout.prop(props, "dlss_enabled")
         col = layout.column()
@@ -253,6 +275,8 @@ class IGNIS_PT_sampling(bpy.types.Panel):
         layout.separator()
         layout.prop(props, "fps_limit")
         layout.prop(props, "show_fps")
+        layout.separator()
+        layout.operator("ignis.reload_scene", icon='FILE_REFRESH')
 
 
 class IGNIS_PT_status(bpy.types.Panel):
@@ -380,6 +404,7 @@ def register():
 
     bpy.utils.register_class(IgnisRTPreferences)
     bpy.utils.register_class(IgnisRTSceneProperties)
+    bpy.utils.register_class(IGNIS_OT_reload_scene)
     bpy.utils.register_class(IGNIS_PT_sampling)
     bpy.utils.register_class(IGNIS_PT_status)
     bpy.utils.register_class(IGNIS_PT_sky)
@@ -403,6 +428,7 @@ def unregister():
     bpy.utils.unregister_class(IGNIS_PT_sky)
     bpy.utils.unregister_class(IGNIS_PT_status)
     bpy.utils.unregister_class(IGNIS_PT_sampling)
+    bpy.utils.unregister_class(IGNIS_OT_reload_scene)
     del bpy.types.Scene.ignis_rt
     bpy.utils.unregister_class(IgnisRTSceneProperties)
     bpy.utils.unregister_class(IgnisRTPreferences)

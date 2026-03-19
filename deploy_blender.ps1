@@ -2,7 +2,7 @@
 #
 # Usage:
 #   .\deploy_blender.ps1              # Build + deploy to latest Blender found
-#   .\deploy_blender.ps1 -BlenderVer 4.4
+#   .\deploy_blender.ps1 -BlenderVer 5.1
 #   .\deploy_blender.ps1 -NoBuild     # Skip cmake build, just copy files
 #   .\deploy_blender.ps1 -Symlink     # Use directory junction instead of copy (dev mode)
 
@@ -21,39 +21,71 @@ $dllRelease = Join-Path $buildDir "Release\ignis_rt.dll"
 $libDir     = Join-Path $addonSrc "lib"
 
 # ============================================================================
-# 1. Find Blender user config directory
+# 1. Find Blender — search user config + Program Files installations
 # ============================================================================
-$blenderBase = "$env:APPDATA\Blender Foundation\Blender"
+$blenderUserBase = "$env:APPDATA\Blender Foundation\Blender"
+$blenderInstallBases = @(
+    "$env:ProgramFiles\Blender Foundation",
+    "${env:ProgramFiles(x86)}\Blender Foundation"
+)
 
-if (-not (Test-Path $blenderBase)) {
-    Write-Host "ERROR: Blender user directory not found at $blenderBase" -ForegroundColor Red
+# Collect all known versions from user config dirs
+$allVersions = @()
+if (Test-Path $blenderUserBase) {
+    Get-ChildItem $blenderUserBase -Directory | ForEach-Object {
+        $allVersions += @{
+            Name = $_.Name
+            AddonsDir = Join-Path $_.FullName "scripts\addons"
+            Source = "user"
+        }
+    }
+}
+
+# Collect versions from Program Files installations (e.g. "Blender 5.1" → version "5.1")
+foreach ($base in $blenderInstallBases) {
+    if (Test-Path $base) {
+        Get-ChildItem $base -Directory | Where-Object { $_.Name -match '^Blender\s+(\d+\.\d+)' } | ForEach-Object {
+            $ver = $Matches[1]
+            $installAddons = Join-Path $_.FullName "$ver\scripts\addons"
+            # Only add if not already found via user config
+            if (-not ($allVersions | Where-Object { $_.Name -eq $ver })) {
+                $allVersions += @{
+                    Name = $ver
+                    AddonsDir = $installAddons
+                    Source = "install"
+                }
+            }
+        }
+    }
+}
+
+if ($allVersions.Count -eq 0) {
+    Write-Host "ERROR: No Blender installations found." -ForegroundColor Red
+    Write-Host "  Searched: $blenderUserBase" -ForegroundColor DarkGray
+    foreach ($b in $blenderInstallBases) { Write-Host "  Searched: $b" -ForegroundColor DarkGray }
     exit 1
 }
 
-$versions = Get-ChildItem $blenderBase -Directory | Sort-Object Name -Descending
-
-if ($versions.Count -eq 0) {
-    Write-Host "ERROR: No Blender versions found in $blenderBase" -ForegroundColor Red
-    exit 1
-}
+# Sort by version descending
+$allVersions = $allVersions | Sort-Object { [version]$_.Name } -Descending
 
 if ($BlenderVer -ne "") {
-    $target = $versions | Where-Object { $_.Name -eq $BlenderVer }
+    $target = $allVersions | Where-Object { $_.Name -eq $BlenderVer } | Select-Object -First 1
     if (-not $target) {
-        $available = ($versions | ForEach-Object { $_.Name }) -join ", "
+        $available = ($allVersions | ForEach-Object { "$($_.Name) ($($_.Source))" }) -join ", "
         Write-Host "ERROR: Blender $BlenderVer not found. Available: $available" -ForegroundColor Red
         exit 1
     }
 } else {
-    $target = $versions[0]
+    $target = $allVersions[0]
 }
 
 $blenderVer  = $target.Name
-$addonsDir   = Join-Path $target.FullName "scripts\addons"
+$addonsDir   = $target.AddonsDir
 $addonDest   = Join-Path $addonsDir "ignis_rt"
 
 Write-Host "=== Ignis RT Blender Deploy ===" -ForegroundColor Cyan
-Write-Host "  Blender version : $blenderVer"
+Write-Host "  Blender version : $blenderVer ($($target.Source))"
 Write-Host "  Addons dir      : $addonsDir"
 Write-Host ""
 

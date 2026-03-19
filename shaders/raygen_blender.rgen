@@ -462,8 +462,9 @@ void main() {
     int maxBounces = clamp(int(cam.parameters.z), 1, MAX_BOUNCES_LIMIT);
 
     // Multi-SPP: configurable samples per pixel (lightPad1 from CPU)
-    int spp = clamp(int(cam.lightPad1), 1, 4);
+    int spp = clamp(int(cam.lightPad1), 1, 128);
     bool rrModeGlobal = (cam.parameters.w == 2u);
+    bool backfaceCulling = (cam.lightPad2 != 0u);
 
     // Accumulators across SPP samples
     vec3 accumDiffuse = vec3(0.0);
@@ -650,6 +651,13 @@ void main() {
         bool frontFace = dot(N, -rayDir) >= 0.0;
         if (!frontFace) N = -N;
 
+        // ---- Backface culling ----
+        if (backfaceCulling && !frontFace && pbrHit.transmission < 0.5) {
+            rayOrigin = worldPos + rayDir * 0.002;
+            bounce--;
+            continue;
+        }
+
         // ---- Alpha cutout ----
         if ((mat.flags & 1u) != 0u && pbrHit.alpha < mat.alphaRef) {
             if (alphaSkips < MAX_ALPHA_SKIPS) {
@@ -747,10 +755,10 @@ void main() {
                 vec3 shadowOrigin = pbrHit.worldPos + N * 0.002;
                 bool inShadow = false;
                 float shadowHitDist = 65504.0;  // no occluder = far
-                for (int shadowSkip = 0; shadowSkip < 4; shadowSkip++) {
+                for (int shadowSkip = 0; shadowSkip < 16; shadowSkip++) {
                     rayQueryEXT shadowRQ;
                     rayQueryInitializeEXT(shadowRQ, topLevelAS,
-                        gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                        gl_RayFlagsOpaqueEXT,
                         0xFF, shadowOrigin, 0.0, sunDir, 10000.0);
                     while (rayQueryProceedEXT(shadowRQ)) {}
 
@@ -943,10 +951,10 @@ void main() {
             // Shadow ray to jittered target (skip glass surfaces)
             vec3 ptShadowOrigin = pbrHit.worldPos + N * 0.002;
             bool inShadow = false;
-            for (int ptShadowSkip = 0; ptShadowSkip < 4; ptShadowSkip++) {
+            for (int ptShadowSkip = 0; ptShadowSkip < 16; ptShadowSkip++) {
                 rayQueryEXT shadowRQ;
                 rayQueryInitializeEXT(shadowRQ, topLevelAS,
-                    gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                    gl_RayFlagsOpaqueEXT,
                     0xFF, ptShadowOrigin, 0.0, shadowDir, shadowDist - 0.004);
                 while (rayQueryProceedEXT(shadowRQ)) {}
                 if (rayQueryGetIntersectionTypeEXT(shadowRQ, true)
@@ -1015,10 +1023,10 @@ void main() {
                     // Shadow ray to emissive surface (skip glass)
                     vec3 eShadowOrigin = pbrHit.worldPos + N * 0.002;
                     bool eInShadow = false;
-                    for (int eShadowSkip = 0; eShadowSkip < 4; eShadowSkip++) {
+                    for (int eShadowSkip = 0; eShadowSkip < 16; eShadowSkip++) {
                         rayQueryEXT eShadowRQ;
                         rayQueryInitializeEXT(eShadowRQ, topLevelAS,
-                            gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                            gl_RayFlagsOpaqueEXT,
                             0xFF, eShadowOrigin, 0.0, eDir, eDist - 0.01);
                         while (rayQueryProceedEXT(eShadowRQ)) {}
                         if (rayQueryGetIntersectionTypeEXT(eShadowRQ, true)

@@ -108,6 +108,9 @@ struct PathTracerConfig {
 
     // Wavefront path tracing (experimental — compute-based multi-kernel pipeline)
     bool  useWavefront       = false;
+
+    // Backface culling
+    bool  backfaceCulling    = false;
 };
 
 } // namespace acpt

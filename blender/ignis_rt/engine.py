@@ -111,6 +111,7 @@ _ignis_instance_count = 0      # mesh instance count after last sync
 _ignis_last_tex_names = None   # texture name tuple from last upload (skip re-upload if same)
 _ignis_last_transforms = None  # cached instance transforms hash for change detection
 _ignis_last_light_count = -1   # track light count for emissive re-export
+_ignis_mat_name_to_index = {}  # persistent material name→index mapping for incremental uploads
 
 # ── Staged loading state machine ──
 LOAD_IDLE = 0          # no loading in progress
@@ -714,7 +715,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             dll_wrapper.upload_emissive_triangles(emissive_data, n_emissive)
             _log(f"Stage FINALIZE: {n_emissive} emissive triangles uploaded")
 
-            # Cleanup cached data
+            # Save material mapping for incremental uploads, then cleanup
+            global _ignis_mat_name_to_index
+            if _load_mat_name_to_index:
+                _ignis_mat_name_to_index = dict(_load_mat_name_to_index)
             _load_unique_meshes = None
             _load_scene_instances = None
             _load_mesh_keys = []
@@ -771,7 +775,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
     def _update_materials(self, depsgraph):
         global _ignis_materials_dirty, _ignis_frame_index, _ignis_tex_manager
-        global _ignis_last_tex_names
+        global _ignis_last_tex_names, _ignis_mat_name_to_index
 
         t0 = time.perf_counter()
         materials_data, mat_name_to_index, textures_list = scene_export.export_materials(depsgraph)
@@ -805,11 +809,76 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
         mat_count = max(len(mat_name_to_index), 1)
         dll_wrapper.upload_materials(materials_data, mat_count)
+        _ignis_mat_name_to_index = dict(mat_name_to_index)
         _ignis_materials_dirty = False
         _ignis_frame_index = 0
 
         dt = time.perf_counter() - t0
         _log(f" Materials update: {mat_count} mat ({len(textures_list)} tex) -- {dt:.3f}s")
+
+    # ------------------------------------------------------------------
+    # Incremental mesh upload (Cycles-style live editing)
+    # ------------------------------------------------------------------
+
+    def _upload_new_meshes(self, depsgraph, new_mesh_keys):
+        """Upload new meshes incrementally without full scene reload."""
+        global _ignis_blas_handles, _ignis_materials_dirty
+        import numpy as np
+
+        t0 = time.perf_counter()
+
+        # Export only the new meshes
+        unique_meshes, instances = scene_export.export_meshes(depsgraph)
+
+        uploaded = 0
+        for mesh_key in new_mesh_keys:
+            if mesh_key not in unique_meshes:
+                continue
+            mdata = unique_meshes[mesh_key]
+
+            # Upload mesh geometry → BLAS
+            positions = np.ascontiguousarray(mdata["positions"], dtype=np.float32)
+            indices = np.ascontiguousarray(mdata["indices"], dtype=np.uint32)
+            blas_handle = dll_wrapper.upload_mesh(positions, mdata["vertex_count"],
+                                                   indices, mdata["index_count"])
+            if blas_handle < 0:
+                _log(f"  BLAS upload failed for '{mesh_key}'")
+                continue
+
+            # Upload attributes (normals + UVs)
+            normals = np.ascontiguousarray(mdata["normals"], dtype=np.float32)
+            uvs = np.ascontiguousarray(mdata["uvs"], dtype=np.float32)
+            dll_wrapper.upload_mesh_attributes(blas_handle, normals, uvs, mdata["vertex_count"])
+
+            # Upload per-primitive material IDs
+            # Find the first instance of this mesh to get material slots
+            mat_name_to_index = _ignis_mat_name_to_index
+            for inst_data in instances:
+                if inst_data["mesh_key"] == mesh_key:
+                    slots = inst_data.get("material_slots", [])
+                    slot_to_global = []
+                    for s in slots:
+                        if s and s.name in mat_name_to_index:
+                            slot_to_global.append(mat_name_to_index[s.name])
+                        else:
+                            slot_to_global.append(0)
+                    tri_mat = mdata.get("tri_material_indices")
+                    if tri_mat is not None and slot_to_global:
+                        global_ids = np.array([slot_to_global[min(m, len(slot_to_global)-1)]
+                                               for m in tri_mat], dtype=np.uint32)
+                        dll_wrapper.upload_mesh_primitive_materials(
+                            blas_handle, global_ids, mdata["tri_count"])
+                    break
+
+            _ignis_blas_handles[mesh_key] = blas_handle
+            uploaded += 1
+
+        # If new materials are needed, mark for re-upload
+        if uploaded > 0:
+            _ignis_materials_dirty = True
+
+        dt = time.perf_counter() - t0
+        _log(f"  Incremental upload: {uploaded} new meshes -- {dt:.3f}s")
 
     # ------------------------------------------------------------------
     # TLAS-only rebuild (cheap)
@@ -905,7 +974,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         if _ignis_full_dirty:
             now = time.perf_counter()
             _log(f"full_dirty triggered (last upload {now - _ignis_last_full_upload:.1f}s ago)")
-            if _ignis_last_full_upload == 0 or (now - _ignis_last_full_upload) >= 15.0:
+            if _ignis_last_full_upload == 0 or (now - _ignis_last_full_upload) >= 5.0:
                 self._begin_staged_load(depsgraph)
                 _draw_loading_screen(w, h, "Preparing scene...", 0.0)
                 self.tag_redraw()
@@ -960,7 +1029,6 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             xform_floats = tuple(f for _, xf in cur_instances for f in xf)
             transforms_changed = len(cur_instances) != _ignis_instance_count
             if not transforms_changed and _ignis_last_transforms is not None:
-                # Check if any float changed by more than epsilon
                 for a, b in zip(xform_floats, _ignis_last_transforms):
                     if abs(a - b) > 1e-5:
                         transforms_changed = True
@@ -981,8 +1049,6 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         tlas_arr[i].mask = 0xFF
                     dll_wrapper.build_tlas(tlas_arr, count)
                     _ignis_instance_count = count
-                    # Do NOT reset _ignis_frame_index — NRD antilag handles
-                    # shadow changes naturally without destructive history wipe
 
         # FPS limiter
         props = context.scene.ignis_rt
@@ -999,6 +1065,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         props = context.scene.ignis_rt
         dll_wrapper.set_int("max_bounces", props.max_bounces)
         dll_wrapper.set_int("spp", props.samples_per_pixel)
+        dll_wrapper.set_int("backface_culling", 1 if props.backface_culling else 0)
         dll_wrapper.set_int("auto_sky_colors", 1 if props.auto_sky_colors else 0)
         if not props.auto_sky_colors:
             dll_wrapper.set_float("ambient_intensity", props.ambient_intensity)
@@ -1028,16 +1095,25 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             # Display
             gl_ok = dll_wrapper.draw_gl(w, h)
             if not gl_ok:
-                pixel_count = w * h
+                # Use actual Vulkan render size (may differ from viewport due to min-1920 enforcement)
+                rw = dll_wrapper.get_int("render_width") or w
+                rh = dll_wrapper.get_int("render_height") or h
+                pixel_count = rw * rh
+                # Ensure float buffer matches render size
+                global _ignis_float_buffer
+                needed = pixel_count * 4
+                if _ignis_float_buffer is None or len(_ignis_float_buffer) < needed:
+                    _ignis_float_buffer = (ctypes.c_float * needed)()
                 ok = dll_wrapper.readback_float(_ignis_float_buffer, pixel_count)
-                if not ok:
+                if ok:
+                    global _ignis_gpu_texture
+                    gpu_buf = gpu.types.Buffer('FLOAT', [pixel_count * 4], _ignis_float_buffer)
+                    _ignis_gpu_texture = gpu.types.GPUTexture((rw, rh), format='RGBA32F', data=gpu_buf)
+                    _draw_texture_flipped(_ignis_gpu_texture, w, h)
                     if _ignis_frame_index < 3:
-                        _log(f"readback failed (frame {_ignis_frame_index})")
-                    return
-                global _ignis_gpu_texture
-                gpu_buf = gpu.types.Buffer('FLOAT', [pixel_count * 4], _ignis_float_buffer)
-                _ignis_gpu_texture = gpu.types.GPUTexture((w, h), format='RGBA32F', data=gpu_buf)
-                _draw_texture_flipped(_ignis_gpu_texture, w, h)
+                        _log(f"CPU readback OK ({rw}x{rh} -> {w}x{h})")
+                elif _ignis_gpu_texture is not None:
+                    _draw_texture_flipped(_ignis_gpu_texture, w, h)
 
             _ignis_frame_index += 1
         except Exception:

@@ -64,6 +64,8 @@ public:
     bool IsDLSSRRActive() const { return dlssRRActive_; }
     void GetRenderResolution(uint32_t* w, uint32_t* h) const { *w = renderWidth_; *h = renderHeight_; }
     void GetDisplayResolution(uint32_t* w, uint32_t* h) const { *w = width_; *h = height_; }
+    uint32_t GetRenderWidth() const { return width_; }
+    uint32_t GetRenderHeight() const { return height_; }
     float GetComputedExposure() const { return computedExposure_; }
 
     Context* GetContext() const { return context_; }
