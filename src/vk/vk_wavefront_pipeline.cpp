@@ -456,6 +456,14 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
         vkCmdDispatchIndirect(cmd, indirectDispatchBuffer_, 3 * sizeof(uint32_t));
 
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+        // Reset shadowRayCount for next bounce (AFTER K3 used it)
+        // Offset 4 bytes = shadowRayCount field in CountersBuffer
+        vkCmdFillBuffer(cmd, countersBuffer_, sizeof(uint32_t), sizeof(uint32_t), 0);
+
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
         // Swap PathState ping-pong: next-bounce writes become current-bounce reads

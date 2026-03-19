@@ -32,10 +32,11 @@ void main() {
     indirect.args[4] = 1u;
     indirect.args[5] = 1u;
 
-    // Swap: active = next, reset next and shadow counters
+    // Swap: active = next, reset next counter
+    // NOTE: shadowRayCount NOT reset here — K3 still needs it!
+    // It gets reset after K3 via vkCmdFillBuffer in RecordDispatch.
     counters.activeRayCount = counters.nextActiveRayCount;
     counters.nextActiveRayCount = 0u;
-    counters.shadowRayCount = 0u;
 
     // Write indirect dispatch args for K1/K2 (active rays next bounce)
     uint activeGroups = (counters.activeRayCount + 255u) / 256u;
