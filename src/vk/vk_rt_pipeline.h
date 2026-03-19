@@ -166,7 +166,9 @@ public:
     VkImage GetViewDepthImage() const { return viewDepthGBuffer_.image; }
     VkImage GetMotionVectorsImage() const { return motionVectorsGBuffer_.image; }
     VkImage GetDiffuseRadianceImage() const { return diffuseRadianceGBuffer_.image; }
+    VkImageView GetDiffuseRadianceView() const { return diffuseRadianceGBuffer_.view; }
     VkImage GetSpecularRadianceImage() const { return specularRadianceGBuffer_.image; }
+    VkImageView GetSpecularRadianceView() const { return specularRadianceGBuffer_.view; }
     VkImage GetAlbedoBufferImage() const { return albedoGBuffer_.image; }
     VkImageView GetAlbedoBufferView() const { return albedoGBuffer_.view; }
     VkImage GetPenumbraImage() const { return penumbraGBuffer_.image; }

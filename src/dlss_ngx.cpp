@@ -578,6 +578,10 @@ void DLSS_NGX::EvaluateRR(
     float deltaTime,
     const float* viewMatrix,
     const float* projMatrix,
+    VkImage diffuseHitDistImage,
+    VkImageView diffuseHitDistView,
+    VkImage specularHitDistImage,
+    VkImageView specularHitDistView,
     bool reset
 ) {
 #ifdef ACPT_HAVE_NGX
@@ -648,6 +652,22 @@ void DLSS_NGX::EvaluateRR(
     // Pass world-to-view and view-to-clip matrices for better temporal reprojection
     if (viewMatrix) evalParams.pInWorldToViewMatrix = const_cast<float*>(viewMatrix);
     if (projMatrix) evalParams.pInViewToClipMatrix = const_cast<float*>(projMatrix);
+
+    // Hit distance for better temporal stability (stored in radiance .a channel)
+    NVSDK_NGX_Resource_VK diffHitDistResource = {};
+    NVSDK_NGX_Resource_VK specHitDistResource = {};
+    if (diffuseHitDistView != VK_NULL_HANDLE) {
+        diffHitDistResource = NVSDK_NGX_Create_ImageView_Resource_VK(
+            diffuseHitDistView, diffuseHitDistImage, fullRange, VK_FORMAT_R16G16B16A16_SFLOAT,
+            m_renderWidth, m_renderHeight, false);
+        evalParams.pInDiffuseHitDistance = &diffHitDistResource;
+    }
+    if (specularHitDistView != VK_NULL_HANDLE) {
+        specHitDistResource = NVSDK_NGX_Create_ImageView_Resource_VK(
+            specularHitDistView, specularHitDistImage, fullRange, VK_FORMAT_R16G16B16A16_SFLOAT,
+            m_renderWidth, m_renderHeight, false);
+        evalParams.pInSpecularHitDistance = &specHitDistResource;
+    }
 
     NVSDK_NGX_Result ngxResult = NGX_VULKAN_EVALUATE_DLSSD_EXT(
         cmdBuf,

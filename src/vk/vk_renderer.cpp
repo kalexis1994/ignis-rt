@@ -722,7 +722,11 @@ void Renderer::RenderFrameRT() {
             rtPipeline_->GetAlbedoBufferView(),
             jitterX_, jitterY_,
             rrDeltaMs / 1000.0f,
-            lastView_, lastProj_,                            // world-to-view + view-to-clip
+            lastView_, lastProj_,
+            rtPipeline_->GetDiffuseRadianceImage(),          // diffuse hit distance (.a)
+            rtPipeline_->GetDiffuseRadianceView(),
+            rtPipeline_->GetSpecularRadianceImage(),         // specular hit distance (.a)
+            rtPipeline_->GetSpecularRadianceView(),
             rrReset);
 
         // Barrier: RR writes → tonemap reads
