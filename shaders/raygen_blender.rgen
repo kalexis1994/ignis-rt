@@ -1063,6 +1063,7 @@ void main() {
             vec3 ambientColor = cam.ambientLight.rgb * cam.ambientLight.w;
             float NdotUp = max(dot(N, vec3(0, 1, 0)), 0.0);
             vec3 ambient = pbrHit.baseColor * ambientColor * NdotUp * ambientMax * (1.0 - pbrHit.metallic);
+
             ambientDiffuse = ambient * throughput;
             diffuseRadiance += ambientDiffuse;
         }
