@@ -24,7 +24,8 @@ Real-time Vulkan ray tracing renderer designed as a Blender viewport render engi
 - **PBR materials** (Cook-Torrance GGX microfacet BRDF)
 
 ### Denoising & Upscaling
-- **NVIDIA DLSS Ray Reconstruction** (experimental — replaces NRD on RTX 40+ GPUs)
+- **Wavefront path tracing** (optional compute-based multi-kernel pipeline)
+- **NVIDIA DLSS Ray Reconstruction** (replaces NRD on all RTX GPUs)
 - **NVIDIA NRD** (ReLAX diffuse+specular denoiser + SIGMA shadow denoiser, fallback for RTX 20/30)
 - **NVIDIA DLSS** upscaling (Ultra Performance to Ultra Quality)
 - **Auto-exposure** with GPU histogram and EMA smoothing
@@ -115,6 +116,7 @@ ignis-rt/
 - **No texture filtering** beyond hardware bilinear
 
 ### Future Plans
+- **Wavefront ray sorting** (sort rays by direction for better BVH cache coherence)
 - **Ray Reconstruction polish** (jitter tuning, specular MVs, hit distance inputs)
 - **ReSTIR DI** for many-light scenarios
 - **Area light** support
