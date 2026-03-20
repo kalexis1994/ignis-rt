@@ -1016,9 +1016,6 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         region = context.region
         w, h = region.width, region.height
 
-        if _ignis_frame_index < 5 and _load_stage == LOAD_IDLE and _ignis_blas_handles:
-            _log(f"view_draw: frame={_ignis_frame_index} stage={_load_stage} dirty={_ignis_full_dirty} w={w} h={h}")
-
         # ── Loading screen: show immediately, process one stage per call ──
         if _load_stage != LOAD_IDLE:
             _draw_loading_screen(w, h, _load_status, _load_progress)
@@ -1053,13 +1050,9 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
         # ── Fast incremental updates (no loading screen needed) ──
         if _ignis_materials_dirty:
-            if _ignis_frame_index < 3: _log("  -> _update_materials")
             self._update_materials(depsgraph)
         elif _ignis_tlas_dirty:
-            if _ignis_frame_index < 3: _log("  -> _rebuild_tlas")
             self._rebuild_tlas(depsgraph)
-
-        if _ignis_frame_index < 3: _log("  -> light sync")
         # ── Light sync (every frame — cheap) ──
         sun = scene_export.export_sun(depsgraph)
         dll_wrapper.set_float("sun_elevation", sun["sun_elevation"])
@@ -1111,9 +1104,6 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             # Incremental BLAS upload for new objects
             # Skip heavy re-export for large scenes — just log and ignore
             if new_objects:
-                if _ignis_frame_index < 3:
-                    _log(f"  Skipping {len(new_objects)} unknown objects (incremental disabled for perf): {list(new_objects.keys())[:5]}...")
-                # Mark as known so we don't retry every frame
                 for obj_name in new_objects:
                     _ignis_known_objects.add(obj_name)
                 # Re-scan to include newly uploaded objects
@@ -1197,8 +1187,6 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             )
 
             # Render
-            if _ignis_frame_index < 3:
-                _log(f"Rendering frame {_ignis_frame_index}...")
             dll_wrapper.render_frame()
 
             # Display
