@@ -271,6 +271,22 @@ def export_meshes(depsgraph):
             "material_slots": [s.material for s in obj.material_slots],
         })
 
+    # Log instance stats for debugging collection/linked issues
+    import os
+    _log_path = os.path.join(os.path.expanduser("~"), "ignis-rt.log")
+    try:
+        from collections import Counter
+        key_counts = Counter(i["mesh_key"] for i in instances)
+        dupes = {k: v for k, v in key_counts.items() if v > 1}
+        if dupes:
+            with open(_log_path, "a") as _lf:
+                _lf.write(f"[ignis-export] Instanced objects ({len(dupes)} unique, {sum(dupes.values())} instances):\n")
+                for k, v in sorted(dupes.items(), key=lambda x: -x[1])[:10]:
+                    _lf.write(f"  '{k}' x{v}\n")
+                _lf.flush()
+    except Exception:
+        pass
+
     return unique_meshes, instances, obj_to_mesh_key
 
 

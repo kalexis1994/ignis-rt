@@ -1161,10 +1161,12 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         if _ignis_blas_handles is not None:
             cur_instances = []
             new_objects = {}  # obj_name → (obj, inst) for incremental upload
+            _sync_obj_count = 0
             for inst in depsgraph.object_instances:
                 obj = inst.object
                 if obj.type != 'MESH':
                     continue
+                _sync_obj_count += 1
                 obj_name = obj.name
                 # Resolve obj.name → mesh_data_key → BLAS handle
                 mesh_key = _ignis_obj_to_mesh.get(obj_name)
@@ -1210,6 +1212,9 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                     if abs(a - b) > 1e-5:
                         transforms_changed = True
                         break
+
+            if _ignis_frame_index < 2:
+                _log(f"  sync: {_sync_obj_count} mesh objects, {len(cur_instances)} known, {len(new_objects)} new, changed={transforms_changed}")
 
             if transforms_changed or new_objects:
                 _ignis_last_transforms = xform_floats
