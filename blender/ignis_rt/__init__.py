@@ -183,12 +183,14 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         name="DLSS Quality",
         description="Upscaling quality preset (higher = sharper but slower)",
         items=[
-            ('1', "Ultra Performance", "3x upscaling — maximum FPS, lowest quality"),
-            ('2', "Balanced", "1.7x upscaling — good balance of quality and performance"),
-            ('3', "Quality", "1.5x upscaling — high quality, moderate performance cost"),
-            ('4', "DLAA", "No upscaling (native resolution) — maximum quality, full AA"),
+            ('1', "Ultra Performance", "3.0x upscaling — maximum FPS"),
+            ('2', "Performance", "2.0x upscaling — high FPS"),
+            ('3', "Balanced", "1.7x upscaling — balanced quality/performance"),
+            ('4', "Quality", "1.5x upscaling — high quality (recommended)"),
+            ('5', "Ultra Quality", "1.3x upscaling — may not be available on all GPUs"),
+            ('6', "DLAA", "Native resolution — anti-aliasing only, no upscaling"),
         ],
-        default='3',
+        default='4',
     )
     dlss_rr_enabled: BoolProperty(
         name="Ray Reconstruction",
@@ -314,7 +316,17 @@ class IGNIS_PT_status(bpy.types.Panel):
 
         col = layout.column(align=True)
         if dlss:
-            col.label(text="DLSS: Active", icon='CHECKMARK')
+            # Show actual quality mode (may differ from selected if GPU doesn't support it)
+            actual_q = dll_wrapper.get_int("dlss_quality_actual")
+            quality_names = {1: "Ultra Performance", 2: "Performance", 3: "Balanced",
+                             4: "Quality", 5: "Ultra Quality", 6: "DLAA"}
+            q_name = quality_names.get(actual_q, f"Mode {actual_q}")
+            props = context.scene.ignis_rt
+            requested_q = int(props.dlss_quality)
+            if actual_q != requested_q and actual_q > 0:
+                col.label(text=f"DLSS: {q_name} (fallback)", icon='INFO')
+            else:
+                col.label(text=f"DLSS: {q_name}", icon='CHECKMARK')
         else:
             col.label(text="DLSS: Off", icon='X')
 

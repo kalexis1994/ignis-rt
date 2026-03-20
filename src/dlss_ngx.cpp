@@ -6,6 +6,7 @@
 #include "ngx/nvsdk_ngx.h"
 #include "ngx/nvsdk_ngx_vk.h"
 #include "ngx/nvsdk_ngx_defs.h"
+#include "ngx/nvsdk_ngx_helpers.h"
 #include "ngx/nvsdk_ngx_helpers_vk.h"
 #include "ngx/nvsdk_ngx_defs_dlssd.h"
 #include "ngx/nvsdk_ngx_helpers_dlssd_vk.h"
@@ -46,20 +47,57 @@ void DLSS_NGX::GetRenderResolution(
     uint32_t* outRenderWidth,
     uint32_t* outRenderHeight
 ) {
-    // DLSS quality mode scaling ratios (approximate)
+#ifdef ACPT_HAVE_NGX
+    // Map our enum to NGX PerfQuality
+    NVSDK_NGX_PerfQuality_Value ngxQuality;
+    switch (qualityMode) {
+        case DLSSQualityMode::UltraPerformance: ngxQuality = NVSDK_NGX_PerfQuality_Value_UltraPerformance; break;
+        case DLSSQualityMode::MaxPerformance:   ngxQuality = NVSDK_NGX_PerfQuality_Value_MaxPerf; break;
+        case DLSSQualityMode::Balanced:         ngxQuality = NVSDK_NGX_PerfQuality_Value_Balanced; break;
+        case DLSSQualityMode::MaxQuality:       ngxQuality = NVSDK_NGX_PerfQuality_Value_MaxQuality; break;
+        case DLSSQualityMode::UltraQuality:     ngxQuality = NVSDK_NGX_PerfQuality_Value_UltraQuality; break;
+        case DLSSQualityMode::DLAA:             ngxQuality = NVSDK_NGX_PerfQuality_Value_DLAA; break;
+        default:                                ngxQuality = NVSDK_NGX_PerfQuality_Value_MaxQuality; break;
+    }
+
+    // Query NGX for the optimal render resolution (GPU-specific)
+    NVSDK_NGX_Parameter* params = nullptr;
+    if (NVSDK_NGX_SUCCEED(NVSDK_NGX_VULKAN_GetCapabilityParameters(&params)) && params) {
+        unsigned int optW = 0, optH = 0, maxW = 0, maxH = 0, minW = 0, minH = 0;
+        float sharpness = 0.0f;
+        NVSDK_NGX_Result res = NGX_DLSS_GET_OPTIMAL_SETTINGS(
+            params, displayWidth, displayHeight, ngxQuality,
+            &optW, &optH, &maxW, &maxH, &minW, &minH, &sharpness);
+        if (NVSDK_NGX_SUCCEED(res) && optW > 0 && optH > 0) {
+            *outRenderWidth = optW;
+            *outRenderHeight = optH;
+            Log(L"[DLSS-NGX] Optimal settings: %ux%u (min %ux%u, max %ux%u) for quality %d\n",
+                optW, optH, minW, minH, maxW, maxH, (int)qualityMode);
+            NVSDK_NGX_VULKAN_DestroyParameters(params);
+            return;
+        }
+        // optW==0 means this quality mode is not supported
+        if (optW == 0) {
+            Log(L"[DLSS-NGX] Quality mode %d not supported by GPU (optW=0), falling back\n", (int)qualityMode);
+        }
+        NVSDK_NGX_VULKAN_DestroyParameters(params);
+    }
+#endif
+
+    // Fallback: hardcoded ratios
     float scalingRatio = 1.0f;
     switch (qualityMode) {
-        case DLSSQualityMode::UltraQuality:  scalingRatio = 1.0f; break;  // Native / DLAA
-        case DLSSQualityMode::MaxQuality:    scalingRatio = 1.5f; break;  // Quality
-        case DLSSQualityMode::Balanced:      scalingRatio = 1.7f; break;  // Balanced
-        case DLSSQualityMode::MaxPerformance: scalingRatio = 3.0f; break; // Ultra Performance
-        default:                             scalingRatio = 1.7f; break;  // Default to Balanced
+        case DLSSQualityMode::UltraPerformance: scalingRatio = 3.0f; break;
+        case DLSSQualityMode::MaxPerformance:   scalingRatio = 2.0f; break;
+        case DLSSQualityMode::Balanced:         scalingRatio = 1.7f; break;
+        case DLSSQualityMode::MaxQuality:       scalingRatio = 1.5f; break;
+        case DLSSQualityMode::UltraQuality:     scalingRatio = 1.3f; break;
+        case DLSSQualityMode::DLAA:             scalingRatio = 1.0f; break;
+        default:                                scalingRatio = 1.5f; break;
     }
 
     *outRenderWidth = static_cast<uint32_t>(displayWidth / scalingRatio);
     *outRenderHeight = static_cast<uint32_t>(displayHeight / scalingRatio);
-
-    // Align to 2 pixels (DLSS requirement), but never exceed display resolution
     *outRenderWidth = (*outRenderWidth + 1) & ~1;
     *outRenderHeight = (*outRenderHeight + 1) & ~1;
     if (*outRenderWidth > displayWidth) *outRenderWidth = displayWidth;
@@ -137,6 +175,57 @@ bool DLSS_NGX::Initialize(
         return false;
     }
 
+    // Query NGX for optimal render resolution (GPU-specific).
+    // If the requested mode is not supported, fall back to the next lower mode.
+    {
+        NVSDK_NGX_Parameter* capParams = nullptr;
+        if (NVSDK_NGX_SUCCEED(NVSDK_NGX_VULKAN_GetCapabilityParameters(&capParams)) && capParams) {
+            // Ordered from highest to lowest quality for fallback
+            struct { DLSSQualityMode mode; NVSDK_NGX_PerfQuality_Value ngx; const wchar_t* name; } modes[] = {
+                { DLSSQualityMode::DLAA,             NVSDK_NGX_PerfQuality_Value_DLAA,              L"DLAA" },
+                { DLSSQualityMode::UltraQuality,     NVSDK_NGX_PerfQuality_Value_UltraQuality,      L"Ultra Quality" },
+                { DLSSQualityMode::MaxQuality,       NVSDK_NGX_PerfQuality_Value_MaxQuality,        L"Quality" },
+                { DLSSQualityMode::Balanced,         NVSDK_NGX_PerfQuality_Value_Balanced,           L"Balanced" },
+                { DLSSQualityMode::MaxPerformance,   NVSDK_NGX_PerfQuality_Value_MaxPerf,            L"Performance" },
+                { DLSSQualityMode::UltraPerformance, NVSDK_NGX_PerfQuality_Value_UltraPerformance,   L"Ultra Performance" },
+            };
+
+            // Find requested mode, then try fallbacks
+            bool found = false;
+            bool startTrying = false;
+            for (auto& m : modes) {
+                if (m.mode == qualityMode) startTrying = true;
+                if (!startTrying) continue;
+
+                unsigned int optW = 0, optH = 0, maxW = 0, maxH = 0, minW = 0, minH = 0;
+                float sharpness = 0.0f;
+                NVSDK_NGX_Result optRes = NGX_DLSS_GET_OPTIMAL_SETTINGS(
+                    capParams, displayWidth, displayHeight, m.ngx,
+                    &optW, &optH, &maxW, &maxH, &minW, &minH, &sharpness);
+                if (NVSDK_NGX_SUCCEED(optRes) && optW > 0 && optH > 0) {
+                    m_renderWidth = optW;
+                    m_renderHeight = optH;
+                    if (m.mode != qualityMode) {
+                        Log(L"[DLSS-NGX] %ls not supported, falling back to %ls\n",
+                            modes[0].name, m.name);  // approximate — just log the fallback
+                    }
+                    Log(L"[DLSS-NGX] NGX optimal: %ux%u (min %ux%u, max %ux%u) mode=%ls\n",
+                        optW, optH, minW, minH, maxW, maxH, m.name);
+                    m_qualityMode = m.mode;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                Log(L"[DLSS-NGX] No supported quality mode found, using fallback ratio\n");
+            }
+            NVSDK_NGX_VULKAN_DestroyParameters(capParams);
+        }
+    }
+
+    Log(L"[DLSS-NGX] Final render resolution: %ux%u -> %ux%u\n",
+        m_renderWidth, m_renderHeight, m_displayWidth, m_displayHeight);
+
     // Allocate NGX parameters
     ngxResult = NVSDK_NGX_VULKAN_AllocateParameters((NVSDK_NGX_Parameter**)&m_ngxParameters);
     if ((ngxResult != NVSDK_NGX_Result_Success)) {
@@ -202,11 +291,13 @@ bool DLSS_NGX::Initialize(
     // NGX:  MaxPerf=0, Balanced=1, MaxQuality=2, UltraPerf=3, UltraQuality=4, DLAA=5
     NVSDK_NGX_PerfQuality_Value ngxQuality;
     switch (m_qualityMode) {
-        case DLSSQualityMode::MaxPerformance: ngxQuality = NVSDK_NGX_PerfQuality_Value_MaxPerf; break;
-        case DLSSQualityMode::Balanced:       ngxQuality = NVSDK_NGX_PerfQuality_Value_Balanced; break;
-        case DLSSQualityMode::MaxQuality:     ngxQuality = NVSDK_NGX_PerfQuality_Value_MaxQuality; break;
-        case DLSSQualityMode::UltraQuality:   ngxQuality = NVSDK_NGX_PerfQuality_Value_UltraQuality; break;
-        default:                              ngxQuality = NVSDK_NGX_PerfQuality_Value_Balanced; break;
+        case DLSSQualityMode::UltraPerformance: ngxQuality = NVSDK_NGX_PerfQuality_Value_UltraPerformance; break;
+        case DLSSQualityMode::MaxPerformance:   ngxQuality = NVSDK_NGX_PerfQuality_Value_MaxPerf; break;
+        case DLSSQualityMode::Balanced:         ngxQuality = NVSDK_NGX_PerfQuality_Value_Balanced; break;
+        case DLSSQualityMode::MaxQuality:       ngxQuality = NVSDK_NGX_PerfQuality_Value_MaxQuality; break;
+        case DLSSQualityMode::UltraQuality:     ngxQuality = NVSDK_NGX_PerfQuality_Value_UltraQuality; break;
+        case DLSSQualityMode::DLAA:             ngxQuality = NVSDK_NGX_PerfQuality_Value_DLAA; break;
+        default:                                ngxQuality = NVSDK_NGX_PerfQuality_Value_Balanced; break;
     }
 
     NVSDK_NGX_DLSS_Create_Params dlssCreateParams = {};
@@ -406,15 +497,8 @@ void DLSS_NGX::Evaluate(
     // Frame time delta helps DLSS with temporal accumulation quality
     evalParams.InFrameTimeDeltaInMsec = deltaTime * 1000.0f;
 
-    // Reactive mask (pInBiasCurrentColorMask) — hints DLSS about dynamic regions
-    NVSDK_NGX_Resource_VK reactiveMaskResource = {};
-    if (reactiveMaskView != VK_NULL_HANDLE && reactiveMaskImage != VK_NULL_HANDLE) {
-        reactiveMaskResource = NVSDK_NGX_Create_ImageView_Resource_VK(
-            reactiveMaskView, reactiveMaskImage, fullRange, VK_FORMAT_R8_UNORM,
-            m_renderWidth, m_renderHeight, false  // read-only
-        );
-        evalParams.pInBiasCurrentColorMask = &reactiveMaskResource;
-    }
+    // Reactive mask disabled — pInBiasCurrentColorMask causes artifacts with current format
+    // TODO: investigate correct usage for DLSS SR reactive mask
 
 
     // Execute DLSS
@@ -455,11 +539,13 @@ bool DLSS_NGX::InitializeRR() {
     // Map quality mode
     NVSDK_NGX_PerfQuality_Value ngxQuality;
     switch (m_qualityMode) {
-        case DLSSQualityMode::MaxPerformance: ngxQuality = NVSDK_NGX_PerfQuality_Value_MaxPerf; break;
-        case DLSSQualityMode::Balanced:       ngxQuality = NVSDK_NGX_PerfQuality_Value_Balanced; break;
-        case DLSSQualityMode::MaxQuality:     ngxQuality = NVSDK_NGX_PerfQuality_Value_MaxQuality; break;
-        case DLSSQualityMode::UltraQuality:   ngxQuality = NVSDK_NGX_PerfQuality_Value_UltraQuality; break;
-        default:                              ngxQuality = NVSDK_NGX_PerfQuality_Value_Balanced; break;
+        case DLSSQualityMode::UltraPerformance: ngxQuality = NVSDK_NGX_PerfQuality_Value_UltraPerformance; break;
+        case DLSSQualityMode::MaxPerformance:   ngxQuality = NVSDK_NGX_PerfQuality_Value_MaxPerf; break;
+        case DLSSQualityMode::Balanced:         ngxQuality = NVSDK_NGX_PerfQuality_Value_Balanced; break;
+        case DLSSQualityMode::MaxQuality:       ngxQuality = NVSDK_NGX_PerfQuality_Value_MaxQuality; break;
+        case DLSSQualityMode::UltraQuality:     ngxQuality = NVSDK_NGX_PerfQuality_Value_UltraQuality; break;
+        case DLSSQualityMode::DLAA:             ngxQuality = NVSDK_NGX_PerfQuality_Value_DLAA; break;
+        default:                                ngxQuality = NVSDK_NGX_PerfQuality_Value_Balanced; break;
     }
 
     // Set RR creation parameters on fresh parameter block
@@ -478,7 +564,14 @@ bool DLSS_NGX::InitializeRR() {
     rrParams->Set(NVSDK_NGX_Parameter_DLSS_Denoise_Mode, (int)NVSDK_NGX_DLSS_Denoise_Mode_DLUnified);
     // Roughness is packed in normalRoughness.a
     rrParams->Set(NVSDK_NGX_Parameter_DLSS_Roughness_Mode, (unsigned int)NVSDK_NGX_DLSS_Roughness_Mode_Packed);
-    rrParams->Set(NVSDK_NGX_Parameter_Use_HW_Depth, (unsigned int)0);
+    rrParams->Set(NVSDK_NGX_Parameter_Use_HW_Depth, (unsigned int)1);  // NDC depth [0,1]
+    // RR model preset: E = latest transformer model (D and E are the only valid RR presets)
+    rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA, (unsigned int)NVSDK_NGX_RayReconstruction_Hint_Render_Preset_E);
+    rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality, (unsigned int)NVSDK_NGX_RayReconstruction_Hint_Render_Preset_E);
+    rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced, (unsigned int)NVSDK_NGX_RayReconstruction_Hint_Render_Preset_E);
+    rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance, (unsigned int)NVSDK_NGX_RayReconstruction_Hint_Render_Preset_D);
+    rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance, (unsigned int)NVSDK_NGX_RayReconstruction_Hint_Render_Preset_D);
+    rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality, (unsigned int)NVSDK_NGX_RayReconstruction_Hint_Render_Preset_E);
     // Output subrects (required by DLSSD)
     rrParams->Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
     // CreationNodeMask / VisibilityNodeMask
@@ -586,7 +679,9 @@ void DLSS_NGX::EvaluateRR(
     VkImageView diffuseHitDistView,
     VkImage specularHitDistImage,
     VkImageView specularHitDistView,
-    bool reset
+    bool reset,
+    VkImage reactiveMaskImage,
+    VkImageView reactiveMaskView
 ) {
 #ifdef ACPT_HAVE_NGX
     if (!m_initialized || !m_rrSupported || !m_ngxFeatureRR) {
@@ -681,8 +776,12 @@ void DLSS_NGX::EvaluateRR(
             m_renderWidth, m_renderHeight, false);
         evalParams.pInSpecularHitDistance = &specHitDistResource;
     }
-    // Specular MVs disabled — need correct convention investigation
-    // evalParams.pInMotionVectorsReflections = nullptr;
+    // Specular MVs: using Path B (hit distance + matrices) instead of direct MVs
+
+    // Reactive mask: disabled for now — pInBiasCurrentColorMask causes artifacts.
+    // TODO: investigate correct field and format for RR reactive mask.
+    // (void)reactiveMaskImage;
+    // (void)reactiveMaskView;
 
     NVSDK_NGX_Result ngxResult = NGX_VULKAN_EVALUATE_DLSSD_EXT(
         cmdBuf,

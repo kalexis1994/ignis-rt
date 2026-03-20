@@ -155,13 +155,75 @@ def export_meshes(depsgraph):
     unique_meshes = {}
     instances = []
     skipped_meshes = set()
+    # Map object name → mesh key (identity for now, but enables incremental lookup)
+    obj_to_mesh_key = {}
+
+    # Build set of objects used as Boolean modifier cutters (should not be rendered)
+    boolean_cutters = set()
+    for obj in depsgraph.objects:
+        if obj.type != 'MESH':
+            continue
+        for mod in obj.modifiers:
+            if mod.type == 'BOOLEAN' and hasattr(mod, 'object') and mod.object:
+                boolean_cutters.add(mod.object.name)
+
+    # Build set of objects in collections hidden from viewport.
+    # Walk the view layer's layer_collection tree to find excluded/hidden collections.
+    hidden_by_collection = set()
+    def _walk_layer_collections(lc, parent_hidden=False):
+        hidden = parent_hidden or lc.hide_viewport or lc.exclude
+        if hidden:
+            for obj in lc.collection.objects:
+                hidden_by_collection.add(obj.name)
+        for child in lc.children:
+            _walk_layer_collections(child, hidden)
+    try:
+        _walk_layer_collections(depsgraph.view_layer.layer_collection)
+    except Exception as _e:
+        import os
+        with open(os.path.join(os.path.expanduser("~"), "ignis-rt.log"), "a") as _lf:
+            _lf.write(f"[ignis-export] ERROR walking layer_collections: {_e}\n")
+
+    # Log what we found
+    import os
+    try:
+        with open(os.path.join(os.path.expanduser("~"), "ignis-rt.log"), "a") as _lf:
+            _lf.write(f"[ignis-export] Hidden by collection: {len(hidden_by_collection)} objects\n")
+            if hidden_by_collection:
+                for name in sorted(hidden_by_collection)[:10]:
+                    _lf.write(f"  hidden: '{name}'\n")
+    except Exception:
+        pass
 
     for instance in depsgraph.object_instances:
         obj = instance.object
         if obj.type != 'MESH':
             continue
 
+        # Skip Boolean modifier cutters
+        if obj.name in boolean_cutters:
+            continue
+
+        # Skip objects in hidden/excluded collections
+        if obj.name in hidden_by_collection:
+            continue
+
+        # Skip objects hidden at object level
+        if not instance.show_self:
+            continue
+        if obj.hide_viewport:
+            continue
+        try:
+            if obj.hide_get():
+                continue
+        except RuntimeError:
+            pass
+        if hasattr(obj, 'visible_camera') and not obj.visible_camera:
+            continue
+
+        # Each object gets its own BLAS (safe: modifiers produce unique geometry)
         mesh_key = obj.name
+        obj_to_mesh_key[obj.name] = mesh_key
 
         if mesh_key in skipped_meshes:
             continue
@@ -220,19 +282,28 @@ def export_meshes(depsgraph):
                 uvs = all_loop_uvs[tri_loops]
 
             # ---- Vertex deduplication ----
-            # Merge vertices with identical pos+normal+UV to reduce BLAS size
-            combined = np.ascontiguousarray(
-                np.hstack([positions, normals, uvs]), dtype=np.float32)
-            void_dt = np.dtype((np.void, combined.dtype.itemsize * combined.shape[1]))
-            _, unique_idx, inverse = np.unique(
-                combined.view(void_dt).ravel(),
-                return_index=True, return_inverse=True)
-
-            dedup_pos = combined[unique_idx, :3]
-            dedup_nrm = combined[unique_idx, 3:6]
-            dedup_uvs = combined[unique_idx, 6:8]
-            dedup_indices = inverse.astype(np.uint32)
-            dedup_vert_count = len(unique_idx)
+            # Skip dedup for large meshes (>50K tris) — np.unique is O(N log N)
+            # and takes seconds on multi-million triangle meshes
+            DEDUP_THRESHOLD = 500000
+            if tri_count <= DEDUP_THRESHOLD:
+                combined = np.ascontiguousarray(
+                    np.hstack([positions, normals, uvs]), dtype=np.float32)
+                void_dt = np.dtype((np.void, combined.dtype.itemsize * combined.shape[1]))
+                _, unique_idx, inverse = np.unique(
+                    combined.view(void_dt).ravel(),
+                    return_index=True, return_inverse=True)
+                dedup_pos = combined[unique_idx, :3]
+                dedup_nrm = combined[unique_idx, 3:6]
+                dedup_uvs = combined[unique_idx, 6:8]
+                dedup_indices = inverse.astype(np.uint32)
+                dedup_vert_count = len(unique_idx)
+            else:
+                # Large mesh: use raw unrolled vertices (no dedup, more VRAM but instant)
+                dedup_pos = positions
+                dedup_nrm = normals
+                dedup_uvs = uvs
+                dedup_indices = np.arange(raw_vert_count, dtype=np.uint32)
+                dedup_vert_count = raw_vert_count
 
             # Per-triangle material indices
             tri_mat_indices = np.empty(tri_count, dtype=np.int32)
@@ -252,13 +323,57 @@ def export_meshes(depsgraph):
             }
             eval_obj.to_mesh_clear()
 
+        xform = _matrix_to_3x4_row_major(instance.matrix_world)
         instances.append({
             "mesh_key": mesh_key,
-            "transform_3x4": _matrix_to_3x4_row_major(instance.matrix_world),
+            "transform_3x4": xform,
             "material_slots": [s.material for s in obj.material_slots],
+            "is_instance": instance.is_instance,
+            "display_type": obj.display_type,
+            "hide_render": obj.hide_render,
+            "hide_viewport": obj.hide_viewport,
+            "visible_camera": getattr(obj, 'visible_camera', '?'),
         })
 
-    return unique_meshes, instances
+    # Dump ALL instances to file for ghost mesh diagnosis
+    import os
+    try:
+        _dump_path = os.path.join(os.path.expanduser("~"), "ignis-instances.txt")
+        with open(_dump_path, "w") as _df:
+            _df.write(f"Total: {len(unique_meshes)} meshes, {len(instances)} instances\n\n")
+            for idx, inst in enumerate(instances):
+                t = inst["transform_3x4"]
+                _df.write(f"[{idx:3d}] mesh='{inst['mesh_key']}' "
+                          f"hide_vp={inst.get('hide_viewport',False)} hide_r={inst.get('hide_render',False)} "
+                          f"vis_cam={inst.get('visible_camera','?')} "
+                          f"pos=({t[3]:.2f}, {t[7]:.2f}, {t[11]:.2f})\n")
+    except Exception:
+        pass
+
+    # Log instance stats + check for duplicate transforms (ghost mesh diagnosis)
+    import os
+    _log_path = os.path.join(os.path.expanduser("~"), "ignis-rt.log")
+    try:
+        from collections import Counter
+        key_counts = Counter(i["mesh_key"] for i in instances)
+        dupes = {k: v for k, v in key_counts.items() if v > 1}
+        if dupes:
+            with open(_log_path, "a") as _lf:
+                _lf.write(f"[ignis-export] Instanced objects ({len(dupes)} unique, {sum(dupes.values())} instances):\n")
+                for k, v in sorted(dupes.items(), key=lambda x: -x[1])[:10]:
+                    _lf.write(f"  '{k}' x{v}\n")
+                # Log transforms for instanced "Small Windows" or similar
+                for k in list(dupes.keys())[:3]:
+                    _lf.write(f"  Transforms for '{k}':\n")
+                    for inst in instances:
+                        if inst["mesh_key"] == k:
+                            t = inst["transform_3x4"]
+                            _lf.write(f"    pos=({t[3]:.2f}, {t[7]:.2f}, {t[11]:.2f})\n")
+                _lf.flush()
+    except Exception:
+        pass
+
+    return unique_meshes, instances, obj_to_mesh_key, hidden_by_collection
 
 
 def export_camera(context):
@@ -317,6 +432,103 @@ def export_camera(context):
         "proj_inv": flatten(proj_inv),
         "width": region.width,
         "height": region.height,
+    }
+
+
+def export_world_hdri(depsgraph):
+    """Extract HDRI environment texture from Blender's World node tree.
+
+    Returns dict with image data or None if no HDRI found:
+        {"name": str, "data": bytes, "width": int, "height": int, "strength": float}
+    """
+    import bpy
+
+    scene = depsgraph.scene
+    world = scene.world
+    if not world or not world.use_nodes or not world.node_tree:
+        return None
+
+    # Find Background node and its color input
+    bg_node = None
+    env_tex_node = None
+    strength = 1.0
+
+    for node in world.node_tree.nodes:
+        if node.type == 'BACKGROUND':
+            bg_node = node
+            # Get strength
+            s_inp = node.inputs.get('Strength')
+            if s_inp:
+                strength = float(s_inp.default_value)
+            # Trace color input to find Environment Texture
+            color_inp = node.inputs.get('Color')
+            if color_inp and color_inp.is_linked:
+                src = color_inp.links[0].from_node
+                # Follow through Mapping/Math/etc. to find the texture
+                _depth = 0
+                while src and _depth < 8:
+                    if src.type == 'TEX_ENVIRONMENT':
+                        env_tex_node = src
+                        break
+                    # Follow first linked input
+                    found = False
+                    for inp in src.inputs:
+                        if inp.is_linked:
+                            src = inp.links[0].from_node
+                            found = True
+                            break
+                    if not found:
+                        break
+                    _depth += 1
+            break
+
+    if env_tex_node is None or env_tex_node.image is None:
+        return None
+
+    image = env_tex_node.image
+    w, h = image.size[0], image.size[1]
+    if w == 0 or h == 0:
+        return None
+
+    # For HDRI (EXR/HDR): extract float pixels, scale to [0,1], encode as PNG manually.
+    import io, zlib
+    px = np.empty(w * h * 4, dtype=np.float32)
+    image.pixels.foreach_get(px)
+    px_rgb = px.reshape(-1, 4)[:, :3]
+    peak = float(np.percentile(px_rgb[px_rgb > 0], 99.5)) if np.any(px_rgb > 0) else 1.0
+    peak = max(peak, 1.0)
+    px_scaled = np.clip(px / peak, 0.0, 1.0)
+    px_u8 = (px_scaled * 255.0 + 0.5).astype(np.uint8).reshape(h, w, 4)
+    px_u8 = px_u8[::-1]  # Blender stores bottom-up, PNG is top-down
+
+    # Minimal PNG encoder (RGBA8, no filtering)
+    def _write_png_chunk(out, chunk_type, chunk_data):
+        out.write(struct.pack('>I', len(chunk_data)))
+        out.write(chunk_type)
+        out.write(chunk_data)
+        out.write(struct.pack('>I', zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF))
+
+    buf = io.BytesIO()
+    buf.write(b'\x89PNG\r\n\x1a\n')  # PNG signature
+    ihdr = struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0)  # 8-bit RGBA
+    _write_png_chunk(buf, b'IHDR', ihdr)
+    # IDAT: raw pixel rows with filter byte 0 (none) per row
+    raw_rows = bytearray()
+    for y in range(h):
+        raw_rows.append(0)  # filter: none
+        raw_rows.extend(px_u8[y].tobytes())
+    _write_png_chunk(buf, b'IDAT', zlib.compress(bytes(raw_rows), 6))
+    _write_png_chunk(buf, b'IEND', b'')
+    data = buf.getvalue()
+
+    strength *= peak
+
+    return {
+        "name": f"__world_hdri__{image.name}",
+        "data": data,
+        "width": image.size[0],
+        "height": image.size[1],
+        "strength": strength,
     }
 
 
@@ -456,6 +668,158 @@ def export_lights(depsgraph):
     return lights
 
 
+def export_emissive_triangles_fast(depsgraph, unique_meshes, scene_instances, mat_name_to_index):
+    """Fast emissive triangle export using already-exported mesh data.
+
+    Avoids re-evaluating meshes from Blender (which hangs on large scenes).
+    Uses positions and tri_material_indices from the EXPORT stage.
+
+    Returns a flat list of floats: 16 floats per triangle (max 256 triangles).
+    """
+    MAX_EMISSIVE_TRIS = 256
+    emissive_tris = []
+
+    if not unique_meshes or not scene_instances:
+        return []
+
+    # Build material emission info from depsgraph
+    mat_emission = {}  # mat_name → (emission_rgb, strength)
+    for inst in depsgraph.object_instances:
+        obj = inst.object
+        if obj.type != 'MESH':
+            continue
+        for slot in obj.material_slots:
+            mat = slot.material
+            if mat is None or mat.name in mat_emission:
+                continue
+            em_color = (0.0, 0.0, 0.0)
+            em_strength = 0.0
+            if mat.use_nodes and mat.node_tree:
+                for node in mat.node_tree.nodes:
+                    if node.type == 'BSDF_PRINCIPLED':
+                        es = node.inputs.get('Emission Strength')
+                        em_strength = float(es.default_value) if es else 0.0
+                        if em_strength > 0.0:
+                            ec = node.inputs.get('Emission Color')
+                            if ec and hasattr(ec.default_value, '__len__'):
+                                em_color = tuple(float(ec.default_value[i]) for i in range(3))
+                        break
+                    elif node.type == 'EMISSION':
+                        s = node.inputs.get('Strength')
+                        c = node.inputs.get('Color')
+                        if s: em_strength = float(s.default_value)
+                        if c: em_color = tuple(float(c.default_value[i]) for i in range(3))
+                        break
+            mat_emission[mat.name] = (em_color, em_strength)
+
+    # Process each instance using pre-exported mesh data
+    for inst_data in scene_instances:
+        if len(emissive_tris) >= MAX_EMISSIVE_TRIS:
+            break
+
+        mesh_key = inst_data["mesh_key"]
+        if mesh_key not in unique_meshes:
+            continue
+        mdata = unique_meshes[mesh_key]
+
+        # Check if any material slot has emission
+        slots = inst_data.get("material_slots", [])
+        slot_emission = []
+        for s in slots:
+            if s and s.name in mat_emission:
+                slot_emission.append(mat_emission[s.name])
+            else:
+                slot_emission.append(((0.0, 0.0, 0.0), 0.0))
+        if not slot_emission:
+            slot_emission = [((0.0, 0.0, 0.0), 0.0)]
+
+        # Check if any slot has emission
+        if not any(s[1] > 0.0 for s in slot_emission):
+            continue
+
+        # Use pre-exported positions (already flattened float32)
+        positions = mdata["positions"].reshape(-1, 3).astype(np.float64)
+        tri_mat = mdata["tri_material_indices"]
+        tri_count = mdata["tri_count"]
+        indices = mdata["indices"].reshape(-1, 3) if mdata["index_count"] == tri_count * 3 else None
+        if indices is None:
+            continue
+
+        # Build transform from instance data
+        xf = inst_data["transform_3x4"]
+        mat_world = np.array([
+            [xf[0], xf[1], xf[2], xf[3]],
+            [xf[4], xf[5], xf[6], xf[7]],
+            [xf[8], xf[9], xf[10], xf[11]],
+            [0.0,   0.0,   0.0,    1.0],
+        ], dtype=np.float64)
+
+        # Transform positions to world space (vectorized)
+        ones = np.ones((len(positions), 1), dtype=np.float64)
+        pos_h = np.hstack([positions, ones])
+        world_pos = (mat_world @ pos_h.T).T[:, :3]
+
+        # The transform already converts Z-up → Y-up (done by _matrix_to_3x4_row_major)
+        # so no additional swizzle needed
+
+        n_slots = len(slot_emission)
+        for ti in range(tri_count):
+            if len(emissive_tris) >= MAX_EMISSIVE_TRIS:
+                break
+
+            mat_idx = min(int(tri_mat[ti]), n_slots - 1)
+            em_color, em_strength = slot_emission[max(mat_idx, 0)]
+            if em_strength <= 0.0:
+                continue
+
+            vi = indices[ti]
+            wp0 = world_pos[vi[0]]
+            wp1 = world_pos[vi[1]]
+            wp2 = world_pos[vi[2]]
+
+            edge1 = wp1 - wp0
+            edge2 = wp2 - wp0
+            cross = np.cross(edge1, edge2)
+            area = 0.5 * np.linalg.norm(cross)
+            if area < 1e-8:
+                continue
+
+            emission = (em_color[0] * em_strength,
+                        em_color[1] * em_strength,
+                        em_color[2] * em_strength)
+            luminance = 0.2126 * emission[0] + 0.7152 * emission[1] + 0.0722 * emission[2]
+            power = area * luminance
+
+            emissive_tris.append((power, [
+                wp0[0], wp0[1], wp0[2], area,
+                wp1[0], wp1[1], wp1[2], 0.0,
+                wp2[0], wp2[1], wp2[2], 0.0,
+                emission[0], emission[1], emission[2], 0.0,
+            ]))
+
+    if not emissive_tris:
+        return []
+
+    # Sort by power descending, keep top MAX_EMISSIVE_TRIS
+    emissive_tris.sort(key=lambda x: x[0], reverse=True)
+    emissive_tris = emissive_tris[:MAX_EMISSIVE_TRIS]
+
+    # Build CDF
+    total_power = sum(t[0] for t in emissive_tris)
+    if total_power <= 0.0:
+        return []
+
+    result = []
+    cumulative = 0.0
+    for power, data in emissive_tris:
+        cumulative += power / total_power
+        data[7] = cumulative  # CDF
+        data[11] = total_power
+        result.extend(data)
+
+    return result
+
+
 def export_emissive_triangles(depsgraph):
     """Export emissive mesh triangles for MIS (Multiple Importance Sampling).
 
@@ -549,31 +913,50 @@ def export_emissive_triangles(depsgraph):
         if not slot_emission:
             slot_emission = [((0.0, 0.0, 0.0), 0.0)]
 
-        for tri in mesh.loop_triangles:
-            mat_idx = tri.material_index
-            if mat_idx >= len(slot_emission):
-                mat_idx = 0
+        # Vectorized emissive triangle extraction (avoids per-tri Python loop)
+        tri_count = len(mesh.loop_triangles)
+
+        # Get per-triangle material indices
+        tri_mat_indices = np.empty(tri_count, dtype=np.int32)
+        mesh.loop_triangles.foreach_get("material_index", tri_mat_indices)
+
+        # Get per-triangle vertex indices
+        tri_verts = np.empty(tri_count * 3, dtype=np.int32)
+        mesh.loop_triangles.foreach_get("vertices", tri_verts)
+        tri_verts = tri_verts.reshape(-1, 3)
+
+        # Build emission mask: which triangles have emission > 0
+        n_slots = len(slot_emission)
+        slot_strengths = np.array([s[1] for s in slot_emission], dtype=np.float64)
+        clamped_mat = np.clip(tri_mat_indices, 0, n_slots - 1)
+        emissive_mask = slot_strengths[clamped_mat] > 0.0
+
+        emissive_indices = np.where(emissive_mask)[0]
+        if len(emissive_indices) == 0:
+            eval_obj.to_mesh_clear()
+            continue
+
+        # Transform ALL positions to world space at once (vectorized)
+        ones = np.ones((len(all_positions), 1), dtype=np.float64)
+        pos_h = np.hstack([all_positions, ones])  # (N, 4)
+        world_pos = (mat_world @ pos_h.T).T[:, :3]  # (N, 3)
+
+        # Blender Z-up → Vulkan Y-up: swap Y↔Z, negate new Z
+        world_pos_vk = world_pos[:, [0, 2, 1]].copy()
+        world_pos_vk[:, 2] *= -1.0
+
+        for ti in emissive_indices:
+            if len(emissive_tris) >= MAX_EMISSIVE_TRIS:
+                break
+
+            mat_idx = clamped_mat[ti]
             em_color, em_strength = slot_emission[mat_idx]
-            if em_strength <= 0.0:
-                continue
 
-            # Get local-space vertices
-            vi = tri.vertices
-            lp0 = all_positions[vi[0]]
-            lp1 = all_positions[vi[1]]
-            lp2 = all_positions[vi[2]]
+            vi = tri_verts[ti]
+            wp0 = world_pos_vk[vi[0]]
+            wp1 = world_pos_vk[vi[1]]
+            wp2 = world_pos_vk[vi[2]]
 
-            # Transform to world space (Blender coordinate system)
-            wp0_b = (mat_world @ np.append(lp0, 1.0))[:3]
-            wp1_b = (mat_world @ np.append(lp1, 1.0))[:3]
-            wp2_b = (mat_world @ np.append(lp2, 1.0))[:3]
-
-            # Convert Blender Z-up → Vulkan Y-up
-            wp0 = np.array([wp0_b[0], wp0_b[2], -wp0_b[1]], dtype=np.float64)
-            wp1 = np.array([wp1_b[0], wp1_b[2], -wp1_b[1]], dtype=np.float64)
-            wp2 = np.array([wp2_b[0], wp2_b[2], -wp2_b[1]], dtype=np.float64)
-
-            # Compute area
             edge1 = wp1 - wp0
             edge2 = wp2 - wp0
             cross = np.cross(edge1, edge2)
@@ -581,7 +964,6 @@ def export_emissive_triangles(depsgraph):
             if area < 1e-8:
                 continue
 
-            # Emission = color * strength
             emission = (em_color[0] * em_strength,
                         em_color[1] * em_strength,
                         em_color[2] * em_strength)
@@ -1041,24 +1423,19 @@ def _get_image_bytes(image):
 
 
 def _encode_bmp(rgba_u8, w, h):
-    """Encode RGBA8 pixels as a 32-bit BMP (stb_image compatible)."""
-    # BMP is bottom-up, so flip rows
-    row_size = w * 4
-    pixel_data = bytearray(row_size * h)
-    for y in range(h):
-        src_row = y * row_size
-        dst_row = (h - 1 - y) * row_size
-        row = rgba_u8[src_row:src_row + row_size]
-        # RGBA → BGRA for BMP
-        for x in range(w):
-            px_off = x * 4
-            pixel_data[dst_row + px_off + 0] = row[px_off + 2]  # B
-            pixel_data[dst_row + px_off + 1] = row[px_off + 1]  # G
-            pixel_data[dst_row + px_off + 2] = row[px_off + 0]  # R
-            pixel_data[dst_row + px_off + 3] = row[px_off + 3]  # A
-        pixel_data[dst_row:dst_row + row_size] = pixel_data[dst_row:dst_row + row_size]
+    """Encode RGBA8 pixels as a 32-bit BMP (stb_image compatible).
 
-    header_size = 14 + 124  # BITMAPFILEHEADER + BITMAPV5HEADER
+    Uses BITMAPINFOHEADER (40 bytes) with BI_BITFIELDS for BGRA layout.
+    stb_image supports this format (v2.28+).
+    """
+    # Use numpy for fast RGBA→BGRA swizzle
+    pixels = np.asarray(rgba_u8, dtype=np.uint8).reshape(h, w, 4)
+    bgra = pixels[:, :, [2, 1, 0, 3]]
+    # BMP is bottom-up by default — flip rows
+    bgra = bgra[::-1]
+    pixel_data = bgra.tobytes()
+
+    header_size = 14 + 40  # BITMAPFILEHEADER + BITMAPINFOHEADER
     file_size = header_size + len(pixel_data)
 
     hdr = bytearray(header_size)
@@ -1066,19 +1443,14 @@ def _encode_bmp(rgba_u8, w, h):
     hdr[0:2] = b'BM'
     struct.pack_into('<I', hdr, 2, file_size)
     struct.pack_into('<I', hdr, 10, header_size)
-    # BITMAPV5HEADER (124 bytes)
-    struct.pack_into('<I', hdr, 14, 124)        # biSize
+    # BITMAPINFOHEADER (40 bytes)
+    struct.pack_into('<I', hdr, 14, 40)          # biSize
     struct.pack_into('<i', hdr, 18, w)           # biWidth
-    struct.pack_into('<i', hdr, 22, -h)          # biHeight (negative = top-down)
+    struct.pack_into('<i', hdr, 22, h)           # biHeight (positive = bottom-up)
     struct.pack_into('<H', hdr, 26, 1)           # biPlanes
     struct.pack_into('<H', hdr, 28, 32)          # biBitCount
-    struct.pack_into('<I', hdr, 30, 3)           # biCompression = BI_BITFIELDS
+    struct.pack_into('<I', hdr, 30, 0)           # biCompression = BI_RGB
     struct.pack_into('<I', hdr, 34, len(pixel_data))
-    # Color masks for RGBA
-    struct.pack_into('<I', hdr, 54, 0x00FF0000)  # R mask
-    struct.pack_into('<I', hdr, 58, 0x0000FF00)  # G mask
-    struct.pack_into('<I', hdr, 62, 0x000000FF)  # B mask
-    struct.pack_into('<I', hdr, 66, 0xFF000000)  # A mask
 
     return bytes(hdr) + bytes(pixel_data)
 
@@ -1406,22 +1778,34 @@ def _resolve_mix_shader(mix_node, register_image_fn):
     return blended
 
 
-def export_materials(depsgraph):
+def export_materials(depsgraph, hidden_objects=None):
     """Export Blender Principled BSDF materials as GPUMaterial byte buffer.
 
     Returns (ctypes byte array, name->global_index dict, textures list).
     textures list = [{"name": str, "data": bytes, "width": int, "height": int}, ...]
+    hidden_objects: set of obj.names to skip (from export_meshes)
     """
     import ctypes
     import bpy
 
-    # Collect unique materials from all mesh objects (including linked/instanced)
+    if hidden_objects is None:
+        hidden_objects = set()
+
+    # Collect unique materials from VISIBLE mesh objects only.
+    # Must match the same objects exported by export_meshes — otherwise
+    # material indices get misaligned (hidden objects add extra materials).
     mat_name_to_index = {}
     mat_list = []
 
     for inst in depsgraph.object_instances:
         obj = inst.object
         if obj.type != 'MESH':
+            continue
+        if not inst.show_self:
+            continue
+        if obj.name in hidden_objects:
+            continue
+        if obj.hide_viewport:
             continue
         if not obj.material_slots:
             # Mesh with no material slots — register a default "None" material
@@ -1475,9 +1859,12 @@ def export_materials(depsgraph):
         buf = (ctypes.c_uint8 * len(data))(*data)
         return buf, {}, []
 
-    # Pack each material
+    # Pack each material (with per-material timing for bottleneck detection)
+    import time as _time
     all_bytes = bytearray()
-    for mat in mat_list:
+    _mat_total = len(mat_list)
+    for _mat_idx, mat in enumerate(mat_list):
+        _mat_t0 = _time.perf_counter()
         # Default material for meshes without material assignment
         if mat is None:
             data = _pack_gpu_material(
@@ -1769,6 +2156,17 @@ def export_materials(depsgraph):
             alpha_ref=alpha_ref,
             transparent_prob=transparent_prob,
         )
+
+        _mat_dt = _time.perf_counter() - _mat_t0
+        if _mat_dt > 0.1:  # Log slow materials (>100ms)
+            import os
+            _log_path = os.path.join(os.path.expanduser("~"), "ignis-rt.log")
+            try:
+                with open(_log_path, "a") as _lf:
+                    _lf.write(f"[ignis-mat] SLOW: '{mat.name}' took {_mat_dt:.3f}s ({_mat_idx+1}/{_mat_total})\n")
+                    _lf.flush()
+            except Exception:
+                pass
 
     buf = (ctypes.c_uint8 * len(all_bytes))(*all_bytes)
     return buf, mat_name_to_index, textures_list

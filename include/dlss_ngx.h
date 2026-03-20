@@ -5,14 +5,16 @@
 
 namespace acpt {
 
-/// DLSS Quality Mode presets (matches NGX DLSSMode)
+/// DLSS Quality Mode presets (matches NGX PerfQuality_Value)
 enum class DLSSQualityMode {
     Off = 0,
-    MaxPerformance = 1,  ///< Ultra Performance (3.0x upscaling)
-    Balanced = 2,        ///< Balanced (1.7x upscaling)
-    MaxQuality = 3,      ///< Quality (1.5x upscaling)
-    UltraQuality = 4,    ///< Ultra Quality / DLAA (1.0x or native)
-    Auto = 5             ///< Let DLSS choose automatically
+    UltraPerformance = 1, ///< 3.0x upscaling — maximum FPS
+    MaxPerformance = 2,    ///< 2.0x upscaling — performance
+    Balanced = 3,          ///< 1.7x upscaling — balanced
+    MaxQuality = 4,        ///< 1.5x upscaling — quality
+    UltraQuality = 5,      ///< 1.3x upscaling — ultra quality
+    DLAA = 6,              ///< Native resolution — anti-aliasing only
+    Auto = 7               ///< Let DLSS choose automatically
 };
 
 /// Active DLSS operating mode
@@ -100,7 +102,9 @@ public:
         VkImageView diffuseHitDistView = VK_NULL_HANDLE,
         VkImage specularHitDistImage = VK_NULL_HANDLE,  // specular hit distance (RGBA16F, .a = hitDist)
         VkImageView specularHitDistView = VK_NULL_HANDLE,
-        bool reset = false
+        bool reset = false,
+        VkImage reactiveMaskImage = VK_NULL_HANDLE,   // reactive mask (R8, 0=static 1=dynamic)
+        VkImageView reactiveMaskView = VK_NULL_HANDLE
     );
 
     /// Get the recommended render resolution for a quality mode
@@ -130,7 +134,8 @@ public:
     /// Get the current active mode
     DLSSMode GetActiveMode() const { return m_activeMode; }
 
-    /// Set DLSS quality mode (requires re-initialization)
+    /// Get/set DLSS quality mode (set requires re-initialization)
+    DLSSQualityMode GetQualityMode() const { return m_qualityMode; }
     void SetQualityMode(DLSSQualityMode mode) { m_qualityMode = mode; }
 
 private:

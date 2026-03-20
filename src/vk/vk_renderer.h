@@ -38,6 +38,7 @@ public:
     bool UploadBLASAttributes(int blasIndex, const float* normals, const float* uvs, uint32_t vertexCount);
     bool UploadBLASPrimitiveMaterials(int blasIndex, const uint32_t* materialIds, uint32_t primitiveCount);
     bool UploadBLASPrimitiveYBounds(int blasIndex, const float* yBounds, uint32_t primitiveCount);
+    void ClearGeometry();
     void UploadMaterialBuffer(const void* materials, uint32_t count);
     void UploadEmissiveTriangles(const float* data, uint32_t triangleCount);
     void UpdateTextureDescriptors(void* texManager);
@@ -67,6 +68,8 @@ public:
     uint32_t GetRenderWidth() const { return width_; }
     uint32_t GetRenderHeight() const { return height_; }
     float GetComputedExposure() const { return computedExposure_; }
+    void ResetFrameIndex() { frameIndex_ = 0; }
+    int GetActualDLSSQuality() const;
 
     Context* GetContext() const { return context_; }
     AccelStructureBuilder* GetAccelBuilder() const { return accelBuilder_; }

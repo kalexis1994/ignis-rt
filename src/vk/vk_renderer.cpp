@@ -437,6 +437,16 @@ bool Renderer::UploadBLASPrimitiveYBounds(int blasIndex, const float* yBounds, u
     return accelBuilder_->UploadBLASPrimitiveYBounds(blasIndex, yBounds, primitiveCount);
 }
 
+void Renderer::ClearGeometry() {
+    if (context_) vkDeviceWaitIdle(context_->GetDevice());
+    if (accelBuilder_) accelBuilder_->ClearBLAS();
+    rtReady_ = false;
+    instanceTransformCount_ = 0;
+    prevInstanceTransforms_.clear();
+    currInstanceTransforms_.clear();
+    Log(L"[VK Renderer] Geometry cleared\n");
+}
+
 void Renderer::UploadMaterialBuffer(const void* materials, uint32_t count) {
     if (rtPipeline_) {
         rtPipeline_->UpdateMaterialBuffer(static_cast<const vk::GPUMaterial*>(materials), count);
@@ -731,7 +741,9 @@ void Renderer::RenderFrameRT() {
             rtPipeline_->GetDiffuseRadianceView(),
             rtPipeline_->GetSpecularRadianceImage(),         // specular hit distance (.a)
             rtPipeline_->GetSpecularRadianceView(),
-            rrReset);
+            rrReset,
+            rtPipeline_->GetReactiveMaskImage(),             // reactive mask (dynamic objects)
+            rtPipeline_->GetReactiveMaskView());
 
         // Barrier: RR writes → tonemap reads
         VkMemoryBarrier rrBarrier{};
@@ -1091,6 +1103,11 @@ bool Renderer::InitGLInterop() {
 
     glInteropFailed_ = true;
     return false;
+}
+
+int Renderer::GetActualDLSSQuality() const {
+    if (dlss_) return static_cast<int>(dlss_->GetQualityMode());
+    return 0;
 }
 
 void Renderer::DrawGL(uint32_t w, uint32_t h) {

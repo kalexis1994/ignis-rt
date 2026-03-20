@@ -64,7 +64,8 @@ void DLSS_NGX::EvaluateRR(VkCommandBuffer cmd,
                             VkImage specMV, VkImageView specMVV,
                             VkImage diffHD, VkImageView diffHDV,
                             VkImage specHD, VkImageView specHDV,
-                            bool reset) {
+                            bool reset,
+                            VkImage reactiveMask, VkImageView reactiveMaskV) {
     // No-op
 }
 
