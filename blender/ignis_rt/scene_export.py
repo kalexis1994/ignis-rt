@@ -176,37 +176,22 @@ def export_meshes(depsgraph):
         if obj.name in boolean_cutters:
             continue
 
-        # Skip objects hidden from viewport
+        # Skip objects not visible in the viewport
+        # hide_viewport: the monitor icon in the Outliner (object level)
+        # hide_get(): per-view-layer visibility (eye icon)
+        # show_self: instance-level visibility
+        # visible_camera: Cycles ray visibility for camera rays
         if not instance.show_self:
+            continue
+        if obj.hide_viewport:
             continue
         try:
             if obj.hide_get():
                 continue
         except RuntimeError:
             pass
-
-        # Skip objects with Cycles camera ray visibility disabled
-        try:
-            if hasattr(obj, 'visible_camera') and not obj.visible_camera:
-                continue
-        except Exception:
-            pass
-
-        # Skip objects with ray visibility disabled (Cycles-compatible)
-        try:
-            rv = obj.get('cycles_visibility', None)
-            if rv is not None and not rv.get('camera', True):
-                continue
-        except Exception:
-            pass
-
-        # Check if the object is truly renderable via Cycles ray visibility
-        try:
-            if hasattr(obj, 'cycles') and hasattr(obj.cycles, 'is_camera_ray_visible'):
-                if not obj.cycles.is_camera_ray_visible:
-                    continue
-        except Exception:
-            pass
+        if hasattr(obj, 'visible_camera') and not obj.visible_camera:
+            continue
 
         # Each object gets its own BLAS (safe: modifiers produce unique geometry)
         mesh_key = obj.name

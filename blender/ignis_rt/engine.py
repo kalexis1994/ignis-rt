@@ -1179,11 +1179,15 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                     continue
                 if not inst.show_self:
                     continue
+                if obj.hide_viewport:
+                    continue
                 try:
                     if obj.hide_get():
                         continue
                 except RuntimeError:
                     pass
+                if hasattr(obj, 'visible_camera') and not obj.visible_camera:
+                    continue
                 _sync_obj_count += 1
                 obj_name = obj.name
                 # Resolve obj.name → mesh_data_key → BLAS handle
