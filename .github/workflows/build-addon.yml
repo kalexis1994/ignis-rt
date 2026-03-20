@@ -31,11 +31,8 @@ jobs:
         shell: bash
         run: |
           git clone --depth 1 https://github.com/NVIDIA/DLSS.git vendor/DLSS
-          echo "--- DLSS headers ---"
           ls vendor/DLSS/include/
-          echo "--- DLSS libs ---"
-          ls vendor/DLSS/lib/Windows_x86_64/x86_64/
-          echo "--- DLSS DLLs ---"
+          ls vendor/DLSS/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib
           ls -lh vendor/DLSS/lib/Windows_x86_64/rel/
 
       # ── NRD SDK (build from source — MIT license) ──────────────
@@ -81,9 +78,8 @@ jobs:
           mkdir -p vendor/ngx_sdk/include/ngx
           mkdir -p vendor/ngx_sdk/lib
           cp vendor/DLSS/include/*.h vendor/ngx_sdk/include/ngx/
-          cp vendor/DLSS/include/nvsdk_ngx_helpers_dlssd*.h vendor/ngx_sdk/include/ngx/ 2>/dev/null || true
           # Stub lib for linker
-          cp vendor/DLSS/lib/Windows_x86_64/x86_64/nvsdk_ngx_d.lib vendor/ngx_sdk/lib/
+          cp vendor/DLSS/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib vendor/ngx_sdk/lib/
           echo "--- NGX SDK layout ---"
           find vendor/ngx_sdk -type f | head -20
 
