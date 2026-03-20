@@ -245,8 +245,8 @@ int AccelStructureBuilder::BuildBLAS(const float* vertices, uint32_t vertexCount
     if (allowUpdate) {
         buildInfo.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
     }
-    // Enable compaction for static BLAS (saves ~40-60% VRAM)
-    bool canCompact = !allowUpdate && vkCmdCopyAccelerationStructureKHR_ && vkCmdWriteAccelerationStructuresPropertiesKHR_;
+    // DISABLED: compaction suspected of causing mesh mismatch (address invalidation)
+    bool canCompact = false; // !allowUpdate && vkCmdCopyAccelerationStructureKHR_ && vkCmdWriteAccelerationStructuresPropertiesKHR_;
     if (canCompact) {
         buildInfo.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR;
     }

@@ -595,6 +595,18 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             _load_mesh_idx = end
             if _load_mesh_idx >= total:
                 _log(f"Stage MESHES: {total} uploaded, {len(_ignis_blas_handles)} success")
+                # Dump BLAS mapping with vertex fingerprints for corruption detection
+                import os
+                try:
+                    with open(os.path.join(os.path.expanduser("~"), "ignis-blas-map.txt"), "w") as _bf:
+                        _bf.write(f"BLAS handles ({len(_ignis_blas_handles)} entries):\n")
+                        for mk, bh in sorted(_ignis_blas_handles.items(), key=lambda x: x[1]):
+                            m = _load_unique_meshes.get(mk, {})
+                            pos = m.get('positions', np.array([]))
+                            v0 = f"({pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f})" if len(pos) >= 3 else "?"
+                            _bf.write(f"  blas={bh:3d} mesh='{mk}' tris={m.get('tri_count',0)} v0={v0}\n")
+                except Exception:
+                    pass
                 _load_stage = LOAD_MATERIALS
             return False
 
@@ -675,8 +687,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         default_idx = _load_mat_name_to_index.get('__ignis_default__', 0)
                         slot_to_global = np.full(n_slots, default_idx, dtype=np.uint32)
                         for i, mat in enumerate(slots):
-                            if mat is not None and mat.name in _load_mat_name_to_index:
-                                slot_to_global[i] = _load_mat_name_to_index[mat.name]
+                            if mat is not None:
+                                mat_key = f"{mat.library.filepath}:{mat.name}" if mat.library else mat.name
+                                if mat_key in _load_mat_name_to_index:
+                                    slot_to_global[i] = _load_mat_name_to_index[mat_key]
                         tri_mats = np.asarray(m["tri_material_indices"], dtype=np.int32)
                         clamped = np.clip(tri_mats, 0, n_slots - 1)
                         global_ids = np.ascontiguousarray(slot_to_global[clamped], dtype=np.uint32)
@@ -1195,22 +1209,23 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 if hasattr(obj, 'visible_camera') and not obj.visible_camera:
                     continue
                 _sync_obj_count += 1
-                obj_name = obj.name
-                # Resolve obj.name → mesh_data_key → BLAS handle
-                mesh_key = _ignis_obj_to_mesh.get(obj_name)
+                # Use library-qualified name (same as export_meshes)
+                if obj.library:
+                    obj_key = f"{obj.library.filepath}:{obj.name}"
+                else:
+                    obj_key = obj.name
+                # Resolve obj_key → mesh_key → BLAS handle
+                mesh_key = _ignis_obj_to_mesh.get(obj_key)
                 if mesh_key is None:
-                    # Try obj.data.name directly (new object with shared mesh)
-                    mesh_key = obj.data.name if obj.data else None
+                    mesh_key = obj_key  # try direct
                 if mesh_key and mesh_key in _ignis_blas_handles:
-                    # Known mesh — add to instances
-                    _ignis_obj_to_mesh[obj_name] = mesh_key  # register alias
                     xform = scene_export._matrix_to_3x4_row_major(inst.matrix_world)
                     cur_instances.append((mesh_key, xform))
                 else:
                     # Unknown object — only upload if genuinely NEW (not a pre-existing
                     # collection instance or hidden object from initial load)
-                    if obj_name not in _ignis_known_objects and obj_name not in new_objects:
-                        new_objects[obj_name] = (obj, inst)
+                    if obj_key not in _ignis_known_objects and obj_key not in new_objects:
+                        new_objects[obj_key] = (obj, inst)
 
             # Incremental BLAS upload for new objects
             if new_objects:
