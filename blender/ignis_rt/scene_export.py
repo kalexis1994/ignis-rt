@@ -155,13 +155,17 @@ def export_meshes(depsgraph):
     unique_meshes = {}
     instances = []
     skipped_meshes = set()
+    # Map object name → mesh key (identity for now, but enables incremental lookup)
+    obj_to_mesh_key = {}
 
     for instance in depsgraph.object_instances:
         obj = instance.object
         if obj.type != 'MESH':
             continue
 
+        # Each object gets its own BLAS (safe: modifiers produce unique geometry)
         mesh_key = obj.name
+        obj_to_mesh_key[obj.name] = mesh_key
 
         if mesh_key in skipped_meshes:
             continue
@@ -258,7 +262,7 @@ def export_meshes(depsgraph):
             "material_slots": [s.material for s in obj.material_slots],
         })
 
-    return unique_meshes, instances
+    return unique_meshes, instances, obj_to_mesh_key
 
 
 def export_camera(context):

@@ -94,6 +94,8 @@ _ignis_initialized = False
 _ignis_width = 0
 _ignis_height = 0
 _ignis_blas_handles = {}       # mesh_key -> BLAS handle
+_ignis_obj_to_mesh = {}        # obj.name -> mesh_key (for BLAS lookup by object name)
+_ignis_known_objects = set()   # ALL obj.names seen during initial load (including skipped)
 _ignis_float_buffer = None     # ctypes c_float array for readback (legacy)
 _ignis_byte_buffer = None      # ctypes c_uint8 array for RGBA8 readback
 _ignis_gpu_texture = None      # Reusable GPUTexture (avoids alloc every frame)
@@ -135,6 +137,7 @@ _load_mesh_idx = 0
 _load_materials_data = None
 _load_mat_name_to_index = None
 _load_textures_list = None
+_load_obj_to_mesh_key = None
 _load_depsgraph = None
 MESH_BATCH_SIZE = 4    # meshes per frame during loading
 
@@ -499,7 +502,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         """Start the staged loading pipeline."""
         global _load_stage, _load_start_time, _load_status, _load_progress
         global _load_unique_meshes, _load_scene_instances, _load_mesh_keys, _load_mesh_idx
-        global _load_materials_data, _load_mat_name_to_index, _load_textures_list
+        global _load_materials_data, _load_mat_name_to_index, _load_textures_list, _load_obj_to_mesh_key
         global _load_depsgraph
         global _ignis_blas_handles
 
@@ -521,7 +524,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         """Process one stage of loading. Returns True when complete."""
         global _load_stage, _load_status, _load_progress
         global _load_unique_meshes, _load_scene_instances, _load_mesh_keys, _load_mesh_idx
-        global _load_materials_data, _load_mat_name_to_index, _load_textures_list
+        global _load_materials_data, _load_mat_name_to_index, _load_textures_list, _load_obj_to_mesh_key
         global _ignis_blas_handles, _ignis_frame_index
         global _ignis_full_dirty, _ignis_materials_dirty, _ignis_tlas_dirty
         global _ignis_last_full_upload, _ignis_instance_count, _ignis_tex_manager
@@ -533,7 +536,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             _load_progress = 0.05
             try:
                 t0 = time.perf_counter()
-                _load_unique_meshes, _load_scene_instances = scene_export.export_meshes(depsgraph)
+                _load_unique_meshes, _load_scene_instances, _load_obj_to_mesh_key = scene_export.export_meshes(depsgraph)
                 _load_mesh_keys = list(_load_unique_meshes.keys())
                 _load_mesh_idx = 0
                 total_tris = sum(m["tri_count"] for m in _load_unique_meshes.values())
@@ -734,16 +737,21 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             dll_wrapper.upload_emissive_triangles(emissive_data, n_emissive)
             _log(f"Stage FINALIZE: {n_emissive} emissive triangles uploaded")
 
-            # Save material mapping for incremental uploads, then cleanup
-            global _ignis_mat_name_to_index
+            # Save material mapping and obj→mesh mapping for incremental updates
+            global _ignis_mat_name_to_index, _ignis_obj_to_mesh, _ignis_known_objects
             if _load_mat_name_to_index:
                 _ignis_mat_name_to_index = dict(_load_mat_name_to_index)
+            if _load_obj_to_mesh_key:
+                _ignis_obj_to_mesh = dict(_load_obj_to_mesh_key)
+            # Record ALL object names seen — so transform sync knows what's "new" vs "pre-existing"
+            _ignis_known_objects = set(_ignis_obj_to_mesh.keys()) | set(_ignis_blas_handles.keys())
             _load_unique_meshes = None
             _load_scene_instances = None
             _load_mesh_keys = []
             _load_materials_data = None
             _load_mat_name_to_index = None
             _load_textures_list = None
+            _load_obj_to_mesh_key = None
 
             _ignis_full_dirty = False
             _ignis_materials_dirty = False
@@ -768,9 +776,9 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
     def view_update(self, context, depsgraph):
         """Called by Blender on scene changes.
-        Note: Blender doesn't reliably call this for all change types in custom
-        render engines. Critical detection (transforms, lights) is done in
-        view_draw instead. This only handles heavy changes that need full reload.
+        - New/deleted objects → handled incrementally in transform sync
+        - Geometry MODIFIED on existing object → full reload (BLAS rebuild)
+        - Material/NodeTree changed → fast material re-upload
         """
         global _ignis_full_dirty, _ignis_materials_dirty
 
@@ -779,14 +787,32 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         if not _ignis_blas_handles:
             return
 
+        has_material_change = False
+        has_geometry_change = False
+        geometry_mesh_name = None
+
         for update in depsgraph.updates:
             uid = update.id
-            if isinstance(uid, bpy.types.Mesh):
+            if isinstance(uid, (bpy.types.Material, bpy.types.NodeTree)):
+                has_material_change = True
+            elif isinstance(uid, bpy.types.Mesh):
                 if update.is_updated_geometry:
-                    _ignis_full_dirty = True
-                    return
-            elif isinstance(uid, (bpy.types.Material, bpy.types.NodeTree)):
-                _ignis_materials_dirty = True
+                    has_geometry_change = True
+                    geometry_mesh_name = uid.name
+
+        # Material changes → fast re-upload (no full reload)
+        if has_material_change:
+            _ignis_materials_dirty = True
+
+        # Geometry changes on known objects → full reload (BLAS needs rebuild)
+        # Skip if accompanied by material change only (Blender reports mesh
+        # update when material slot changes, but topology didn't change)
+        if has_geometry_change and not has_material_change:
+            if geometry_mesh_name and (
+                geometry_mesh_name in _ignis_known_objects or
+                geometry_mesh_name in _ignis_blas_handles
+            ):
+                _ignis_full_dirty = True
 
     # ------------------------------------------------------------------
     # Materials-only re-upload (fast)
@@ -839,18 +865,32 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
     # Incremental mesh upload (Cycles-style live editing)
     # ------------------------------------------------------------------
 
-    def _upload_new_meshes(self, depsgraph, new_mesh_keys):
-        """Upload new meshes incrementally without full scene reload."""
-        global _ignis_blas_handles, _ignis_materials_dirty
+    def _upload_new_objects(self, depsgraph, new_objects):
+        """Upload new objects incrementally (Cycles-style live editing).
+
+        new_objects: dict of obj_name → (obj, instance) for objects not yet in BLAS.
+        """
+        global _ignis_blas_handles, _ignis_obj_to_mesh, _ignis_materials_dirty
         import numpy as np
 
         t0 = time.perf_counter()
 
-        # Export only the new meshes
-        unique_meshes, instances = scene_export.export_meshes(depsgraph)
+        # Export full scene meshes (reuses dedup — only new mesh_keys matter)
+        unique_meshes, instances, obj_to_mesh = scene_export.export_meshes(depsgraph)
 
         uploaded = 0
-        for mesh_key in new_mesh_keys:
+        for obj_name in new_objects:
+            mesh_key = obj_to_mesh.get(obj_name)
+            if not mesh_key:
+                continue
+
+            # Register the obj→mesh mapping
+            _ignis_obj_to_mesh[obj_name] = mesh_key
+
+            # If this mesh_key already has a BLAS (shared mesh data), skip upload
+            if mesh_key in _ignis_blas_handles:
+                continue
+
             if mesh_key not in unique_meshes:
                 continue
             mdata = unique_meshes[mesh_key]
@@ -870,34 +910,38 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             dll_wrapper.upload_mesh_attributes(blas_handle, normals, uvs, mdata["vertex_count"])
 
             # Upload per-primitive material IDs
-            # Find the first instance of this mesh to get material slots
-            mat_name_to_index = _ignis_mat_name_to_index
             for inst_data in instances:
                 if inst_data["mesh_key"] == mesh_key:
                     slots = inst_data.get("material_slots", [])
-                    slot_to_global = []
-                    for s in slots:
-                        if s and s.name in mat_name_to_index:
-                            slot_to_global.append(mat_name_to_index[s.name])
-                        else:
-                            slot_to_global.append(0)
+                    n_slots = max(len(slots), 1)
+                    default_idx = _ignis_mat_name_to_index.get('__ignis_default__', 0)
+                    slot_to_global = [default_idx] * n_slots
+                    for i, mat in enumerate(slots):
+                        if mat and mat.name in _ignis_mat_name_to_index:
+                            slot_to_global[i] = _ignis_mat_name_to_index[mat.name]
                     tri_mat = mdata.get("tri_material_indices")
-                    if tri_mat is not None and slot_to_global:
-                        global_ids = np.array([slot_to_global[min(m, len(slot_to_global)-1)]
-                                               for m in tri_mat], dtype=np.uint32)
+                    if tri_mat is not None:
+                        clamped = np.clip(tri_mat, 0, n_slots - 1)
+                        global_ids = np.array([slot_to_global[m] for m in clamped], dtype=np.uint32)
                         dll_wrapper.upload_mesh_primitive_materials(
                             blas_handle, global_ids, mdata["tri_count"])
                     break
 
             _ignis_blas_handles[mesh_key] = blas_handle
             uploaded += 1
+            _log(f"  Incremental BLAS: '{mesh_key}' ({mdata['tri_count']} tris) -> handle {blas_handle}")
 
-        # If new materials are needed, mark for re-upload
+        # Register all new objects as known
+        for obj_name in new_objects:
+            _ignis_known_objects.add(obj_name)
+
+        # New materials might be needed
         if uploaded > 0:
             _ignis_materials_dirty = True
+            _ignis_frame_index = 0
 
         dt = time.perf_counter() - t0
-        _log(f"  Incremental upload: {uploaded} new meshes -- {dt:.3f}s")
+        _log(f"  Incremental upload: {uploaded} new, {len(new_objects) - uploaded} shared -- {dt:.3f}s")
 
     # ------------------------------------------------------------------
     # TLAS-only rebuild (cheap)
@@ -912,8 +956,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             obj = inst.object
             if obj.type != 'MESH':
                 continue
-            mesh_key = obj.name
-            if mesh_key not in _ignis_blas_handles:
+            mesh_key = _ignis_obj_to_mesh.get(obj.name)
+            if not mesh_key or mesh_key not in _ignis_blas_handles:
                 continue
             xform = scene_export._matrix_to_3x4_row_major(inst.matrix_world)
             instances.append((mesh_key, xform))
@@ -1031,18 +1075,50 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             _ignis_last_light_count = n_lights
 
         # ── Transform sync (detect moved/added/removed objects per frame) ──
-        global _ignis_last_transforms
-        if _ignis_blas_handles:
+        # Uses obj→mesh mapping for BLAS lookup. Handles:
+        # - Moved objects (transform changed)
+        # - New objects (obj.name not in mapping → upload BLAS incrementally)
+        # - Removed objects (not in depsgraph → excluded from TLAS)
+        global _ignis_last_transforms, _ignis_obj_to_mesh
+        if _ignis_blas_handles is not None:
             cur_instances = []
+            new_objects = {}  # obj_name → (obj, inst) for incremental upload
             for inst in depsgraph.object_instances:
                 obj = inst.object
                 if obj.type != 'MESH':
                     continue
-                mesh_key = obj.name
-                if mesh_key not in _ignis_blas_handles:
-                    continue
-                xform = scene_export._matrix_to_3x4_row_major(inst.matrix_world)
-                cur_instances.append((mesh_key, xform))
+                obj_name = obj.name
+                # Resolve obj.name → mesh_data_key → BLAS handle
+                mesh_key = _ignis_obj_to_mesh.get(obj_name)
+                if mesh_key is None:
+                    # Try obj.data.name directly (new object with shared mesh)
+                    mesh_key = obj.data.name if obj.data else None
+                if mesh_key and mesh_key in _ignis_blas_handles:
+                    # Known mesh — add to instances
+                    _ignis_obj_to_mesh[obj_name] = mesh_key  # register alias
+                    xform = scene_export._matrix_to_3x4_row_major(inst.matrix_world)
+                    cur_instances.append((mesh_key, xform))
+                else:
+                    # Unknown object — only upload if genuinely NEW (not a pre-existing
+                    # collection instance or hidden object from initial load)
+                    if obj_name not in _ignis_known_objects and obj_name not in new_objects:
+                        new_objects[obj_name] = (obj, inst)
+
+            # Incremental BLAS upload for new objects
+            if new_objects:
+                if _ignis_frame_index < 3:
+                    _log(f"  Unknown objects ({len(new_objects)}): {list(new_objects.keys())[:5]}...")
+                self._upload_new_objects(depsgraph, new_objects)
+                # Re-scan to include newly uploaded objects
+                cur_instances = []
+                for inst in depsgraph.object_instances:
+                    obj = inst.object
+                    if obj.type != 'MESH':
+                        continue
+                    mesh_key = _ignis_obj_to_mesh.get(obj.name)
+                    if mesh_key and mesh_key in _ignis_blas_handles:
+                        xform = scene_export._matrix_to_3x4_row_major(inst.matrix_world)
+                        cur_instances.append((mesh_key, xform))
 
             # Compare with tolerance to avoid float jitter causing constant resets
             xform_floats = tuple(f for _, xf in cur_instances for f in xf)
@@ -1053,7 +1129,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         transforms_changed = True
                         break
 
-            if transforms_changed:
+            if transforms_changed or new_objects:
                 _ignis_last_transforms = xform_floats
                 count = len(cur_instances)
                 if count > 0:
@@ -1067,6 +1143,11 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         tlas_arr[i].customIndex = blas_idx
                         tlas_arr[i].mask = 0xFF
                     dll_wrapper.build_tlas(tlas_arr, count)
+                    # Reset denoiser only when objects added/removed (count changed),
+                    # NOT on transform-only changes (NRD anti-lag handles those naturally)
+                    if count != _ignis_instance_count or new_objects:
+                        _ignis_frame_index = 0
+                        dll_wrapper.set_int("reset_history", 1)
                     _ignis_instance_count = count
 
         # FPS limiter

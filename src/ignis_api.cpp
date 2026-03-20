@@ -556,6 +556,9 @@ IGNIS_API void ignis_set_int(const char* key, int value) {
     else if (strcmp(key, "shader_mode") == 0)       cfg->shaderMode = value;
     else if (strcmp(key, "use_wavefront") == 0)    cfg->useWavefront = (value != 0);
     else if (strcmp(key, "backface_culling") == 0) cfg->backfaceCulling = (value != 0);
+    else if (strcmp(key, "reset_history") == 0 && value != 0) {
+        if (g_renderer) g_renderer->ResetFrameIndex();
+    }
 }
 
 IGNIS_API int ignis_get_int(const char* key) {
