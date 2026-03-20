@@ -4,136 +4,109 @@
 
 # Ignis RT
 
-Real-time Vulkan ray tracing renderer designed as a Blender viewport render engine. Built on top of hardware-accelerated ray tracing with NVIDIA NRD temporal denoising and DLSS upscaling.
+Real-time Vulkan path tracing renderer for Blender. Hardware-accelerated ray tracing with NVIDIA DLSS Ray Reconstruction for production-quality denoising at 30-60 FPS.
 
 <p align="center">
   <img src="icons/ignis_rt_preview.png" alt="Ignis RT viewport render">
 </p>
 
-![Vulkan](https://img.shields.io/badge/Vulkan-1.2-red) ![Platform](https://img.shields.io/badge/Platform-Windows-blue) ![Blender](https://img.shields.io/badge/Blender-4.0%2B-orange)
+![Vulkan](https://img.shields.io/badge/Vulkan-1.3-red) ![Platform](https://img.shields.io/badge/Platform-Windows-blue) ![Blender](https://img.shields.io/badge/Blender-5.0%2B-orange) ![GPU](https://img.shields.io/badge/GPU-NVIDIA%20RTX-green)
 
 ## Features
 
-### Rendering
-- **Vulkan RT pipeline** with ray query and hardware acceleration
-- **Path tracing** with configurable bounce count (1-8)
-- **Point/spot light support** via Next Event Estimation (NEE) direct sampling with soft shadows
-- **Emissive materials** with indirect lighting contribution (GI from emissive surfaces)
-- **Shadow demodulation** (CP2077-style: unshadowed radiance + separate SIGMA shadow denoising)
-- **Procedural sky** with Preetham/Rayleigh+Mie atmospheric scattering
-- **PBR materials** (Cook-Torrance GGX microfacet BRDF)
+### Path Tracing
+- **Hardware RT** with Vulkan ray query (RTX cores)
+- **Configurable bounces** (1-8) with separate glass bounce budget (16)
+- **Multi-SPP** (1-128 samples per pixel per frame)
+- **GGX microfacet BRDF** (Cook-Torrance) with importance sampling
+- **Cycles-style glass** (GGX refraction, Fresnel, rough glass)
+- **Stochastic transparency** (Transparent BSDF passthrough, alpha cutout)
+- **Multiple Importance Sampling** for emissive triangle NEE
+- **Russian Roulette** with perceptual sqrt weighting
 
 ### Denoising & Upscaling
-- **Wavefront path tracing** (optional compute-based multi-kernel pipeline)
-- **NVIDIA DLSS Ray Reconstruction** (replaces NRD on all RTX GPUs)
-- **NVIDIA NRD** (ReLAX diffuse+specular denoiser + SIGMA shadow denoiser, fallback for RTX 20/30)
-- **NVIDIA DLSS** upscaling (Ultra Performance to Ultra Quality)
+- **DLSS Ray Reconstruction** — neural denoiser that replaces traditional denoising + upscaling in one pass (all RTX GPUs)
+- **NRD ReLAX + SIGMA** fallback — temporal denoiser for diffuse/specular + shadow denoiser
+- **DLSS Super Resolution** — temporal upscaling (Ultra Performance to DLAA)
 - **Auto-exposure** with GPU histogram and EMA smoothing
-- **Triangular dithering** to eliminate 8-bit banding
 
 ### Blender Integration
-- **Viewport render engine** (set render engine to "Ignis RT", then Viewport Shading > Rendered)
-- **Staged loading** with animated loading screen (no UI freeze on complex scenes)
-- **Per-frame sync** for object transforms and lights (move/rotate without full reload)
-- **Material support**: Principled BSDF, Diffuse, Glossy, Glass, Emission, Mix Shader
-- **Blackbody node** support for physically-based light color temperatures
-- **Linked .blend** material support (libraries, collections, appended assets)
-- **Crash-safe logging** with per-mesh diagnostics and fsync
+- **Native viewport render engine** (no external windows)
+- **Blender 5.0+** with extension system support
+- **Staged loading** with animated loading screen
+- **Per-frame sync** for transforms, lights, materials
+- **Material support**: Principled BSDF, Diffuse, Glossy, Glass, Transparent, Emission, Mix Shader, Add Shader
+- **Shader node evaluation**: ColorRamp, MixRGB, Math, Gamma, Invert, Bright/Contrast, Hue/Sat, Clamp, Map Range
+- **Alpha cutout** from texture (fence, wireframe, leaf materials)
+- **Bump-to-roughness** conversion for frosted glass at low SPP
+- **Backface culling** toggle
+- **Reload Scene** button for manual refresh
 
-### Shader Architecture
-- Modular GLSL includes (`common.glsl`, `sampling.glsl`, `pbr_brdf.glsl`, `nrd_encode.glsl`, `tonemap.glsl`)
-- Multiple tonemapping curves (AgX, ACES, Reinhard, Hable, Khronos Neutral)
-- GGX VNDF sampling (Heitz 2018)
-- ReSTIR GI reservoir infrastructure (prepared, not yet active)
+### Sky & Lighting
+- **Procedural sky** with Preetham/Rayleigh+Mie atmospheric scattering
+- **Physically correct GI** — no fake ambient, all illumination from ray bounces
+- **Sun + point/spot/area lights** with soft shadows
+- **Emissive materials** with MIS light sampling
 
 ## Requirements
 
-- **GPU**: NVIDIA RTX series (ray tracing hardware required)
+- **GPU**: NVIDIA RTX series (RTX 20/30/40/50 — hardware ray tracing required)
 - **OS**: Windows 10/11
-- **Vulkan SDK**: 1.2+
-- **Blender**: 4.0+ (GPU backend must be set to **OpenGL**: Edit > Preferences > System > GPU Backend)
-- **Build tools**: CMake 3.20+, Visual Studio 2022
+- **Blender**: 5.0+ (GPU backend must be **OpenGL**: Edit > Preferences > System > GPU Backend)
+- **Build tools**: CMake 3.20+, Visual Studio 2022, Vulkan SDK 1.3+
 
-### Optional SDKs
-- **NVIDIA NRD SDK** for denoising (`-DIGNIS_USE_NRD=ON -DIGNIS_NRD_ROOT=<path>`)
-- **NVIDIA NGX SDK** for DLSS (`-DIGNIS_USE_DLSS=ON -DIGNIS_NGX_ROOT=<path>`)
+## Install (Addon)
 
-## Building
+Download `ignis_rt_addon.zip` from [Releases](https://github.com/kalexis1994/ignis-rt/releases) and install in Blender:
+
+1. Edit > Preferences > Add-ons > Install from Disk > select zip
+2. Enable "Ignis RT"
+3. Set render engine to **Ignis RT**
+4. Viewport Shading > Rendered (or Z > Rendered)
+
+## Building from Source
 
 ```bash
-# Configure
-cmake -S . -B build -DIGNIS_USE_NRD=ON -DIGNIS_USE_DLSS=ON \
-  -DIGNIS_NRD_ROOT="path/to/NRD" \
-  -DIGNIS_NGX_ROOT="path/to/NGX"
-
-# Build
+cmake -S . -B build
 cmake --build build --config Release
 ```
 
-## Deploying to Blender
+### Deploy to Blender
 
 ```powershell
-# Full build + deploy
-.\deploy_blender.ps1
-
-# Skip build, just copy files
-.\deploy_blender.ps1 -NoBuild
-
-# Dev mode (symlink — Python changes are instant)
-.\deploy_blender.ps1 -Symlink
+.\deploy_blender.ps1              # Build + deploy to latest Blender
+.\deploy_blender.ps1 -NoBuild     # Skip build, just copy files
+.\deploy_blender.ps1 -Symlink     # Dev mode (Python changes are instant)
 ```
-
-Then in Blender:
-1. Edit > Preferences > Add-ons > search "Ignis" > Enable
-2. Set render engine to **Ignis RT**
-3. Viewport Shading > Rendered (or press Z > Rendered)
 
 ## Project Structure
 
 ```
 ignis-rt/
-  include/           # Public headers (C API, config, NRD/DLSS integration)
-  src/
-    vk/              # Vulkan core (context, renderer, RT pipeline, interop)
-    *.cpp             # API implementation, NRD integration, sky model
+  include/           # Public headers (C API, config, NRD/DLSS)
+  src/vk/            # Vulkan core (context, renderer, RT pipeline, interop)
   shaders/
-    include/          # Shared GLSL modules (BRDF, sampling, tonemapping)
-    raygen_blender.rgen  # Main Blender path tracer
-    nrd_composite.comp   # NRD output compositing + tonemapping
-    tonemap.comp         # Post-DLSS HDR to LDR conversion
+    include/          # Shared GLSL (BRDF, sampling, sky, tonemapping)
+    raygen_blender.rgen  # Main path tracer
+    wavefront/        # Compute-based wavefront kernels
   blender/ignis_rt/   # Blender addon (Python)
-  tests/              # Test executable
 ```
 
-## Known Limitations & Roadmap
+## Known Limitations
 
-### Current Limitations
-- **Specular reflections** can appear noisy during camera motion (converges when static)
-- **SHARC radiance cache** disabled pending stability investigation on complex scenes
-- **ReSTIR GI** infrastructure ready but disabled (buffer access needs validation)
-- **Sun-only SIGMA shadows** (point light shadows use inline path tracing, not SIGMA)
-- **No area lights** (point lights only, soft shadows via stochastic sampling)
-- **No texture filtering** beyond hardware bilinear
-
-### Future Plans
-- **Wavefront ray sorting** (sort rays by direction for better BVH cache coherence)
-- **Ray Reconstruction polish** (jitter tuning, specular MVs, hit distance inputs)
-- **ReSTIR DI** for many-light scenarios
-- **Area light** support
-- **Texture LOD / mipmap** streaming
-- **Final render** (F12) support
-- **Multi-GPU** support
+- Specular reflections can shimmer during camera motion (converges when static)
+- No volumetrics (fog, SSS) yet
+- No procedural textures on GPU (Noise, Voronoi — use constant color fallback)
+- DLAA mode may show noise (RR works best with upscaling)
 
 ## Contributing
 
-All contributions are welcome! Whether it's bug fixes, new features, performance improvements, or documentation, feel free to open an issue or submit a pull request.
-
-Areas where contributions would be especially valuable:
-- Specular reflection quality and temporal stability
-- Additional Blender material node support
-- Performance optimization for complex scenes
-- Ray Reconstruction refinement (specular MVs, hit distance, jitter stability)
+Contributions welcome! Areas where help is especially valuable:
+- Procedural texture GPU implementation
+- Volumetrics / subsurface scattering
+- Incremental scene updates (add/remove objects without full reload)
+- Additional Blender shader node support
 
 ## License
 
-This project is licensed under the [GNU General Public License v3.0](LICENSE).
+[GNU General Public License v3.0](LICENSE)
