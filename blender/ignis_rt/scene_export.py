@@ -167,20 +167,48 @@ def export_meshes(depsgraph):
             if mod.type == 'BOOLEAN' and hasattr(mod, 'object') and mod.object:
                 boolean_cutters.add(mod.object.name)
 
+    # Build set of objects in collections hidden from viewport.
+    # Walk the view layer's layer_collection tree to find excluded/hidden collections.
+    hidden_by_collection = set()
+    def _walk_layer_collections(lc, parent_hidden=False):
+        hidden = parent_hidden or lc.hide_viewport or lc.exclude
+        if hidden:
+            for obj in lc.collection.objects:
+                hidden_by_collection.add(obj.name)
+        for child in lc.children:
+            _walk_layer_collections(child, hidden)
+    try:
+        _walk_layer_collections(depsgraph.view_layer.layer_collection)
+    except Exception as _e:
+        import os
+        with open(os.path.join(os.path.expanduser("~"), "ignis-rt.log"), "a") as _lf:
+            _lf.write(f"[ignis-export] ERROR walking layer_collections: {_e}\n")
+
+    # Log what we found
+    import os
+    try:
+        with open(os.path.join(os.path.expanduser("~"), "ignis-rt.log"), "a") as _lf:
+            _lf.write(f"[ignis-export] Hidden by collection: {len(hidden_by_collection)} objects\n")
+            if hidden_by_collection:
+                for name in sorted(hidden_by_collection)[:10]:
+                    _lf.write(f"  hidden: '{name}'\n")
+    except Exception:
+        pass
+
     for instance in depsgraph.object_instances:
         obj = instance.object
         if obj.type != 'MESH':
             continue
 
-        # Skip Boolean modifier cutters (not real geometry — just shape operators)
+        # Skip Boolean modifier cutters
         if obj.name in boolean_cutters:
             continue
 
-        # Skip objects not visible in the viewport
-        # hide_viewport: the monitor icon in the Outliner (object level)
-        # hide_get(): per-view-layer visibility (eye icon)
-        # show_self: instance-level visibility
-        # visible_camera: Cycles ray visibility for camera rays
+        # Skip objects in hidden/excluded collections
+        if obj.name in hidden_by_collection:
+            continue
+
+        # Skip objects hidden at object level
         if not instance.show_self:
             continue
         if obj.hide_viewport:
@@ -303,6 +331,7 @@ def export_meshes(depsgraph):
             "is_instance": instance.is_instance,
             "display_type": obj.display_type,
             "hide_render": obj.hide_render,
+            "hide_viewport": obj.hide_viewport,
             "visible_camera": getattr(obj, 'visible_camera', '?'),
         })
 
@@ -314,8 +343,8 @@ def export_meshes(depsgraph):
             _df.write(f"Total: {len(unique_meshes)} meshes, {len(instances)} instances\n\n")
             for idx, inst in enumerate(instances):
                 t = inst["transform_3x4"]
-                _df.write(f"[{idx:3d}] mesh='{inst['mesh_key']}' inst={inst.get('is_instance',False)} "
-                          f"disp={inst.get('display_type','?')} hide_r={inst.get('hide_render',False)} "
+                _df.write(f"[{idx:3d}] mesh='{inst['mesh_key']}' "
+                          f"hide_vp={inst.get('hide_viewport',False)} hide_r={inst.get('hide_render',False)} "
                           f"vis_cam={inst.get('visible_camera','?')} "
                           f"pos=({t[3]:.2f}, {t[7]:.2f}, {t[11]:.2f})\n")
     except Exception:
@@ -344,7 +373,7 @@ def export_meshes(depsgraph):
     except Exception:
         pass
 
-    return unique_meshes, instances, obj_to_mesh_key
+    return unique_meshes, instances, obj_to_mesh_key, hidden_by_collection
 
 
 def export_camera(context):

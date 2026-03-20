@@ -96,6 +96,7 @@ _ignis_height = 0
 _ignis_blas_handles = {}       # mesh_key -> BLAS handle
 _ignis_obj_to_mesh = {}        # obj.name -> mesh_key (for BLAS lookup by object name)
 _ignis_known_objects = set()   # ALL obj.names seen during initial load (including skipped)
+_ignis_hidden_objects = set()  # obj.names in hidden collections (skip in sync)
 _ignis_float_buffer = None     # ctypes c_float array for readback (legacy)
 _ignis_byte_buffer = None      # ctypes c_uint8 array for RGBA8 readback
 _ignis_gpu_texture = None      # Reusable GPUTexture (avoids alloc every frame)
@@ -502,7 +503,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         """Start the staged loading pipeline."""
         global _load_stage, _load_start_time, _load_status, _load_progress
         global _load_unique_meshes, _load_scene_instances, _load_mesh_keys, _load_mesh_idx
-        global _load_materials_data, _load_mat_name_to_index, _load_textures_list, _load_obj_to_mesh_key
+        global _load_materials_data, _load_mat_name_to_index, _load_textures_list, _load_obj_to_mesh_key, _load_hidden
         global _load_depsgraph
         global _ignis_blas_handles
 
@@ -535,7 +536,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         """Process one stage of loading. Returns True when complete."""
         global _load_stage, _load_status, _load_progress
         global _load_unique_meshes, _load_scene_instances, _load_mesh_keys, _load_mesh_idx
-        global _load_materials_data, _load_mat_name_to_index, _load_textures_list, _load_obj_to_mesh_key
+        global _load_materials_data, _load_mat_name_to_index, _load_textures_list, _load_obj_to_mesh_key, _load_hidden
         global _ignis_blas_handles, _ignis_frame_index
         global _ignis_full_dirty, _ignis_materials_dirty, _ignis_tlas_dirty
         global _ignis_last_full_upload, _ignis_instance_count, _ignis_tex_manager
@@ -548,7 +549,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             _load_progress = 0.05
             try:
                 t0 = time.perf_counter()
-                _load_unique_meshes, _load_scene_instances, _load_obj_to_mesh_key = scene_export.export_meshes(depsgraph)
+                _load_unique_meshes, _load_scene_instances, _load_obj_to_mesh_key, _load_hidden = scene_export.export_meshes(depsgraph)
                 _load_mesh_keys = list(_load_unique_meshes.keys())
                 _load_mesh_idx = 0
                 total_tris = sum(m["tri_count"] for m in _load_unique_meshes.values())
@@ -779,13 +780,15 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 _log("Stage FINALIZE: emissive export failed, continuing without MIS")
 
             # Save material mapping and obj→mesh mapping for incremental updates
-            global _ignis_mat_name_to_index, _ignis_obj_to_mesh, _ignis_known_objects
+            global _ignis_mat_name_to_index, _ignis_obj_to_mesh, _ignis_known_objects, _ignis_hidden_objects
             if _load_mat_name_to_index:
                 _ignis_mat_name_to_index = dict(_load_mat_name_to_index)
             if _load_obj_to_mesh_key:
                 _ignis_obj_to_mesh = dict(_load_obj_to_mesh_key)
             # Record ALL object names seen — so transform sync knows what's "new" vs "pre-existing"
             _ignis_known_objects = set(_ignis_obj_to_mesh.keys()) | set(_ignis_blas_handles.keys())
+            if _load_hidden:
+                _ignis_hidden_objects = set(_load_hidden)
             _load_unique_meshes = None
             _load_scene_instances = None
             _load_mesh_keys = []
@@ -1178,6 +1181,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 if obj.type != 'MESH':
                     continue
                 if not inst.show_self:
+                    continue
+                if obj.name in _ignis_hidden_objects:
                     continue
                 if obj.hide_viewport:
                     continue
