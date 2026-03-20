@@ -39,7 +39,7 @@ jobs:
       - name: Clone and build NRD
         shell: bash
         run: |
-          git clone --depth 1 https://github.com/NVIDIAGameWorks/NRD.git vendor/NRD
+          git clone --depth 1 https://github.com/NVIDIA-RTX/NRD.git vendor/NRD
           cd vendor/NRD
           # NRD uses its own build script to prepare the SDK
           # First, update dependencies (ShaderMake, MathLib)
