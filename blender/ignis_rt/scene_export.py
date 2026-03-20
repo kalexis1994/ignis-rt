@@ -333,6 +333,103 @@ def export_camera(context):
     }
 
 
+def export_world_hdri(depsgraph):
+    """Extract HDRI environment texture from Blender's World node tree.
+
+    Returns dict with image data or None if no HDRI found:
+        {"name": str, "data": bytes, "width": int, "height": int, "strength": float}
+    """
+    import bpy
+
+    scene = depsgraph.scene
+    world = scene.world
+    if not world or not world.use_nodes or not world.node_tree:
+        return None
+
+    # Find Background node and its color input
+    bg_node = None
+    env_tex_node = None
+    strength = 1.0
+
+    for node in world.node_tree.nodes:
+        if node.type == 'BACKGROUND':
+            bg_node = node
+            # Get strength
+            s_inp = node.inputs.get('Strength')
+            if s_inp:
+                strength = float(s_inp.default_value)
+            # Trace color input to find Environment Texture
+            color_inp = node.inputs.get('Color')
+            if color_inp and color_inp.is_linked:
+                src = color_inp.links[0].from_node
+                # Follow through Mapping/Math/etc. to find the texture
+                _depth = 0
+                while src and _depth < 8:
+                    if src.type == 'TEX_ENVIRONMENT':
+                        env_tex_node = src
+                        break
+                    # Follow first linked input
+                    found = False
+                    for inp in src.inputs:
+                        if inp.is_linked:
+                            src = inp.links[0].from_node
+                            found = True
+                            break
+                    if not found:
+                        break
+                    _depth += 1
+            break
+
+    if env_tex_node is None or env_tex_node.image is None:
+        return None
+
+    image = env_tex_node.image
+    w, h = image.size[0], image.size[1]
+    if w == 0 or h == 0:
+        return None
+
+    # For HDRI (EXR/HDR): extract float pixels, scale to [0,1], encode as PNG manually.
+    import io, zlib
+    px = np.empty(w * h * 4, dtype=np.float32)
+    image.pixels.foreach_get(px)
+    px_rgb = px.reshape(-1, 4)[:, :3]
+    peak = float(np.percentile(px_rgb[px_rgb > 0], 99.5)) if np.any(px_rgb > 0) else 1.0
+    peak = max(peak, 1.0)
+    px_scaled = np.clip(px / peak, 0.0, 1.0)
+    px_u8 = (px_scaled * 255.0 + 0.5).astype(np.uint8).reshape(h, w, 4)
+    px_u8 = px_u8[::-1]  # Blender stores bottom-up, PNG is top-down
+
+    # Minimal PNG encoder (RGBA8, no filtering)
+    def _write_png_chunk(out, chunk_type, chunk_data):
+        out.write(struct.pack('>I', len(chunk_data)))
+        out.write(chunk_type)
+        out.write(chunk_data)
+        out.write(struct.pack('>I', zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF))
+
+    buf = io.BytesIO()
+    buf.write(b'\x89PNG\r\n\x1a\n')  # PNG signature
+    ihdr = struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0)  # 8-bit RGBA
+    _write_png_chunk(buf, b'IHDR', ihdr)
+    # IDAT: raw pixel rows with filter byte 0 (none) per row
+    raw_rows = bytearray()
+    for y in range(h):
+        raw_rows.append(0)  # filter: none
+        raw_rows.extend(px_u8[y].tobytes())
+    _write_png_chunk(buf, b'IDAT', zlib.compress(bytes(raw_rows), 6))
+    _write_png_chunk(buf, b'IEND', b'')
+    data = buf.getvalue()
+
+    strength *= peak
+
+    return {
+        "name": f"__world_hdri__{image.name}",
+        "data": data,
+        "width": image.size[0],
+        "height": image.size[1],
+        "strength": strength,
+    }
+
+
 def export_sun(depsgraph):
     """Find the first SUN light and extract direction/intensity.
 
@@ -1224,15 +1321,19 @@ def _get_image_bytes(image):
 
 
 def _encode_bmp(rgba_u8, w, h):
-    """Encode RGBA8 pixels as a 32-bit BMP (stb_image compatible)."""
-    # Use numpy for fast RGBA→BGRA swizzle + row flip (avoids Python pixel loop)
+    """Encode RGBA8 pixels as a 32-bit BMP (stb_image compatible).
+
+    Uses BITMAPINFOHEADER (40 bytes) with BI_BITFIELDS for BGRA layout.
+    stb_image supports this format (v2.28+).
+    """
+    # Use numpy for fast RGBA→BGRA swizzle
     pixels = np.asarray(rgba_u8, dtype=np.uint8).reshape(h, w, 4)
-    # RGBA → BGRA: swap R and B channels
     bgra = pixels[:, :, [2, 1, 0, 3]]
-    # Top-down BMP: use negative height (no row flip needed)
+    # BMP is bottom-up by default — flip rows
+    bgra = bgra[::-1]
     pixel_data = bgra.tobytes()
 
-    header_size = 14 + 124  # BITMAPFILEHEADER + BITMAPV5HEADER
+    header_size = 14 + 40  # BITMAPFILEHEADER + BITMAPINFOHEADER
     file_size = header_size + len(pixel_data)
 
     hdr = bytearray(header_size)
@@ -1240,19 +1341,14 @@ def _encode_bmp(rgba_u8, w, h):
     hdr[0:2] = b'BM'
     struct.pack_into('<I', hdr, 2, file_size)
     struct.pack_into('<I', hdr, 10, header_size)
-    # BITMAPV5HEADER (124 bytes)
-    struct.pack_into('<I', hdr, 14, 124)        # biSize
+    # BITMAPINFOHEADER (40 bytes)
+    struct.pack_into('<I', hdr, 14, 40)          # biSize
     struct.pack_into('<i', hdr, 18, w)           # biWidth
-    struct.pack_into('<i', hdr, 22, -h)          # biHeight (negative = top-down)
+    struct.pack_into('<i', hdr, 22, h)           # biHeight (positive = bottom-up)
     struct.pack_into('<H', hdr, 26, 1)           # biPlanes
     struct.pack_into('<H', hdr, 28, 32)          # biBitCount
-    struct.pack_into('<I', hdr, 30, 3)           # biCompression = BI_BITFIELDS
+    struct.pack_into('<I', hdr, 30, 0)           # biCompression = BI_RGB
     struct.pack_into('<I', hdr, 34, len(pixel_data))
-    # Color masks for RGBA
-    struct.pack_into('<I', hdr, 54, 0x00FF0000)  # R mask
-    struct.pack_into('<I', hdr, 58, 0x0000FF00)  # G mask
-    struct.pack_into('<I', hdr, 62, 0x000000FF)  # B mask
-    struct.pack_into('<I', hdr, 66, 0xFF000000)  # A mask
 
     return bytes(hdr) + bytes(pixel_data)
 

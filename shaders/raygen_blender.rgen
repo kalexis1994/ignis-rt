@@ -239,7 +239,25 @@ vec3 proceduralSky(vec3 dir, vec3 sunDirL, vec3 ambColor, vec3 sunTint) {
     return max(clearSky, vec3(0.0));
 }
 
+vec2 directionToEquirectangular(vec3 dir) {
+    // Blender/Cycles convention: Y-up in our engine
+    // phi = atan2(dir.x, -dir.z), theta = acos(dir.y)
+    float u = atan(dir.x, -dir.z) / (2.0 * PI) + 0.5;
+    float v = acos(clamp(dir.y, -1.0, 1.0)) / PI;
+    return vec2(u, v);
+}
+
 vec3 evaluateSky(vec3 dir) {
+    // HDRI environment map: sample equirectangular texture if available
+    int hdriIdx = int(cam.windParams.x);
+    if (hdriIdx >= 0) {
+        float hdriStrength = cam.windParams.y;
+        vec2 uv = directionToEquirectangular(dir);
+        vec3 hdriColor = texture(textures[nonuniformEXT(uint(hdriIdx))], uv).rgb;
+        return hdriColor * hdriStrength;
+    }
+
+    // Fallback: procedural sky
     float sunIntensitySky = cam.sunLight.w;
 
     // No sun in scene → black sky (no procedural sky without a sun)

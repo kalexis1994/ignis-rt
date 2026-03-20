@@ -111,6 +111,10 @@ struct PathTracerConfig {
 
     // Backface culling
     bool  backfaceCulling    = false;
+
+    // HDRI environment map
+    int   hdriTexIndex       = -1;     // texture index (-1 = no HDRI, use procedural sky)
+    float hdriStrength       = 1.0f;   // environment intensity multiplier
 };
 
 } // namespace acpt

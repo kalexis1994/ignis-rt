@@ -722,6 +722,33 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             dll_wrapper.set_float("sun_color_g", sun_color[1])
             dll_wrapper.set_float("sun_color_b", sun_color[2])
 
+            # World HDRI environment map
+            try:
+                hdri = scene_export.export_world_hdri(depsgraph)
+                if hdri:
+                    _log(f"Stage FINALIZE: HDRI '{hdri['name']}' {hdri['width']}x{hdri['height']}, strength={hdri['strength']:.2f}")
+                    # Upload as texture via the texture manager
+                    if _ignis_tex_manager:
+                        data_np = np.frombuffer(hdri["data"], dtype=np.uint8).copy()
+                        hdri_idx = dll_wrapper.texture_manager_add(
+                            _ignis_tex_manager, hdri["name"],
+                            data_np.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                            len(hdri["data"]), hdri["width"], hdri["height"], 1, 0)
+                        if hdri_idx >= 0:
+                            dll_wrapper.texture_manager_upload_all(_ignis_tex_manager)
+                            dll_wrapper.update_texture_descriptors(_ignis_tex_manager)
+                            dll_wrapper.set_int("hdri_tex_index", hdri_idx)
+                            dll_wrapper.set_float("hdri_strength", hdri["strength"])
+                            _log(f"Stage FINALIZE: HDRI uploaded as texture {hdri_idx}")
+                        else:
+                            _log("Stage FINALIZE: HDRI texture add failed")
+                    else:
+                        _log("Stage FINALIZE: No texture manager for HDRI")
+                else:
+                    dll_wrapper.set_int("hdri_tex_index", -1)
+            except Exception:
+                _log_exception("FINALIZE HDRI")
+
             # Point/spot/area lights
             light_data = scene_export.export_lights(depsgraph)
             n_lights = len(light_data) // 16
@@ -878,8 +905,67 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
         t0 = time.perf_counter()
 
-        # Export full scene meshes (reuses dedup — only new mesh_keys matter)
-        unique_meshes, instances, obj_to_mesh = scene_export.export_meshes(depsgraph)
+        # Export only the new objects (not the full scene — avoids 10s hang on large scenes)
+        unique_meshes = {}
+        instances = []
+        obj_to_mesh = {}
+        for obj_name, (obj, inst) in new_objects.items():
+            mesh_key = obj.name
+            obj_to_mesh[obj_name] = mesh_key
+            if mesh_key in unique_meshes:
+                continue
+            try:
+                eval_obj = obj.evaluated_get(depsgraph)
+                mesh = eval_obj.to_mesh()
+                if mesh is None:
+                    continue
+                mesh.calc_loop_triangles()
+                if len(mesh.loop_triangles) == 0:
+                    eval_obj.to_mesh_clear()
+                    continue
+                tri_count = len(mesh.loop_triangles)
+                raw_vert_count = tri_count * 3
+                tri_loops = np.empty(raw_vert_count, dtype=np.int32)
+                mesh.loop_triangles.foreach_get("loops", tri_loops)
+                tri_verts_idx = np.empty(raw_vert_count, dtype=np.int32)
+                mesh.loop_triangles.foreach_get("vertices", tri_verts_idx)
+                all_pos = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
+                mesh.vertices.foreach_get("co", all_pos)
+                all_pos = all_pos.reshape(-1, 3)
+                all_nrm = np.empty(len(mesh.loops) * 3, dtype=np.float32)
+                try:
+                    mesh.corner_normals.foreach_get("vector", all_nrm)
+                except (AttributeError, RuntimeError):
+                    mesh.calc_normals_split()
+                    mesh.loops.foreach_get("normal", all_nrm)
+                all_nrm = all_nrm.reshape(-1, 3)
+                positions = all_pos[tri_verts_idx]
+                normals = all_nrm[tri_loops]
+                uvs = np.zeros((raw_vert_count, 2), dtype=np.float32)
+                if mesh.uv_layers.active is not None:
+                    all_uvs = np.empty(len(mesh.uv_layers.active.data) * 2, dtype=np.float32)
+                    mesh.uv_layers.active.data.foreach_get("uv", all_uvs)
+                    uvs = all_uvs.reshape(-1, 2)[tri_loops]
+                tri_mat_indices = np.empty(tri_count, dtype=np.int32)
+                mesh.loop_triangles.foreach_get("material_index", tri_mat_indices)
+                indices = np.arange(raw_vert_count, dtype=np.uint32)
+                unique_meshes[mesh_key] = {
+                    "positions": np.ascontiguousarray(positions.flatten(), dtype=np.float32),
+                    "normals": np.ascontiguousarray(normals.flatten(), dtype=np.float32),
+                    "uvs": np.ascontiguousarray(uvs.flatten(), dtype=np.float32),
+                    "indices": indices,
+                    "vertex_count": raw_vert_count,
+                    "index_count": raw_vert_count,
+                    "tri_count": tri_count,
+                    "tri_material_indices": tri_mat_indices,
+                }
+                eval_obj.to_mesh_clear()
+                instances.append({
+                    "mesh_key": mesh_key,
+                    "material_slots": [s.material for s in obj.material_slots],
+                })
+            except Exception:
+                _log_exception(f"incremental export '{obj_name}'")
 
         uploaded = 0
         for obj_name in new_objects:
@@ -992,11 +1078,6 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         n_lights = len(light_data) // 16
         dll_wrapper.upload_lights(light_data, n_lights)
 
-        # Re-export emissive triangles (transforms may have changed)
-        emissive_data = scene_export.export_emissive_triangles(depsgraph)
-        n_emissive = len(emissive_data) // 16
-        dll_wrapper.upload_emissive_triangles(emissive_data, n_emissive)
-
         _ignis_tlas_dirty = False
         _ignis_instance_count = len(instances)
         _ignis_frame_index = 0
@@ -1102,10 +1183,14 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         new_objects[obj_name] = (obj, inst)
 
             # Incremental BLAS upload for new objects
-            # Skip heavy re-export for large scenes — just log and ignore
             if new_objects:
-                for obj_name in new_objects:
-                    _ignis_known_objects.add(obj_name)
+                try:
+                    self._upload_new_objects(depsgraph, new_objects)
+                except Exception:
+                    _log_exception("incremental mesh upload")
+                    # Mark as known so we don't retry every frame
+                    for obj_name in new_objects:
+                        _ignis_known_objects.add(obj_name)
                 # Re-scan to include newly uploaded objects
                 cur_instances = []
                 for inst in depsgraph.object_instances:
