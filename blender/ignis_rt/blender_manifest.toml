@@ -10,7 +10,7 @@ license = ["SPDX:GPL-3.0-or-later"]
 
 website = "https://github.com/kalexis1994/ignis-rt"
 
-blender_version_min = "4.2.0"
+blender_version_min = "5.0.0"
 
 platforms = ["windows-x64"]
 
