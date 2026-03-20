@@ -1177,6 +1177,13 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 obj = inst.object
                 if obj.type != 'MESH':
                     continue
+                if not inst.show_self:
+                    continue
+                try:
+                    if obj.hide_get():
+                        continue
+                except RuntimeError:
+                    pass
                 _sync_obj_count += 1
                 obj_name = obj.name
                 # Resolve obj.name → mesh_data_key → BLAS handle

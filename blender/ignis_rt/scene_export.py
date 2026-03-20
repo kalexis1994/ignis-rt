@@ -158,10 +158,55 @@ def export_meshes(depsgraph):
     # Map object name → mesh key (identity for now, but enables incremental lookup)
     obj_to_mesh_key = {}
 
+    # Build set of objects used as Boolean modifier cutters (should not be rendered)
+    boolean_cutters = set()
+    for obj in depsgraph.objects:
+        if obj.type != 'MESH':
+            continue
+        for mod in obj.modifiers:
+            if mod.type == 'BOOLEAN' and hasattr(mod, 'object') and mod.object:
+                boolean_cutters.add(mod.object.name)
+
     for instance in depsgraph.object_instances:
         obj = instance.object
         if obj.type != 'MESH':
             continue
+
+        # Skip Boolean modifier cutters (not real geometry — just shape operators)
+        if obj.name in boolean_cutters:
+            continue
+
+        # Skip objects hidden from viewport
+        if not instance.show_self:
+            continue
+        try:
+            if obj.hide_get():
+                continue
+        except RuntimeError:
+            pass
+
+        # Skip objects with Cycles camera ray visibility disabled
+        try:
+            if hasattr(obj, 'visible_camera') and not obj.visible_camera:
+                continue
+        except Exception:
+            pass
+
+        # Skip objects with ray visibility disabled (Cycles-compatible)
+        try:
+            rv = obj.get('cycles_visibility', None)
+            if rv is not None and not rv.get('camera', True):
+                continue
+        except Exception:
+            pass
+
+        # Check if the object is truly renderable via Cycles ray visibility
+        try:
+            if hasattr(obj, 'cycles') and hasattr(obj.cycles, 'is_camera_ray_visible'):
+                if not obj.cycles.is_camera_ray_visible:
+                    continue
+        except Exception:
+            pass
 
         # Each object gets its own BLAS (safe: modifiers produce unique geometry)
         mesh_key = obj.name
@@ -265,11 +310,31 @@ def export_meshes(depsgraph):
             }
             eval_obj.to_mesh_clear()
 
+        xform = _matrix_to_3x4_row_major(instance.matrix_world)
         instances.append({
             "mesh_key": mesh_key,
-            "transform_3x4": _matrix_to_3x4_row_major(instance.matrix_world),
+            "transform_3x4": xform,
             "material_slots": [s.material for s in obj.material_slots],
+            "is_instance": instance.is_instance,
+            "display_type": obj.display_type,
+            "hide_render": obj.hide_render,
+            "visible_camera": getattr(obj, 'visible_camera', '?'),
         })
+
+    # Dump ALL instances to file for ghost mesh diagnosis
+    import os
+    try:
+        _dump_path = os.path.join(os.path.expanduser("~"), "ignis-instances.txt")
+        with open(_dump_path, "w") as _df:
+            _df.write(f"Total: {len(unique_meshes)} meshes, {len(instances)} instances\n\n")
+            for idx, inst in enumerate(instances):
+                t = inst["transform_3x4"]
+                _df.write(f"[{idx:3d}] mesh='{inst['mesh_key']}' inst={inst.get('is_instance',False)} "
+                          f"disp={inst.get('display_type','?')} hide_r={inst.get('hide_render',False)} "
+                          f"vis_cam={inst.get('visible_camera','?')} "
+                          f"pos=({t[3]:.2f}, {t[7]:.2f}, {t[11]:.2f})\n")
+    except Exception:
+        pass
 
     # Log instance stats + check for duplicate transforms (ghost mesh diagnosis)
     import os
