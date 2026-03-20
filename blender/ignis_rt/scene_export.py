@@ -1778,22 +1778,34 @@ def _resolve_mix_shader(mix_node, register_image_fn):
     return blended
 
 
-def export_materials(depsgraph):
+def export_materials(depsgraph, hidden_objects=None):
     """Export Blender Principled BSDF materials as GPUMaterial byte buffer.
 
     Returns (ctypes byte array, name->global_index dict, textures list).
     textures list = [{"name": str, "data": bytes, "width": int, "height": int}, ...]
+    hidden_objects: set of obj.names to skip (from export_meshes)
     """
     import ctypes
     import bpy
 
-    # Collect unique materials from all mesh objects (including linked/instanced)
+    if hidden_objects is None:
+        hidden_objects = set()
+
+    # Collect unique materials from VISIBLE mesh objects only.
+    # Must match the same objects exported by export_meshes — otherwise
+    # material indices get misaligned (hidden objects add extra materials).
     mat_name_to_index = {}
     mat_list = []
 
     for inst in depsgraph.object_instances:
         obj = inst.object
         if obj.type != 'MESH':
+            continue
+        if not inst.show_self:
+            continue
+        if obj.name in hidden_objects:
+            continue
+        if obj.hide_viewport:
             continue
         if not obj.material_slots:
             # Mesh with no material slots — register a default "None" material

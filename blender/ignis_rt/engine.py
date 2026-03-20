@@ -605,7 +605,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             try:
                 t0 = time.perf_counter()
                 _load_materials_data, _load_mat_name_to_index, _load_textures_list = \
-                    scene_export.export_materials(depsgraph)
+                    scene_export.export_materials(depsgraph, hidden_objects=_load_hidden)
                 _log(f"Stage MATERIALS: exporting {len(_load_mat_name_to_index)} materials, "
                      f"{len(_load_textures_list)} textures")
 
@@ -681,7 +681,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         clamped = np.clip(tri_mats, 0, n_slots - 1)
                         global_ids = np.ascontiguousarray(slot_to_global[clamped], dtype=np.uint32)
                         dll_wrapper.upload_mesh_primitive_materials(blas, global_ids, m["tri_count"])
-                        _log(f"  matIDs '{mesh_key}': {m['tri_count']} tris, {n_slots} slots")
+                        slot_names = [s.name if s else 'None' for s in slots]
+                        _log(f"  matIDs '{mesh_key}': blas={blas} {m['tri_count']} tris, {n_slots} slots={slot_names} -> global={list(slot_to_global)}")
             except Exception:
                 _log_exception("LOAD_MATIDS")
                 _load_stage = LOAD_IDLE
@@ -867,7 +868,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         global _ignis_last_tex_names, _ignis_mat_name_to_index
 
         t0 = time.perf_counter()
-        materials_data, mat_name_to_index, textures_list = scene_export.export_materials(depsgraph)
+        materials_data, mat_name_to_index, textures_list = scene_export.export_materials(depsgraph, hidden_objects=_ignis_hidden_objects)
 
         new_tex_names = tuple(t["name"] for t in textures_list)
         if new_tex_names != _ignis_last_tex_names:
