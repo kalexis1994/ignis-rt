@@ -58,6 +58,7 @@ class AccelStructureBuilder {
 public:
     bool Initialize(Context* context);
     void Shutdown();
+    void ClearBLAS();  // Destroy all BLAS for full scene reload
 
     // Build BLAS from vertex/index data
     // Returns BLAS index (-1 on failure)

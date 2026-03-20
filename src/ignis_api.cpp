@@ -224,6 +224,10 @@ IGNIS_API void ignis_destroy(void) {
     Log(L"[Ignis] ignis_destroy() done\n");
 }
 
+IGNIS_API void ignis_clear_geometry() {
+    if (g_renderer) g_renderer->ClearGeometry();
+}
+
 IGNIS_API int ignis_upload_mesh(const float* vertices, uint32_t vertexCount,
                                 const uint32_t* indices, uint32_t indexCount) {
     if (!g_renderer) return -1;

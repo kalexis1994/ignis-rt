@@ -58,7 +58,14 @@ void AccelStructureBuilder::Shutdown() {
     DestroyAccelBuffer(gpuBlasScratchBuffer_);
     gpuBlasScratchSize_ = 0;
 
-    // Destroy all BLAS
+    ClearBLAS();
+    Log(L"[VK AccelStruct] Shutdown\n");
+}
+
+void AccelStructureBuilder::ClearBLAS() {
+    if (!context_) return;
+    VkDevice device = context_->GetDevice();
+
     for (auto& blas : blasList_) {
         if (blas.handle != VK_NULL_HANDLE && vkDestroyAccelerationStructureKHR_) {
             vkDestroyAccelerationStructureKHR_(device, blas.handle, nullptr);

@@ -90,6 +90,9 @@ def load():
     # ------------------------------------------------------------------
     # Geometry upload
     # ------------------------------------------------------------------
+    _lib.ignis_clear_geometry.argtypes = []
+    _lib.ignis_clear_geometry.restype = None
+
     _lib.ignis_upload_mesh.argtypes = [
         POINTER(c_float), c_uint32,
         POINTER(c_uint32), c_uint32,
@@ -208,6 +211,11 @@ def create(width: int, height: int) -> bool:
 def destroy():
     if _lib is not None:
         _lib.ignis_destroy()
+
+
+def clear_geometry():
+    """Destroy all BLAS (call before full scene reload)."""
+    _lib.ignis_clear_geometry()
 
 
 def upload_mesh(vertices, vertex_count: int, indices, index_count: int) -> int:

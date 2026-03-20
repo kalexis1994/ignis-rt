@@ -518,6 +518,17 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         _load_mat_name_to_index = None
         _load_textures_list = None
         _ignis_blas_handles = {}
+        # Destroy texture manager before clearing geometry (avoids dangling references)
+        global _ignis_tex_manager
+        if _ignis_tex_manager is not None:
+            try:
+                dll_wrapper.destroy_texture_manager(_ignis_tex_manager)
+            except Exception:
+                pass
+            _ignis_tex_manager = None
+        # Clear GPU BLAS before reload — prevents index mismatch when BLAS
+        # accumulate across reloads (handle 0 would reference old geometry)
+        dll_wrapper.clear_geometry()
         _log("Staged load: BEGIN")
 
     def _tick_staged_load(self, depsgraph):

@@ -271,7 +271,7 @@ def export_meshes(depsgraph):
             "material_slots": [s.material for s in obj.material_slots],
         })
 
-    # Log instance stats for debugging collection/linked issues
+    # Log instance stats + check for duplicate transforms (ghost mesh diagnosis)
     import os
     _log_path = os.path.join(os.path.expanduser("~"), "ignis-rt.log")
     try:
@@ -283,6 +283,13 @@ def export_meshes(depsgraph):
                 _lf.write(f"[ignis-export] Instanced objects ({len(dupes)} unique, {sum(dupes.values())} instances):\n")
                 for k, v in sorted(dupes.items(), key=lambda x: -x[1])[:10]:
                     _lf.write(f"  '{k}' x{v}\n")
+                # Log transforms for instanced "Small Windows" or similar
+                for k in list(dupes.keys())[:3]:
+                    _lf.write(f"  Transforms for '{k}':\n")
+                    for inst in instances:
+                        if inst["mesh_key"] == k:
+                            t = inst["transform_3x4"]
+                            _lf.write(f"    pos=({t[3]:.2f}, {t[7]:.2f}, {t[11]:.2f})\n")
                 _lf.flush()
     except Exception:
         pass

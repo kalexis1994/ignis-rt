@@ -437,6 +437,16 @@ bool Renderer::UploadBLASPrimitiveYBounds(int blasIndex, const float* yBounds, u
     return accelBuilder_->UploadBLASPrimitiveYBounds(blasIndex, yBounds, primitiveCount);
 }
 
+void Renderer::ClearGeometry() {
+    if (context_) vkDeviceWaitIdle(context_->GetDevice());
+    if (accelBuilder_) accelBuilder_->ClearBLAS();
+    rtReady_ = false;
+    instanceTransformCount_ = 0;
+    prevInstanceTransforms_.clear();
+    currInstanceTransforms_.clear();
+    Log(L"[VK Renderer] Geometry cleared\n");
+}
+
 void Renderer::UploadMaterialBuffer(const void* materials, uint32_t count) {
     if (rtPipeline_) {
         rtPipeline_->UpdateMaterialBuffer(static_cast<const vk::GPUMaterial*>(materials), count);
