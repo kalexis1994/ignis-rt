@@ -1046,21 +1046,12 @@ def _get_image_bytes(image):
 
 def _encode_bmp(rgba_u8, w, h):
     """Encode RGBA8 pixels as a 32-bit BMP (stb_image compatible)."""
-    # BMP is bottom-up, so flip rows
-    row_size = w * 4
-    pixel_data = bytearray(row_size * h)
-    for y in range(h):
-        src_row = y * row_size
-        dst_row = (h - 1 - y) * row_size
-        row = rgba_u8[src_row:src_row + row_size]
-        # RGBA → BGRA for BMP
-        for x in range(w):
-            px_off = x * 4
-            pixel_data[dst_row + px_off + 0] = row[px_off + 2]  # B
-            pixel_data[dst_row + px_off + 1] = row[px_off + 1]  # G
-            pixel_data[dst_row + px_off + 2] = row[px_off + 0]  # R
-            pixel_data[dst_row + px_off + 3] = row[px_off + 3]  # A
-        pixel_data[dst_row:dst_row + row_size] = pixel_data[dst_row:dst_row + row_size]
+    # Use numpy for fast RGBA→BGRA swizzle + row flip (avoids Python pixel loop)
+    pixels = np.asarray(rgba_u8, dtype=np.uint8).reshape(h, w, 4)
+    # RGBA → BGRA: swap R and B channels
+    bgra = pixels[:, :, [2, 1, 0, 3]]
+    # Top-down BMP: use negative height (no row flip needed)
+    pixel_data = bgra.tobytes()
 
     header_size = 14 + 124  # BITMAPFILEHEADER + BITMAPV5HEADER
     file_size = header_size + len(pixel_data)
@@ -1479,9 +1470,12 @@ def export_materials(depsgraph):
         buf = (ctypes.c_uint8 * len(data))(*data)
         return buf, {}, []
 
-    # Pack each material
+    # Pack each material (with per-material timing for bottleneck detection)
+    import time as _time
     all_bytes = bytearray()
-    for mat in mat_list:
+    _mat_total = len(mat_list)
+    for _mat_idx, mat in enumerate(mat_list):
+        _mat_t0 = _time.perf_counter()
         # Default material for meshes without material assignment
         if mat is None:
             data = _pack_gpu_material(
@@ -1773,6 +1767,17 @@ def export_materials(depsgraph):
             alpha_ref=alpha_ref,
             transparent_prob=transparent_prob,
         )
+
+        _mat_dt = _time.perf_counter() - _mat_t0
+        if _mat_dt > 0.1:  # Log slow materials (>100ms)
+            import os
+            _log_path = os.path.join(os.path.expanduser("~"), "ignis-rt.log")
+            try:
+                with open(_log_path, "a") as _lf:
+                    _lf.write(f"[ignis-mat] SLOW: '{mat.name}' took {_mat_dt:.3f}s ({_mat_idx+1}/{_mat_total})\n")
+                    _lf.flush()
+            except Exception:
+                pass
 
     buf = (ctypes.c_uint8 * len(all_bytes))(*all_bytes)
     return buf, mat_name_to_index, textures_list

@@ -731,7 +731,9 @@ void Renderer::RenderFrameRT() {
             rtPipeline_->GetDiffuseRadianceView(),
             rtPipeline_->GetSpecularRadianceImage(),         // specular hit distance (.a)
             rtPipeline_->GetSpecularRadianceView(),
-            rrReset);
+            rrReset,
+            rtPipeline_->GetReactiveMaskImage(),             // reactive mask (dynamic objects)
+            rtPipeline_->GetReactiveMaskView());
 
         // Barrier: RR writes → tonemap reads
         VkMemoryBarrier rrBarrier{};
@@ -1091,6 +1093,11 @@ bool Renderer::InitGLInterop() {
 
     glInteropFailed_ = true;
     return false;
+}
+
+int Renderer::GetActualDLSSQuality() const {
+    if (dlss_) return static_cast<int>(dlss_->GetQualityMode());
+    return 0;
 }
 
 void Renderer::DrawGL(uint32_t w, uint32_t h) {

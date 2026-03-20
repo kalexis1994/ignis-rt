@@ -1356,7 +1356,7 @@ void main() {
             imageStore(specularAlbedoImg, pixel, vec4(specAlbedo, 0.0));
         }
 
-        // DLSS NDC depth
+        // DLSS depth: NDC depth [0,1] (Use_HW_Depth=1)
         vec4 clipPos = cam.proj * vec4(0.0, 0.0, primaryViewZ, 1.0);
         float ndcZ = clamp(clipPos.z / clipPos.w, 0.0, 1.0);
         imageStore(dlssDepthImg, pixel, vec4(ndcZ, 0, 0, 0));

@@ -583,6 +583,9 @@ IGNIS_API int ignis_get_int(const char* key) {
     if (strcmp(key, "render_width") == 0)  return g_renderer ? (int)g_renderer->GetRenderWidth() : 0;
     if (strcmp(key, "render_height") == 0) return g_renderer ? (int)g_renderer->GetRenderHeight() : 0;
 
+    // Actual DLSS quality mode used (may differ from requested if GPU doesn't support it)
+    if (strcmp(key, "dlss_quality_actual") == 0) return g_renderer ? g_renderer->GetActualDLSSQuality() : 0;
+
     return 0;
 }
 

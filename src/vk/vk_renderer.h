@@ -68,6 +68,7 @@ public:
     uint32_t GetRenderHeight() const { return height_; }
     float GetComputedExposure() const { return computedExposure_; }
     void ResetFrameIndex() { frameIndex_ = 0; }
+    int GetActualDLSSQuality() const;
 
     Context* GetContext() const { return context_; }
     AccelStructureBuilder* GetAccelBuilder() const { return accelBuilder_; }
