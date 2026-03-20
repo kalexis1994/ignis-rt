@@ -658,6 +658,17 @@ void main() {
         }
         Material mat = materialBuffer.materials[matIdx];
 
+        // DEBUG: material index visualization (debugView == 99)
+        if (cam.parameters.y == 99u && bounce == 0 && sampleIdx == 0) {
+            float r = float(matIdx % 7u) / 6.0;
+            float g = float((matIdx / 7u) % 7u) / 6.0;
+            float b = float((matIdx / 49u) % 7u) / 6.0;
+            imageStore(dlssDepthImg, pixel, vec4(0.5, 0, 0, 0));
+            totalRadiance = vec3(r, g, b);
+            diffuseRadiance = totalRadiance;
+            break;
+        }
+
         // Evaluate PBR material
         PBRHit pbrHit = evaluateBlenderMaterial(
             mat, worldPos, worldN,

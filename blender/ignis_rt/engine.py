@@ -846,6 +846,11 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         if not _ignis_blas_handles:
             return
 
+        # Ignore updates for 2 seconds after a load completes
+        # (Blender sends accumulated depsgraph updates that would re-trigger full load)
+        if _ignis_last_full_upload > 0 and (time.perf_counter() - _ignis_last_full_upload) < 2.0:
+            return
+
         has_material_change = False
         has_geometry_change = False
         geometry_mesh_name = None
@@ -882,7 +887,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         global _ignis_last_tex_names, _ignis_mat_name_to_index
 
         t0 = time.perf_counter()
-        materials_data, mat_name_to_index, textures_list = scene_export.export_materials(depsgraph, hidden_objects=_ignis_hidden_objects)
+        materials_data, mat_name_to_index, textures_list = scene_export.export_materials(
+            depsgraph, hidden_objects=_ignis_hidden_objects, existing_mapping=_ignis_mat_name_to_index)
 
         new_tex_names = tuple(t["name"] for t in textures_list)
         if new_tex_names != _ignis_last_tex_names:
@@ -1149,8 +1155,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         # ── Full scene upload needed? Start staged loading ──
         if _ignis_full_dirty:
             now = time.perf_counter()
-            _log(f"full_dirty triggered (last upload {now - _ignis_last_full_upload:.1f}s ago)")
-            if _ignis_last_full_upload == 0 or (now - _ignis_last_full_upload) >= 5.0:
+            time_since_last = now - _ignis_last_full_upload if _ignis_last_full_upload > 0 else 999.0
+            # Cooldown: don't reload within 5s of the last complete load
+            if _ignis_last_full_upload == 0 or time_since_last >= 5.0:
+                _log(f"full_dirty triggered ({time_since_last:.1f}s since last)")
                 self._begin_staged_load(depsgraph)
                 _draw_loading_screen(w, h, "Preparing scene...", 0.0)
                 self.tag_redraw()
@@ -1160,7 +1168,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
         # ── Fast incremental updates (no loading screen needed) ──
         if _ignis_materials_dirty:
-            self._update_materials(depsgraph)
+            # Skip auto material update after initial load — prevents material index
+            # reordering that breaks per-BLAS material IDs. Only update on explicit
+            # user action (Reload Scene button) via full_dirty.
+            _ignis_materials_dirty = False
         elif _ignis_tlas_dirty:
             self._rebuild_tlas(depsgraph)
         # ── Light sync (every frame — cheap) ──
@@ -1296,6 +1307,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         dll_wrapper.set_int("max_bounces", props.max_bounces)
         dll_wrapper.set_int("spp", props.samples_per_pixel)
         dll_wrapper.set_int("backface_culling", 1 if props.backface_culling else 0)
+        dll_wrapper.set_int("debug_view", props.debug_view)
         dll_wrapper.set_int("auto_sky_colors", 1 if props.auto_sky_colors else 0)
         if not props.auto_sky_colors:
             dll_wrapper.set_float("ambient_intensity", props.ambient_intensity)

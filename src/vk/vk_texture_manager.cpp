@@ -239,8 +239,13 @@ int TextureManager::AddTexture(const KN5Texture& kn5Tex) {
             Log(L"[VK TextureMgr] Loaded %S as PNG/JPG (%dx%d, %d channels)\n",
                 kn5Tex.name.c_str(), width, height, stbChannels);
         } else {
-            Log(L"[VK TextureMgr] Failed to load %S (not DDS, not PNG/JPG)\n", kn5Tex.name.c_str());
-            return -1;
+            Log(L"[VK TextureMgr] Failed to load %S (not DDS, not PNG/JPG) — inserting 1x1 pink dummy\n", kn5Tex.name.c_str());
+            // Insert a 1x1 pink dummy texture to keep indices aligned.
+            // Materials reference textures by index — skipping would shift all subsequent indices.
+            width = 1; height = 1; mipCount = 1; dxgiFormat = 28; // RGBA8
+            stbPixels = (stbi_uc*)STBI_MALLOC(4);
+            stbPixels[0] = 255; stbPixels[1] = 0; stbPixels[2] = 255; stbPixels[3] = 255; // pink
+            isSTB = true;
         }
     }
 

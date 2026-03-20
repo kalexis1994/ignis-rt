@@ -1784,12 +1784,14 @@ def _resolve_mix_shader(mix_node, register_image_fn):
     return blended
 
 
-def export_materials(depsgraph, hidden_objects=None):
+def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
     """Export Blender Principled BSDF materials as GPUMaterial byte buffer.
 
     Returns (ctypes byte array, name->global_index dict, textures list).
     textures list = [{"name": str, "data": bytes, "width": int, "height": int}, ...]
     hidden_objects: set of obj.names to skip (from export_meshes)
+    existing_mapping: if provided, reuse this mat_name→index mapping to preserve
+                      the same order as the initial load (avoids MATIDS mismatch)
     """
     import ctypes
     import bpy
@@ -1798,10 +1800,14 @@ def export_materials(depsgraph, hidden_objects=None):
         hidden_objects = set()
 
     # Collect unique materials from VISIBLE mesh objects only.
-    # Must match the same objects exported by export_meshes — otherwise
-    # material indices get misaligned (hidden objects add extra materials).
-    mat_name_to_index = {}
-    mat_list = []
+    # If existing_mapping is provided, reuse the same index assignment
+    # so that per-BLAS material IDs remain valid.
+    if existing_mapping:
+        mat_name_to_index = dict(existing_mapping)
+        mat_list = [None] * len(mat_name_to_index)
+    else:
+        mat_name_to_index = {}
+        mat_list = []
 
     for inst in depsgraph.object_instances:
         obj = inst.object
@@ -1830,6 +1836,10 @@ def export_materials(depsgraph, hidden_objects=None):
             # Use library-qualified name for materials from linked .blend files
             mat_key = f"{mat.library.filepath}:{mat.name}" if mat.library else mat.name
             if mat_key in mat_name_to_index:
+                # Update the material reference (may have changed properties)
+                idx = mat_name_to_index[mat_key]
+                if idx < len(mat_list):
+                    mat_list[idx] = mat
                 continue
             mat_name_to_index[mat_key] = len(mat_list)
             mat_list.append(mat)
@@ -1866,6 +1876,21 @@ def export_materials(depsgraph, hidden_objects=None):
         data = _pack_gpu_material()
         buf = (ctypes.c_uint8 * len(data))(*data)
         return buf, {}, []
+
+    # Dump material order to file for debugging
+    import os
+    try:
+        with open(os.path.join(os.path.expanduser("~"), "ignis-mat-order.txt"), "w") as _mf:
+            _mf.write(f"Material buffer order ({len(mat_list)} materials):\n")
+            for _mi, _mm in enumerate(mat_list):
+                _mn = _mm.name if _mm else "None (default)"
+                _lib = f" [{_mm.library.filepath}]" if _mm and _mm.library else ""
+                _mf.write(f"  [{_mi:3d}] {_mn}{_lib}\n")
+            _mf.write(f"\nmat_name_to_index:\n")
+            for _mk, _mv in sorted(mat_name_to_index.items(), key=lambda x: x[1]):
+                _mf.write(f"  [{_mv:3d}] {_mk}\n")
+    except Exception:
+        pass
 
     # Pack each material (with per-material timing for bottleneck detection)
     import time as _time
