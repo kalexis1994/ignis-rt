@@ -45,7 +45,8 @@ void DLSS_NGX::Evaluate(VkCommandBuffer cmd,
                           VkImage output, VkImageView outputView,
                           VkFormat colorFormat, VkFormat depthFormat, VkFormat mvFormat,
                           float jitterX, float jitterY,
-                          float deltaTime, float sharpness, bool reset) {
+                          float deltaTime, float sharpness, bool reset,
+                          VkImage reactiveMaskImage, VkImageView reactiveMaskView) {
     // No-op
 }
 
