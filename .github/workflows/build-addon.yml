@@ -3,6 +3,7 @@ name: Build Blender Addon
 on:
   push:
     branches: [main]
+    tags: ['v*']
 
 jobs:
   build:
@@ -66,15 +67,32 @@ jobs:
           mkdir -p staging/ignis_rt/shaders/wavefront
           cp shaders/wavefront/*.spv staging/ignis_rt/shaders/wavefront/ 2>/dev/null || true
 
+      # ── Inject version from tag into manifest ───────────────────
+      - name: Inject release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "Injecting version $VERSION into manifest"
+          sed -i "s/^version = .*/version = \"$VERSION\"/" staging/ignis_rt/blender_manifest.toml
+
       - name: Create zip
         shell: bash
         run: |
           cd staging
           7z a -tzip ../ignis_rt_addon.zip ignis_rt/
 
-      # ── Upload artifact ─────────────────────────────────────────
+      # ── Upload artifact (always) ──────────────────────────────
       - name: Upload addon zip
         uses: actions/upload-artifact@v4
         with:
           name: ignis-rt-blender-addon
           path: ignis_rt_addon.zip
+
+      # ── Create GitHub Release (only on tags) ───────────────────
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ignis_rt_addon.zip
+          generate_release_notes: true
