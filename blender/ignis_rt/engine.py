@@ -531,7 +531,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         global _ignis_last_tex_names
 
         if _load_stage == LOAD_EXPORT:
-            # ── Stage 1: Export meshes from depsgraph (CPU-bound) ──
+            # ── Stage 1: Export ALL meshes + instances from depsgraph ──
+            # This extracts geometry from Blender (CPU-bound, requires GIL)
             _load_status = "Exporting geometry..."
             _load_progress = 0.05
             try:
@@ -545,8 +546,6 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 _log(f"Stage EXPORT: {len(_load_mesh_keys)} meshes, "
                      f"{total_tris:,} tris, {total_verts:,} verts, "
                      f"{len(_load_scene_instances)} inst -- {dt:.2f}s")
-                for mk, m in _load_unique_meshes.items():
-                    _log(f"  mesh '{mk}': {m['tri_count']} tris, {m['vertex_count']} verts")
             except Exception:
                 _log_exception("LOAD_EXPORT")
                 _load_stage = LOAD_IDLE
@@ -555,19 +554,18 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             return False
 
         elif _load_stage == LOAD_MESHES:
-            # ── Stage 2: Upload meshes in batches ──
+            # ── Stage 2: Upload meshes to GPU in batches ──
+            # Each batch: BLAS build + attribute upload (GPU-bound)
             total = len(_load_mesh_keys)
-            end = min(_load_mesh_idx + MESH_BATCH_SIZE, total)
-            _load_status = f"Uploading meshes... {end}/{total}"
+            batch_size = max(MESH_BATCH_SIZE, total // 20)  # at least 5% per frame
+            end = min(_load_mesh_idx + batch_size, total)
+            _load_status = f"Building BVH... {end}/{total}"
             _load_progress = 0.1 + 0.4 * (end / max(total, 1))
 
             for i in range(_load_mesh_idx, end):
                 mesh_key = _load_mesh_keys[i]
                 m = _load_unique_meshes[mesh_key]
                 try:
-                    _log(f"  uploading '{mesh_key}': {m['tri_count']} tris, "
-                         f"{m['vertex_count']} verts, "
-                         f"{m['index_count']} indices")
                     blas = dll_wrapper.upload_mesh(
                         m["positions"], m["vertex_count"],
                         m["indices"], m["index_count"],
@@ -579,7 +577,6 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                     dll_wrapper.upload_mesh_attributes(
                         blas, m["normals"], m["uvs"], m["vertex_count"],
                     )
-                    _log(f"  OK blas={blas}")
                 except Exception:
                     _log_exception(f"LOAD_MESHES uploading '{mesh_key}'")
 
@@ -731,11 +728,17 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             dll_wrapper.upload_lights(light_data, n_lights)
             _log(f"Stage FINALIZE: {n_lights} lights uploaded")
 
-            # Emissive triangles for MIS
-            emissive_data = scene_export.export_emissive_triangles(depsgraph)
-            n_emissive = len(emissive_data) // 16
-            dll_wrapper.upload_emissive_triangles(emissive_data, n_emissive)
-            _log(f"Stage FINALIZE: {n_emissive} emissive triangles uploaded")
+            # Emissive triangles for MIS — use already-exported mesh data to avoid
+            # re-evaluating meshes (which hangs on 7M+ tri scenes)
+            try:
+                emissive_data = scene_export.export_emissive_triangles_fast(
+                    depsgraph, _load_unique_meshes, _load_scene_instances, _load_mat_name_to_index)
+                n_emissive = len(emissive_data) // 16
+                dll_wrapper.upload_emissive_triangles(emissive_data, n_emissive)
+                _log(f"Stage FINALIZE: {n_emissive} emissive triangles uploaded")
+            except Exception:
+                _log_exception("FINALIZE emissive triangles")
+                _log("Stage FINALIZE: emissive export failed, continuing without MIS")
 
             # Save material mapping and obj→mesh mapping for incremental updates
             global _ignis_mat_name_to_index, _ignis_obj_to_mesh, _ignis_known_objects
@@ -1013,6 +1016,9 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         region = context.region
         w, h = region.width, region.height
 
+        if _ignis_frame_index < 5 and _load_stage == LOAD_IDLE and _ignis_blas_handles:
+            _log(f"view_draw: frame={_ignis_frame_index} stage={_load_stage} dirty={_ignis_full_dirty} w={w} h={h}")
+
         # ── Loading screen: show immediately, process one stage per call ──
         if _load_stage != LOAD_IDLE:
             _draw_loading_screen(w, h, _load_status, _load_progress)
@@ -1047,10 +1053,13 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
         # ── Fast incremental updates (no loading screen needed) ──
         if _ignis_materials_dirty:
+            if _ignis_frame_index < 3: _log("  -> _update_materials")
             self._update_materials(depsgraph)
         elif _ignis_tlas_dirty:
+            if _ignis_frame_index < 3: _log("  -> _rebuild_tlas")
             self._rebuild_tlas(depsgraph)
 
+        if _ignis_frame_index < 3: _log("  -> light sync")
         # ── Light sync (every frame — cheap) ──
         sun = scene_export.export_sun(depsgraph)
         dll_wrapper.set_float("sun_elevation", sun["sun_elevation"])
@@ -1065,14 +1074,9 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         n_lights = len(light_data) // 16
         dll_wrapper.upload_lights(light_data, n_lights)
 
-        # Re-export emissive triangles when scene objects change
-        # (cheap check: track light count changes as proxy for scene edits)
+        # Track light count — emissive re-export is done in FINALIZE only (not per-frame)
         global _ignis_last_light_count
-        if n_lights != _ignis_last_light_count:
-            emissive_data = scene_export.export_emissive_triangles(depsgraph)
-            n_emissive = len(emissive_data) // 16
-            dll_wrapper.upload_emissive_triangles(emissive_data, n_emissive)
-            _ignis_last_light_count = n_lights
+        _ignis_last_light_count = n_lights
 
         # ── Transform sync (detect moved/added/removed objects per frame) ──
         # Uses obj→mesh mapping for BLAS lookup. Handles:
@@ -1105,10 +1109,13 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         new_objects[obj_name] = (obj, inst)
 
             # Incremental BLAS upload for new objects
+            # Skip heavy re-export for large scenes — just log and ignore
             if new_objects:
                 if _ignis_frame_index < 3:
-                    _log(f"  Unknown objects ({len(new_objects)}): {list(new_objects.keys())[:5]}...")
-                self._upload_new_objects(depsgraph, new_objects)
+                    _log(f"  Skipping {len(new_objects)} unknown objects (incremental disabled for perf): {list(new_objects.keys())[:5]}...")
+                # Mark as known so we don't retry every frame
+                for obj_name in new_objects:
+                    _ignis_known_objects.add(obj_name)
                 # Re-scan to include newly uploaded objects
                 cur_instances = []
                 for inst in depsgraph.object_instances:
@@ -1190,6 +1197,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             )
 
             # Render
+            if _ignis_frame_index < 3:
+                _log(f"Rendering frame {_ignis_frame_index}...")
             dll_wrapper.render_frame()
 
             # Display

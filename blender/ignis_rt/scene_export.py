@@ -224,19 +224,28 @@ def export_meshes(depsgraph):
                 uvs = all_loop_uvs[tri_loops]
 
             # ---- Vertex deduplication ----
-            # Merge vertices with identical pos+normal+UV to reduce BLAS size
-            combined = np.ascontiguousarray(
-                np.hstack([positions, normals, uvs]), dtype=np.float32)
-            void_dt = np.dtype((np.void, combined.dtype.itemsize * combined.shape[1]))
-            _, unique_idx, inverse = np.unique(
-                combined.view(void_dt).ravel(),
-                return_index=True, return_inverse=True)
-
-            dedup_pos = combined[unique_idx, :3]
-            dedup_nrm = combined[unique_idx, 3:6]
-            dedup_uvs = combined[unique_idx, 6:8]
-            dedup_indices = inverse.astype(np.uint32)
-            dedup_vert_count = len(unique_idx)
+            # Skip dedup for large meshes (>50K tris) — np.unique is O(N log N)
+            # and takes seconds on multi-million triangle meshes
+            DEDUP_THRESHOLD = 500000
+            if tri_count <= DEDUP_THRESHOLD:
+                combined = np.ascontiguousarray(
+                    np.hstack([positions, normals, uvs]), dtype=np.float32)
+                void_dt = np.dtype((np.void, combined.dtype.itemsize * combined.shape[1]))
+                _, unique_idx, inverse = np.unique(
+                    combined.view(void_dt).ravel(),
+                    return_index=True, return_inverse=True)
+                dedup_pos = combined[unique_idx, :3]
+                dedup_nrm = combined[unique_idx, 3:6]
+                dedup_uvs = combined[unique_idx, 6:8]
+                dedup_indices = inverse.astype(np.uint32)
+                dedup_vert_count = len(unique_idx)
+            else:
+                # Large mesh: use raw unrolled vertices (no dedup, more VRAM but instant)
+                dedup_pos = positions
+                dedup_nrm = normals
+                dedup_uvs = uvs
+                dedup_indices = np.arange(raw_vert_count, dtype=np.uint32)
+                dedup_vert_count = raw_vert_count
 
             # Per-triangle material indices
             tri_mat_indices = np.empty(tri_count, dtype=np.int32)
@@ -460,6 +469,158 @@ def export_lights(depsgraph):
     return lights
 
 
+def export_emissive_triangles_fast(depsgraph, unique_meshes, scene_instances, mat_name_to_index):
+    """Fast emissive triangle export using already-exported mesh data.
+
+    Avoids re-evaluating meshes from Blender (which hangs on large scenes).
+    Uses positions and tri_material_indices from the EXPORT stage.
+
+    Returns a flat list of floats: 16 floats per triangle (max 256 triangles).
+    """
+    MAX_EMISSIVE_TRIS = 256
+    emissive_tris = []
+
+    if not unique_meshes or not scene_instances:
+        return []
+
+    # Build material emission info from depsgraph
+    mat_emission = {}  # mat_name → (emission_rgb, strength)
+    for inst in depsgraph.object_instances:
+        obj = inst.object
+        if obj.type != 'MESH':
+            continue
+        for slot in obj.material_slots:
+            mat = slot.material
+            if mat is None or mat.name in mat_emission:
+                continue
+            em_color = (0.0, 0.0, 0.0)
+            em_strength = 0.0
+            if mat.use_nodes and mat.node_tree:
+                for node in mat.node_tree.nodes:
+                    if node.type == 'BSDF_PRINCIPLED':
+                        es = node.inputs.get('Emission Strength')
+                        em_strength = float(es.default_value) if es else 0.0
+                        if em_strength > 0.0:
+                            ec = node.inputs.get('Emission Color')
+                            if ec and hasattr(ec.default_value, '__len__'):
+                                em_color = tuple(float(ec.default_value[i]) for i in range(3))
+                        break
+                    elif node.type == 'EMISSION':
+                        s = node.inputs.get('Strength')
+                        c = node.inputs.get('Color')
+                        if s: em_strength = float(s.default_value)
+                        if c: em_color = tuple(float(c.default_value[i]) for i in range(3))
+                        break
+            mat_emission[mat.name] = (em_color, em_strength)
+
+    # Process each instance using pre-exported mesh data
+    for inst_data in scene_instances:
+        if len(emissive_tris) >= MAX_EMISSIVE_TRIS:
+            break
+
+        mesh_key = inst_data["mesh_key"]
+        if mesh_key not in unique_meshes:
+            continue
+        mdata = unique_meshes[mesh_key]
+
+        # Check if any material slot has emission
+        slots = inst_data.get("material_slots", [])
+        slot_emission = []
+        for s in slots:
+            if s and s.name in mat_emission:
+                slot_emission.append(mat_emission[s.name])
+            else:
+                slot_emission.append(((0.0, 0.0, 0.0), 0.0))
+        if not slot_emission:
+            slot_emission = [((0.0, 0.0, 0.0), 0.0)]
+
+        # Check if any slot has emission
+        if not any(s[1] > 0.0 for s in slot_emission):
+            continue
+
+        # Use pre-exported positions (already flattened float32)
+        positions = mdata["positions"].reshape(-1, 3).astype(np.float64)
+        tri_mat = mdata["tri_material_indices"]
+        tri_count = mdata["tri_count"]
+        indices = mdata["indices"].reshape(-1, 3) if mdata["index_count"] == tri_count * 3 else None
+        if indices is None:
+            continue
+
+        # Build transform from instance data
+        xf = inst_data["transform_3x4"]
+        mat_world = np.array([
+            [xf[0], xf[1], xf[2], xf[3]],
+            [xf[4], xf[5], xf[6], xf[7]],
+            [xf[8], xf[9], xf[10], xf[11]],
+            [0.0,   0.0,   0.0,    1.0],
+        ], dtype=np.float64)
+
+        # Transform positions to world space (vectorized)
+        ones = np.ones((len(positions), 1), dtype=np.float64)
+        pos_h = np.hstack([positions, ones])
+        world_pos = (mat_world @ pos_h.T).T[:, :3]
+
+        # The transform already converts Z-up → Y-up (done by _matrix_to_3x4_row_major)
+        # so no additional swizzle needed
+
+        n_slots = len(slot_emission)
+        for ti in range(tri_count):
+            if len(emissive_tris) >= MAX_EMISSIVE_TRIS:
+                break
+
+            mat_idx = min(int(tri_mat[ti]), n_slots - 1)
+            em_color, em_strength = slot_emission[max(mat_idx, 0)]
+            if em_strength <= 0.0:
+                continue
+
+            vi = indices[ti]
+            wp0 = world_pos[vi[0]]
+            wp1 = world_pos[vi[1]]
+            wp2 = world_pos[vi[2]]
+
+            edge1 = wp1 - wp0
+            edge2 = wp2 - wp0
+            cross = np.cross(edge1, edge2)
+            area = 0.5 * np.linalg.norm(cross)
+            if area < 1e-8:
+                continue
+
+            emission = (em_color[0] * em_strength,
+                        em_color[1] * em_strength,
+                        em_color[2] * em_strength)
+            luminance = 0.2126 * emission[0] + 0.7152 * emission[1] + 0.0722 * emission[2]
+            power = area * luminance
+
+            emissive_tris.append((power, [
+                wp0[0], wp0[1], wp0[2], area,
+                wp1[0], wp1[1], wp1[2], 0.0,
+                wp2[0], wp2[1], wp2[2], 0.0,
+                emission[0], emission[1], emission[2], 0.0,
+            ]))
+
+    if not emissive_tris:
+        return []
+
+    # Sort by power descending, keep top MAX_EMISSIVE_TRIS
+    emissive_tris.sort(key=lambda x: x[0], reverse=True)
+    emissive_tris = emissive_tris[:MAX_EMISSIVE_TRIS]
+
+    # Build CDF
+    total_power = sum(t[0] for t in emissive_tris)
+    if total_power <= 0.0:
+        return []
+
+    result = []
+    cumulative = 0.0
+    for power, data in emissive_tris:
+        cumulative += power / total_power
+        data[7] = cumulative  # CDF
+        data[11] = total_power
+        result.extend(data)
+
+    return result
+
+
 def export_emissive_triangles(depsgraph):
     """Export emissive mesh triangles for MIS (Multiple Importance Sampling).
 
@@ -553,31 +714,50 @@ def export_emissive_triangles(depsgraph):
         if not slot_emission:
             slot_emission = [((0.0, 0.0, 0.0), 0.0)]
 
-        for tri in mesh.loop_triangles:
-            mat_idx = tri.material_index
-            if mat_idx >= len(slot_emission):
-                mat_idx = 0
+        # Vectorized emissive triangle extraction (avoids per-tri Python loop)
+        tri_count = len(mesh.loop_triangles)
+
+        # Get per-triangle material indices
+        tri_mat_indices = np.empty(tri_count, dtype=np.int32)
+        mesh.loop_triangles.foreach_get("material_index", tri_mat_indices)
+
+        # Get per-triangle vertex indices
+        tri_verts = np.empty(tri_count * 3, dtype=np.int32)
+        mesh.loop_triangles.foreach_get("vertices", tri_verts)
+        tri_verts = tri_verts.reshape(-1, 3)
+
+        # Build emission mask: which triangles have emission > 0
+        n_slots = len(slot_emission)
+        slot_strengths = np.array([s[1] for s in slot_emission], dtype=np.float64)
+        clamped_mat = np.clip(tri_mat_indices, 0, n_slots - 1)
+        emissive_mask = slot_strengths[clamped_mat] > 0.0
+
+        emissive_indices = np.where(emissive_mask)[0]
+        if len(emissive_indices) == 0:
+            eval_obj.to_mesh_clear()
+            continue
+
+        # Transform ALL positions to world space at once (vectorized)
+        ones = np.ones((len(all_positions), 1), dtype=np.float64)
+        pos_h = np.hstack([all_positions, ones])  # (N, 4)
+        world_pos = (mat_world @ pos_h.T).T[:, :3]  # (N, 3)
+
+        # Blender Z-up → Vulkan Y-up: swap Y↔Z, negate new Z
+        world_pos_vk = world_pos[:, [0, 2, 1]].copy()
+        world_pos_vk[:, 2] *= -1.0
+
+        for ti in emissive_indices:
+            if len(emissive_tris) >= MAX_EMISSIVE_TRIS:
+                break
+
+            mat_idx = clamped_mat[ti]
             em_color, em_strength = slot_emission[mat_idx]
-            if em_strength <= 0.0:
-                continue
 
-            # Get local-space vertices
-            vi = tri.vertices
-            lp0 = all_positions[vi[0]]
-            lp1 = all_positions[vi[1]]
-            lp2 = all_positions[vi[2]]
+            vi = tri_verts[ti]
+            wp0 = world_pos_vk[vi[0]]
+            wp1 = world_pos_vk[vi[1]]
+            wp2 = world_pos_vk[vi[2]]
 
-            # Transform to world space (Blender coordinate system)
-            wp0_b = (mat_world @ np.append(lp0, 1.0))[:3]
-            wp1_b = (mat_world @ np.append(lp1, 1.0))[:3]
-            wp2_b = (mat_world @ np.append(lp2, 1.0))[:3]
-
-            # Convert Blender Z-up → Vulkan Y-up
-            wp0 = np.array([wp0_b[0], wp0_b[2], -wp0_b[1]], dtype=np.float64)
-            wp1 = np.array([wp1_b[0], wp1_b[2], -wp1_b[1]], dtype=np.float64)
-            wp2 = np.array([wp2_b[0], wp2_b[2], -wp2_b[1]], dtype=np.float64)
-
-            # Compute area
             edge1 = wp1 - wp0
             edge2 = wp2 - wp0
             cross = np.cross(edge1, edge2)
@@ -585,7 +765,6 @@ def export_emissive_triangles(depsgraph):
             if area < 1e-8:
                 continue
 
-            # Emission = color * strength
             emission = (em_color[0] * em_strength,
                         em_color[1] * em_strength,
                         em_color[2] * em_strength)
