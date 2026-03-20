@@ -26,19 +26,75 @@ jobs:
           echo "VULKAN_SDK=C:\VulkanSDK\$ver" >> $env:GITHUB_ENV
           echo "C:\VulkanSDK\$ver\Bin" >> $env:GITHUB_PATH
 
-      # ── Download DLSS DLLs from NVIDIA repo ─────────────────────
-      - name: Download DLSS DLLs
+      # ── DLSS SDK (headers + lib + runtime DLLs) ────────────────
+      - name: Clone DLSS SDK
         shell: bash
         run: |
-          DLSS_BASE="https://github.com/NVIDIA/DLSS/raw/main/lib/Windows_x86_64/rel"
-          mkdir -p vendor_dlls
-          curl -sL -o vendor_dlls/nvngx_dlss.dll  "$DLSS_BASE/nvngx_dlss.dll"
-          curl -sL -o vendor_dlls/nvngx_dlssd.dll "$DLSS_BASE/nvngx_dlssd.dll"
-          ls -lh vendor_dlls/
+          git clone --depth 1 https://github.com/NVIDIA/DLSS.git vendor/DLSS
+          echo "--- DLSS headers ---"
+          ls vendor/DLSS/include/
+          echo "--- DLSS libs ---"
+          ls vendor/DLSS/lib/Windows_x86_64/x86_64/
+          echo "--- DLSS DLLs ---"
+          ls -lh vendor/DLSS/lib/Windows_x86_64/rel/
 
-      # ── Build ignis_rt.dll ──────────────────────────────────────
+      # ── NRD SDK (build from source — MIT license) ──────────────
+      - name: Clone and build NRD
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/NVIDIAGameWorks/NRD.git vendor/NRD
+          cd vendor/NRD
+          # NRD uses its own build script to prepare the SDK
+          # First, update dependencies (ShaderMake, MathLib)
+          git submodule update --init --recursive 2>/dev/null || true
+
+      - name: Build NRD
+        shell: cmd
+        run: |
+          cd vendor\NRD
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release
+          if exist "build\Release\NRD.dll" (
+            echo NRD.dll built successfully
+          ) else (
+            echo Checking for SDK layout...
+            dir /s /b NRD.dll 2>nul || echo NRD.dll not found, checking _Bin...
+            dir /s /b _Bin 2>nul || echo _Bin not found either
+          )
+
+      # Fallback: if NRD build puts DLL in non-standard location, find it
+      - name: Locate NRD artifacts
+        shell: bash
+        run: |
+          echo "--- Searching for NRD.lib ---"
+          find vendor/NRD -name "NRD.lib" -type f 2>/dev/null || echo "NRD.lib not found"
+          echo "--- Searching for NRD.dll ---"
+          find vendor/NRD -name "NRD.dll" -type f 2>/dev/null || echo "NRD.dll not found"
+          echo "--- Searching for NRD.h ---"
+          find vendor/NRD -name "NRD.h" -path "*/Include/*" -type f 2>/dev/null || echo "NRD.h not found"
+
+      # ── Prepare NGX SDK layout for CMake ───────────────────────
+      # CMake expects: NGX_ROOT/include/ngx/*.h + NGX_ROOT/lib/nvsdk_ngx_d.lib
+      - name: Prepare NGX SDK layout
+        shell: bash
+        run: |
+          mkdir -p vendor/ngx_sdk/include/ngx
+          mkdir -p vendor/ngx_sdk/lib
+          cp vendor/DLSS/include/*.h vendor/ngx_sdk/include/ngx/
+          cp vendor/DLSS/include/nvsdk_ngx_helpers_dlssd*.h vendor/ngx_sdk/include/ngx/ 2>/dev/null || true
+          # Stub lib for linker
+          cp vendor/DLSS/lib/Windows_x86_64/x86_64/nvsdk_ngx_d.lib vendor/ngx_sdk/lib/
+          echo "--- NGX SDK layout ---"
+          find vendor/ngx_sdk -type f | head -20
+
+      # ── Build ignis_rt.dll (with DLSS + NRD) ──────────────────
       - name: Configure CMake
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
+            -DIGNIS_USE_NRD=ON `
+            -DIGNIS_USE_DLSS=ON `
+            -DIGNIS_NRD_ROOT="${{ github.workspace }}/vendor/NRD" `
+            -DIGNIS_NGX_ROOT="${{ github.workspace }}/vendor/ngx_sdk"
 
       - name: Build
         run: cmake --build build --config Release
@@ -55,21 +111,24 @@ jobs:
           cp blender/ignis_rt/blender_manifest.toml staging/ignis_rt/ 2>/dev/null || true
           cp -r blender/ignis_rt/icons staging/ignis_rt/ 2>/dev/null || true
 
-          # DLL (built)
+          # DLL (built with DLSS + NRD support)
           cp build/Release/ignis_rt.dll staging/ignis_rt/lib/
 
-          # Vendor DLLs (DLSS SR + RR)
-          cp vendor_dlls/nvngx_dlss.dll  staging/ignis_rt/lib/
-          cp vendor_dlls/nvngx_dlssd.dll staging/ignis_rt/lib/
+          # DLSS runtime DLLs (from NVIDIA repo — redistribution allowed)
+          cp vendor/DLSS/lib/Windows_x86_64/rel/nvngx_dlss.dll  staging/ignis_rt/lib/
+          cp vendor/DLSS/lib/Windows_x86_64/rel/nvngx_dlssd.dll staging/ignis_rt/lib/
 
-          # NRD DLL + composite shader (from repo lib/)
-          cp blender/ignis_rt/lib/NRD.dll          staging/ignis_rt/lib/ 2>/dev/null || true
-          cp blender/ignis_rt/lib/nrd_composite.spv staging/ignis_rt/lib/ 2>/dev/null || true
+          # NRD runtime DLL (MIT license)
+          find vendor/NRD -name "NRD.dll" -type f -exec cp {} staging/ignis_rt/lib/ \; 2>/dev/null
+          ls -lh staging/ignis_rt/lib/NRD.dll 2>/dev/null || echo "WARNING: NRD.dll not found"
 
           # Compiled shaders
           cp shaders/*.spv staging/ignis_rt/shaders/
           mkdir -p staging/ignis_rt/shaders/wavefront
           cp shaders/wavefront/*.spv staging/ignis_rt/shaders/wavefront/ 2>/dev/null || true
+
+          echo "=== Addon contents ==="
+          find staging/ignis_rt -type f | sort
 
       # ── Inject version from release tag into manifest ──────────
       - name: Inject release version
