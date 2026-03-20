@@ -221,9 +221,15 @@ def export_meshes(depsgraph):
         if hasattr(obj, 'visible_camera') and not obj.visible_camera:
             continue
 
-        # Each object gets its own BLAS (safe: modifiers produce unique geometry)
-        mesh_key = obj.name
-        obj_to_mesh_key[obj.name] = mesh_key
+        # Each object gets its own BLAS (safe: modifiers produce unique geometry).
+        # Include library path for linked objects to avoid name collisions
+        # (e.g., "Cube.026" in classroom vs "Cube.026" in coatStand.blend)
+        if obj.library:
+            mesh_key = f"{obj.library.filepath}:{obj.name}"
+        else:
+            mesh_key = obj.name
+        # Use same library-qualified key for the mapping (avoids collision in transform sync)
+        obj_to_mesh_key[mesh_key] = mesh_key
 
         if mesh_key in skipped_meshes:
             continue
@@ -1821,9 +1827,11 @@ def export_materials(depsgraph, hidden_objects=None):
                     mat_name_to_index['__ignis_default__'] = len(mat_list)
                     mat_list.append(None)
                 continue
-            if mat.name in mat_name_to_index:
+            # Use library-qualified name for materials from linked .blend files
+            mat_key = f"{mat.library.filepath}:{mat.name}" if mat.library else mat.name
+            if mat_key in mat_name_to_index:
                 continue
-            mat_name_to_index[mat.name] = len(mat_list)
+            mat_name_to_index[mat_key] = len(mat_list)
             mat_list.append(mat)
 
     # Collect unique textures across all materials
