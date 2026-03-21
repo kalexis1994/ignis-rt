@@ -89,6 +89,7 @@ VkFormat TextureManager::DXGIFormatToVulkan(unsigned int dxgiFormat) {
         case 96:  return VK_FORMAT_BC6H_SFLOAT_BLOCK;
         case 98:  return VK_FORMAT_BC7_UNORM_BLOCK;
         case 99:  return VK_FORMAT_BC7_SRGB_BLOCK;
+        case 10:  return VK_FORMAT_R16G16B16A16_SFLOAT;  // DXGI_FORMAT_R16G16B16A16_FLOAT
         case 28:  return VK_FORMAT_R8G8B8A8_UNORM;
         case 29:  return VK_FORMAT_R8G8B8A8_SRGB;
         case 87:  return VK_FORMAT_B8G8R8A8_UNORM;
@@ -122,6 +123,9 @@ void TextureManager::CalculateMipOffsetAndSize(int width, int height, int mipLev
         case VK_FORMAT_BC7_UNORM_BLOCK:
         case VK_FORMAT_BC7_SRGB_BLOCK:
             blockSize = 16;
+            break;
+        case VK_FORMAT_R16G16B16A16_SFLOAT:
+            blockSize = 8; // 2 bytes × 4 channels
             break;
         default:
             blockSize = 4; // RGBA8 fallback
@@ -227,7 +231,20 @@ int TextureManager::AddTexture(const KN5Texture& kn5Tex) {
     bool isSTB = false;
     stbi_uc* stbPixels = nullptr;
 
-    if (!isDDS) {
+    // Raw HDR texture: if dxgiFormat is explicitly set (non-zero) and not DDS,
+    // treat data as raw pixels in the specified format (e.g., float16 RGBA from HDRI export)
+    bool isRawHDR = false;
+    if (!isDDS && kn5Tex.dxgiFormat != 0 && kn5Tex.width > 0 && kn5Tex.height > 0) {
+        width = kn5Tex.width;
+        height = kn5Tex.height;
+        mipCount = kn5Tex.mipLevels > 0 ? kn5Tex.mipLevels : 1;
+        dxgiFormat = kn5Tex.dxgiFormat;
+        isRawHDR = true;
+        Log(L"[VK TextureMgr] Raw HDR %S: %dx%d dxgi=%u dataSize=%zu\n",
+            kn5Tex.name.c_str(), width, height, dxgiFormat, kn5Tex.data.size());
+    }
+
+    if (!isDDS && !isRawHDR) {
         // Try loading as PNG/JPG with stb_image
         int stbChannels = 0;
         stbPixels = stbi_load_from_memory(kn5Tex.data.data(), (int)kn5Tex.data.size(),
@@ -239,8 +256,15 @@ int TextureManager::AddTexture(const KN5Texture& kn5Tex) {
             Log(L"[VK TextureMgr] Loaded %S as PNG/JPG (%dx%d, %d channels)\n",
                 kn5Tex.name.c_str(), width, height, stbChannels);
         } else {
-            Log(L"[VK TextureMgr] Failed to load %S (not DDS, not PNG/JPG)\n", kn5Tex.name.c_str());
-            return -1;
+            const char* stbErr = stbi_failure_reason();
+            Log(L"[VK TextureMgr] Failed to load %S: %S — inserting 1x1 flat dummy\n",
+                kn5Tex.name.c_str(), stbErr ? stbErr : "unknown error");
+            // Insert a 1x1 dummy texture to keep indices aligned.
+            // Use flat normal blue (128,128,255) so failed normal maps don't distort shading.
+            width = 1; height = 1; mipCount = 1; dxgiFormat = 28; // RGBA8
+            stbPixels = (stbi_uc*)STBI_MALLOC(4);
+            stbPixels[0] = 128; stbPixels[1] = 128; stbPixels[2] = 255; stbPixels[3] = 255; // flat normal blue
+            isSTB = true;
         }
     }
 
@@ -345,7 +369,11 @@ int TextureManager::AddTexture(const KN5Texture& kn5Tex) {
     VkDeviceSize srcDataSize = 0;
     const uint8_t* srcPixels = nullptr;
 
-    if (isSTB) {
+    if (isRawHDR) {
+        // Raw HDR: data is already in the target format (e.g., float16 RGBA)
+        srcDataSize = kn5Tex.data.size();
+        srcPixels = kn5Tex.data.data();
+    } else if (isSTB) {
         // stb_image: already decoded to RGBA8
         srcDataSize = (VkDeviceSize)width * height * 4;
         srcPixels = stbPixels;

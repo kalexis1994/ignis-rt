@@ -34,7 +34,7 @@ layout(binding = 2, set = 0) uniform CameraProperties {
     // Point/spot lights
     uint lightCount;
     uint lightPad0, lightPad1, lightPad2;
-    vec4 lights[32]; // 8 lights × 4 vec4s: [pos.xyz+range, col.rgb+intensity, dir.xyz+sizeX, tan.xyz+sizeY]
+    vec4 lights[128]; // 32 lights × 4 vec4s: [pos.xyz+range, col.rgb+intensity, dir.xyz+sizeX, tan.xyz+sizeY]
 } cam;
 
 // Geometry metadata
@@ -240,9 +240,11 @@ vec3 proceduralSky(vec3 dir, vec3 sunDirL, vec3 ambColor, vec3 sunTint) {
 }
 
 vec2 directionToEquirectangular(vec3 dir) {
-    // Blender/Cycles convention: Y-up in our engine
-    // phi = atan2(dir.x, -dir.z), theta = acos(dir.y)
-    float u = atan(dir.x, -dir.z) / (2.0 * PI) + 0.5;
+    // Match Cycles' equirectangular mapping (Z-up → our Y-up):
+    // Cycles: u = atan2(cy, cx) / (-2*PI) + 0.5  where cx=dir.x, cy=dir.y (Z-up)
+    // Our Y-up: Cycles.x = our.x, Cycles.y = -our.z, Cycles.z = our.y
+    float phi = atan(-dir.z, dir.x);
+    float u = 0.5 - phi / (2.0 * PI);
     float v = acos(clamp(dir.y, -1.0, 1.0)) / PI;
     return vec2(u, v);
 }
@@ -253,7 +255,9 @@ vec3 evaluateSky(vec3 dir) {
     if (hdriIdx >= 0) {
         float hdriStrength = cam.windParams.y;
         vec2 uv = directionToEquirectangular(dir);
+        // Sample HDRI — float16 texture preserves full HDR range natively
         vec3 hdriColor = texture(textures[nonuniformEXT(uint(hdriIdx))], uv).rgb;
+
         return hdriColor * hdriStrength;
     }
 
@@ -313,8 +317,13 @@ PBRHit evaluateBlenderMaterial(
     hit.roughness = clamp(mat.ksSpecularEXP, 0.01, 1.0);
     hit.metallic = clamp(mat.fresnelC, 0.0, 1.0);
     hit.specularLevel = mat.fresnelEXP;
+
+    // If material has stochastic passthrough, disable glass refraction.
+    // Passthrough handles transparency; remaining rays do reflection (metallic=1).
+    float tpCheck = mat.multB;
+    hit.transmission = (tpCheck > 0.0) ? 0.0 : mat.multR;
     hit.ior = mat.detailUVMultiplier;
-    hit.transmission = mat.multR;
+    // transmission already set above (with passthrough override)
 
     // Base color + alpha: texture or scalar fallback
     float texAlpha = 1.0;
@@ -324,8 +333,27 @@ PBRHit evaluateBlenderMaterial(
         texAlpha = texColor.a;
     } else {
         hit.baseColor = vec3(mat.ksAmbient, mat.ksDiffuse, mat.ksSpecular);
+        // No diffuse texture — read alpha from emission texture if present
+        // (fire/billboard materials use emission texture for both color and alpha)
+        if (mat.detailTexIndex != 0xFFFFFFFFu) {
+            texAlpha = texture(textures[nonuniformEXT(mat.detailTexIndex)], uv).a;
+        }
     }
     hit.alpha = texAlpha * mat.multG;
+
+    // Hue/Saturation/Value adjustment (from HUE_SAT node in Base Color chain)
+    // detailNMMult = color_value (brightness), detailNMMultV = color_saturation
+    float colorValue = mat.detailNMMult;
+    float colorSaturation = mat.detailNMMultV;
+    if (colorValue != 1.0 || colorSaturation != 1.0) {
+        // Apply value (brightness multiplier)
+        hit.baseColor *= colorValue;
+        // Apply saturation (0 = grayscale, 1 = original)
+        if (colorSaturation < 1.0) {
+            float lum = dot(hit.baseColor, vec3(0.2126, 0.7152, 0.0722));
+            hit.baseColor = mix(vec3(lum), hit.baseColor, colorSaturation);
+        }
+    }
 
     // ORM map: R=occlusion, G=roughness, B=metallic (standard convention)
     if (mat.mapsTexIndex != 0xFFFFFFFFu) {
@@ -390,7 +418,14 @@ PBRHit evaluateBlenderMaterial(
     // bounces, so emission_strength=1 matches Cycles perceived brightness.
     vec3 emissionColor = vec3(mat.emissiveR, mat.emissiveG, mat.emissiveB);
     if (mat.detailTexIndex != 0xFFFFFFFFu) {
-        emissionColor *= texture(textures[nonuniformEXT(mat.detailTexIndex)], uv).rgb;
+        vec3 emTex = texture(textures[nonuniformEXT(mat.detailTexIndex)], uv).rgb;
+        // If scalar emission is black but texture exists, use texture directly
+        // (Blender Emission Color default is black when texture provides the color)
+        if (dot(emissionColor, emissionColor) < 0.001) {
+            emissionColor = emTex;
+        } else {
+            emissionColor *= emTex;
+        }
     }
     hit.emission = emissionColor * mat.fresnelMaxLevel * PI;
 
@@ -650,13 +685,31 @@ void main() {
         vec2 uv2_ = vec2(uvData.uv[i2*2+0], 1.0 - uvData.uv[i2*2+1]);
         vec2 hitUV = uv0_ * bary.x + uv1_ * bary.y + uv2_ * bary.z;
 
-        // Fetch material
+        // Fetch material (need matIdx before UV scale)
         uint matIdx = 0u;
         if (geo.primMaterialBufferAddress != 0u) {
             PrimMaterials primMats = PrimMaterials(geo.primMaterialBufferAddress);
             matIdx = primMats.m[primitiveId];
         }
         Material mat = materialBuffer.materials[matIdx];
+
+        // Apply UV scale from Mapping node (stored in multA, magicMult)
+        float uvScaleX = mat.multA;
+        float uvScaleY = mat.magicMult;
+        if (uvScaleX != 1.0 || uvScaleY != 1.0) {
+            hitUV *= vec2(uvScaleX, uvScaleY);
+        }
+
+        // DEBUG: material index visualization (debugView == 99)
+        if (cam.parameters.y == 99u && bounce == 0 && sampleIdx == 0) {
+            float r = float(matIdx % 7u) / 6.0;
+            float g = float((matIdx / 7u) % 7u) / 6.0;
+            float b = float((matIdx / 49u) % 7u) / 6.0;
+            imageStore(dlssDepthImg, pixel, vec4(0.5, 0, 0, 0));
+            totalRadiance = vec3(r, g, b);
+            diffuseRadiance = totalRadiance;
+            break;
+        }
 
         // Evaluate PBR material
         PBRHit pbrHit = evaluateBlenderMaterial(
@@ -687,9 +740,21 @@ void main() {
         }
 
         // ---- Stochastic transparent passthrough (Cycles-style) ----
-        // mat.multB = transparent_prob: probability that the ray passes straight through.
-        // This handles Transparent BSDF in Mix/Add Shader without refraction.
+        // For materials with Transparent BSDF (tp > 0), use Fresnel to determine
+        // pass-through vs reflection probability. At normal incidence most light
+        // passes through; at grazing angles reflection dominates.
+        // This matches Cycles' behavior for architectural glass (Transparent + Glossy).
         float transparentProb = mat.multB;
+        // For glass+transparent materials: use Fresnel to split pass-through vs reflection.
+        // At normal incidence ~96% passes, ~4% reflects (matches Glass BSDF Fresnel).
+        if (transparentProb > 0.0) {
+            float cosTheta = abs(dot(N, -rayDir));
+            float iorGlass = max(pbrHit.ior, 1.01);
+            float f0 = (iorGlass - 1.0) / (iorGlass + 1.0);
+            f0 = f0 * f0;
+            float fresnelRefl = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
+            transparentProb = 1.0 - fresnelRefl;  // Fresnel transmission probability
+        }
         if (transparentProb > 0.0 && rand01() < transparentProb) {
             // Ray passes through — no refraction, no absorption (like Cycles Transparent BSDF)
             rayOrigin = worldPos + rayDir * 0.002;
@@ -750,7 +815,7 @@ void main() {
         // ---- NEE throughput early-out (skip shadow rays when contribution is negligible) ----
         float maxThroughput = max(throughput.r, max(throughput.g, throughput.b));
         bool skipSunNEE = (bounce >= 2 && maxThroughput < 0.01);
-        bool skipLocalNEE = (bounce >= 2);  // point/spot/emissive only on bounce 0-1
+        bool skipLocalNEE = false;  // NEE on all bounces (Cycles behavior)
 
         // Glass/transmission surfaces don't scatter light — skip NEE entirely.
         // Light reaches through glass via refraction paths, not direct illumination.
@@ -759,6 +824,18 @@ void main() {
         if (isGlass) {
             skipSunNEE = true;
             skipLocalNEE = true;
+        }
+
+        // On higher bounces: sample 1 random light instead of all (importance sampling)
+        // Scale contribution by lightCount to maintain unbiased estimate
+        uint neeStart = 0u;
+        uint neeEnd = min(cam.lightCount, 32u);
+        float neeScale = 1.0;
+        if (bounce >= 2 && cam.lightCount > 1u && !skipLocalNEE) {
+            uint randIdx = min(uint(rand01() * float(cam.lightCount)), cam.lightCount - 1u);
+            neeStart = randIdx;
+            neeEnd = randIdx + 1u;
+            neeScale = float(cam.lightCount);
         }
 
         // ---- NEE: Direct sun light ----
@@ -848,31 +925,18 @@ void main() {
                 );
 
                 if (bounce == 0) {
-                    bool rrMode = (cam.parameters.w == 2u);
-                    if (rrMode) {
-                        // RR mode: apply shadow directly — no SIGMA separation needed.
-                        // Ray Reconstruction handles denoising of the shadowed signal.
-                        float shadow = inShadow ? 0.0 : 1.0;
-                        diffuseRadiance += diffContrib * sunRadiance * throughput * shadow;
-                        specularRadiance += specContrib * sunRadiance * throughput * shadow;
-                    } else {
-                        // CP2077-style shadow separation:
-                        // Write UNSHADOWED direct light to NRD (RELAX sees stable signal).
-                        // SIGMA denoises the shadow separately; composite re-applies it.
-                        vec3 sunDiffContrib = diffContrib * sunRadiance * throughput;
-                        diffuseRadiance += sunDiffContrib;
-                        directSunDiffuse = sunDiffContrib;  // remember for sunFraction
-                        specularRadiance += specContrib * sunRadiance * throughput;
+                    // Always apply shadow directly (works for both RR and NRD modes)
+                    float shadow = inShadow ? 0.0 : 1.0;
+                    diffuseRadiance += diffContrib * sunRadiance * throughput * shadow;
+                    specularRadiance += specContrib * sunRadiance * throughput * shadow;
 
-                        // Store penumbra for SIGMA
-                        primaryNdotLSample = NdotL;
-                        if (inShadow) {
-                            // Penumbra radius = distToOccluder * tanAngle * 0.5
-                            float sigmaTanAngle = 0.04;
-                            primaryPenumbraSample = min(shadowHitDist * sigmaTanAngle * 0.5, 32768.0);
-                        } else {
-                            primaryPenumbraSample = 65504.0;  // fully lit
-                        }
+                    // Store penumbra for SIGMA (NRD fallback)
+                    primaryNdotLSample = NdotL;
+                    if (inShadow) {
+                        float sigmaTanAngle = 0.04;
+                        primaryPenumbraSample = min(shadowHitDist * sigmaTanAngle * 0.5, 32768.0);
+                    } else {
+                        primaryPenumbraSample = 65504.0;
                     }
                 } else {
                     // Indirect bounces: apply shadow directly (SIGMA only handles primary)
@@ -889,7 +953,7 @@ void main() {
 
         // ---- NEE: Point/spot/area lights (bounce 0-1 only) ----
         if (!skipLocalNEE)
-        for (uint li = 0u; li < cam.lightCount && li < 8u; li++) {
+        for (uint li = neeStart; li < neeEnd; li++) {
             vec4 lightPosRange = cam.lights[li * 4u];
             vec4 lightColInt   = cam.lights[li * 4u + 1u];
             vec4 lightDirSizeX = cam.lights[li * 4u + 2u];
@@ -900,9 +964,21 @@ void main() {
             vec3 lightColor = lightColInt.rgb;
             float lightInt  = lightColInt.w;
 
-            // Negative range = area light
-            bool isAreaLight = (rawRange < 0.0);
-            float lightRange = isAreaLight ? max(sqrt(lightInt / 0.01), 1.0) : rawRange;
+            // Negative range = area or spot light
+            bool isSpecialLight = (rawRange < 0.0);
+            float sizeY = lightTanSizeY.w;
+            // Distinguish: spot light has negative sizeY (negated spot_smooth),
+            // area light has positive sizeY (physical dimension in meters)
+            bool isSpotLight = isSpecialLight && sizeY < 0.0;
+            bool isAreaLight = isSpecialLight && !isSpotLight;
+            float lightRange;
+            if (isAreaLight) {
+                lightRange = max(sqrt(lightInt / 0.01), 1.0);
+            } else if (isSpotLight) {
+                lightRange = -rawRange;
+            } else {
+                lightRange = rawRange;
+            }
             lightRange = min(lightRange, 100.0);
 
             vec3 toLight = lightPos - pbrHit.worldPos;
@@ -911,6 +987,19 @@ void main() {
             vec3 L = toLight / dist;
             float NdotL_pt = dot(N, L);
             if (NdotL_pt <= 0.0) continue;
+
+            // Spot light: cone attenuation (Cycles formula)
+            if (isSpotLight) {
+                vec3 spotDir = lightDirSizeX.xyz;
+                float cosHalfAngle = lightDirSizeX.w;
+                float spotSmooth = abs(lightTanSizeY.w);  // negated in export as spot flag
+                float cosAngle = dot(-L, spotDir);
+                // smoothstep((cosAngle - cosHalfAngle) * spotSmooth)
+                float t = clamp((cosAngle - cosHalfAngle) * spotSmooth, 0.0, 1.0);
+                float spotAtten = t * t * (3.0 - 2.0 * t);  // Hermite smoothstep
+                if (spotAtten <= 0.0) continue;
+                lightInt *= spotAtten;
+            }
 
             // Area light: check direction cull and sample on the light plane
             vec3 jitteredTarget;
@@ -951,11 +1040,9 @@ void main() {
             // For point lights: use distance to center (jitter is just for soft shadows)
             float effectiveDist = isAreaLight ? sampleDist : dist;
 
-            // Inverse-square falloff with windowed range
-            float falloff = 1.0 / (effectiveDist * effectiveDist + 0.01);
-            float window = clamp(1.0 - pow(effectiveDist / lightRange, 4.0), 0.0, 1.0);
-            window = window * window;
-            float attenuation = falloff * window;
+            // Inverse-square falloff (physically correct, like Cycles)
+            float falloff = 1.0 / (effectiveDist * effectiveDist + 0.001);
+            float attenuation = falloff;
 
             // Area light: multiply by area (uniform sampling PDF = 1/area)
             // and cosine at light surface for correct geometric term
@@ -1013,10 +1100,10 @@ void main() {
 
             if (bounce == 0) {
                 // Point lights: apply shadow directly (SIGMA only handles sun)
-                diffuseRadiance += diffC * lightRadiance * shadow * throughput;
-                specularRadiance += specC * lightRadiance * shadow * throughput;
+                diffuseRadiance += diffC * lightRadiance * shadow * throughput * neeScale;
+                specularRadiance += specC * lightRadiance * shadow * throughput * neeScale;
             } else {
-                vec3 directLight = (diffC + specC) * lightRadiance * shadow;
+                vec3 directLight = (diffC + specC) * lightRadiance * shadow * neeScale;
                 if (isDiffusePath) {
                     diffuseRadiance += directLight * throughput * giIntensity;
                 } else {
@@ -1142,24 +1229,26 @@ void main() {
             if (glassBounces >= MAX_GLASS_BOUNCES) break;
 
             float eta = frontFace ? (1.0 / pbrHit.ior) : pbrHit.ior;
-            float alpha = max(pbrHit.roughness * pbrHit.roughness, 0.001);
+            float alpha = pbrHit.roughness * pbrHit.roughness;
 
             // Sample microfacet normal (GGX) for rough glass
+            // Cycles: when alpha² < 2e-10, treat as perfectly specular (H = N, no sampling)
             vec3 V = -rayDir;
             vec3 H;
-            if (alpha > 0.002) {
-                // GGX importance sampling of half-vector
+            bool singularGlass = (alpha < 0.0005);  // ~roughness < 0.022
+            if (!singularGlass && alpha > 0.0) {
+                // GGX importance sampling of half-vector (rough glass)
+                alpha = max(alpha, 0.001);
                 vec2 xi = rand2();
                 float phi = 2.0 * PI * xi.x;
                 float cosTheta = sqrt((1.0 - xi.y) / (1.0 + (alpha * alpha - 1.0) * xi.y));
                 float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
-                // Build TBN from N
                 vec3 up = abs(N.y) < 0.999 ? vec3(0,1,0) : vec3(1,0,0);
                 vec3 tanX = normalize(cross(up, N));
                 vec3 tanY = cross(N, tanX);
                 H = normalize(sinTheta * cos(phi) * tanX + sinTheta * sin(phi) * tanY + cosTheta * N);
             } else {
-                H = N;
+                H = N;  // Perfect specular: no microfacet scatter
             }
 
             // Fresnel at microfacet (use full IOR for correct reflections)

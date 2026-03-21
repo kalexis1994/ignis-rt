@@ -172,6 +172,12 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         description="Cull back-facing triangles (skip geometry facing away from camera)",
         update=_tag_redraw,
     )
+    debug_view: IntProperty(
+        name="Debug View",
+        default=0, min=0, max=99,
+        description="Debug visualization (0=off, 99=material index)",
+        update=_tag_redraw,
+    )
 
     # -- DLSS --
     dlss_enabled: BoolProperty(
@@ -287,6 +293,8 @@ class IGNIS_PT_sampling(bpy.types.Panel):
         layout.prop(props, "show_fps")
         layout.separator()
         layout.operator("ignis.reload_scene", icon='FILE_REFRESH')
+        layout.separator()
+        layout.prop(props, "debug_view")
 
 
 class IGNIS_PT_status(bpy.types.Panel):

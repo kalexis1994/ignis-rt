@@ -128,6 +128,170 @@ def _matrix_to_3x4_row_major(blender_matrix):
     return m[:3, :].flatten().tolist()
 
 
+def _export_particle_hair(eval_obj, particle_system, depsgraph):
+    """Convert particle hair strands to cross-shaped quad geometry.
+
+    Each strand becomes 2 perpendicular quads (4 tris) for visibility from all angles.
+    Uses co_object() for correct coordinate space (like Cycles' BKE_particle_co_hair).
+
+    Returns mesh dict compatible with unique_meshes format, or None if no hair.
+    """
+    ps = particle_system
+    particles = ps.particles
+    if len(particles) == 0:
+        return None
+
+    settings = ps.settings
+
+    # Find the ParticleSystem modifier for co_object()
+    ps_modifier = None
+    for mod in eval_obj.modifiers:
+        if mod.type == 'PARTICLE_SYSTEM' and mod.particle_system == ps:
+            ps_modifier = mod
+            break
+
+    # Hair width: use particle render size, or estimate from strand length
+    hair_radius = getattr(settings, 'radius_scale', 0.0)
+    if hair_radius <= 0:
+        # Estimate from first strand using co_object for correct positions
+        if len(particles) > 0 and len(particles[0].hair_keys) >= 2:
+            p0_keys = particles[0].hair_keys
+            if ps_modifier:
+                p0 = np.array(p0_keys[0].co_object(eval_obj, ps_modifier, particles[0]), dtype=np.float32)
+                p1 = np.array(p0_keys[-1].co_object(eval_obj, ps_modifier, particles[0]), dtype=np.float32)
+            else:
+                p0 = np.array(p0_keys[0].co, dtype=np.float32)
+                p1 = np.array(p0_keys[-1].co, dtype=np.float32)
+            strand_len = np.linalg.norm(p1 - p0)
+            hair_radius = max(strand_len * 0.05, 0.005)
+        else:
+            hair_radius = 0.01
+
+    all_positions = []
+    all_normals = []
+    all_uvs = []
+    all_indices = []
+    all_mat_indices = []
+    vert_offset = 0
+
+    # Material index from particle settings
+    mat_idx = getattr(settings, 'material', 1) - 1  # 1-based in Blender
+    if mat_idx < 0:
+        mat_idx = 0
+
+    for p_idx, particle in enumerate(particles):
+        hair_keys = particle.hair_keys
+        n_keys = len(hair_keys)
+        if n_keys < 2:
+            continue
+
+        # Extract hair key positions in OBJECT LOCAL space
+        # co_object() returns the correct position (like Cycles' BKE_particle_co_hair)
+        keys = np.empty((n_keys, 3), dtype=np.float32)
+        if ps_modifier:
+            for ki in range(n_keys):
+                keys[ki] = hair_keys[ki].co_object(eval_obj, ps_modifier, particle)
+        else:
+            raw = np.empty(n_keys * 3, dtype=np.float32)
+            hair_keys.foreach_get("co", raw)
+            keys = raw.reshape(-1, 3)
+
+        root = keys[0]
+        tip = keys[-1]
+        strand_dir = tip - root
+        strand_len = np.linalg.norm(strand_dir)
+
+        # Log first strand
+        if p_idx == 0:
+            import os
+            try:
+                with open(os.path.join(os.path.expanduser("~"), "ignis-rt.log"), "a") as _lf:
+                    _lf.write(f"[ignis-hair] co_object strand: root=({root[0]:.4f},{root[1]:.4f},{root[2]:.4f}) "
+                              f"tip=({tip[0]:.4f},{tip[1]:.4f},{tip[2]:.4f}) len={strand_len:.4f} radius={hair_radius:.4f}\n")
+                    _lf.flush()
+            except Exception:
+                pass
+        if strand_len < 1e-8:
+            continue
+
+        # Generate a cross-shaped pair of quads per strand for visibility from all angles.
+        # Each quad: 2 triangles, aligned along the strand, rotated 90° from each other.
+        # This gives volume without needing camera-facing billboards.
+        strand_up = strand_dir / strand_len
+
+        # First perpendicular direction
+        ref = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        if abs(np.dot(strand_up, ref)) > 0.9:
+            ref = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        perp1 = np.cross(strand_up, ref)
+        perp1 /= max(np.linalg.norm(perp1), 1e-8)
+
+        # Second perpendicular (90° rotated)
+        perp2 = np.cross(strand_up, perp1)
+        perp2 /= max(np.linalg.norm(perp2), 1e-8)
+
+        # For each cross direction, create a quad from root to tip
+        for perp in [perp1, perp2]:
+            v_base = vert_offset
+            quad_verts = np.empty((4, 3), dtype=np.float32)
+            quad_normals = np.empty((4, 3), dtype=np.float32)
+            quad_uvs = np.empty((4, 2), dtype=np.float32)
+
+            # Root: wider
+            quad_verts[0] = root - perp * hair_radius
+            quad_verts[1] = root + perp * hair_radius
+            # Tip: narrower (taper)
+            quad_verts[2] = tip - perp * hair_radius * 0.3
+            quad_verts[3] = tip + perp * hair_radius * 0.3
+
+            # Normal: perpendicular to quad face
+            normal = np.cross(perp, strand_up)
+            n_len = np.linalg.norm(normal)
+            if n_len > 1e-8:
+                normal /= n_len
+            quad_normals[:] = normal
+
+            quad_uvs[0] = [0.0, 0.0]
+            quad_uvs[1] = [1.0, 0.0]
+            quad_uvs[2] = [0.0, 1.0]
+            quad_uvs[3] = [1.0, 1.0]
+
+            all_positions.append(quad_verts)
+            all_normals.append(quad_normals)
+            all_uvs.append(quad_uvs)
+
+            # Two triangles per quad (both sides visible — no backface cull for hair)
+            all_indices.extend([v_base, v_base+2, v_base+1,
+                                v_base+1, v_base+2, v_base+3])
+            all_mat_indices.extend([mat_idx, mat_idx])
+            vert_offset += 4
+
+    if not all_positions:
+        return None
+
+    positions = np.concatenate(all_positions, axis=0).astype(np.float32)
+    normals = np.concatenate(all_normals, axis=0).astype(np.float32)
+    uvs = np.concatenate(all_uvs, axis=0).astype(np.float32)
+    indices = np.array(all_indices, dtype=np.uint32)
+    mat_indices = np.array(all_mat_indices, dtype=np.int32)
+
+    tri_count = len(mat_indices)
+    vert_count = len(positions)
+
+    return {
+        "name": f"hair_{eval_obj.name}",
+        "positions": np.ascontiguousarray(positions.flatten(), dtype=np.float32),
+        "normals": np.ascontiguousarray(normals.flatten(), dtype=np.float32),
+        "uvs": np.ascontiguousarray(uvs.flatten(), dtype=np.float32),
+        "indices": np.ascontiguousarray(indices, dtype=np.uint32),
+        "vertex_count": vert_count,
+        "index_count": len(indices),
+        "tri_count": tri_count,
+        "raw_vert_count": vert_count,
+        "tri_material_indices": mat_indices,
+    }
+
+
 def export_meshes(depsgraph):
     """Export mesh data with instancing and vertex deduplication.
 
@@ -341,6 +505,52 @@ def export_meshes(depsgraph):
             "visible_camera": getattr(obj, 'visible_camera', '?'),
         })
 
+    # Export particle hair as ribbon meshes
+    for instance in depsgraph.object_instances:
+        obj = instance.object
+        if obj.type != 'MESH':
+            continue
+        if not instance.show_self or obj.name in hidden_by_collection:
+            continue
+        # Check for particle systems with HAIR type
+        eval_obj = obj.evaluated_get(depsgraph)
+        for ps_idx, ps in enumerate(eval_obj.particle_systems):
+            if ps.settings.type != 'HAIR':
+                continue
+            if ps.settings.render_type != 'PATH':
+                continue
+
+            hair_key = f"{obj.name}__hair_{ps_idx}"
+            if obj.library:
+                hair_key = f"{obj.library.filepath}:{hair_key}"
+            if hair_key in unique_meshes:
+                continue
+
+            # Extract hair strands and convert to ribbon mesh
+            hair_mesh = _export_particle_hair(eval_obj, ps, depsgraph)
+            if hair_mesh is not None:
+                unique_meshes[hair_key] = hair_mesh
+                obj_to_mesh_key[hair_key] = hair_key
+                xform = _matrix_to_3x4_row_major(instance.matrix_world)
+                # Use parent object's material slots
+                instances.append({
+                    "mesh_key": hair_key,
+                    "transform_3x4": xform,
+                    "material_slots": [s.material for s in obj.material_slots],
+                    "is_instance": instance.is_instance,
+                    "display_type": obj.display_type,
+                    "hide_render": obj.hide_render,
+                    "hide_viewport": obj.hide_viewport,
+                    "visible_camera": getattr(obj, 'visible_camera', '?'),
+                })
+                import os
+                try:
+                    with open(os.path.join(os.path.expanduser("~"), "ignis-rt.log"), "a") as _lf:
+                        _lf.write(f"[ignis-export] Hair '{hair_key}': {hair_mesh['tri_count']} tris from {len(ps.particles)} strands\n")
+                        _lf.flush()
+                except Exception:
+                    pass
+
     # Dump ALL instances to file for ghost mesh diagnosis
     import os
     try:
@@ -441,6 +651,95 @@ def export_camera(context):
     }
 
 
+def _extract_sun_from_hdri(rgb, w, h):
+    """Detect the sun disc in an HDRI and extract direction + intensity.
+
+    Real-time renderers can't importance-sample the tiny bright sun disc
+    efficiently, so we extract it as a separate directional light for NEE.
+
+    Args:
+        rgb: numpy array (N, 3) of linear HDR pixel values (Blender bottom-up).
+        w, h: image dimensions.
+
+    Returns:
+        dict with sun_elevation, sun_azimuth, sun_intensity, sun_color
+        or None if no bright sun found.
+    """
+    luminance = 0.2126 * rgb[:, 0] + 0.7152 * rgb[:, 1] + 0.0722 * rgb[:, 2]
+    avg_lum = np.mean(luminance)
+    if avg_lum < 1e-6:
+        return None
+
+    # Sun threshold: pixels > 500x average luminance are considered sun
+    sun_threshold = avg_lum * 500.0
+    sun_mask = luminance > sun_threshold
+    n_sun = np.sum(sun_mask)
+    if n_sun < 4:
+        return None  # No significant sun disc found
+
+    # Compute pixel solid angles for equirectangular projection
+    # Each row has latitude: theta = (row / h - 0.5) * PI  (Blender: row 0 = bottom)
+    row_indices = np.arange(w * h) // w  # row index for each pixel
+    theta = (row_indices.astype(np.float64) / h - 0.5) * math.pi  # latitude
+    cos_theta = np.cos(theta)
+    pixel_solid_angle = (2.0 * math.pi / w) * (math.pi / h) * cos_theta
+
+    # Sun total power (irradiance at perpendicular surface)
+    sun_power = np.sum(luminance[sun_mask] * pixel_solid_angle[sun_mask])
+
+    # Sun weighted centroid (luminance-weighted average UV)
+    sun_indices = np.where(sun_mask)[0]
+    sun_rows = sun_indices // w  # y in Blender coords (0 = bottom)
+    sun_cols = sun_indices % w
+    sun_weights = luminance[sun_mask]
+    total_weight = np.sum(sun_weights)
+
+    avg_col = np.sum(sun_cols * sun_weights) / total_weight
+    avg_row = np.sum(sun_rows * sun_weights) / total_weight
+
+    # UV from centroid (Blender bottom-up: row 0 = bottom → v=0)
+    u = avg_col / w
+    v = avg_row / h
+
+    # Equirectangular UV → 3D direction (Vulkan Y-up, matching shader)
+    # Shader: phi = atan(dir.z, dir.x), theta = asin(dir.y)
+    #         uv.x = 0.5 + phi/(2*PI), uv.y = 0.5 + theta/PI
+    # Inverse:
+    phi = (u - 0.5) * 2.0 * math.pi
+    lat = (v - 0.5) * math.pi
+    dir_x = math.cos(lat) * math.cos(phi)
+    dir_y = math.sin(lat)
+    dir_z = math.cos(lat) * math.sin(phi)
+
+    # Elevation = angle from horizon (asin of Y component)
+    elevation_deg = math.degrees(math.asin(max(-1.0, min(1.0, dir_y))))
+    # Azimuth = angle around Y axis from +Z toward +X
+    azimuth_deg = math.degrees(math.atan2(dir_x, dir_z))
+
+    # Sun color: luminance-weighted average, normalized to max component = 1
+    sun_rgb = np.sum(rgb[sun_mask] * sun_weights[:, np.newaxis], axis=0) / total_weight
+    max_comp = max(sun_rgb[0], sun_rgb[1], sun_rgb[2], 1e-6)
+    sun_color = (float(sun_rgb[0] / max_comp),
+                 float(sun_rgb[1] / max_comp),
+                 float(sun_rgb[2] / max_comp))
+
+    # Intensity: match Blender SUN convention (energy in W/m²)
+    # export_sun multiplies by PI, so we provide the raw irradiance here
+    sun_intensity = float(sun_power)
+
+    print(f"[ignis_rt] HDRI sun extraction: dir=({dir_x:.3f},{dir_y:.3f},{dir_z:.3f}) "
+          f"elev={elevation_deg:.1f}° azim={azimuth_deg:.1f}° "
+          f"intensity={sun_intensity:.1f} color=({sun_color[0]:.3f},{sun_color[1]:.3f},{sun_color[2]:.3f}) "
+          f"sun_pixels={n_sun}")
+
+    return {
+        "sun_elevation": elevation_deg,
+        "sun_azimuth": azimuth_deg,
+        "sun_intensity": sun_intensity,
+        "sun_color": sun_color,
+    }
+
+
 def export_world_hdri(depsgraph):
     """Extract HDRI environment texture from Blender's World node tree.
 
@@ -496,38 +795,26 @@ def export_world_hdri(depsgraph):
     if w == 0 or h == 0:
         return None
 
-    # For HDRI (EXR/HDR): extract float pixels, scale to [0,1], encode as PNG manually.
-    import io, zlib
+    # Extract float pixels from Blender
     px = np.empty(w * h * 4, dtype=np.float32)
     image.pixels.foreach_get(px)
-    px_rgb = px.reshape(-1, 4)[:, :3]
-    peak = float(np.percentile(px_rgb[px_rgb > 0], 99.5)) if np.any(px_rgb > 0) else 1.0
-    peak = max(peak, 1.0)
-    px_scaled = np.clip(px / peak, 0.0, 1.0)
-    px_u8 = (px_scaled * 255.0 + 0.5).astype(np.uint8).reshape(h, w, 4)
-    px_u8 = px_u8[::-1]  # Blender stores bottom-up, PNG is top-down
+    px_rgba = px.reshape(-1, 4)
+    rgb = px_rgba[:, :3].copy()
 
-    # Minimal PNG encoder (RGBA8, no filtering)
-    def _write_png_chunk(out, chunk_type, chunk_data):
-        out.write(struct.pack('>I', len(chunk_data)))
-        out.write(chunk_type)
-        out.write(chunk_data)
-        out.write(struct.pack('>I', zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF))
+    # ---- Extract sun from HDRI for directional light NEE ----
+    extracted_sun = _extract_sun_from_hdri(rgb, w, h)
 
-    buf = io.BytesIO()
-    buf.write(b'\x89PNG\r\n\x1a\n')  # PNG signature
-    ihdr = struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0)  # 8-bit RGBA
-    _write_png_chunk(buf, b'IHDR', ihdr)
-    # IDAT: raw pixel rows with filter byte 0 (none) per row
-    raw_rows = bytearray()
-    for y in range(h):
-        raw_rows.append(0)  # filter: none
-        raw_rows.extend(px_u8[y].tobytes())
-    _write_png_chunk(buf, b'IDAT', zlib.compress(bytes(raw_rows), 6))
-    _write_png_chunk(buf, b'IEND', b'')
-    data = buf.getvalue()
-
-    strength *= peak
+    # Upload as float16 RGBA — preserves HDR range without 8-bit clipping.
+    # Clamp to prevent fireflies from extreme sun values (67000+) at low SPP.
+    # Max ~500 preserves sky/clouds/bright surfaces while the extracted sun NEE
+    # handles the actual solar disc separately.
+    HDRI_MAX_RADIANCE = 500.0
+    px_rgba_clamped = px_rgba.copy()
+    px_rgba_clamped[:, :3] = np.minimum(px_rgba_clamped[:, :3], HDRI_MAX_RADIANCE)
+    # Flip vertically: Blender stores bottom-up, Vulkan textures are top-down
+    px_rgba_flipped = px_rgba_clamped.reshape(h, w, 4)[::-1].copy()
+    px_f16 = px_rgba_flipped.astype(np.float16)
+    data = px_f16.tobytes()
 
     return {
         "name": f"__world_hdri__{image.name}",
@@ -535,6 +822,8 @@ def export_world_hdri(depsgraph):
         "width": image.size[0],
         "height": image.size[1],
         "strength": strength,
+        "dxgi_format": 10,  # DXGI_FORMAT_R16G16B16A16_FLOAT — native HDR
+        "extracted_sun": extracted_sun,
     }
 
 
@@ -593,8 +882,80 @@ def export_sun(depsgraph):
     return defaults
 
 
+def _blackbody_to_rgb(temperature_k):
+    """Convert Blackbody color temperature (Kelvin) to linear Rec.709 RGB.
+
+    Polynomial coefficients from Blender/Cycles (Apache 2.0 license).
+    Source: intern/cycles/kernel/tables.h + svm/math_util.h
+    Copyright: 2011-2022 Blender Foundation
+    Formula: R,G = a/t + b*t + c;  B = ((a*t + b)*t + c)*t + d
+    """
+    t = float(temperature_k)
+
+    if t >= 12000.0:
+        return (0.8263, 0.9945, 1.0)  # clamped blue
+    if t < 800.0:
+        return (1.0, 0.0, 0.0)  # very dim red
+
+    # Piecewise table indices (same breakpoints as Cycles)
+    _r_table = [
+        (1.61919106e+03, -2.05010916e-03, 5.02995757e+00),
+        (2.48845471e+03, -1.11330907e-03, 3.22621544e+00),
+        (3.34143193e+03, -4.86551192e-04, 1.76486769e+00),
+        (4.09461742e+03, -1.27446582e-04, 7.25731635e-01),
+        (4.67028036e+03,  2.91258199e-05, 1.26703442e-01),
+        (4.59509185e+03,  2.87495649e-05, 1.50345020e-01),
+        (3.78717450e+03,  9.35907826e-06, 3.99075871e-01),
+    ]
+    _g_table = [
+        (-4.88999748e+02,  6.04330754e-04, -7.55807526e-02),
+        (-7.55994277e+02,  3.16730098e-04,  4.78306139e-01),
+        (-1.02363977e+03,  1.20223470e-04,  9.36662319e-01),
+        (-1.26571316e+03,  4.87340896e-06,  1.27054498e+00),
+        (-1.42529332e+03, -4.01150431e-05,  1.43972784e+00),
+        (-1.17554822e+03, -2.16378048e-05,  1.30408023e+00),
+        (-5.00799571e+02, -4.59832026e-06,  1.09098763e+00),
+    ]
+    _b_table = [
+        ( 5.96945309e-11, -4.85742887e-08, -9.70622247e-05, -4.07936148e-03),
+        ( 2.40430366e-11,  5.55021075e-08, -1.98503712e-04,  2.89312858e-02),
+        (-1.40949732e-11,  1.89878968e-07, -3.56632824e-04,  9.10767778e-02),
+        (-3.61460868e-11,  2.84822009e-07, -4.93211319e-04,  1.56723440e-01),
+        (-1.97075738e-11,  1.75359352e-07, -2.50542825e-04, -2.22783266e-02),
+        (-1.61603419e-11,  1.09815345e-07, -1.41329376e-04, -4.42452373e-02),
+        (-1.01587682e-11,  6.20469931e-08, -6.59693818e-05, -9.14294750e-03),
+    ]
+    _breaks = [965.0, 1167.0, 1449.0, 1902.0, 3315.0, 6365.0]
+
+    if t >= _breaks[5]:
+        i = 6
+    elif t >= _breaks[4]:
+        i = 5
+    elif t >= _breaks[3]:
+        i = 4
+    elif t >= _breaks[2]:
+        i = 3
+    elif t >= _breaks[1]:
+        i = 2
+    elif t >= _breaks[0]:
+        i = 1
+    else:
+        i = 0
+
+    t_inv = 1.0 / t
+    r = _r_table[i]
+    g = _g_table[i]
+    b = _b_table[i]
+
+    rv = r[0] * t_inv + r[1] * t + r[2]
+    gv = g[0] * t_inv + g[1] * t + g[2]
+    bv = ((b[0] * t + b[1]) * t + b[2]) * t + b[3]
+
+    return (max(0.0, rv), max(0.0, gv), max(0.0, bv))
+
+
 def export_lights(depsgraph):
-    """Export point/spot/area lights (max 8) for NEE direct sampling.
+    """Export point/spot/area lights (max 32) for NEE direct sampling.
 
     Returns a flat list of floats: 16 floats per light.
     [posX, posY, posZ, range, colR, colG, colB, intensity, dirX, dirY, dirZ, sizeX, tanX, tanY, tanZ, sizeY]
@@ -607,7 +968,7 @@ def export_lights(depsgraph):
         light = obj.data
         if light.type == 'SUN':
             continue  # sun is handled separately
-        if len(lights) >= 128:  # 8 lights × 16 floats each
+        if len(lights) >= 512:  # 32 lights × 16 floats each
             break
 
         # World position (Blender Z-up -> Vulkan Y-up)
@@ -618,6 +979,14 @@ def export_lights(depsgraph):
 
         energy = light.energy
         color = light.color
+
+        # Check for Blackbody node in light's node tree (overrides light.color)
+        if hasattr(light, 'use_nodes') and light.use_nodes and light.node_tree:
+            for node in light.node_tree.nodes:
+                if node.type == 'BLACKBODY':
+                    temp_k = node.inputs['Temperature'].default_value
+                    color = _blackbody_to_rgb(temp_k)
+                    break
         estimated_range = max(math.sqrt(energy / 0.01), 1.0) if energy > 0 else 10.0
         estimated_range = min(estimated_range, 100.0)
 
@@ -649,10 +1018,24 @@ def export_lights(depsgraph):
             # Negative range signals area light to shader
             export_range = -max(size_x, size_y) * 0.5
             # Cycles area light: energy is total power (Watts).
-            # Radiance = power * PI / area.  The extra PI compensates the
-            # BRDF's 1/PI diffuse term so energy=1 matches Cycles brightness.
+            # Radiance = power / (PI * area).  Shader multiplies by areaSize
+            # in NEE, so we pass radiance = power / (PI * area).
             area = size_x * size_y
-            intensity = energy * math.pi / area if area > 0 else energy
+            intensity = energy / (math.pi * area) if area > 0 else energy
+        elif light.type == 'SPOT':
+            # Spot light: pack cone parameters into size_x (cos_half_angle)
+            # and size_y (spot_smooth factor)
+            spot_angle = light.spot_size  # full cone angle in radians
+            spot_blend = light.spot_blend  # 0 = hard, 1 = full smooth
+            cos_half = math.cos(spot_angle * 0.5)
+            # Cycles formula: spot_smooth = 1.0 / ((1 - cos_half) * blend)
+            if spot_blend > 0.001:
+                spot_smooth = 1.0 / ((1.0 - cos_half) * spot_blend)
+            else:
+                spot_smooth = 1e6  # hard edge
+            size_x = cos_half       # packed in size_x
+            size_y = -spot_smooth   # NEGATIVE sizeY signals spot light (vs area)
+            export_range = -estimated_range
         else:
             export_range = estimated_range
 
@@ -739,8 +1122,8 @@ def export_emissive_triangles_fast(depsgraph, unique_meshes, scene_instances, ma
         if not slot_emission:
             slot_emission = [((0.0, 0.0, 0.0), 0.0)]
 
-        # Check if any slot has emission
-        if not any(s[1] > 0.0 for s in slot_emission):
+        # Check if any slot has REAL emission (strength > 0 AND non-black color)
+        if not any(s[1] > 0.0 and sum(s[0]) > 0.001 for s in slot_emission):
             continue
 
         # Use pre-exported positions (already flattened float32)
@@ -775,7 +1158,7 @@ def export_emissive_triangles_fast(depsgraph, unique_meshes, scene_instances, ma
 
             mat_idx = min(int(tri_mat[ti]), n_slots - 1)
             em_color, em_strength = slot_emission[max(mat_idx, 0)]
-            if em_strength <= 0.0:
+            if em_strength <= 0.0 or sum(em_color) < 0.001:
                 continue
 
             vi = indices[ti]
@@ -1041,6 +1424,10 @@ def _pack_gpu_material(
     flags=0,
     alpha_ref=0.5,
     transparent_prob=0.0,
+    uv_scale_x=1.0,
+    uv_scale_y=1.0,
+    color_value=1.0,
+    color_saturation=1.0,
 ):
     """Pack one material into 140 bytes matching GPUMaterial."""
     return _GPU_MATERIAL_STRUCT.pack(
@@ -1065,7 +1452,7 @@ def _pack_gpu_material(
         # Multilayer tex indices (6x NO_TEX)
         _NO_TEX, _NO_TEX, _NO_TEX, _NO_TEX, _NO_TEX, _NO_TEX,
         # multR=transmission, multG=alpha, multB=transparentProb, rest unused
-        transmission, alpha, transparent_prob, 1.0, 1.0, 1.0, 1.0,
+        transmission, alpha, transparent_prob, uv_scale_x, uv_scale_y, color_value, color_saturation,
         # sunSpecular, sunSpecularEXP
         0.0, 0.0,
     )
@@ -1204,9 +1591,22 @@ def _resolve_color_input(socket, default=(0.8, 0.8, 0.8), _depth=0):
 
     # MixRGB / Mix — blend two colors
     if from_node.type in ('MIX_RGB', 'MIX'):
-        fac = _resolve_scalar_input(from_node.inputs.get('Fac') or from_node.inputs.get('Factor'), 0.5, _depth + 1)
-        c1 = _resolve_color_input(from_node.inputs.get('Color1') or from_node.inputs.get('A'), default, _depth + 1)
-        c2 = _resolve_color_input(from_node.inputs.get('Color2') or from_node.inputs.get('B'), default, _depth + 1)
+        fac_inp = from_node.inputs.get('Fac') or from_node.inputs[0]
+        fac = _resolve_scalar_input(fac_inp, 0.5, _depth + 1)
+
+        if from_node.type == 'MIX':
+            # Blender 4.0+ Mix node: inputs are duplicated for float/vector/RGBA/rotation.
+            # Color inputs are type RGBA (indices 6,7 typically). Find them by type.
+            rgba_inputs = [inp for inp in from_node.inputs if inp.type == 'RGBA']
+            c1_inp = rgba_inputs[0] if len(rgba_inputs) > 0 else None
+            c2_inp = rgba_inputs[1] if len(rgba_inputs) > 1 else None
+        else:
+            # Old MIX_RGB node
+            c1_inp = from_node.inputs.get('Color1')
+            c2_inp = from_node.inputs.get('Color2')
+
+        c1 = _resolve_color_input(c1_inp, default, _depth + 1)
+        c2 = _resolve_color_input(c2_inp, default, _depth + 1)
         blend_type = getattr(from_node, 'blend_type', 'MIX')
         if blend_type == 'MIX':
             return _lerp_color(c1, c2, fac)
@@ -1307,6 +1707,30 @@ def _get_principled_input(node, input_name, default):
     return inp.default_value
 
 
+def _find_uv_scale(socket, _depth=0):
+    """Find Mapping node UV scale in the texture chain. Returns (scaleX, scaleY)."""
+    if not socket or not socket.is_linked or _depth > 8:
+        return (1.0, 1.0)
+    node = socket.links[0].from_node
+    if node.type == 'MAPPING':
+        scale_inp = node.inputs.get('Scale')
+        if scale_inp:
+            s = scale_inp.default_value
+            return (float(s[0]), float(s[1]))
+        return (1.0, 1.0)
+    if node.type == 'TEX_IMAGE':
+        vec_inp = node.inputs.get('Vector')
+        if vec_inp:
+            return _find_uv_scale(vec_inp, _depth + 1)
+    # Follow any linked input
+    for inp in node.inputs:
+        if inp.is_linked:
+            result = _find_uv_scale(inp, _depth + 1)
+            if result != (1.0, 1.0):
+                return result
+    return (1.0, 1.0)
+
+
 def _find_image_texture_node(socket, _depth=0):
     """Follow links from a BSDF input to find an Image Texture node.
 
@@ -1368,6 +1792,13 @@ def _find_image_texture_node(socket, _depth=0):
         'TEX_GRADIENT',     # Gradient texture
     }
     if from_node.type in _PASSTHROUGH_TYPES:
+        # For Blender 5.x MIX node: search RGBA inputs first (avoid float/vector 'A'/'B')
+        if from_node.type == 'MIX':
+            for inp in from_node.inputs:
+                if inp.type == 'RGBA' and inp.is_linked:
+                    result = _find_image_texture_node(inp, _depth + 1)
+                    if result:
+                        return result
         # Try common color input names
         for inp_name in ('Color', 'Color1', 'Color2', 'Fac', 'Image', 'A', 'B', 'Value'):
             inp = from_node.inputs.get(inp_name)
@@ -1404,24 +1835,45 @@ def _get_image_bytes(image):
 
     # Packed in .blend: raw file bytes (PNG/JPG/etc.)
     if image.packed_file:
-        data = bytes(image.packed_file.data)
+        raw = bytes(image.packed_file.data)
+        # Verify it's a format stb_image can handle (PNG/JPG/BMP headers)
+        # PNG: 89 50 4E 47, JPG: FF D8 FF, BMP: 42 4D
+        if (raw[:4] == b'\x89PNG' or raw[:3] == b'\xff\xd8\xff' or raw[:2] == b'BM'):
+            data = raw
+        # else: skip packed data — fall through to pixel extraction
 
     # File on disk
-    if data is None:
+    if data is None and not (image.size[0] > 0 and image.size[1] > 0 and len(image.pixels) > 0):
         filepath = bpy.path.abspath(image.filepath_from_user())
         if filepath and os.path.isfile(filepath):
             with open(filepath, 'rb') as f:
                 data = f.read()
 
-    # Generated/viewer images: extract pixels as raw RGBA8
+    # Pixel extraction fallback: read float pixels from Blender and encode as PNG
+    # Handles EXR, 16-bit PNG, generated images, and any format Blender can open
     if data is None and image.size[0] > 0 and image.size[1] > 0:
+        import io, zlib, struct as _struct
         w, h = image.size[0], image.size[1]
         px = np.empty(w * h * 4, dtype=np.float32)
         image.pixels.foreach_get(px)
-        # float [0,1] → uint8 [0,255]
-        px_u8 = (np.clip(px, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
-        # Encode as minimal BMP for stb_image
-        data = _encode_bmp(px_u8, w, h)
+        px_u8 = (np.clip(px, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8).reshape(h, w, 4)
+        px_u8 = px_u8[::-1]  # flip Y (Blender bottom-up → PNG top-down)
+        # Minimal PNG encoder
+        def _png_chunk(out, ctype, cdata):
+            out.write(_struct.pack('>I', len(cdata)))
+            out.write(ctype)
+            out.write(cdata)
+            out.write(_struct.pack('>I', zlib.crc32(ctype + cdata) & 0xFFFFFFFF))
+        buf = io.BytesIO()
+        buf.write(b'\x89PNG\r\n\x1a\n')
+        _png_chunk(buf, b'IHDR', _struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0))
+        raw_rows = bytearray()
+        for y in range(h):
+            raw_rows.append(0)
+            raw_rows.extend(px_u8[y].tobytes())
+        _png_chunk(buf, b'IDAT', zlib.compress(bytes(raw_rows), 6))
+        _png_chunk(buf, b'IEND', b'')
+        data = buf.getvalue()
 
     if data is not None:
         _image_bytes_cache[image.name] = data
@@ -1591,6 +2043,10 @@ def _extract_shader_props(node, register_image_fn):
         color_inp = node.inputs.get('Color')
         if color_inp:
             props['emission'] = _resolve_color_input(color_inp, (1.0, 1.0, 1.0))
+            # If emission resolved to near-black but has a linked texture,
+            # use white as emission color so the texture provides the color
+            if color_inp.is_linked and sum(props['emission']) < 0.01:
+                props['emission'] = (1.0, 1.0, 1.0)
             props['base_color'] = props['emission']
             tex_node = _find_image_texture_node(color_inp)
             if tex_node and tex_node.image:
@@ -1738,12 +2194,25 @@ def _resolve_mix_shader(mix_node, register_image_fn):
     s2_type = shader2_node.type if shader2_node else None
     if s1_type == 'BSDF_TRANSPARENT':
         result = dict(p2)
-        result['transparent_prob'] = (1.0 - fac)  # fac=0 → all transparent, fac=1 → all p2
+        if s2_type == 'BSDF_GLASS':
+            # Glass + Transparent: use passthrough for transparency, Glossy for reflection.
+            # Don't refract — for architectural glass the entry/exit cancel (flat pane).
+            # Set metallic=1 so non-passthrough rays do specular reflection, not diffuse.
+            result['transparent_prob'] = (1.0 - fac)
+            result['transmission'] = 0.0  # no refraction (passthrough handles transparency)
+            result['metallic'] = 1.0      # pure reflection for non-passthrough rays
+        else:
+            result['transparent_prob'] = (1.0 - fac)
         result['flags'] = result.get('flags', 0) | 2
         return result
     if s2_type == 'BSDF_TRANSPARENT':
         result = dict(p1)
-        result['transparent_prob'] = fac  # fac=0 → all p1, fac=1 → all transparent
+        if s1_type == 'BSDF_GLASS':
+            result['transparent_prob'] = fac
+            result['transmission'] = 0.0
+            result['metallic'] = 1.0
+        else:
+            result['transparent_prob'] = fac
         result['flags'] = result.get('flags', 0) | 2
         return result
 
@@ -1784,12 +2253,14 @@ def _resolve_mix_shader(mix_node, register_image_fn):
     return blended
 
 
-def export_materials(depsgraph, hidden_objects=None):
+def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
     """Export Blender Principled BSDF materials as GPUMaterial byte buffer.
 
     Returns (ctypes byte array, name->global_index dict, textures list).
     textures list = [{"name": str, "data": bytes, "width": int, "height": int}, ...]
     hidden_objects: set of obj.names to skip (from export_meshes)
+    existing_mapping: if provided, reuse this mat_name→index mapping to preserve
+                      the same order as the initial load (avoids MATIDS mismatch)
     """
     import ctypes
     import bpy
@@ -1798,10 +2269,14 @@ def export_materials(depsgraph, hidden_objects=None):
         hidden_objects = set()
 
     # Collect unique materials from VISIBLE mesh objects only.
-    # Must match the same objects exported by export_meshes — otherwise
-    # material indices get misaligned (hidden objects add extra materials).
-    mat_name_to_index = {}
-    mat_list = []
+    # If existing_mapping is provided, reuse the same index assignment
+    # so that per-BLAS material IDs remain valid.
+    if existing_mapping:
+        mat_name_to_index = dict(existing_mapping)
+        mat_list = [None] * len(mat_name_to_index)
+    else:
+        mat_name_to_index = {}
+        mat_list = []
 
     for inst in depsgraph.object_instances:
         obj = inst.object
@@ -1830,6 +2305,10 @@ def export_materials(depsgraph, hidden_objects=None):
             # Use library-qualified name for materials from linked .blend files
             mat_key = f"{mat.library.filepath}:{mat.name}" if mat.library else mat.name
             if mat_key in mat_name_to_index:
+                # Update the material reference (may have changed properties)
+                idx = mat_name_to_index[mat_key]
+                if idx < len(mat_list):
+                    mat_list[idx] = mat
                 continue
             mat_name_to_index[mat_key] = len(mat_list)
             mat_list.append(mat)
@@ -1867,6 +2346,21 @@ def export_materials(depsgraph, hidden_objects=None):
         buf = (ctypes.c_uint8 * len(data))(*data)
         return buf, {}, []
 
+    # Dump material order to file for debugging
+    import os
+    try:
+        with open(os.path.join(os.path.expanduser("~"), "ignis-mat-order.txt"), "w") as _mf:
+            _mf.write(f"Material buffer order ({len(mat_list)} materials):\n")
+            for _mi, _mm in enumerate(mat_list):
+                _mn = _mm.name if _mm else "None (default)"
+                _lib = f" [{_mm.library.filepath}]" if _mm and _mm.library else ""
+                _mf.write(f"  [{_mi:3d}] {_mn}{_lib}\n")
+            _mf.write(f"\nmat_name_to_index:\n")
+            for _mk, _mv in sorted(mat_name_to_index.items(), key=lambda x: x[1]):
+                _mf.write(f"  [{_mv:3d}] {_mk}\n")
+    except Exception:
+        pass
+
     # Pack each material (with per-material timing for bottleneck detection)
     import time as _time
     all_bytes = bytearray()
@@ -1896,6 +2390,10 @@ def export_materials(depsgraph, hidden_objects=None):
         ior = 1.5
         transmission = 0.0
         transparent_prob = 0.0
+        uv_scale_x = 1.0
+        uv_scale_y = 1.0
+        color_value = 1.0
+        color_saturation = 1.0
         flags = 0
         alpha_ref = 0.5
 
@@ -2026,6 +2524,35 @@ def export_materials(depsgraph, hidden_objects=None):
                 bc_node = _find_image_texture_node(node.inputs.get('Base Color'))
                 if bc_node and bc_node.image:
                     diffuse_tex = _register_image(bc_node.image)
+
+                # UV scale from Mapping node (applies to all textures)
+                uv_scale = _find_uv_scale(node.inputs.get('Base Color'))
+                uv_scale_x, uv_scale_y = uv_scale
+
+                # Hue/Saturation/Value node in Base Color chain
+                bc_inp = node.inputs.get('Base Color')
+                if bc_inp and bc_inp.is_linked:
+                    _hsv_node = bc_inp.links[0].from_node
+                    _hsv_depth = 0
+                    while _hsv_node and _hsv_depth < 8:
+                        if _hsv_node.type == 'HUE_SAT':
+                            val_inp = _hsv_node.inputs.get('Value')
+                            sat_inp = _hsv_node.inputs.get('Saturation')
+                            if val_inp:
+                                color_value = float(val_inp.default_value)
+                            if sat_inp:
+                                color_saturation = float(sat_inp.default_value)
+                            break
+                        # Follow first linked input
+                        _found = False
+                        for _inp in _hsv_node.inputs:
+                            if _inp.is_linked:
+                                _hsv_node = _inp.links[0].from_node
+                                _found = True
+                                break
+                        if not _found:
+                            break
+                        _hsv_depth += 1
 
                 # Roughness
                 roughness = float(_get_principled_input(node, 'Roughness', 0.5))
@@ -2163,6 +2690,10 @@ def export_materials(depsgraph, hidden_objects=None):
             flags=flags,
             alpha_ref=alpha_ref,
             transparent_prob=transparent_prob,
+            uv_scale_x=uv_scale_x,
+            uv_scale_y=uv_scale_y,
+            color_value=color_value,
+            color_saturation=color_saturation,
         )
 
         _mat_dt = _time.perf_counter() - _mat_t0

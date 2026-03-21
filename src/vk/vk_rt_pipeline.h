@@ -104,9 +104,9 @@ struct CameraUBO {
     float rainParams[4];       // [0]=wetness, [1]=waterLevel, [2]=rainIntensity, [3]=reserved
     int32_t jitterPattern[32]; // 8 x ivec4
     // Point/spot lights (NEE direct sampling)
-    uint32_t lightCount;       // number of active lights (0-8)
+    uint32_t lightCount;       // number of active lights (0-32)
     uint32_t lightPad[3];
-    float lights[128];         // 8 lights × 16 floats: [pos.xyz+range, col.rgb+intensity, dir.xyz+sizeX, tan.xyz+sizeY]
+    float lights[512];         // 32 lights × 16 floats: [pos.xyz+range, col.rgb+intensity, dir.xyz+sizeX, tan.xyz+sizeY]
 };
 
 // Pick result from GPU raycast

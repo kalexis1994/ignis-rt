@@ -114,6 +114,7 @@ _ignis_instance_count = 0      # mesh instance count after last sync
 _ignis_last_tex_names = None   # texture name tuple from last upload (skip re-upload if same)
 _ignis_last_transforms = None  # cached instance transforms hash for change detection
 _ignis_last_light_count = -1   # track light count for emissive re-export
+_ignis_hdri_sun = None         # sun extracted from HDRI (used as fallback when no SUN light)
 _ignis_mat_name_to_index = {}  # persistent material name→index mapping for incremental uploads
 
 # ── Staged loading state machine ──
@@ -187,7 +188,7 @@ def _get_logo_texture():
         return _loading_logo_texture
     try:
         icons_dir = os.path.join(os.path.dirname(__file__), "icons")
-        logo_path = os.path.join(icons_dir, "ignis_512.png")
+        logo_path = os.path.join(icons_dir, "ignis_icon.png")
         if not os.path.isfile(logo_path):
             return None
         img = bpy.data.images.load(logo_path, check_existing=True)
@@ -215,19 +216,28 @@ def _get_font_id():
 
 
 def _draw_fire_ring(shader, cx, cy, t, radius=22, segments=48, ring_width=4.0):
-    """Draw a fire-colored spinning ring using many small arcs."""
+    """Draw a sunset-colored spinning ring using the Ignis palette."""
     for i in range(segments):
         frac = i / segments
         angle = 2 * math.pi * frac - t * 4.0  # clockwise rotation
 
-        # Fire color: head is bright yellow, tail fades to dark red
         sweep = (frac + t * 4.0 / (2 * math.pi)) % 1.0
         intensity = pow(1.0 - sweep, 2.0)  # bright head, fading tail
 
-        # RGB fire gradient: yellow -> orange -> red -> dark
-        r_col = min(1.0, 0.3 + intensity * 1.4)
-        g_col = max(0.0, intensity * 0.9 - 0.1)
-        b_col = max(0.0, intensity * 0.15 - 0.1)
+        # Ignis palette gradient: golden → sunset-500 → sunset-900 → darkness
+        # golden #D4B87A (0.831,0.722,0.478)
+        # sunset-500 #E06030 (0.878,0.376,0.188)
+        # sunset-900 #7A3218 (0.478,0.196,0.094)
+        if intensity > 0.5:
+            t2 = (intensity - 0.5) * 2.0  # 0→1 for top half
+            r_col = 0.878 + t2 * (0.831 - 0.878)  # sunset-500 → golden
+            g_col = 0.376 + t2 * (0.722 - 0.376)
+            b_col = 0.188 + t2 * (0.478 - 0.188)
+        else:
+            t2 = intensity * 2.0  # 0→1 for bottom half
+            r_col = 0.478 + t2 * (0.878 - 0.478)  # sunset-900 → sunset-500
+            g_col = 0.196 + t2 * (0.376 - 0.196)
+            b_col = 0.094 + t2 * (0.188 - 0.094)
         alpha = max(0.0, min(1.0, intensity * 1.5))
 
         # Dot size varies: bigger at head
@@ -260,12 +270,13 @@ def _draw_loading_screen(w, h, status="", progress=0.0):
         _loading_screen_start = now
     fade = min((now - _loading_screen_start) / 0.6, 1.0)
 
-    COL_FLAME = (1.0, 0.3, 0.0, fade)
-    COL_AMBER = (1.0, 0.72, 0.0, fade)
-    COL_BG = (0.08, 0.04, 0.02, 1.0)  # bg always opaque
-    COL_TEXT = (1.0, 1.0, 1.0, fade)
-    COL_TEXT_DIM = (0.7, 0.7, 0.7, fade)
-    COL_BAR_BG = (0.15, 0.10, 0.06, fade)
+    # Ignis palette — darkness + sunset + sky
+    COL_BG = (0.055, 0.055, 0.063, 1.0)         # darkness-700 #1C1C1E
+    COL_FLAME = (0.878, 0.376, 0.188, fade)      # sunset-500 #E06030
+    COL_AMBER = (0.831, 0.722, 0.478, fade)      # golden #D4B87A
+    COL_TEXT = (0.863, 0.890, 0.929, fade)        # sky-50 #DCE4ED
+    COL_TEXT_DIM = (0.561, 0.647, 0.769, fade)    # sky-500 #8FA7C4
+    COL_BAR_BG = (0.180, 0.180, 0.190, fade)     # darkness-500 #2E2E30
 
     gpu.state.blend_set('NONE')
     gpu.state.depth_test_set('NONE')
@@ -741,26 +752,22 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             _load_progress = 0.95
 
             sun = scene_export.export_sun(depsgraph)
-            dll_wrapper.set_float("sun_elevation", sun["sun_elevation"])
-            dll_wrapper.set_float("sun_azimuth", sun["sun_azimuth"])
-            dll_wrapper.set_float("sun_intensity", sun["sun_intensity"])
-            sun_color = sun.get("sun_color", (1.0, 1.0, 1.0))
-            dll_wrapper.set_float("sun_color_r", sun_color[0])
-            dll_wrapper.set_float("sun_color_g", sun_color[1])
-            dll_wrapper.set_float("sun_color_b", sun_color[2])
 
             # World HDRI environment map
+            hdri_sun = None
             try:
                 hdri = scene_export.export_world_hdri(depsgraph)
                 if hdri:
                     _log(f"Stage FINALIZE: HDRI '{hdri['name']}' {hdri['width']}x{hdri['height']}, strength={hdri['strength']:.2f}")
+                    hdri_sun = hdri.get("extracted_sun")
                     # Upload as texture via the texture manager
                     if _ignis_tex_manager:
                         data_np = np.frombuffer(hdri["data"], dtype=np.uint8).copy()
+                        hdri_dxgi = hdri.get("dxgi_format", 0)
                         hdri_idx = dll_wrapper.texture_manager_add(
                             _ignis_tex_manager, hdri["name"],
                             data_np.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-                            len(hdri["data"]), hdri["width"], hdri["height"], 1, 0)
+                            len(hdri["data"]), hdri["width"], hdri["height"], 1, hdri_dxgi)
                         if hdri_idx >= 0:
                             dll_wrapper.texture_manager_upload_all(_ignis_tex_manager)
                             dll_wrapper.update_texture_descriptors(_ignis_tex_manager)
@@ -775,6 +782,28 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                     dll_wrapper.set_int("hdri_tex_index", -1)
             except Exception:
                 _log_exception("FINALIZE HDRI")
+
+            # Use HDRI-extracted sun if no Blender SUN light exists
+            global _ignis_hdri_sun
+            if sun["sun_intensity"] <= 0.0 and hdri_sun:
+                sun = hdri_sun
+                hdri_str = hdri["strength"] if hdri else 1.0
+                # Scale by PI to compensate for hemisphere sampling deficit
+                # (Cycles importance-samples the sun disc efficiently; we use NEE)
+                sun["sun_intensity"] = sun["sun_intensity"] * hdri_str * math.pi
+                _log(f"Stage FINALIZE: Sun from HDRI — elev={sun['sun_elevation']:.1f}° "
+                     f"azim={sun['sun_azimuth']:.1f}° intensity={sun['sun_intensity']:.1f} "
+                     f"color=({sun['sun_color'][0]:.3f},{sun['sun_color'][1]:.3f},{sun['sun_color'][2]:.3f})")
+                # Cache for per-frame sync (export_sun returns 0 when no SUN light)
+                _ignis_hdri_sun = dict(sun)
+
+            dll_wrapper.set_float("sun_elevation", sun["sun_elevation"])
+            dll_wrapper.set_float("sun_azimuth", sun["sun_azimuth"])
+            dll_wrapper.set_float("sun_intensity", sun["sun_intensity"])
+            sun_color = sun.get("sun_color", (1.0, 1.0, 1.0))
+            dll_wrapper.set_float("sun_color_r", sun_color[0])
+            dll_wrapper.set_float("sun_color_g", sun_color[1])
+            dll_wrapper.set_float("sun_color_b", sun_color[2])
 
             # Point/spot/area lights
             light_data = scene_export.export_lights(depsgraph)
@@ -846,6 +875,11 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         if not _ignis_blas_handles:
             return
 
+        # Ignore updates for 2 seconds after a load completes
+        # (Blender sends accumulated depsgraph updates that would re-trigger full load)
+        if _ignis_last_full_upload > 0 and (time.perf_counter() - _ignis_last_full_upload) < 2.0:
+            return
+
         has_material_change = False
         has_geometry_change = False
         geometry_mesh_name = None
@@ -882,7 +916,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         global _ignis_last_tex_names, _ignis_mat_name_to_index
 
         t0 = time.perf_counter()
-        materials_data, mat_name_to_index, textures_list = scene_export.export_materials(depsgraph, hidden_objects=_ignis_hidden_objects)
+        materials_data, mat_name_to_index, textures_list = scene_export.export_materials(
+            depsgraph, hidden_objects=_ignis_hidden_objects, existing_mapping=_ignis_mat_name_to_index)
 
         new_tex_names = tuple(t["name"] for t in textures_list)
         if new_tex_names != _ignis_last_tex_names:
@@ -1094,6 +1129,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             dll_wrapper.build_tlas(tlas_arr, count)
 
         sun = scene_export.export_sun(depsgraph)
+        if sun["sun_intensity"] <= 0.0 and _ignis_hdri_sun:
+            sun = _ignis_hdri_sun
         dll_wrapper.set_float("sun_elevation", sun["sun_elevation"])
         dll_wrapper.set_float("sun_azimuth", sun["sun_azimuth"])
         dll_wrapper.set_float("sun_intensity", sun["sun_intensity"])
@@ -1149,8 +1186,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         # ── Full scene upload needed? Start staged loading ──
         if _ignis_full_dirty:
             now = time.perf_counter()
-            _log(f"full_dirty triggered (last upload {now - _ignis_last_full_upload:.1f}s ago)")
-            if _ignis_last_full_upload == 0 or (now - _ignis_last_full_upload) >= 5.0:
+            time_since_last = now - _ignis_last_full_upload if _ignis_last_full_upload > 0 else 999.0
+            # Cooldown: don't reload within 5s of the last complete load
+            if _ignis_last_full_upload == 0 or time_since_last >= 5.0:
+                _log(f"full_dirty triggered ({time_since_last:.1f}s since last)")
                 self._begin_staged_load(depsgraph)
                 _draw_loading_screen(w, h, "Preparing scene...", 0.0)
                 self.tag_redraw()
@@ -1160,11 +1199,16 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
         # ── Fast incremental updates (no loading screen needed) ──
         if _ignis_materials_dirty:
-            self._update_materials(depsgraph)
+            # Skip auto material update after initial load — prevents material index
+            # reordering that breaks per-BLAS material IDs. Only update on explicit
+            # user action (Reload Scene button) via full_dirty.
+            _ignis_materials_dirty = False
         elif _ignis_tlas_dirty:
             self._rebuild_tlas(depsgraph)
         # ── Light sync (every frame — cheap) ──
         sun = scene_export.export_sun(depsgraph)
+        if sun["sun_intensity"] <= 0.0 and _ignis_hdri_sun:
+            sun = _ignis_hdri_sun
         dll_wrapper.set_float("sun_elevation", sun["sun_elevation"])
         dll_wrapper.set_float("sun_azimuth", sun["sun_azimuth"])
         dll_wrapper.set_float("sun_intensity", sun["sun_intensity"])
@@ -1247,6 +1291,16 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         xform = scene_export._matrix_to_3x4_row_major(inst.matrix_world)
                         cur_instances.append((mesh_key, xform))
 
+            # Add hair instances (not in depsgraph — use parent object transform)
+            for hair_key, blas_idx in _ignis_blas_handles.items():
+                if '__hair_' in hair_key:
+                    # Find parent object transform from existing instances
+                    parent_name = hair_key.split('__hair_')[0]
+                    for mk, xf in cur_instances:
+                        if mk == parent_name:
+                            cur_instances.append((hair_key, xf))
+                            break
+
             # Compare with tolerance to avoid float jitter causing constant resets
             xform_floats = tuple(f for _, xf in cur_instances for f in xf)
             transforms_changed = len(cur_instances) != _ignis_instance_count
@@ -1296,6 +1350,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         dll_wrapper.set_int("max_bounces", props.max_bounces)
         dll_wrapper.set_int("spp", props.samples_per_pixel)
         dll_wrapper.set_int("backface_culling", 1 if props.backface_culling else 0)
+        dll_wrapper.set_int("debug_view", props.debug_view)
         dll_wrapper.set_int("auto_sky_colors", 1 if props.auto_sky_colors else 0)
         if not props.auto_sky_colors:
             dll_wrapper.set_float("ambient_intensity", props.ambient_intensity)
