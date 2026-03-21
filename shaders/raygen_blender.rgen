@@ -255,12 +255,9 @@ vec3 evaluateSky(vec3 dir) {
     if (hdriIdx >= 0) {
         float hdriStrength = cam.windParams.y;
         vec2 uv = directionToEquirectangular(dir);
-        vec3 compressed = texture(textures[nonuniformEXT(uint(hdriIdx))], uv).rgb;
-        // Inverse Reinhard with pre-exposure: recover HDR from tonemapped 8-bit
-        // Encode: compressed = (x * E) / (1 + x * E)
-        // Decode: x = compressed / ((1 - compressed) * E)
-        const float PRE_EXPOSURE = 4.0;
-        vec3 hdriColor = compressed / (max(vec3(1.0) - compressed, vec3(0.001)) * PRE_EXPOSURE);
+        // Sample HDRI — float16 texture preserves full HDR range natively
+        vec3 hdriColor = texture(textures[nonuniformEXT(uint(hdriIdx))], uv).rgb;
+
         return hdriColor * hdriStrength;
     }
 
@@ -928,31 +925,18 @@ void main() {
                 );
 
                 if (bounce == 0) {
-                    bool rrMode = (cam.parameters.w == 2u);
-                    if (rrMode) {
-                        // RR mode: apply shadow directly — no SIGMA separation needed.
-                        // Ray Reconstruction handles denoising of the shadowed signal.
-                        float shadow = inShadow ? 0.0 : 1.0;
-                        diffuseRadiance += diffContrib * sunRadiance * throughput * shadow;
-                        specularRadiance += specContrib * sunRadiance * throughput * shadow;
-                    } else {
-                        // CP2077-style shadow separation:
-                        // Write UNSHADOWED direct light to NRD (RELAX sees stable signal).
-                        // SIGMA denoises the shadow separately; composite re-applies it.
-                        vec3 sunDiffContrib = diffContrib * sunRadiance * throughput;
-                        diffuseRadiance += sunDiffContrib;
-                        directSunDiffuse = sunDiffContrib;  // remember for sunFraction
-                        specularRadiance += specContrib * sunRadiance * throughput;
+                    // Always apply shadow directly (works for both RR and NRD modes)
+                    float shadow = inShadow ? 0.0 : 1.0;
+                    diffuseRadiance += diffContrib * sunRadiance * throughput * shadow;
+                    specularRadiance += specContrib * sunRadiance * throughput * shadow;
 
-                        // Store penumbra for SIGMA
-                        primaryNdotLSample = NdotL;
-                        if (inShadow) {
-                            // Penumbra radius = distToOccluder * tanAngle * 0.5
-                            float sigmaTanAngle = 0.04;
-                            primaryPenumbraSample = min(shadowHitDist * sigmaTanAngle * 0.5, 32768.0);
-                        } else {
-                            primaryPenumbraSample = 65504.0;  // fully lit
-                        }
+                    // Store penumbra for SIGMA (NRD fallback)
+                    primaryNdotLSample = NdotL;
+                    if (inShadow) {
+                        float sigmaTanAngle = 0.04;
+                        primaryPenumbraSample = min(shadowHitDist * sigmaTanAngle * 0.5, 32768.0);
+                    } else {
+                        primaryPenumbraSample = 65504.0;
                     }
                 } else {
                     // Indirect bounces: apply shadow directly (SIGMA only handles primary)

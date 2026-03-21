@@ -114,6 +114,7 @@ _ignis_instance_count = 0      # mesh instance count after last sync
 _ignis_last_tex_names = None   # texture name tuple from last upload (skip re-upload if same)
 _ignis_last_transforms = None  # cached instance transforms hash for change detection
 _ignis_last_light_count = -1   # track light count for emissive re-export
+_ignis_hdri_sun = None         # sun extracted from HDRI (used as fallback when no SUN light)
 _ignis_mat_name_to_index = {}  # persistent material name→index mapping for incremental uploads
 
 # ── Staged loading state machine ──
@@ -741,26 +742,22 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             _load_progress = 0.95
 
             sun = scene_export.export_sun(depsgraph)
-            dll_wrapper.set_float("sun_elevation", sun["sun_elevation"])
-            dll_wrapper.set_float("sun_azimuth", sun["sun_azimuth"])
-            dll_wrapper.set_float("sun_intensity", sun["sun_intensity"])
-            sun_color = sun.get("sun_color", (1.0, 1.0, 1.0))
-            dll_wrapper.set_float("sun_color_r", sun_color[0])
-            dll_wrapper.set_float("sun_color_g", sun_color[1])
-            dll_wrapper.set_float("sun_color_b", sun_color[2])
 
             # World HDRI environment map
+            hdri_sun = None
             try:
                 hdri = scene_export.export_world_hdri(depsgraph)
                 if hdri:
                     _log(f"Stage FINALIZE: HDRI '{hdri['name']}' {hdri['width']}x{hdri['height']}, strength={hdri['strength']:.2f}")
+                    hdri_sun = hdri.get("extracted_sun")
                     # Upload as texture via the texture manager
                     if _ignis_tex_manager:
                         data_np = np.frombuffer(hdri["data"], dtype=np.uint8).copy()
+                        hdri_dxgi = hdri.get("dxgi_format", 0)
                         hdri_idx = dll_wrapper.texture_manager_add(
                             _ignis_tex_manager, hdri["name"],
                             data_np.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-                            len(hdri["data"]), hdri["width"], hdri["height"], 1, 0)
+                            len(hdri["data"]), hdri["width"], hdri["height"], 1, hdri_dxgi)
                         if hdri_idx >= 0:
                             dll_wrapper.texture_manager_upload_all(_ignis_tex_manager)
                             dll_wrapper.update_texture_descriptors(_ignis_tex_manager)
@@ -775,6 +772,28 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                     dll_wrapper.set_int("hdri_tex_index", -1)
             except Exception:
                 _log_exception("FINALIZE HDRI")
+
+            # Use HDRI-extracted sun if no Blender SUN light exists
+            global _ignis_hdri_sun
+            if sun["sun_intensity"] <= 0.0 and hdri_sun:
+                sun = hdri_sun
+                hdri_str = hdri["strength"] if hdri else 1.0
+                # Scale by PI to compensate for hemisphere sampling deficit
+                # (Cycles importance-samples the sun disc efficiently; we use NEE)
+                sun["sun_intensity"] = sun["sun_intensity"] * hdri_str * math.pi
+                _log(f"Stage FINALIZE: Sun from HDRI — elev={sun['sun_elevation']:.1f}° "
+                     f"azim={sun['sun_azimuth']:.1f}° intensity={sun['sun_intensity']:.1f} "
+                     f"color=({sun['sun_color'][0]:.3f},{sun['sun_color'][1]:.3f},{sun['sun_color'][2]:.3f})")
+                # Cache for per-frame sync (export_sun returns 0 when no SUN light)
+                _ignis_hdri_sun = dict(sun)
+
+            dll_wrapper.set_float("sun_elevation", sun["sun_elevation"])
+            dll_wrapper.set_float("sun_azimuth", sun["sun_azimuth"])
+            dll_wrapper.set_float("sun_intensity", sun["sun_intensity"])
+            sun_color = sun.get("sun_color", (1.0, 1.0, 1.0))
+            dll_wrapper.set_float("sun_color_r", sun_color[0])
+            dll_wrapper.set_float("sun_color_g", sun_color[1])
+            dll_wrapper.set_float("sun_color_b", sun_color[2])
 
             # Point/spot/area lights
             light_data = scene_export.export_lights(depsgraph)
@@ -1100,6 +1119,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             dll_wrapper.build_tlas(tlas_arr, count)
 
         sun = scene_export.export_sun(depsgraph)
+        if sun["sun_intensity"] <= 0.0 and _ignis_hdri_sun:
+            sun = _ignis_hdri_sun
         dll_wrapper.set_float("sun_elevation", sun["sun_elevation"])
         dll_wrapper.set_float("sun_azimuth", sun["sun_azimuth"])
         dll_wrapper.set_float("sun_intensity", sun["sun_intensity"])
@@ -1176,6 +1197,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             self._rebuild_tlas(depsgraph)
         # ── Light sync (every frame — cheap) ──
         sun = scene_export.export_sun(depsgraph)
+        if sun["sun_intensity"] <= 0.0 and _ignis_hdri_sun:
+            sun = _ignis_hdri_sun
         dll_wrapper.set_float("sun_elevation", sun["sun_elevation"])
         dll_wrapper.set_float("sun_azimuth", sun["sun_azimuth"])
         dll_wrapper.set_float("sun_intensity", sun["sun_intensity"])

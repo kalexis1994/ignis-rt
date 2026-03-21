@@ -651,6 +651,95 @@ def export_camera(context):
     }
 
 
+def _extract_sun_from_hdri(rgb, w, h):
+    """Detect the sun disc in an HDRI and extract direction + intensity.
+
+    Real-time renderers can't importance-sample the tiny bright sun disc
+    efficiently, so we extract it as a separate directional light for NEE.
+
+    Args:
+        rgb: numpy array (N, 3) of linear HDR pixel values (Blender bottom-up).
+        w, h: image dimensions.
+
+    Returns:
+        dict with sun_elevation, sun_azimuth, sun_intensity, sun_color
+        or None if no bright sun found.
+    """
+    luminance = 0.2126 * rgb[:, 0] + 0.7152 * rgb[:, 1] + 0.0722 * rgb[:, 2]
+    avg_lum = np.mean(luminance)
+    if avg_lum < 1e-6:
+        return None
+
+    # Sun threshold: pixels > 500x average luminance are considered sun
+    sun_threshold = avg_lum * 500.0
+    sun_mask = luminance > sun_threshold
+    n_sun = np.sum(sun_mask)
+    if n_sun < 4:
+        return None  # No significant sun disc found
+
+    # Compute pixel solid angles for equirectangular projection
+    # Each row has latitude: theta = (row / h - 0.5) * PI  (Blender: row 0 = bottom)
+    row_indices = np.arange(w * h) // w  # row index for each pixel
+    theta = (row_indices.astype(np.float64) / h - 0.5) * math.pi  # latitude
+    cos_theta = np.cos(theta)
+    pixel_solid_angle = (2.0 * math.pi / w) * (math.pi / h) * cos_theta
+
+    # Sun total power (irradiance at perpendicular surface)
+    sun_power = np.sum(luminance[sun_mask] * pixel_solid_angle[sun_mask])
+
+    # Sun weighted centroid (luminance-weighted average UV)
+    sun_indices = np.where(sun_mask)[0]
+    sun_rows = sun_indices // w  # y in Blender coords (0 = bottom)
+    sun_cols = sun_indices % w
+    sun_weights = luminance[sun_mask]
+    total_weight = np.sum(sun_weights)
+
+    avg_col = np.sum(sun_cols * sun_weights) / total_weight
+    avg_row = np.sum(sun_rows * sun_weights) / total_weight
+
+    # UV from centroid (Blender bottom-up: row 0 = bottom → v=0)
+    u = avg_col / w
+    v = avg_row / h
+
+    # Equirectangular UV → 3D direction (Vulkan Y-up, matching shader)
+    # Shader: phi = atan(dir.z, dir.x), theta = asin(dir.y)
+    #         uv.x = 0.5 + phi/(2*PI), uv.y = 0.5 + theta/PI
+    # Inverse:
+    phi = (u - 0.5) * 2.0 * math.pi
+    lat = (v - 0.5) * math.pi
+    dir_x = math.cos(lat) * math.cos(phi)
+    dir_y = math.sin(lat)
+    dir_z = math.cos(lat) * math.sin(phi)
+
+    # Elevation = angle from horizon (asin of Y component)
+    elevation_deg = math.degrees(math.asin(max(-1.0, min(1.0, dir_y))))
+    # Azimuth = angle around Y axis from +Z toward +X
+    azimuth_deg = math.degrees(math.atan2(dir_x, dir_z))
+
+    # Sun color: luminance-weighted average, normalized to max component = 1
+    sun_rgb = np.sum(rgb[sun_mask] * sun_weights[:, np.newaxis], axis=0) / total_weight
+    max_comp = max(sun_rgb[0], sun_rgb[1], sun_rgb[2], 1e-6)
+    sun_color = (float(sun_rgb[0] / max_comp),
+                 float(sun_rgb[1] / max_comp),
+                 float(sun_rgb[2] / max_comp))
+
+    # Intensity: match Blender SUN convention (energy in W/m²)
+    # export_sun multiplies by PI, so we provide the raw irradiance here
+    sun_intensity = float(sun_power)
+
+    print(f"[ignis_rt] HDRI sun extraction: dir=({dir_x:.3f},{dir_y:.3f},{dir_z:.3f}) "
+          f"elev={elevation_deg:.1f}° azim={azimuth_deg:.1f}° "
+          f"intensity={sun_intensity:.1f} color=({sun_color[0]:.3f},{sun_color[1]:.3f},{sun_color[2]:.3f}) "
+          f"sun_pixels={n_sun}")
+
+    return {
+        "sun_elevation": elevation_deg,
+        "sun_azimuth": azimuth_deg,
+        "sun_intensity": sun_intensity,
+        "sun_color": sun_color,
+    }
+
+
 def export_world_hdri(depsgraph):
     """Extract HDRI environment texture from Blender's World node tree.
 
@@ -706,46 +795,26 @@ def export_world_hdri(depsgraph):
     if w == 0 or h == 0:
         return None
 
-    # For HDRI (EXR/HDR): extract float pixels, scale to [0,1], encode as PNG manually.
-    import io, zlib
+    # Extract float pixels from Blender
     px = np.empty(w * h * 4, dtype=np.float32)
     image.pixels.foreach_get(px)
-    px_rgb = px.reshape(-1, 4)[:, :3]
-    # Compress HDR → 8-bit using Reinhard with pre-exposure.
-    # Pre-exposure boosts dark values before compression → more 8-bit precision for ambient.
-    # Reinhard: out = (in * E) / (1 + in * E)
-    # Shader inverse: hdri = (tex / (1 - tex)) / E * strength
-    PRE_EXPOSURE = 4.0  # boost darks 4x for more precision in ambient range
     px_rgba = px.reshape(-1, 4)
     rgb = px_rgba[:, :3].copy()
-    alpha = px_rgba[:, 3:4]
-    rgb_exposed = np.maximum(rgb * PRE_EXPOSURE, 0.0)
-    compressed = rgb_exposed / (1.0 + rgb_exposed)
-    px_out = np.concatenate([compressed, alpha], axis=1)
-    px_u8 = (np.clip(px_out, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8).reshape(h, w, 4)
-    px_u8 = px_u8[::-1]  # Blender stores bottom-up, PNG is top-down
 
-    # Minimal PNG encoder (RGBA8, no filtering)
-    def _write_png_chunk(out, chunk_type, chunk_data):
-        out.write(struct.pack('>I', len(chunk_data)))
-        out.write(chunk_type)
-        out.write(chunk_data)
-        out.write(struct.pack('>I', zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF))
+    # ---- Extract sun from HDRI for directional light NEE ----
+    extracted_sun = _extract_sun_from_hdri(rgb, w, h)
 
-    buf = io.BytesIO()
-    buf.write(b'\x89PNG\r\n\x1a\n')  # PNG signature
-    ihdr = struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0)  # 8-bit RGBA
-    _write_png_chunk(buf, b'IHDR', ihdr)
-    # IDAT: raw pixel rows with filter byte 0 (none) per row
-    raw_rows = bytearray()
-    for y in range(h):
-        raw_rows.append(0)  # filter: none
-        raw_rows.extend(px_u8[y].tobytes())
-    _write_png_chunk(buf, b'IDAT', zlib.compress(bytes(raw_rows), 6))
-    _write_png_chunk(buf, b'IEND', b'')
-    data = buf.getvalue()
-
-    # No peak scaling needed — Reinhard inverse in shader recovers full HDR range
+    # Upload as float16 RGBA — preserves HDR range without 8-bit clipping.
+    # Clamp to prevent fireflies from extreme sun values (67000+) at low SPP.
+    # Max ~500 preserves sky/clouds/bright surfaces while the extracted sun NEE
+    # handles the actual solar disc separately.
+    HDRI_MAX_RADIANCE = 500.0
+    px_rgba_clamped = px_rgba.copy()
+    px_rgba_clamped[:, :3] = np.minimum(px_rgba_clamped[:, :3], HDRI_MAX_RADIANCE)
+    # Flip vertically: Blender stores bottom-up, Vulkan textures are top-down
+    px_rgba_flipped = px_rgba_clamped.reshape(h, w, 4)[::-1].copy()
+    px_f16 = px_rgba_flipped.astype(np.float16)
+    data = px_f16.tobytes()
 
     return {
         "name": f"__world_hdri__{image.name}",
@@ -753,6 +822,8 @@ def export_world_hdri(depsgraph):
         "width": image.size[0],
         "height": image.size[1],
         "strength": strength,
+        "dxgi_format": 10,  # DXGI_FORMAT_R16G16B16A16_FLOAT — native HDR
+        "extracted_sun": extracted_sun,
     }
 
 
