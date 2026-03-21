@@ -843,7 +843,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             _log(f" Staged load: COMPLETE ({dt:.2f}s total)")
             _load_stage = LOAD_IDLE
             _load_progress = 1.0
-            loading_screen.reset()
+            loading_screen.begin_fadeout()  # start fade-out transition to render
             return True
 
         return True  # unknown stage = done
@@ -1154,7 +1154,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         w, h = region.width, region.height
         self._last_w, self._last_h = w, h
 
-        # ── First contact: start with smooth fade-in before any work ──
+        # ── First contact: capture viewport and start cross-fade ──
         if not _ignis_initialized and _load_stage == LOAD_IDLE:
             _load_stage = LOAD_FADEIN
             _load_start_time = time.perf_counter()
@@ -1394,6 +1394,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             _ignis_frame_index += 1
         except Exception:
             _log_exception(f"view_draw render/display (frame {_ignis_frame_index})")
+
+        # Loading screen fade-out overlay (cross-fade from loader to render)
+        if loading_screen.draw_fadeout(w, h):
+            pass  # still fading — will redraw
 
         # FPS overlay
         if props.show_fps:
