@@ -31,7 +31,7 @@ layout(binding = 2, set = 0) uniform CameraProperties {
     ivec4 jitterPattern[8];
     uint lightCount;
     uint lightPad0, lightPad1, lightPad2;
-    vec4 lights[32];
+    vec4 lights[128];
 } cam;
 
 // Geometry metadata (same as raygen_blender.rgen)
@@ -408,7 +408,7 @@ void main() {
 
     // ---- NEE: Point/spot/area lights (bounce 0-1 only) ----
     if (!skipLocalNEE) {
-        for (uint li = 0u; li < cam.lightCount && li < 8u; li++) {
+        for (uint li = 0u; li < cam.lightCount && li < 32u; li++) {
             vec4 lightPosRange = cam.lights[li * 4u];
             vec4 lightColInt = cam.lights[li * 4u + 1u];
             vec3 lightPos = lightPosRange.xyz;

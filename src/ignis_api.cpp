@@ -410,7 +410,9 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
     cam.windParams[0] = static_cast<float>(cfg->hdriTexIndex);  // -1 = no HDRI
     cam.windParams[1] = cfg->hdriStrength;
     if (s_lightCount > 0) {
-        memcpy(cam.lights, s_lightData, s_lightCount * 16 * sizeof(float));
+        uint32_t uboLights = (s_lightCount > 32) ? 32 : s_lightCount;
+        cam.lightCount = uboLights;
+        memcpy(cam.lights, s_lightData, uboLights * 16 * sizeof(float));
     }
 
     g_renderer->UpdateCamera(cam);

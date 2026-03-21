@@ -26,7 +26,7 @@ layout(binding = 2, set = 0) uniform CameraProperties {
     ivec4 jitterPattern[8];
     uint lightCount;
     uint lightPad0, lightPad1, lightPad2;
-    vec4 lights[32];
+    vec4 lights[128];
 } cam;
 
 layout(binding = 12, set = 0) uniform sampler2D blueNoiseTexture;

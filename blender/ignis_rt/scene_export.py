@@ -711,20 +711,19 @@ def export_world_hdri(depsgraph):
     px = np.empty(w * h * 4, dtype=np.float32)
     image.pixels.foreach_get(px)
     px_rgb = px.reshape(-1, 4)[:, :3]
-    # Compress HDR → 8-bit using Reinhard tonemap to preserve color hue.
-    # Linear scaling clips highlights to white (loses warm tones).
-    # Reinhard: out = in / (1 + in) — preserves color ratios.
-    # Shader inverts: hdri_color = tex / (1 - tex) * strength
+    # Compress HDR → 8-bit using Reinhard with pre-exposure.
+    # Pre-exposure boosts dark values before compression → more 8-bit precision for ambient.
+    # Reinhard: out = (in * E) / (1 + in * E)
+    # Shader inverse: hdri = (tex / (1 - tex)) / E * strength
+    PRE_EXPOSURE = 4.0  # boost darks 4x for more precision in ambient range
     px_rgba = px.reshape(-1, 4)
     rgb = px_rgba[:, :3].copy()
     alpha = px_rgba[:, 3:4]
-    # Reinhard per-channel: compressed = rgb / (1 + rgb)
-    rgb_pos = np.maximum(rgb, 0.0)
-    compressed = rgb_pos / (1.0 + rgb_pos)
+    rgb_exposed = np.maximum(rgb * PRE_EXPOSURE, 0.0)
+    compressed = rgb_exposed / (1.0 + rgb_exposed)
     px_out = np.concatenate([compressed, alpha], axis=1)
     px_u8 = (np.clip(px_out, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8).reshape(h, w, 4)
     px_u8 = px_u8[::-1]  # Blender stores bottom-up, PNG is top-down
-    # strength = 1.0 (Reinhard inverse in shader handles reconstruction)
 
     # Minimal PNG encoder (RGBA8, no filtering)
     def _write_png_chunk(out, chunk_type, chunk_data):
@@ -812,8 +811,80 @@ def export_sun(depsgraph):
     return defaults
 
 
+def _blackbody_to_rgb(temperature_k):
+    """Convert Blackbody color temperature (Kelvin) to linear Rec.709 RGB.
+
+    Polynomial coefficients from Blender/Cycles (Apache 2.0 license).
+    Source: intern/cycles/kernel/tables.h + svm/math_util.h
+    Copyright: 2011-2022 Blender Foundation
+    Formula: R,G = a/t + b*t + c;  B = ((a*t + b)*t + c)*t + d
+    """
+    t = float(temperature_k)
+
+    if t >= 12000.0:
+        return (0.8263, 0.9945, 1.0)  # clamped blue
+    if t < 800.0:
+        return (1.0, 0.0, 0.0)  # very dim red
+
+    # Piecewise table indices (same breakpoints as Cycles)
+    _r_table = [
+        (1.61919106e+03, -2.05010916e-03, 5.02995757e+00),
+        (2.48845471e+03, -1.11330907e-03, 3.22621544e+00),
+        (3.34143193e+03, -4.86551192e-04, 1.76486769e+00),
+        (4.09461742e+03, -1.27446582e-04, 7.25731635e-01),
+        (4.67028036e+03,  2.91258199e-05, 1.26703442e-01),
+        (4.59509185e+03,  2.87495649e-05, 1.50345020e-01),
+        (3.78717450e+03,  9.35907826e-06, 3.99075871e-01),
+    ]
+    _g_table = [
+        (-4.88999748e+02,  6.04330754e-04, -7.55807526e-02),
+        (-7.55994277e+02,  3.16730098e-04,  4.78306139e-01),
+        (-1.02363977e+03,  1.20223470e-04,  9.36662319e-01),
+        (-1.26571316e+03,  4.87340896e-06,  1.27054498e+00),
+        (-1.42529332e+03, -4.01150431e-05,  1.43972784e+00),
+        (-1.17554822e+03, -2.16378048e-05,  1.30408023e+00),
+        (-5.00799571e+02, -4.59832026e-06,  1.09098763e+00),
+    ]
+    _b_table = [
+        ( 5.96945309e-11, -4.85742887e-08, -9.70622247e-05, -4.07936148e-03),
+        ( 2.40430366e-11,  5.55021075e-08, -1.98503712e-04,  2.89312858e-02),
+        (-1.40949732e-11,  1.89878968e-07, -3.56632824e-04,  9.10767778e-02),
+        (-3.61460868e-11,  2.84822009e-07, -4.93211319e-04,  1.56723440e-01),
+        (-1.97075738e-11,  1.75359352e-07, -2.50542825e-04, -2.22783266e-02),
+        (-1.61603419e-11,  1.09815345e-07, -1.41329376e-04, -4.42452373e-02),
+        (-1.01587682e-11,  6.20469931e-08, -6.59693818e-05, -9.14294750e-03),
+    ]
+    _breaks = [965.0, 1167.0, 1449.0, 1902.0, 3315.0, 6365.0]
+
+    if t >= _breaks[5]:
+        i = 6
+    elif t >= _breaks[4]:
+        i = 5
+    elif t >= _breaks[3]:
+        i = 4
+    elif t >= _breaks[2]:
+        i = 3
+    elif t >= _breaks[1]:
+        i = 2
+    elif t >= _breaks[0]:
+        i = 1
+    else:
+        i = 0
+
+    t_inv = 1.0 / t
+    r = _r_table[i]
+    g = _g_table[i]
+    b = _b_table[i]
+
+    rv = r[0] * t_inv + r[1] * t + r[2]
+    gv = g[0] * t_inv + g[1] * t + g[2]
+    bv = ((b[0] * t + b[1]) * t + b[2]) * t + b[3]
+
+    return (max(0.0, rv), max(0.0, gv), max(0.0, bv))
+
+
 def export_lights(depsgraph):
-    """Export point/spot/area lights (max 8) for NEE direct sampling.
+    """Export point/spot/area lights (max 32) for NEE direct sampling.
 
     Returns a flat list of floats: 16 floats per light.
     [posX, posY, posZ, range, colR, colG, colB, intensity, dirX, dirY, dirZ, sizeX, tanX, tanY, tanZ, sizeY]
@@ -826,7 +897,7 @@ def export_lights(depsgraph):
         light = obj.data
         if light.type == 'SUN':
             continue  # sun is handled separately
-        if len(lights) >= 128:  # 8 lights × 16 floats each
+        if len(lights) >= 512:  # 32 lights × 16 floats each
             break
 
         # World position (Blender Z-up -> Vulkan Y-up)
@@ -837,6 +908,14 @@ def export_lights(depsgraph):
 
         energy = light.energy
         color = light.color
+
+        # Check for Blackbody node in light's node tree (overrides light.color)
+        if hasattr(light, 'use_nodes') and light.use_nodes and light.node_tree:
+            for node in light.node_tree.nodes:
+                if node.type == 'BLACKBODY':
+                    temp_k = node.inputs['Temperature'].default_value
+                    color = _blackbody_to_rgb(temp_k)
+                    break
         estimated_range = max(math.sqrt(energy / 0.01), 1.0) if energy > 0 else 10.0
         estimated_range = min(estimated_range, 100.0)
 
@@ -884,8 +963,7 @@ def export_lights(depsgraph):
             else:
                 spot_smooth = 1e6  # hard edge
             size_x = cos_half       # packed in size_x
-            size_y = spot_smooth    # packed in size_y
-            # Negative range with size_x > 0 signals spot light
+            size_y = -spot_smooth   # NEGATIVE sizeY signals spot light (vs area)
             export_range = -estimated_range
         else:
             export_range = estimated_range
@@ -973,8 +1051,8 @@ def export_emissive_triangles_fast(depsgraph, unique_meshes, scene_instances, ma
         if not slot_emission:
             slot_emission = [((0.0, 0.0, 0.0), 0.0)]
 
-        # Check if any slot has emission
-        if not any(s[1] > 0.0 for s in slot_emission):
+        # Check if any slot has REAL emission (strength > 0 AND non-black color)
+        if not any(s[1] > 0.0 and sum(s[0]) > 0.001 for s in slot_emission):
             continue
 
         # Use pre-exported positions (already flattened float32)
@@ -1009,7 +1087,7 @@ def export_emissive_triangles_fast(depsgraph, unique_meshes, scene_instances, ma
 
             mat_idx = min(int(tri_mat[ti]), n_slots - 1)
             em_color, em_strength = slot_emission[max(mat_idx, 0)]
-            if em_strength <= 0.0:
+            if em_strength <= 0.0 or sum(em_color) < 0.001:
                 continue
 
             vi = indices[ti]
