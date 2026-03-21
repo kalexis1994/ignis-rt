@@ -1,8 +1,6 @@
 <p align="center">
-  <img src="icons/ignis_logo.png" width="128" alt="Ignis RT">
+  <img src="icons/ignis_logo.png" width="280" alt="Ignis RT">
 </p>
-
-# Ignis RT
 
 Real-time Vulkan path tracing renderer for Blender. Hardware-accelerated ray tracing with NVIDIA DLSS Ray Reconstruction for production-quality denoising at 30-60 FPS.
 
