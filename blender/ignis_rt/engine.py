@@ -187,7 +187,7 @@ def _get_logo_texture():
         return _loading_logo_texture
     try:
         icons_dir = os.path.join(os.path.dirname(__file__), "icons")
-        logo_path = os.path.join(icons_dir, "ignis_512.png")
+        logo_path = os.path.join(icons_dir, "ignis_icon.png")
         if not os.path.isfile(logo_path):
             return None
         img = bpy.data.images.load(logo_path, check_existing=True)
@@ -215,19 +215,28 @@ def _get_font_id():
 
 
 def _draw_fire_ring(shader, cx, cy, t, radius=22, segments=48, ring_width=4.0):
-    """Draw a fire-colored spinning ring using many small arcs."""
+    """Draw a sunset-colored spinning ring using the Ignis palette."""
     for i in range(segments):
         frac = i / segments
         angle = 2 * math.pi * frac - t * 4.0  # clockwise rotation
 
-        # Fire color: head is bright yellow, tail fades to dark red
         sweep = (frac + t * 4.0 / (2 * math.pi)) % 1.0
         intensity = pow(1.0 - sweep, 2.0)  # bright head, fading tail
 
-        # RGB fire gradient: yellow -> orange -> red -> dark
-        r_col = min(1.0, 0.3 + intensity * 1.4)
-        g_col = max(0.0, intensity * 0.9 - 0.1)
-        b_col = max(0.0, intensity * 0.15 - 0.1)
+        # Ignis palette gradient: golden → sunset-500 → sunset-900 → darkness
+        # golden #D4B87A (0.831,0.722,0.478)
+        # sunset-500 #E06030 (0.878,0.376,0.188)
+        # sunset-900 #7A3218 (0.478,0.196,0.094)
+        if intensity > 0.5:
+            t2 = (intensity - 0.5) * 2.0  # 0→1 for top half
+            r_col = 0.878 + t2 * (0.831 - 0.878)  # sunset-500 → golden
+            g_col = 0.376 + t2 * (0.722 - 0.376)
+            b_col = 0.188 + t2 * (0.478 - 0.188)
+        else:
+            t2 = intensity * 2.0  # 0→1 for bottom half
+            r_col = 0.478 + t2 * (0.878 - 0.478)  # sunset-900 → sunset-500
+            g_col = 0.196 + t2 * (0.376 - 0.196)
+            b_col = 0.094 + t2 * (0.188 - 0.094)
         alpha = max(0.0, min(1.0, intensity * 1.5))
 
         # Dot size varies: bigger at head
@@ -260,12 +269,13 @@ def _draw_loading_screen(w, h, status="", progress=0.0):
         _loading_screen_start = now
     fade = min((now - _loading_screen_start) / 0.6, 1.0)
 
-    COL_FLAME = (1.0, 0.3, 0.0, fade)
-    COL_AMBER = (1.0, 0.72, 0.0, fade)
-    COL_BG = (0.08, 0.04, 0.02, 1.0)  # bg always opaque
-    COL_TEXT = (1.0, 1.0, 1.0, fade)
-    COL_TEXT_DIM = (0.7, 0.7, 0.7, fade)
-    COL_BAR_BG = (0.15, 0.10, 0.06, fade)
+    # Ignis palette — darkness + sunset + sky
+    COL_BG = (0.055, 0.055, 0.063, 1.0)         # darkness-700 #1C1C1E
+    COL_FLAME = (0.878, 0.376, 0.188, fade)      # sunset-500 #E06030
+    COL_AMBER = (0.831, 0.722, 0.478, fade)      # golden #D4B87A
+    COL_TEXT = (0.863, 0.890, 0.929, fade)        # sky-50 #DCE4ED
+    COL_TEXT_DIM = (0.561, 0.647, 0.769, fade)    # sky-500 #8FA7C4
+    COL_BAR_BG = (0.180, 0.180, 0.190, fade)     # darkness-500 #2E2E30
 
     gpu.state.blend_set('NONE')
     gpu.state.depth_test_set('NONE')
