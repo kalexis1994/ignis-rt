@@ -84,6 +84,9 @@ def load():
     _lib.ignis_create.argtypes = [c_uint32, c_uint32]
     _lib.ignis_create.restype = c_bool
 
+    _lib.ignis_create_step.argtypes = [c_uint32, c_uint32]
+    _lib.ignis_create_step.restype = c_char_p
+
     _lib.ignis_destroy.argtypes = []
     _lib.ignis_destroy.restype = None
 
@@ -186,6 +189,12 @@ def load():
     _lib.ignis_texture_manager_upload_all.argtypes = [c_void_p]
     _lib.ignis_texture_manager_upload_all.restype = c_bool
 
+    _lib.ignis_texture_manager_upload_one.argtypes = [c_void_p]
+    _lib.ignis_texture_manager_upload_one.restype = c_bool
+
+    _lib.ignis_texture_manager_pending_count.argtypes = [c_void_p]
+    _lib.ignis_texture_manager_pending_count.restype = c_int
+
     _lib.ignis_update_texture_descriptors.argtypes = [c_void_p]
     _lib.ignis_update_texture_descriptors.restype = None
 
@@ -206,6 +215,12 @@ def set_log_path(path: str):
 
 def create(width: int, height: int) -> bool:
     return _lib.ignis_create(c_uint32(width), c_uint32(height))
+
+
+def create_step(width: int, height: int):
+    """Execute one init step. Returns step name (str) or None when done."""
+    result = _lib.ignis_create_step(c_uint32(width), c_uint32(height))
+    return result.decode('utf-8') if result else None
 
 
 def destroy():
@@ -345,6 +360,16 @@ def texture_manager_add(handle, name: str, data, data_size: int,
 
 def texture_manager_upload_all(handle) -> bool:
     return _lib.ignis_texture_manager_upload_all(handle)
+
+
+def texture_manager_upload_one(handle) -> bool:
+    """Upload one pending texture to GPU. Returns True if uploaded, False if none pending."""
+    return _lib.ignis_texture_manager_upload_one(handle)
+
+
+def texture_manager_pending_count(handle) -> int:
+    """Return number of textures still waiting for GPU upload."""
+    return _lib.ignis_texture_manager_pending_count(handle)
 
 
 def update_texture_descriptors(handle):

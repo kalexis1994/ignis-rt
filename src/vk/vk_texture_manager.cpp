@@ -697,6 +697,148 @@ bool TextureManager::UploadAll() {
     return true;
 }
 
+int TextureManager::GetPendingUploadCount() const {
+    int count = 0;
+    for (const auto& tex : textures_) {
+        if (!tex.uploaded && tex.stagingBuffer != VK_NULL_HANDLE) count++;
+    }
+    return count;
+}
+
+bool TextureManager::UploadOne() {
+    VkDevice device = context_->GetDevice();
+
+    // Find next pending texture starting from cursor
+    while (uploadCursor_ < (int)textures_.size()) {
+        auto& tex = textures_[uploadCursor_];
+        if (!tex.uploaded && tex.stagingBuffer != VK_NULL_HANDLE) break;
+        uploadCursor_++;
+    }
+    if (uploadCursor_ >= (int)textures_.size()) {
+        uploadCursor_ = 0;  // reset for next batch
+        return false;  // nothing to upload
+    }
+
+    auto& tex = textures_[uploadCursor_];
+    VkCommandBuffer cmd = context_->BeginSingleTimeCommands();
+
+    // Transition UNDEFINED -> TRANSFER_DST_OPTIMAL
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = tex.image;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = tex.mipLevels;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    // Copy mip levels from staging buffer to image
+    std::vector<VkBufferImageCopy> copyRegions;
+    int mipsToUpload = tex.generateMips ? 1 : tex.mipLevels;
+    for (int mip = 0; mip < mipsToUpload; mip++) {
+        size_t offset, size;
+        int mipWidth, mipHeight;
+        CalculateMipOffsetAndSize(tex.width, tex.height, mip, tex.format, offset, size, mipWidth, mipHeight);
+
+        if (offset + size > (size_t)tex.stagingSize) break;
+
+        VkBufferImageCopy region{};
+        region.bufferOffset = offset;
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = mip;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = { (uint32_t)mipWidth, (uint32_t)mipHeight, 1 };
+        copyRegions.push_back(region);
+    }
+
+    if (!copyRegions.empty()) {
+        vkCmdCopyBufferToImage(cmd, tex.stagingBuffer, tex.image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            (uint32_t)copyRegions.size(), copyRegions.data());
+    }
+
+    if (tex.generateMips && tex.mipLevels > 1) {
+        // Generate mipmaps via blit chain
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+        int mipW = tex.width, mipH = tex.height;
+        for (int mip = 1; mip < tex.mipLevels; mip++) {
+            int nextW = mipW > 1 ? mipW / 2 : 1;
+            int nextH = mipH > 1 ? mipH / 2 : 1;
+
+            VkImageBlit blit{};
+            blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)(mip - 1), 0, 1 };
+            blit.srcOffsets[1] = { mipW, mipH, 1 };
+            blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)mip, 0, 1 };
+            blit.dstOffsets[1] = { nextW, nextH, 1 };
+
+            vkCmdBlitImage(cmd, tex.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1, &blit, VK_FILTER_LINEAR);
+
+            barrier.subresourceRange.baseMipLevel = mip;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+            mipW = nextW; mipH = nextH;
+        }
+
+        // All mips TRANSFER_SRC -> SHADER_READ_ONLY
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = tex.mipLevels;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+            0, 0, nullptr, 0, nullptr, 1, &barrier);
+    } else {
+        // No mip gen — transition to shader read
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+            0, 0, nullptr, 0, nullptr, 1, &barrier);
+    }
+
+    context_->EndSingleTimeCommands(cmd);
+
+    // Free staging buffer
+    tex.uploaded = true;
+    vkDestroyBuffer(device, tex.stagingBuffer, nullptr);
+    vkFreeMemory(device, tex.stagingMemory, nullptr);
+    tex.stagingBuffer = VK_NULL_HANDLE;
+    tex.stagingMemory = VK_NULL_HANDLE;
+
+    uploadCursor_++;
+    return true;
+}
+
 VkImageView TextureManager::GetImageView(int index) const {
     if (index < 0 || index >= (int)textures_.size()) return VK_NULL_HANDLE;
     return textures_[index].imageView;

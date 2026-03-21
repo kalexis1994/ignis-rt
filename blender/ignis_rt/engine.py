@@ -119,6 +119,7 @@ _ignis_mat_name_to_index = {}  # persistent material name→index mapping for in
 
 # ── Staged loading state machine ──
 LOAD_IDLE = 0          # no loading in progress
+LOAD_FADEIN = -1       # show loading screen fade-in (no work yet)
 LOAD_INIT = 1          # initialize renderer
 LOAD_EXPORT = 2        # export meshes from depsgraph (CPU)
 LOAD_MESHES = 3        # upload meshes to GPU (batched)
@@ -126,6 +127,9 @@ LOAD_MATERIALS = 4     # upload materials + textures
 LOAD_MATIDS = 5        # assign per-primitive material IDs
 LOAD_TLAS = 6          # build acceleration structure
 LOAD_FINALIZE = 7      # final setup (sun, etc.)
+LOAD_TEX_UPLOAD = 8    # upload textures one-at-a-time to GPU (smooth spinner)
+
+FADEIN_DURATION = 0.8  # seconds to show loading screen before starting work
 
 _load_stage = LOAD_IDLE
 _load_start_time = 0.0
@@ -141,6 +145,8 @@ _load_mat_name_to_index = None
 _load_textures_list = None
 _load_obj_to_mesh_key = None
 _load_depsgraph = None
+_load_tex_idx = 0
+_load_tex_buffers = []
 MESH_BATCH_SIZE = 4    # meshes per frame during loading
 
 
@@ -177,188 +183,7 @@ def _draw_fps_overlay(w, h):
     gpu.state.blend_set('NONE')
 
 
-_loading_logo_texture = None
-_loading_font_id = None
-
-
-def _get_logo_texture():
-    """Load the logo texture for the loading screen (cached)."""
-    global _loading_logo_texture
-    if _loading_logo_texture is not None:
-        return _loading_logo_texture
-    try:
-        icons_dir = os.path.join(os.path.dirname(__file__), "icons")
-        logo_path = os.path.join(icons_dir, "ignis_icon.png")
-        if not os.path.isfile(logo_path):
-            return None
-        img = bpy.data.images.load(logo_path, check_existing=True)
-        img.gl_load()
-        _loading_logo_texture = gpu.texture.from_image(img)
-        return _loading_logo_texture
-    except Exception:
-        return None
-
-
-def _get_font_id():
-    """Load Nova Round font (cached). Returns blf font id."""
-    global _loading_font_id
-    if _loading_font_id is not None:
-        return _loading_font_id
-    try:
-        font_path = os.path.join(os.path.dirname(__file__), "icons", "NovaRound-Regular.ttf")
-        if os.path.isfile(font_path):
-            _loading_font_id = blf.load(font_path)
-        else:
-            _loading_font_id = 0
-    except Exception:
-        _loading_font_id = 0
-    return _loading_font_id
-
-
-def _draw_fire_ring(shader, cx, cy, t, radius=22, segments=48, ring_width=4.0):
-    """Draw a sunset-colored spinning ring using the Ignis palette."""
-    for i in range(segments):
-        frac = i / segments
-        angle = 2 * math.pi * frac - t * 4.0  # clockwise rotation
-
-        sweep = (frac + t * 4.0 / (2 * math.pi)) % 1.0
-        intensity = pow(1.0 - sweep, 2.0)  # bright head, fading tail
-
-        # Ignis palette gradient: golden → sunset-500 → sunset-900 → darkness
-        # golden #D4B87A (0.831,0.722,0.478)
-        # sunset-500 #E06030 (0.878,0.376,0.188)
-        # sunset-900 #7A3218 (0.478,0.196,0.094)
-        if intensity > 0.5:
-            t2 = (intensity - 0.5) * 2.0  # 0→1 for top half
-            r_col = 0.878 + t2 * (0.831 - 0.878)  # sunset-500 → golden
-            g_col = 0.376 + t2 * (0.722 - 0.376)
-            b_col = 0.188 + t2 * (0.478 - 0.188)
-        else:
-            t2 = intensity * 2.0  # 0→1 for bottom half
-            r_col = 0.478 + t2 * (0.878 - 0.478)  # sunset-900 → sunset-500
-            g_col = 0.196 + t2 * (0.376 - 0.196)
-            b_col = 0.094 + t2 * (0.188 - 0.094)
-        alpha = max(0.0, min(1.0, intensity * 1.5))
-
-        # Dot size varies: bigger at head
-        dot_r = ring_width * (0.4 + 0.6 * intensity)
-
-        dx = cx + math.cos(angle) * radius
-        dy = cy + math.sin(angle) * radius
-
-        # Draw circle
-        verts = [(dx, dy)]
-        for s in range(13):
-            a = 2 * math.pi * s / 12
-            verts.append((dx + math.cos(a) * dot_r, dy + math.sin(a) * dot_r))
-        dot_batch = batch_for_shader(shader, 'TRI_FAN', {"pos": verts})
-        shader.bind()
-        shader.uniform_float("color", (r_col, g_col, b_col, alpha))
-        dot_batch.draw(shader)
-
-
-_loading_screen_start = 0.0
-
-
-def _draw_loading_screen(w, h, status="", progress=0.0):
-    """Draw the IGNIS RT loading screen with logo and glowing spinner."""
-    global _loading_screen_start
-
-    # Fade-in: track start time, alpha ramps 0→1 over 0.6s
-    now = time.perf_counter()
-    if _loading_screen_start <= 0.0:
-        _loading_screen_start = now
-    fade = min((now - _loading_screen_start) / 0.6, 1.0)
-
-    # Ignis palette — darkness + sunset + sky
-    COL_BG = (0.055, 0.055, 0.063, 1.0)         # darkness-700 #1C1C1E
-    COL_FLAME = (0.878, 0.376, 0.188, fade)      # sunset-500 #E06030
-    COL_AMBER = (0.831, 0.722, 0.478, fade)      # golden #D4B87A
-    COL_TEXT = (0.863, 0.890, 0.929, fade)        # sky-50 #DCE4ED
-    COL_TEXT_DIM = (0.561, 0.647, 0.769, fade)    # sky-500 #8FA7C4
-    COL_BAR_BG = (0.180, 0.180, 0.190, fade)     # darkness-500 #2E2E30
-
-    gpu.state.blend_set('NONE')
-    gpu.state.depth_test_set('NONE')
-    gpu.state.depth_mask_set(False)
-
-    # Dark brown background
-    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
-    bg = ((0, 0), (w, 0), (w, h), (0, h))
-    batch = batch_for_shader(shader, 'TRI_FAN', {"pos": bg})
-    shader.bind()
-    shader.uniform_float("color", COL_BG)
-    batch.draw(shader)
-
-    cx, cy = w / 2, h / 2
-    gpu.state.blend_set('ALPHA')
-
-    # Logo image (full UVs, transparent PNG)
-    logo_tex = _get_logo_texture()
-    if logo_tex and fade > 0.01:
-        logo_size = 100
-        lx = cx - logo_size / 2
-        ly = cy + 25
-        img_shader = gpu.shader.from_builtin('IMAGE')
-        img_batch = batch_for_shader(img_shader, 'TRI_FAN', {
-            "pos": ((lx, ly), (lx + logo_size, ly), (lx + logo_size, ly + logo_size), (lx, ly + logo_size)),
-            "texCoord": ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)),
-        })
-        img_shader.bind()
-        img_shader.uniform_sampler("image", logo_tex)
-        img_batch.draw(img_shader)
-
-        # Fade-in overlay: cover logo with bg color at inverse alpha
-        if fade < 1.0:
-            shader.bind()
-            shader.uniform_float("color", (COL_BG[0], COL_BG[1], COL_BG[2], 1.0 - fade))
-            logo_cover = ((lx, ly), (lx + logo_size, ly), (lx + logo_size, ly + logo_size), (lx, ly + logo_size))
-            batch_for_shader(shader, 'TRI_FAN', {"pos": logo_cover}).draw(shader)
-
-        title_y = ly - 8
-    else:
-        title_y = cy + 30
-
-    # "Ignis RT" title
-    font_id = _get_font_id()
-    blf.size(font_id, 48)
-    blf.color(font_id, *COL_TEXT)
-    title = "Ignis RT"
-    tw, th = blf.dimensions(font_id, title)
-    blf.position(font_id, cx - tw / 2, title_y - 48, 0)
-    blf.draw(font_id, title)
-
-    # Fire ring spinner
-    spinner_y = title_y - 100
-    _draw_fire_ring(shader, cx, spinner_y, time.perf_counter())
-
-    # Status text
-    if status:
-        blf.size(font_id, 18)
-        blf.color(font_id, *COL_TEXT_DIM)
-        sw = blf.dimensions(font_id, status)[0]
-        blf.position(font_id, cx - sw / 2, spinner_y - 55, 0)
-        blf.draw(font_id, status)
-
-    # Progress bar
-    if progress > 0.0:
-        bar_w = 240
-        bar_h = 4
-        bx = cx - bar_w / 2
-        by = spinner_y - 75
-        bg_verts = ((bx, by), (bx + bar_w, by), (bx + bar_w, by + bar_h), (bx, by + bar_h))
-        bg_batch = batch_for_shader(shader, 'TRI_FAN', {"pos": bg_verts})
-        shader.bind()
-        shader.uniform_float("color", COL_BAR_BG)
-        bg_batch.draw(shader)
-        fill_w = bar_w * min(progress, 1.0)
-        fill_verts = ((bx, by), (bx + fill_w, by), (bx + fill_w, by + bar_h), (bx, by + bar_h))
-        fill_batch = batch_for_shader(shader, 'TRI_FAN', {"pos": fill_verts})
-        shader.bind()
-        shader.uniform_float("color", COL_FLAME)
-        fill_batch.draw(shader)
-
-    gpu.state.blend_set('NONE')
+from . import loading_screen
 
 
 def _ignis_shutdown():
@@ -548,12 +373,110 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         global _load_stage, _load_status, _load_progress
         global _load_unique_meshes, _load_scene_instances, _load_mesh_keys, _load_mesh_idx
         global _load_materials_data, _load_mat_name_to_index, _load_textures_list, _load_obj_to_mesh_key, _load_hidden
+        global _load_tex_idx, _load_tex_buffers
+        global _ignis_initialized, _ignis_width, _ignis_height
+        global _ignis_float_buffer, _ignis_byte_buffer
         global _ignis_blas_handles, _ignis_frame_index
         global _ignis_full_dirty, _ignis_materials_dirty, _ignis_tlas_dirty
         global _ignis_last_full_upload, _ignis_instance_count, _ignis_tex_manager
         global _ignis_last_tex_names
 
-        if _load_stage == LOAD_EXPORT:
+        # Yield frame: skip one frame of work to let the spinner animate
+        if hasattr(self, '_load_yield') and self._load_yield:
+            self._load_yield = False
+            return False
+
+        if _load_stage == LOAD_FADEIN:
+            # ── Fade-in phase: just show loading screen, no work yet ──
+            _load_status = ""
+            _load_progress = 0.0
+            elapsed = time.perf_counter() - _load_start_time
+            if elapsed >= FADEIN_DURATION:
+                if not _ignis_initialized:
+                    # Show "Initializing" text for 1 frame before blocking
+                    _load_status = "Initializing renderer..."
+                    _load_stage = LOAD_INIT
+                else:
+                    _load_stage = LOAD_EXPORT
+            return False
+
+        elif _load_stage == LOAD_INIT:
+            # ── Stage 0: Vulkan init in background thread (spinner stays smooth) ──
+            import threading
+
+            if not hasattr(self, '_init_thread'):
+                # First call: load DLL + configure on main thread, then start worker
+                _load_status = "Initializing renderer..."
+                _load_progress = 0.01
+                dll_wrapper.load()
+                from . import get_log_path, get_base_path
+                dll_wrapper.set_log_path(get_log_path())
+                dll_wrapper.set_base_path(get_base_path())
+                dll_wrapper.set_int("shader_mode", 1)
+                try:
+                    props = bpy.context.scene.ignis_rt
+                    if props.dlss_enabled:
+                        dll_wrapper.set_int("dlss_enabled", 1)
+                        dll_wrapper.set_int("dlss_quality", int(props.dlss_quality))
+                        if props.dlss_rr_enabled and int(props.dlss_quality) < 6:
+                            dll_wrapper.set_int("dlss_rr_enabled", 1)
+                    if hasattr(props, 'samples_per_pixel') and props.samples_per_pixel > 1:
+                        dll_wrapper.set_int("spp", props.samples_per_pixel)
+                    if props.use_wavefront:
+                        dll_wrapper.set_int("use_wavefront", 1)
+                except Exception:
+                    pass
+
+                w = self._last_w if hasattr(self, '_last_w') else 1920
+                h = self._last_h if hasattr(self, '_last_h') else 1080
+                self._init_w, self._init_h = w, h
+                self._init_ok = None  # result from thread
+
+                def _worker():
+                    try:
+                        self._init_ok = dll_wrapper.create(w, h)
+                    except Exception as e:
+                        _log(f"Init thread error: {e}")
+                        self._init_ok = False
+
+                self._init_thread = threading.Thread(target=_worker, daemon=True)
+                self._init_thread.start()
+                return False
+
+            # Poll thread
+            if self._init_thread.is_alive():
+                _load_status = "Initializing renderer..."
+                _load_progress = 0.03
+                return False  # spinner keeps spinning
+
+            # Thread complete
+            self._init_thread.join()
+            ok = self._init_ok
+            w, h = self._init_w, self._init_h
+            del self._init_thread, self._init_ok, self._init_w, self._init_h
+
+            if not ok:
+                _log("ERROR: ignis_create failed in background thread")
+                _load_stage = LOAD_IDLE
+                return True
+
+            # Finalize Python-side state
+            _ignis_initialized = True
+            _ignis_width = w
+            _ignis_height = h
+            _ignis_frame_index = 0
+            _ignis_blas_handles = {}
+            _ignis_full_dirty = True
+            _ignis_materials_dirty = False
+            _ignis_tlas_dirty = False
+            _ignis_float_buffer = (ctypes.c_float * (w * h * 4))()
+            _ignis_byte_buffer = (ctypes.c_uint8 * (w * h * 4))()
+            _log("Init complete (background thread)")
+            _load_stage = LOAD_EXPORT
+            self._load_yield = True
+            return False
+
+        elif _load_stage == LOAD_EXPORT:
             # ── Stage 1: Export ALL meshes + instances from depsgraph ──
             # This extracts geometry from Blender (CPU-bound, requires GIL)
             _load_status = "Exporting geometry..."
@@ -574,13 +497,14 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 _load_stage = LOAD_IDLE
                 return True
             _load_stage = LOAD_MESHES
+            self._load_yield = True  # breathe after export
             return False
 
         elif _load_stage == LOAD_MESHES:
             # ── Stage 2: Upload meshes to GPU in batches ──
             # Each batch: BLAS build + attribute upload (GPU-bound)
             total = len(_load_mesh_keys)
-            batch_size = max(MESH_BATCH_SIZE, total // 20)  # at least 5% per frame
+            batch_size = 1  # 1 mesh per frame for smooth spinner
             end = min(_load_mesh_idx + batch_size, total)
             _load_status = f"Building BVH... {end}/{total}"
             _load_progress = 0.1 + 0.4 * (end / max(total, 1))
@@ -619,78 +543,137 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 except Exception:
                     pass
                 _load_stage = LOAD_MATERIALS
+                self._load_yield = True  # breathe after mesh upload
             return False
 
         elif _load_stage == LOAD_MATERIALS:
-            # ── Stage 3: Materials + textures ──
-            _load_status = "Loading materials & textures..."
-            _load_progress = 0.55
-            try:
-                t0 = time.perf_counter()
-                _load_materials_data, _load_mat_name_to_index, _load_textures_list = \
-                    scene_export.export_materials(depsgraph, hidden_objects=_load_hidden)
-                _log(f"Stage MATERIALS: exporting {len(_load_mat_name_to_index)} materials, "
-                     f"{len(_load_textures_list)} textures")
+            # ── Stage 3: Materials + textures (chunked for smooth spinner) ──
+            # Sub-stage A: export materials from Blender (one-time)
+            if _load_materials_data is None:
+                _load_status = "Exporting materials..."
+                _load_progress = 0.50
+                try:
+                    _load_materials_data, _load_mat_name_to_index, _load_textures_list = \
+                        scene_export.export_materials(depsgraph, hidden_objects=_load_hidden)
+                    _log(f"Stage MATERIALS: exporting {len(_load_mat_name_to_index)} materials, "
+                         f"{len(_load_textures_list)} textures")
+                    _load_tex_idx = 0
+                    _load_tex_buffers = []
+                    if _load_textures_list:
+                        if _ignis_tex_manager is not None:
+                            dll_wrapper.destroy_texture_manager(_ignis_tex_manager)
+                            _ignis_tex_manager = None
+                        _ignis_tex_manager = dll_wrapper.create_texture_manager()
+                except Exception:
+                    _log_exception("LOAD_MATERIALS export")
+                    _load_stage = LOAD_IDLE
+                    return True
+                return False
 
-                if _load_textures_list:
-                    if _ignis_tex_manager is not None:
-                        dll_wrapper.destroy_texture_manager(_ignis_tex_manager)
-                        _ignis_tex_manager = None
-                    _ignis_tex_manager = dll_wrapper.create_texture_manager()
-                    if _ignis_tex_manager:
-                        tex_buffers = []
-                        for ti, tex_info in enumerate(_load_textures_list):
-                            _log(f"  tex[{ti}] '{tex_info['name']}': "
-                                 f"{tex_info['width']}x{tex_info['height']}, "
-                                 f"{len(tex_info['data'])} bytes")
-                            data_bytes = tex_info["data"]
-                            data_np = np.frombuffer(data_bytes, dtype=np.uint8).copy()
-                            tex_buffers.append(data_np)
-                            dll_wrapper.texture_manager_add(
-                                _ignis_tex_manager,
-                                tex_info["name"],
-                                data_np.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-                                len(data_bytes),
-                                tex_info["width"], tex_info["height"],
-                                1, 0,
-                            )
-                        _log("  uploading all textures to GPU...")
-                        ok = dll_wrapper.texture_manager_upload_all(_ignis_tex_manager)
-                        if ok:
-                            dll_wrapper.update_texture_descriptors(_ignis_tex_manager)
-                            _log("  texture upload OK")
-                        else:
-                            _log("  WARNING: texture upload failed")
-                        del tex_buffers
+            # Sub-stage B: extract + add textures one per frame
+            if hasattr(self, '_load_tex_idx_done') and self._load_tex_idx_done:
+                pass  # skip to material upload (no textures)
+            elif _load_textures_list and _ignis_tex_manager:
+                total_tex = len(_load_textures_list)
+                if _load_tex_idx < total_tex:
+                    ti = _load_tex_idx
+                    tex_info = _load_textures_list[ti]
+                    _load_status = f"Loading textures... {ti + 1}/{total_tex}"
+                    _load_progress = 0.50 + 0.15 * ((ti + 1) / max(total_tex, 1))
 
-                mat_count = max(len(_load_mat_name_to_index), 1)
-                dll_wrapper.upload_materials(_load_materials_data, mat_count)
-                _ignis_last_tex_names = tuple(t["name"] for t in _load_textures_list)
+                    # Extract pixel data from Blender (deferred from export_materials)
+                    scene_export.extract_texture_bytes(tex_info)
 
-                dt = time.perf_counter() - t0
-                _log(f"Stage MATERIALS: {mat_count} mat, "
-                     f"{len(_load_textures_list)} tex -- {dt:.2f}s")
-            except Exception:
-                _log_exception("LOAD_MATERIALS")
-                _load_stage = LOAD_IDLE
-                return True
+                    if tex_info["data"] is not None:
+                        _log(f"  tex[{ti}] '{tex_info['name']}': "
+                             f"{tex_info['width']}x{tex_info['height']}, "
+                             f"{len(tex_info['data'])} bytes")
+                        data_bytes = tex_info["data"]
+                        data_np = np.frombuffer(data_bytes, dtype=np.uint8).copy()
+                        _load_tex_buffers.append(data_np)
+                        dll_wrapper.texture_manager_add(
+                            _ignis_tex_manager,
+                            tex_info["name"],
+                            data_np.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                            len(data_bytes),
+                            tex_info["width"], tex_info["height"],
+                            1, 0,
+                        )
+
+                    _load_tex_idx += 1
+                    if _load_tex_idx < total_tex:
+                        return False  # next texture next frame
+                # All textures added → transition to per-frame GPU upload
+                self._load_tex_idx_done = True
+                _load_stage = LOAD_TEX_UPLOAD
+                return False
+
+            # No textures — go straight to material upload
+            _load_status = "Uploading materials..."
+            _load_progress = 0.68
+            mat_count = max(len(_load_mat_name_to_index), 1)
+            dll_wrapper.upload_materials(_load_materials_data, mat_count)
+            _ignis_last_tex_names = tuple(t["name"] for t in _load_textures_list)
+            _log(f"Stage MATERIALS: {mat_count} mat, {len(_load_textures_list)} tex")
+            self._load_tex_idx_done = False
+            _load_stage = LOAD_MATIDS
+            return False
+
+        elif _load_stage == LOAD_TEX_UPLOAD:
+            # ── Stage 3b: Upload textures to GPU one-at-a-time (smooth spinner) ──
+            if _ignis_tex_manager:
+                pending = dll_wrapper.texture_manager_pending_count(_ignis_tex_manager)
+                total_tex = len(_load_textures_list) if _load_textures_list else 0
+                done_count = total_tex - pending
+
+                if pending > 0:
+                    _load_status = f"Uploading textures to GPU... {done_count + 1}/{total_tex}"
+                    _load_progress = 0.55 + 0.13 * ((done_count + 1) / max(total_tex, 1))
+                    dll_wrapper.texture_manager_upload_one(_ignis_tex_manager)
+                    return False  # next frame uploads next texture
+
+                # All uploaded — update descriptors
+                dll_wrapper.update_texture_descriptors(_ignis_tex_manager)
+                _log(f"  texture upload OK ({total_tex} textures)")
+
+            _load_tex_buffers = []
+
+            # Upload material buffer
+            _load_status = "Uploading materials..."
+            _load_progress = 0.68
+            mat_count = max(len(_load_mat_name_to_index), 1)
+            dll_wrapper.upload_materials(_load_materials_data, mat_count)
+            _ignis_last_tex_names = tuple(t["name"] for t in _load_textures_list)
+            _log(f"Stage MATERIALS: {mat_count} mat, {len(_load_textures_list)} tex")
+            self._load_tex_idx_done = False
             _load_stage = LOAD_MATIDS
             return False
 
         elif _load_stage == LOAD_MATIDS:
-            # ── Stage 4: Per-primitive material IDs ──
-            _load_status = "Assigning materials to triangles..."
-            _load_progress = 0.7
-            try:
+            # ── Stage 4: Per-primitive material IDs (chunked) ──
+            # Build lookup on first call
+            if not hasattr(self, '_matid_keys'):
                 mesh_first_inst = {}
                 for inst in _load_scene_instances:
                     if inst["mesh_key"] not in mesh_first_inst:
                         mesh_first_inst[inst["mesh_key"]] = inst
+                self._matid_keys = list(_load_unique_meshes.keys())
+                self._matid_first_inst = mesh_first_inst
+                self._matid_idx = 0
 
-                for mesh_key, m in _load_unique_meshes.items():
+            total = len(self._matid_keys)
+            MATID_BATCH = 10  # 10 matID uploads per frame
+            end = min(self._matid_idx + MATID_BATCH, total)
+            _load_status = f"Assigning materials... {end}/{total}"
+            _load_progress = 0.70 + 0.10 * (end / max(total, 1))
+
+            try:
+                for ki in range(self._matid_idx, end):
+                    mesh_key = self._matid_keys[ki]
+                    m = _load_unique_meshes[mesh_key]
                     blas = _ignis_blas_handles.get(mesh_key)
                     if blas is not None and m["tri_count"] > 0:
-                        first_inst = mesh_first_inst.get(mesh_key)
+                        first_inst = self._matid_first_inst.get(mesh_key)
                         if first_inst is None:
                             continue
                         slots = first_inst["material_slots"]
@@ -711,10 +694,17 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             except Exception:
                 _log_exception("LOAD_MATIDS")
                 _load_stage = LOAD_IDLE
+                del self._matid_keys, self._matid_first_inst, self._matid_idx
                 return True
 
+            self._matid_idx = end
+            if self._matid_idx < total:
+                return False  # more to process
+
             _log("Stage MATIDS: done")
+            del self._matid_keys, self._matid_first_inst, self._matid_idx
             _load_stage = LOAD_TLAS
+            self._load_yield = True  # breathe after matIDs
             return False
 
         elif _load_stage == LOAD_TLAS:
@@ -744,6 +734,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 _load_stage = LOAD_IDLE
                 return True
             _load_stage = LOAD_FINALIZE
+            self._load_yield = True  # breathe after TLAS build
             return False
 
         elif _load_stage == LOAD_FINALIZE:
@@ -852,8 +843,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             _log(f" Staged load: COMPLETE ({dt:.2f}s total)")
             _load_stage = LOAD_IDLE
             _load_progress = 1.0
-            global _loading_screen_start
-            _loading_screen_start = 0.0  # reset for next fade-in
+            loading_screen.begin_fadeout()  # start fade-out transition to render
             return True
 
         return True  # unknown stage = done
@@ -1158,40 +1148,41 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
     def view_draw(self, context, depsgraph):
         """Called on every viewport redraw."""
         global _ignis_frame_index, _ignis_full_dirty, _ignis_materials_dirty, _ignis_tlas_dirty
-        global _load_stage, _ignis_instance_count
+        global _load_stage, _ignis_instance_count, _load_start_time
 
         region = context.region
         w, h = region.width, region.height
+        self._last_w, self._last_h = w, h
 
-        # ── Loading screen: show immediately, process one stage per call ──
+        # ── First contact: capture viewport and start cross-fade ──
+        if not _ignis_initialized and _load_stage == LOAD_IDLE:
+            _load_stage = LOAD_FADEIN
+            _load_start_time = time.perf_counter()
+            loading_screen.reset()
+            loading_screen.draw(w, h, "", 0.0)
+            self.tag_redraw()
+            return
+
+        # ── Loading screen: show and process one stage per call ──
         if _load_stage != LOAD_IDLE:
-            _draw_loading_screen(w, h, _load_status, _load_progress)
+            loading_screen.draw(w, h, _load_status, _load_progress)
             try:
                 done = self._tick_staged_load(depsgraph)
             except Exception:
                 _log_exception("view_draw -> _tick_staged_load")
                 _load_stage = LOAD_IDLE
                 done = True
-            if not done:
-                self.tag_redraw()
-            else:
-                self.tag_redraw()
+            self.tag_redraw()
             return
 
-        # ── Init renderer (fast — just Vulkan setup, no scene) ──
-        if not self._ensure_init(w, h):
-            _draw_loading_screen(w, h, "Initializing Vulkan...")
-            return
-
-        # ── Full scene upload needed? Start staged loading ──
+        # ── Full scene upload needed? Start staged loading with fade-in ──
         if _ignis_full_dirty:
             now = time.perf_counter()
             time_since_last = now - _ignis_last_full_upload if _ignis_last_full_upload > 0 else 999.0
-            # Cooldown: don't reload within 5s of the last complete load
             if _ignis_last_full_upload == 0 or time_since_last >= 5.0:
                 _log(f"full_dirty triggered ({time_since_last:.1f}s since last)")
                 self._begin_staged_load(depsgraph)
-                _draw_loading_screen(w, h, "Preparing scene...", 0.0)
+                loading_screen.draw(w, h, "Preparing scene...", 0.0)
                 self.tag_redraw()
                 return
             else:
@@ -1403,6 +1394,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             _ignis_frame_index += 1
         except Exception:
             _log_exception(f"view_draw render/display (frame {_ignis_frame_index})")
+
+        # Loading screen fade-out overlay (cross-fade from loader to render)
+        if loading_screen.draw_fadeout(w, h):
+            pass  # still fading — will redraw
 
         # FPS overlay
         if props.show_fps:

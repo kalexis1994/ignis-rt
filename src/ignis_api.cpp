@@ -210,6 +210,42 @@ IGNIS_API bool ignis_create(uint32_t width, uint32_t height) {
     return true;
 }
 
+IGNIS_API const char* ignis_create_step(uint32_t width, uint32_t height) {
+    const uint32_t MIN_WIDTH = 1920;
+    if (width < MIN_WIDTH) {
+        float aspect = (float)height / (float)width;
+        width = MIN_WIDTH;
+        height = (uint32_t)(MIN_WIDTH * aspect);
+        height = (height + 1) & ~1;
+    }
+
+    if (!g_renderer) {
+        g_hiddenWindow = CreateHiddenWindow();
+        if (!g_hiddenWindow) return nullptr;
+        g_renderer = new acpt::vk::Renderer();
+        Log(L"[Ignis] ignis_create_step(%u, %u) — starting phased init\n", width, height);
+    }
+
+    const char* stepName = g_renderer->InitializeStep(g_hiddenWindow, width, height);
+    if (stepName) {
+        Log(L"[Ignis] Init step: %S\n", stepName);
+        return stepName;
+    }
+
+    // nullptr = all steps complete
+    if (g_renderer->GetInitStep() >= 5) {
+        Log(L"[Ignis] Phased init complete\n");
+        return nullptr;
+    }
+
+    // Error
+    Log(L"[Ignis] Phased init failed at step %d\n", g_renderer->GetInitStep());
+    delete g_renderer;
+    g_renderer = nullptr;
+    DestroyHiddenWindow();
+    return nullptr;
+}
+
 void ignis_reset_prev_frame();  // forward declaration
 
 IGNIS_API void ignis_destroy(void) {
@@ -636,6 +672,16 @@ IGNIS_API int ignis_texture_manager_add(void* mgr, const char* name,
 IGNIS_API bool ignis_texture_manager_upload_all(void* mgr) {
     if (!mgr) return false;
     return static_cast<acpt::vk::TextureManager*>(mgr)->UploadAll();
+}
+
+IGNIS_API bool ignis_texture_manager_upload_one(void* mgr) {
+    if (!mgr) return false;
+    return static_cast<acpt::vk::TextureManager*>(mgr)->UploadOne();
+}
+
+IGNIS_API int ignis_texture_manager_pending_count(void* mgr) {
+    if (!mgr) return 0;
+    return static_cast<acpt::vk::TextureManager*>(mgr)->GetPendingUploadCount();
 }
 
 IGNIS_API void ignis_update_texture_descriptors(void* mgr) {

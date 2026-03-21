@@ -18,6 +18,8 @@ IGNIS_API void   ignis_set_log_path(const char* path);    // log file output pat
 
 // Lifecycle
 IGNIS_API bool   ignis_create(uint32_t width, uint32_t height);
+// Phased init: call once per frame, returns step name or NULL when done.
+IGNIS_API const char* ignis_create_step(uint32_t width, uint32_t height);
 IGNIS_API void   ignis_destroy(void);
 
 // Geometry upload
@@ -77,6 +79,8 @@ IGNIS_API int    ignis_texture_manager_add(void* mgr, const char* name,
                                             int width, int height, int mipLevels,
                                             uint32_t dxgiFormat);
 IGNIS_API bool   ignis_texture_manager_upload_all(void* mgr);
+IGNIS_API bool   ignis_texture_manager_upload_one(void* mgr);   // upload 1 texture per call (smooth loading)
+IGNIS_API int    ignis_texture_manager_pending_count(void* mgr); // textures still waiting for GPU upload
 IGNIS_API void   ignis_update_texture_descriptors(void* mgr);
 
 #ifdef __cplusplus

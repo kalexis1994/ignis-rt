@@ -23,6 +23,15 @@ struct CameraUBO;
 class Renderer {
 public:
     bool Initialize(HWND hwnd, uint32_t width, uint32_t height);
+    // Phased initialization (call one per frame for smooth loading screen)
+    // Step 0: Vulkan context (instance, device, swapchain)
+    // Step 1: Basic pipelines + geometry
+    // Step 2: RT pipeline + interop
+    // Step 3: DLSS initialization
+    // Step 4: NRD + G-buffers + compose pipelines
+    // Returns step name string, or nullptr when all steps complete.
+    const char* InitializeStep(HWND hwnd, uint32_t width, uint32_t height);
+    int GetInitStep() const { return initStep_; }
     void Shutdown();
     void RenderFrame();
 
@@ -89,6 +98,7 @@ public:
 private:
     bool CreateCommandBuffers();
     bool CreateSyncObjects();
+    void InitRT_Remaining();  // RT pipeline + NRD (called after DLSS init in phased mode)
 
     Context* context_ = nullptr;
     Pipeline* pipeline_ = nullptr;
@@ -102,6 +112,8 @@ private:
     Interop* interop_ = nullptr;
     bool rtReady_ = false;
     bool useDirectInterop_ = false;
+    int initStep_ = 0;          // phased init progress
+    HWND initHwnd_ = nullptr;   // saved for phased init
     bool glInteropFailed_ = false;
 
     // Scene meshes (rasterization demo)
