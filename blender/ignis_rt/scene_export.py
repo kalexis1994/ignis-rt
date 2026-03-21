@@ -1418,9 +1418,22 @@ def _resolve_color_input(socket, default=(0.8, 0.8, 0.8), _depth=0):
 
     # MixRGB / Mix — blend two colors
     if from_node.type in ('MIX_RGB', 'MIX'):
-        fac = _resolve_scalar_input(from_node.inputs.get('Fac') or from_node.inputs.get('Factor'), 0.5, _depth + 1)
-        c1 = _resolve_color_input(from_node.inputs.get('Color1') or from_node.inputs.get('A'), default, _depth + 1)
-        c2 = _resolve_color_input(from_node.inputs.get('Color2') or from_node.inputs.get('B'), default, _depth + 1)
+        fac_inp = from_node.inputs.get('Fac') or from_node.inputs[0]
+        fac = _resolve_scalar_input(fac_inp, 0.5, _depth + 1)
+
+        if from_node.type == 'MIX':
+            # Blender 4.0+ Mix node: inputs are duplicated for float/vector/RGBA/rotation.
+            # Color inputs are type RGBA (indices 6,7 typically). Find them by type.
+            rgba_inputs = [inp for inp in from_node.inputs if inp.type == 'RGBA']
+            c1_inp = rgba_inputs[0] if len(rgba_inputs) > 0 else None
+            c2_inp = rgba_inputs[1] if len(rgba_inputs) > 1 else None
+        else:
+            # Old MIX_RGB node
+            c1_inp = from_node.inputs.get('Color1')
+            c2_inp = from_node.inputs.get('Color2')
+
+        c1 = _resolve_color_input(c1_inp, default, _depth + 1)
+        c2 = _resolve_color_input(c2_inp, default, _depth + 1)
         blend_type = getattr(from_node, 'blend_type', 'MIX')
         if blend_type == 'MIX':
             return _lerp_color(c1, c2, fac)
@@ -1606,6 +1619,13 @@ def _find_image_texture_node(socket, _depth=0):
         'TEX_GRADIENT',     # Gradient texture
     }
     if from_node.type in _PASSTHROUGH_TYPES:
+        # For Blender 5.x MIX node: search RGBA inputs first (avoid float/vector 'A'/'B')
+        if from_node.type == 'MIX':
+            for inp in from_node.inputs:
+                if inp.type == 'RGBA' and inp.is_linked:
+                    result = _find_image_texture_node(inp, _depth + 1)
+                    if result:
+                        return result
         # Try common color input names
         for inp_name in ('Color', 'Color1', 'Color2', 'Fac', 'Image', 'A', 'B', 'Value'):
             inp = from_node.inputs.get(inp_name)
@@ -1850,6 +1870,10 @@ def _extract_shader_props(node, register_image_fn):
         color_inp = node.inputs.get('Color')
         if color_inp:
             props['emission'] = _resolve_color_input(color_inp, (1.0, 1.0, 1.0))
+            # If emission resolved to near-black but has a linked texture,
+            # use white as emission color so the texture provides the color
+            if color_inp.is_linked and sum(props['emission']) < 0.01:
+                props['emission'] = (1.0, 1.0, 1.0)
             props['base_color'] = props['emission']
             tex_node = _find_image_texture_node(color_inp)
             if tex_node and tex_node.image:
