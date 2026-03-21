@@ -1258,6 +1258,16 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         xform = scene_export._matrix_to_3x4_row_major(inst.matrix_world)
                         cur_instances.append((mesh_key, xform))
 
+            # Add hair instances (not in depsgraph — use parent object transform)
+            for hair_key, blas_idx in _ignis_blas_handles.items():
+                if '__hair_' in hair_key:
+                    # Find parent object transform from existing instances
+                    parent_name = hair_key.split('__hair_')[0]
+                    for mk, xf in cur_instances:
+                        if mk == parent_name:
+                            cur_instances.append((hair_key, xf))
+                            break
+
             # Compare with tolerance to avoid float jitter causing constant resets
             xform_floats = tuple(f for _, xf in cur_instances for f in xf)
             transforms_changed = len(cur_instances) != _ignis_instance_count

@@ -128,6 +128,170 @@ def _matrix_to_3x4_row_major(blender_matrix):
     return m[:3, :].flatten().tolist()
 
 
+def _export_particle_hair(eval_obj, particle_system, depsgraph):
+    """Convert particle hair strands to cross-shaped quad geometry.
+
+    Each strand becomes 2 perpendicular quads (4 tris) for visibility from all angles.
+    Uses co_object() for correct coordinate space (like Cycles' BKE_particle_co_hair).
+
+    Returns mesh dict compatible with unique_meshes format, or None if no hair.
+    """
+    ps = particle_system
+    particles = ps.particles
+    if len(particles) == 0:
+        return None
+
+    settings = ps.settings
+
+    # Find the ParticleSystem modifier for co_object()
+    ps_modifier = None
+    for mod in eval_obj.modifiers:
+        if mod.type == 'PARTICLE_SYSTEM' and mod.particle_system == ps:
+            ps_modifier = mod
+            break
+
+    # Hair width: use particle render size, or estimate from strand length
+    hair_radius = getattr(settings, 'radius_scale', 0.0)
+    if hair_radius <= 0:
+        # Estimate from first strand using co_object for correct positions
+        if len(particles) > 0 and len(particles[0].hair_keys) >= 2:
+            p0_keys = particles[0].hair_keys
+            if ps_modifier:
+                p0 = np.array(p0_keys[0].co_object(eval_obj, ps_modifier, particles[0]), dtype=np.float32)
+                p1 = np.array(p0_keys[-1].co_object(eval_obj, ps_modifier, particles[0]), dtype=np.float32)
+            else:
+                p0 = np.array(p0_keys[0].co, dtype=np.float32)
+                p1 = np.array(p0_keys[-1].co, dtype=np.float32)
+            strand_len = np.linalg.norm(p1 - p0)
+            hair_radius = max(strand_len * 0.05, 0.005)
+        else:
+            hair_radius = 0.01
+
+    all_positions = []
+    all_normals = []
+    all_uvs = []
+    all_indices = []
+    all_mat_indices = []
+    vert_offset = 0
+
+    # Material index from particle settings
+    mat_idx = getattr(settings, 'material', 1) - 1  # 1-based in Blender
+    if mat_idx < 0:
+        mat_idx = 0
+
+    for p_idx, particle in enumerate(particles):
+        hair_keys = particle.hair_keys
+        n_keys = len(hair_keys)
+        if n_keys < 2:
+            continue
+
+        # Extract hair key positions in OBJECT LOCAL space
+        # co_object() returns the correct position (like Cycles' BKE_particle_co_hair)
+        keys = np.empty((n_keys, 3), dtype=np.float32)
+        if ps_modifier:
+            for ki in range(n_keys):
+                keys[ki] = hair_keys[ki].co_object(eval_obj, ps_modifier, particle)
+        else:
+            raw = np.empty(n_keys * 3, dtype=np.float32)
+            hair_keys.foreach_get("co", raw)
+            keys = raw.reshape(-1, 3)
+
+        root = keys[0]
+        tip = keys[-1]
+        strand_dir = tip - root
+        strand_len = np.linalg.norm(strand_dir)
+
+        # Log first strand
+        if p_idx == 0:
+            import os
+            try:
+                with open(os.path.join(os.path.expanduser("~"), "ignis-rt.log"), "a") as _lf:
+                    _lf.write(f"[ignis-hair] co_object strand: root=({root[0]:.4f},{root[1]:.4f},{root[2]:.4f}) "
+                              f"tip=({tip[0]:.4f},{tip[1]:.4f},{tip[2]:.4f}) len={strand_len:.4f} radius={hair_radius:.4f}\n")
+                    _lf.flush()
+            except Exception:
+                pass
+        if strand_len < 1e-8:
+            continue
+
+        # Generate a cross-shaped pair of quads per strand for visibility from all angles.
+        # Each quad: 2 triangles, aligned along the strand, rotated 90° from each other.
+        # This gives volume without needing camera-facing billboards.
+        strand_up = strand_dir / strand_len
+
+        # First perpendicular direction
+        ref = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        if abs(np.dot(strand_up, ref)) > 0.9:
+            ref = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        perp1 = np.cross(strand_up, ref)
+        perp1 /= max(np.linalg.norm(perp1), 1e-8)
+
+        # Second perpendicular (90° rotated)
+        perp2 = np.cross(strand_up, perp1)
+        perp2 /= max(np.linalg.norm(perp2), 1e-8)
+
+        # For each cross direction, create a quad from root to tip
+        for perp in [perp1, perp2]:
+            v_base = vert_offset
+            quad_verts = np.empty((4, 3), dtype=np.float32)
+            quad_normals = np.empty((4, 3), dtype=np.float32)
+            quad_uvs = np.empty((4, 2), dtype=np.float32)
+
+            # Root: wider
+            quad_verts[0] = root - perp * hair_radius
+            quad_verts[1] = root + perp * hair_radius
+            # Tip: narrower (taper)
+            quad_verts[2] = tip - perp * hair_radius * 0.3
+            quad_verts[3] = tip + perp * hair_radius * 0.3
+
+            # Normal: perpendicular to quad face
+            normal = np.cross(perp, strand_up)
+            n_len = np.linalg.norm(normal)
+            if n_len > 1e-8:
+                normal /= n_len
+            quad_normals[:] = normal
+
+            quad_uvs[0] = [0.0, 0.0]
+            quad_uvs[1] = [1.0, 0.0]
+            quad_uvs[2] = [0.0, 1.0]
+            quad_uvs[3] = [1.0, 1.0]
+
+            all_positions.append(quad_verts)
+            all_normals.append(quad_normals)
+            all_uvs.append(quad_uvs)
+
+            # Two triangles per quad (both sides visible — no backface cull for hair)
+            all_indices.extend([v_base, v_base+2, v_base+1,
+                                v_base+1, v_base+2, v_base+3])
+            all_mat_indices.extend([mat_idx, mat_idx])
+            vert_offset += 4
+
+    if not all_positions:
+        return None
+
+    positions = np.concatenate(all_positions, axis=0).astype(np.float32)
+    normals = np.concatenate(all_normals, axis=0).astype(np.float32)
+    uvs = np.concatenate(all_uvs, axis=0).astype(np.float32)
+    indices = np.array(all_indices, dtype=np.uint32)
+    mat_indices = np.array(all_mat_indices, dtype=np.int32)
+
+    tri_count = len(mat_indices)
+    vert_count = len(positions)
+
+    return {
+        "name": f"hair_{eval_obj.name}",
+        "positions": np.ascontiguousarray(positions.flatten(), dtype=np.float32),
+        "normals": np.ascontiguousarray(normals.flatten(), dtype=np.float32),
+        "uvs": np.ascontiguousarray(uvs.flatten(), dtype=np.float32),
+        "indices": np.ascontiguousarray(indices, dtype=np.uint32),
+        "vertex_count": vert_count,
+        "index_count": len(indices),
+        "tri_count": tri_count,
+        "raw_vert_count": vert_count,
+        "tri_material_indices": mat_indices,
+    }
+
+
 def export_meshes(depsgraph):
     """Export mesh data with instancing and vertex deduplication.
 
@@ -340,6 +504,52 @@ def export_meshes(depsgraph):
             "hide_viewport": obj.hide_viewport,
             "visible_camera": getattr(obj, 'visible_camera', '?'),
         })
+
+    # Export particle hair as ribbon meshes
+    for instance in depsgraph.object_instances:
+        obj = instance.object
+        if obj.type != 'MESH':
+            continue
+        if not instance.show_self or obj.name in hidden_by_collection:
+            continue
+        # Check for particle systems with HAIR type
+        eval_obj = obj.evaluated_get(depsgraph)
+        for ps_idx, ps in enumerate(eval_obj.particle_systems):
+            if ps.settings.type != 'HAIR':
+                continue
+            if ps.settings.render_type != 'PATH':
+                continue
+
+            hair_key = f"{obj.name}__hair_{ps_idx}"
+            if obj.library:
+                hair_key = f"{obj.library.filepath}:{hair_key}"
+            if hair_key in unique_meshes:
+                continue
+
+            # Extract hair strands and convert to ribbon mesh
+            hair_mesh = _export_particle_hair(eval_obj, ps, depsgraph)
+            if hair_mesh is not None:
+                unique_meshes[hair_key] = hair_mesh
+                obj_to_mesh_key[hair_key] = hair_key
+                xform = _matrix_to_3x4_row_major(instance.matrix_world)
+                # Use parent object's material slots
+                instances.append({
+                    "mesh_key": hair_key,
+                    "transform_3x4": xform,
+                    "material_slots": [s.material for s in obj.material_slots],
+                    "is_instance": instance.is_instance,
+                    "display_type": obj.display_type,
+                    "hide_render": obj.hide_render,
+                    "hide_viewport": obj.hide_viewport,
+                    "visible_camera": getattr(obj, 'visible_camera', '?'),
+                })
+                import os
+                try:
+                    with open(os.path.join(os.path.expanduser("~"), "ignis-rt.log"), "a") as _lf:
+                        _lf.write(f"[ignis-export] Hair '{hair_key}': {hair_mesh['tri_count']} tris from {len(ps.particles)} strands\n")
+                        _lf.flush()
+                except Exception:
+                    pass
 
     # Dump ALL instances to file for ghost mesh diagnosis
     import os
@@ -1041,6 +1251,10 @@ def _pack_gpu_material(
     flags=0,
     alpha_ref=0.5,
     transparent_prob=0.0,
+    uv_scale_x=1.0,
+    uv_scale_y=1.0,
+    color_value=1.0,
+    color_saturation=1.0,
 ):
     """Pack one material into 140 bytes matching GPUMaterial."""
     return _GPU_MATERIAL_STRUCT.pack(
@@ -1065,7 +1279,7 @@ def _pack_gpu_material(
         # Multilayer tex indices (6x NO_TEX)
         _NO_TEX, _NO_TEX, _NO_TEX, _NO_TEX, _NO_TEX, _NO_TEX,
         # multR=transmission, multG=alpha, multB=transparentProb, rest unused
-        transmission, alpha, transparent_prob, 1.0, 1.0, 1.0, 1.0,
+        transmission, alpha, transparent_prob, uv_scale_x, uv_scale_y, color_value, color_saturation,
         # sunSpecular, sunSpecularEXP
         0.0, 0.0,
     )
@@ -1307,6 +1521,30 @@ def _get_principled_input(node, input_name, default):
     return inp.default_value
 
 
+def _find_uv_scale(socket, _depth=0):
+    """Find Mapping node UV scale in the texture chain. Returns (scaleX, scaleY)."""
+    if not socket or not socket.is_linked or _depth > 8:
+        return (1.0, 1.0)
+    node = socket.links[0].from_node
+    if node.type == 'MAPPING':
+        scale_inp = node.inputs.get('Scale')
+        if scale_inp:
+            s = scale_inp.default_value
+            return (float(s[0]), float(s[1]))
+        return (1.0, 1.0)
+    if node.type == 'TEX_IMAGE':
+        vec_inp = node.inputs.get('Vector')
+        if vec_inp:
+            return _find_uv_scale(vec_inp, _depth + 1)
+    # Follow any linked input
+    for inp in node.inputs:
+        if inp.is_linked:
+            result = _find_uv_scale(inp, _depth + 1)
+            if result != (1.0, 1.0):
+                return result
+    return (1.0, 1.0)
+
+
 def _find_image_texture_node(socket, _depth=0):
     """Follow links from a BSDF input to find an Image Texture node.
 
@@ -1404,24 +1642,45 @@ def _get_image_bytes(image):
 
     # Packed in .blend: raw file bytes (PNG/JPG/etc.)
     if image.packed_file:
-        data = bytes(image.packed_file.data)
+        raw = bytes(image.packed_file.data)
+        # Verify it's a format stb_image can handle (PNG/JPG/BMP headers)
+        # PNG: 89 50 4E 47, JPG: FF D8 FF, BMP: 42 4D
+        if (raw[:4] == b'\x89PNG' or raw[:3] == b'\xff\xd8\xff' or raw[:2] == b'BM'):
+            data = raw
+        # else: skip packed data — fall through to pixel extraction
 
     # File on disk
-    if data is None:
+    if data is None and not (image.size[0] > 0 and image.size[1] > 0 and len(image.pixels) > 0):
         filepath = bpy.path.abspath(image.filepath_from_user())
         if filepath and os.path.isfile(filepath):
             with open(filepath, 'rb') as f:
                 data = f.read()
 
-    # Generated/viewer images: extract pixels as raw RGBA8
+    # Pixel extraction fallback: read float pixels from Blender and encode as PNG
+    # Handles EXR, 16-bit PNG, generated images, and any format Blender can open
     if data is None and image.size[0] > 0 and image.size[1] > 0:
+        import io, zlib, struct as _struct
         w, h = image.size[0], image.size[1]
         px = np.empty(w * h * 4, dtype=np.float32)
         image.pixels.foreach_get(px)
-        # float [0,1] → uint8 [0,255]
-        px_u8 = (np.clip(px, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
-        # Encode as minimal BMP for stb_image
-        data = _encode_bmp(px_u8, w, h)
+        px_u8 = (np.clip(px, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8).reshape(h, w, 4)
+        px_u8 = px_u8[::-1]  # flip Y (Blender bottom-up → PNG top-down)
+        # Minimal PNG encoder
+        def _png_chunk(out, ctype, cdata):
+            out.write(_struct.pack('>I', len(cdata)))
+            out.write(ctype)
+            out.write(cdata)
+            out.write(_struct.pack('>I', zlib.crc32(ctype + cdata) & 0xFFFFFFFF))
+        buf = io.BytesIO()
+        buf.write(b'\x89PNG\r\n\x1a\n')
+        _png_chunk(buf, b'IHDR', _struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0))
+        raw_rows = bytearray()
+        for y in range(h):
+            raw_rows.append(0)
+            raw_rows.extend(px_u8[y].tobytes())
+        _png_chunk(buf, b'IDAT', zlib.compress(bytes(raw_rows), 6))
+        _png_chunk(buf, b'IEND', b'')
+        data = buf.getvalue()
 
     if data is not None:
         _image_bytes_cache[image.name] = data
@@ -1921,6 +2180,10 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         ior = 1.5
         transmission = 0.0
         transparent_prob = 0.0
+        uv_scale_x = 1.0
+        uv_scale_y = 1.0
+        color_value = 1.0
+        color_saturation = 1.0
         flags = 0
         alpha_ref = 0.5
 
@@ -2051,6 +2314,35 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                 bc_node = _find_image_texture_node(node.inputs.get('Base Color'))
                 if bc_node and bc_node.image:
                     diffuse_tex = _register_image(bc_node.image)
+
+                # UV scale from Mapping node (applies to all textures)
+                uv_scale = _find_uv_scale(node.inputs.get('Base Color'))
+                uv_scale_x, uv_scale_y = uv_scale
+
+                # Hue/Saturation/Value node in Base Color chain
+                bc_inp = node.inputs.get('Base Color')
+                if bc_inp and bc_inp.is_linked:
+                    _hsv_node = bc_inp.links[0].from_node
+                    _hsv_depth = 0
+                    while _hsv_node and _hsv_depth < 8:
+                        if _hsv_node.type == 'HUE_SAT':
+                            val_inp = _hsv_node.inputs.get('Value')
+                            sat_inp = _hsv_node.inputs.get('Saturation')
+                            if val_inp:
+                                color_value = float(val_inp.default_value)
+                            if sat_inp:
+                                color_saturation = float(sat_inp.default_value)
+                            break
+                        # Follow first linked input
+                        _found = False
+                        for _inp in _hsv_node.inputs:
+                            if _inp.is_linked:
+                                _hsv_node = _inp.links[0].from_node
+                                _found = True
+                                break
+                        if not _found:
+                            break
+                        _hsv_depth += 1
 
                 # Roughness
                 roughness = float(_get_principled_input(node, 'Roughness', 0.5))
@@ -2188,6 +2480,10 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
             flags=flags,
             alpha_ref=alpha_ref,
             transparent_prob=transparent_prob,
+            uv_scale_x=uv_scale_x,
+            uv_scale_y=uv_scale_y,
+            color_value=color_value,
+            color_saturation=color_saturation,
         )
 
         _mat_dt = _time.perf_counter() - _mat_t0

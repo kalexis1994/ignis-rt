@@ -324,8 +324,27 @@ PBRHit evaluateBlenderMaterial(
         texAlpha = texColor.a;
     } else {
         hit.baseColor = vec3(mat.ksAmbient, mat.ksDiffuse, mat.ksSpecular);
+        // No diffuse texture — read alpha from emission texture if present
+        // (fire/billboard materials use emission texture for both color and alpha)
+        if (mat.detailTexIndex != 0xFFFFFFFFu) {
+            texAlpha = texture(textures[nonuniformEXT(mat.detailTexIndex)], uv).a;
+        }
     }
     hit.alpha = texAlpha * mat.multG;
+
+    // Hue/Saturation/Value adjustment (from HUE_SAT node in Base Color chain)
+    // detailNMMult = color_value (brightness), detailNMMultV = color_saturation
+    float colorValue = mat.detailNMMult;
+    float colorSaturation = mat.detailNMMultV;
+    if (colorValue != 1.0 || colorSaturation != 1.0) {
+        // Apply value (brightness multiplier)
+        hit.baseColor *= colorValue;
+        // Apply saturation (0 = grayscale, 1 = original)
+        if (colorSaturation < 1.0) {
+            float lum = dot(hit.baseColor, vec3(0.2126, 0.7152, 0.0722));
+            hit.baseColor = mix(vec3(lum), hit.baseColor, colorSaturation);
+        }
+    }
 
     // ORM map: R=occlusion, G=roughness, B=metallic (standard convention)
     if (mat.mapsTexIndex != 0xFFFFFFFFu) {
@@ -390,7 +409,14 @@ PBRHit evaluateBlenderMaterial(
     // bounces, so emission_strength=1 matches Cycles perceived brightness.
     vec3 emissionColor = vec3(mat.emissiveR, mat.emissiveG, mat.emissiveB);
     if (mat.detailTexIndex != 0xFFFFFFFFu) {
-        emissionColor *= texture(textures[nonuniformEXT(mat.detailTexIndex)], uv).rgb;
+        vec3 emTex = texture(textures[nonuniformEXT(mat.detailTexIndex)], uv).rgb;
+        // If scalar emission is black but texture exists, use texture directly
+        // (Blender Emission Color default is black when texture provides the color)
+        if (dot(emissionColor, emissionColor) < 0.001) {
+            emissionColor = emTex;
+        } else {
+            emissionColor *= emTex;
+        }
     }
     hit.emission = emissionColor * mat.fresnelMaxLevel * PI;
 
@@ -650,13 +676,20 @@ void main() {
         vec2 uv2_ = vec2(uvData.uv[i2*2+0], 1.0 - uvData.uv[i2*2+1]);
         vec2 hitUV = uv0_ * bary.x + uv1_ * bary.y + uv2_ * bary.z;
 
-        // Fetch material
+        // Fetch material (need matIdx before UV scale)
         uint matIdx = 0u;
         if (geo.primMaterialBufferAddress != 0u) {
             PrimMaterials primMats = PrimMaterials(geo.primMaterialBufferAddress);
             matIdx = primMats.m[primitiveId];
         }
         Material mat = materialBuffer.materials[matIdx];
+
+        // Apply UV scale from Mapping node (stored in multA, magicMult)
+        float uvScaleX = mat.multA;
+        float uvScaleY = mat.magicMult;
+        if (uvScaleX != 1.0 || uvScaleY != 1.0) {
+            hitUV *= vec2(uvScaleX, uvScaleY);
+        }
 
         // DEBUG: material index visualization (debugView == 99)
         if (cam.parameters.y == 99u && bounce == 0 && sampleIdx == 0) {
