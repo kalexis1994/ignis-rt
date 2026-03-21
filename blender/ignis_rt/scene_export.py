@@ -2253,6 +2253,27 @@ def _resolve_mix_shader(mix_node, register_image_fn):
     return blended
 
 
+def extract_texture_bytes(tex_info):
+    """Read pixel data for one deferred texture entry. Call once per frame for smooth loading.
+
+    Modifies tex_info in place: fills 'data' with bytes, removes 'image_ref'.
+    Returns True if data was extracted, False on failure.
+    """
+    if tex_info.get("data") is not None:
+        return True  # already extracted
+    image = tex_info.get("image_ref")
+    if image is None:
+        return False
+    data = _get_image_bytes(image)
+    if data is None:
+        return False
+    tex_info["data"] = data
+    tex_info["width"] = image.size[0]
+    tex_info["height"] = image.size[1]
+    del tex_info["image_ref"]  # free Blender reference
+    return True
+
+
 def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
     """Export Blender Principled BSDF materials as GPUMaterial byte buffer.
 
@@ -2325,14 +2346,16 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         key = image.name
         if key in texture_registry:
             return texture_registry[key]["index"]
-        data = _get_image_bytes(image)
-        if data is None:
+        # Don't read pixel data yet — defer to per-frame extraction for smooth loading.
+        # Store the image reference; engine.py will call extract_texture_bytes() later.
+        if image.size[0] == 0 or image.size[1] == 0:
             return _NO_TEX
         idx = len(textures_list)
         entry = {
             "index": idx,
             "name": key,
-            "data": data,
+            "data": None,  # deferred — filled by extract_texture_bytes()
+            "image_ref": image,  # Blender image reference for lazy loading
             "width": image.size[0],
             "height": image.size[1],
         }

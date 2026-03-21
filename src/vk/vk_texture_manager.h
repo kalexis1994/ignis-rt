@@ -23,6 +23,13 @@ public:
     // Upload all pending textures to GPU (batch, call after all AddTexture)
     bool UploadAll();
 
+    // Upload ONE pending texture to GPU. Returns true if a texture was uploaded,
+    // false if no pending textures remain. Call once per frame for smooth loading.
+    bool UploadOne();
+
+    // Returns the number of textures still waiting for GPU upload
+    int GetPendingUploadCount() const;
+
     // Getters for descriptor writes
     uint32_t GetTextureCount() const { return (uint32_t)textures_.size(); }
     VkImageView GetImageView(int index) const;
@@ -49,6 +56,7 @@ private:
     std::vector<GPUTexture> textures_;
     VkSampler sampler_ = VK_NULL_HANDLE;
     Context* context_ = nullptr;
+    int uploadCursor_ = 0;  // index of next texture to upload in UploadOne()
 };
 
 } // namespace vk

@@ -37,6 +37,103 @@ bool ImGui_WantCaptureMouse();
 namespace acpt {
 namespace vk {
 
+const char* Renderer::InitializeStep(HWND hwnd, uint32_t width, uint32_t height) {
+    // Phased initialization — one step per call for smooth loading screen.
+    // Returns step name, or nullptr when complete.
+
+    if (initStep_ == 0) {
+        // Step 0: Vulkan context
+        width_ = width; height_ = height;
+        initHwnd_ = hwnd;
+        context_ = new Context();
+        pipeline_ = new Pipeline();
+        geometry_ = new Geometry();
+        rasterizer_ = new Rasterizer();
+        if (!context_->Initialize(hwnd, width, height)) {
+            Log(L"[VK Renderer] ERROR: Failed to initialize context\n");
+            return nullptr;
+        }
+        initStep_ = 1;
+        return "Vulkan context ready";
+    }
+
+    if (initStep_ == 1) {
+        // Step 1: Basic pipelines + geometry
+        if (!pipeline_->Initialize(context_) ||
+            !pipeline_->CreateGraphicsPipeline("shaders/basic.vert.spv", "shaders/basic.frag.spv") ||
+            !geometry_->Initialize(context_)) {
+            Log(L"[VK Renderer] ERROR: Failed basic pipeline/geometry init\n");
+            return nullptr;
+        }
+        sphereMesh_ = new Mesh(); *sphereMesh_ = Geometry::CreateSphere(1.0f, 32, 32);
+        geometry_->UploadMesh(*sphereMesh_);
+        planeMesh_ = new Mesh(); *planeMesh_ = Geometry::CreatePlane(10.0f);
+        geometry_->UploadMesh(*planeMesh_);
+        rasterizer_->Initialize(context_, pipeline_, geometry_);
+        rasterizer_->SetScene(sphereMesh_, planeMesh_);
+        CreateCommandBuffers();
+        CreateSyncObjects();
+        initStep_ = 2;
+        return "Pipelines ready";
+    }
+
+    if (initStep_ == 2) {
+        // Step 2: RT pipeline + interop
+        if (!context_->IsRayQuerySupported()) {
+            Log(L"[VK Renderer] RT not supported\n");
+            initStep_ = 5; // done
+            return nullptr;
+        }
+        interop_ = new Interop();
+        if (!interop_->Initialize(context_, width_, height_)) {
+            delete interop_; interop_ = nullptr;
+            initStep_ = 5;
+            return nullptr;
+        }
+        renderWidth_ = width_; renderHeight_ = height_;
+        initStep_ = 3;
+        return "RT interop ready";
+    }
+
+    if (initStep_ == 3) {
+        // Step 3: DLSS initialization
+        PathTracerConfig* cfg = VK_GetConfig();
+        if (cfg && cfg->dlssEnabled) {
+            dlss_ = new DLSS_NGX();
+            DLSSQualityMode mode = static_cast<DLSSQualityMode>(cfg->dlssQualityMode);
+            if (dlss_->Initialize(context_->GetInstance(), context_->GetDevice(),
+                                  context_->GetPhysicalDevice(), context_->GetCommandPool(),
+                                  context_->GetGraphicsQueue(), width_, height_, mode)) {
+                if (dlss_->IsSupported()) {
+                    dlss_->GetCurrentRenderResolution(&renderWidth_, &renderHeight_);
+                    dlssActive_ = true;
+                    Log(L"[VK Renderer] DLSS active: render %ux%u -> display %ux%u\n",
+                        renderWidth_, renderHeight_, width_, height_);
+                }
+            }
+            if (!dlssActive_ && dlss_) { delete dlss_; dlss_ = nullptr; }
+        }
+        // Create DLSS intermediate images if active
+        if (dlssActive_) {
+            // (DLSS color/HDR images are created in InitRT — we call it from step 4)
+        }
+        initStep_ = 4;
+        return "DLSS ready";
+    }
+
+    if (initStep_ == 4) {
+        // Step 4: NRD + G-buffers + RT pipeline + compose
+        // Call the full InitRT which handles the remaining setup
+        // (interop + DLSS already done, InitRT will skip those)
+        InitRT_Remaining();
+        Log(L"[VK Renderer] ========== INITIALIZATION COMPLETE ==========\n");
+        initStep_ = 5;
+        return nullptr; // done
+    }
+
+    return nullptr; // already complete
+}
+
 bool Renderer::Initialize(HWND hwnd, uint32_t width, uint32_t height) {
     width_ = width;
     height_ = height;
@@ -390,6 +487,135 @@ bool Renderer::InitRT() {
     }
 
     return true;
+}
+
+void Renderer::InitRT_Remaining() {
+    // Called from phased init step 4 — interop + DLSS already initialized.
+    // Handles: DLSS images, RR, AccelStruct, RT Pipeline, NRD, Wavefront.
+    PathTracerConfig* cfg = VK_GetConfig();
+    VkDevice device = context_->GetDevice();
+
+    // Create DLSS intermediate images if active (same code as InitRT)
+    if (dlssActive_) {
+        // Color input image (render resolution)
+        VkImageCreateInfo imgInfo{};
+        imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imgInfo.imageType = VK_IMAGE_TYPE_2D;
+        imgInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        imgInfo.extent = { renderWidth_, renderHeight_, 1 };
+        imgInfo.mipLevels = 1; imgInfo.arrayLayers = 1;
+        imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imgInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+        if (vkCreateImage(device, &imgInfo, nullptr, &dlssColorInput_) == VK_SUCCESS) {
+            VkMemoryRequirements memReqs;
+            vkGetImageMemoryRequirements(device, dlssColorInput_, &memReqs);
+            VkMemoryAllocateInfo allocInfo{};
+            allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            allocInfo.allocationSize = memReqs.size;
+            allocInfo.memoryTypeIndex = context_->FindMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (vkAllocateMemory(device, &allocInfo, nullptr, &dlssColorInputMemory_) == VK_SUCCESS) {
+                vkBindImageMemory(device, dlssColorInput_, dlssColorInputMemory_, 0);
+                VkImageViewCreateInfo viewInfo{};
+                viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+                viewInfo.image = dlssColorInput_;
+                viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                viewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+                viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                vkCreateImageView(device, &viewInfo, nullptr, &dlssColorInputView_);
+            }
+        }
+
+        // HDR output image (display resolution)
+        imgInfo.extent = { width_, height_, 1 };
+        imgInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (vkCreateImage(device, &imgInfo, nullptr, &dlssHdrOutput_) == VK_SUCCESS) {
+            VkMemoryRequirements memReqs;
+            vkGetImageMemoryRequirements(device, dlssHdrOutput_, &memReqs);
+            VkMemoryAllocateInfo allocInfo{};
+            allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            allocInfo.allocationSize = memReqs.size;
+            allocInfo.memoryTypeIndex = context_->FindMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (vkAllocateMemory(device, &allocInfo, nullptr, &dlssHdrOutputMemory_) == VK_SUCCESS) {
+                vkBindImageMemory(device, dlssHdrOutput_, dlssHdrOutputMemory_, 0);
+                VkImageViewCreateInfo viewInfo{};
+                viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+                viewInfo.image = dlssHdrOutput_;
+                viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                viewInfo.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+                viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                vkCreateImageView(device, &viewInfo, nullptr, &dlssHdrOutputView_);
+            }
+        }
+
+        // Transition to GENERAL layout
+        VkCommandBuffer cmd = context_->BeginSingleTimeCommands();
+        VkImageMemoryBarrier barriers[2] = {};
+        uint32_t bc = 0;
+        if (dlssColorInput_) {
+            barriers[bc].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barriers[bc].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barriers[bc].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barriers[bc].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[bc].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[bc].image = dlssColorInput_;
+            barriers[bc].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            bc++;
+        }
+        if (dlssHdrOutput_) {
+            barriers[bc].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barriers[bc].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barriers[bc].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barriers[bc].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[bc].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[bc].image = dlssHdrOutput_;
+            barriers[bc].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            bc++;
+        }
+        if (bc > 0) {
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, bc, barriers);
+        }
+        context_->EndSingleTimeCommands(cmd);
+    }
+
+    // Ray Reconstruction
+    if (cfg && cfg->dlssRREnabled && dlssActive_ && dlss_) {
+        if (dlss_->InitializeRR()) {
+            dlssRRActive_ = true;
+            Log(L"[VK Renderer] DLSS Ray Reconstruction active\n");
+        }
+    }
+
+    // Acceleration structure builder
+    accelBuilder_ = new AccelStructureBuilder();
+    accelBuilder_->Initialize(context_);
+
+    // RT pipeline
+    rtPipeline_ = new RTPipeline();
+    rtPipeline_->Initialize(context_, accelBuilder_, interop_);
+    if (dlssActive_ && dlssColorInputView_) {
+        rtPipeline_->UpdateStorageImage(dlssColorInputView_);
+    }
+
+    // NRD denoiser
+    if (!InitNRD()) {
+        rtPipeline_->CreateGBuffers(renderWidth_, renderHeight_);
+    }
+
+    // Wavefront (experimental)
+    if (cfg && cfg->useWavefront) {
+        wavefrontPipeline_ = new WavefrontPipeline();
+        if (!wavefrontPipeline_->Initialize(context_, rtPipeline_, renderWidth_, renderHeight_, cfg->maxBounces)) {
+            delete wavefrontPipeline_;
+            wavefrontPipeline_ = nullptr;
+        }
+    }
+
+    rtReady_ = true;
 }
 
 bool Renderer::BuildAccelStructure(const float* vertices, uint32_t vertexCount,
