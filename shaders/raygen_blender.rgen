@@ -319,14 +319,10 @@ PBRHit evaluateBlenderMaterial(
     hit.metallic = clamp(mat.fresnelC, 0.0, 1.0);
     hit.specularLevel = mat.fresnelEXP;
 
-    // If material has stochastic passthrough (Transparent BSDF mix),
-    // disable glass refraction — passthrough IS the transparency.
-    // Remaining rays should evaluate BRDF (reflection), not refract.
-    float transparentProb = mat.multB;
-    hit.transmission = mat.multR;
-    if (transparentProb > 0.0) {
-        hit.transmission = 0.0;  // no refraction, passthrough handles transparency
-    }
+    // If material has stochastic passthrough, disable glass refraction.
+    // Passthrough handles transparency; remaining rays do reflection (metallic=1).
+    float tpCheck = mat.multB;
+    hit.transmission = (tpCheck > 0.0) ? 0.0 : mat.multR;
     hit.ior = mat.detailUVMultiplier;
     // transmission already set above (with passthrough override)
 
@@ -750,7 +746,16 @@ void main() {
         // passes through; at grazing angles reflection dominates.
         // This matches Cycles' behavior for architectural glass (Transparent + Glossy).
         float transparentProb = mat.multB;
-        // transparentProb = mix factor from Blender's Mix Shader (Cycles-style stochastic selection)
+        // For glass+transparent materials: use Fresnel to split pass-through vs reflection.
+        // At normal incidence ~96% passes, ~4% reflects (matches Glass BSDF Fresnel).
+        if (transparentProb > 0.0) {
+            float cosTheta = abs(dot(N, -rayDir));
+            float iorGlass = max(pbrHit.ior, 1.01);
+            float f0 = (iorGlass - 1.0) / (iorGlass + 1.0);
+            f0 = f0 * f0;
+            float fresnelRefl = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
+            transparentProb = 1.0 - fresnelRefl;  // Fresnel transmission probability
+        }
         if (transparentProb > 0.0 && rand01() < transparentProb) {
             // Ray passes through — no refraction, no absorption (like Cycles Transparent BSDF)
             rayOrigin = worldPos + rayDir * 0.002;
@@ -961,9 +966,21 @@ void main() {
             vec3 lightColor = lightColInt.rgb;
             float lightInt  = lightColInt.w;
 
-            // Negative range = area light
-            bool isAreaLight = (rawRange < 0.0);
-            float lightRange = isAreaLight ? max(sqrt(lightInt / 0.01), 1.0) : rawRange;
+            // Negative range = area or spot light
+            bool isSpecialLight = (rawRange < 0.0);
+            float sizeX = lightDirSizeX.w;
+            // Distinguish: area light has sizeX >= 1.0 (dimension in meters),
+            // spot light has sizeX < 1.0 (cos_half_angle)
+            bool isAreaLight = isSpecialLight && sizeX >= 1.0;
+            bool isSpotLight = isSpecialLight && sizeX < 1.0;
+            float lightRange;
+            if (isAreaLight) {
+                lightRange = max(sqrt(lightInt / 0.01), 1.0);
+            } else if (isSpotLight) {
+                lightRange = -rawRange;
+            } else {
+                lightRange = rawRange;
+            }
             lightRange = min(lightRange, 100.0);
 
             vec3 toLight = lightPos - pbrHit.worldPos;
@@ -972,6 +989,19 @@ void main() {
             vec3 L = toLight / dist;
             float NdotL_pt = dot(N, L);
             if (NdotL_pt <= 0.0) continue;
+
+            // Spot light: cone attenuation (Cycles formula)
+            if (isSpotLight) {
+                vec3 spotDir = lightDirSizeX.xyz;
+                float cosHalfAngle = sizeX;
+                float spotSmooth = lightTanSizeY.w;
+                float cosAngle = dot(-L, spotDir);
+                // smoothstep((cosAngle - cosHalfAngle) * spotSmooth)
+                float t = clamp((cosAngle - cosHalfAngle) * spotSmooth, 0.0, 1.0);
+                float spotAtten = t * t * (3.0 - 2.0 * t);  // Hermite smoothstep
+                if (spotAtten <= 0.0) continue;
+                lightInt *= spotAtten;
+            }
 
             // Area light: check direction cull and sample on the light plane
             vec3 jitteredTarget;

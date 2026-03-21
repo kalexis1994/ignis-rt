@@ -868,10 +868,25 @@ def export_lights(depsgraph):
             # Negative range signals area light to shader
             export_range = -max(size_x, size_y) * 0.5
             # Cycles area light: energy is total power (Watts).
-            # Radiance = power * PI / area.  The extra PI compensates the
-            # BRDF's 1/PI diffuse term so energy=1 matches Cycles brightness.
+            # Radiance = power / (PI * area).  Shader multiplies by areaSize
+            # in NEE, so we pass radiance = power / (PI * area).
             area = size_x * size_y
-            intensity = energy * math.pi / area if area > 0 else energy
+            intensity = energy / (math.pi * area) if area > 0 else energy
+        elif light.type == 'SPOT':
+            # Spot light: pack cone parameters into size_x (cos_half_angle)
+            # and size_y (spot_smooth factor)
+            spot_angle = light.spot_size  # full cone angle in radians
+            spot_blend = light.spot_blend  # 0 = hard, 1 = full smooth
+            cos_half = math.cos(spot_angle * 0.5)
+            # Cycles formula: spot_smooth = 1.0 / ((1 - cos_half) * blend)
+            if spot_blend > 0.001:
+                spot_smooth = 1.0 / ((1.0 - cos_half) * spot_blend)
+            else:
+                spot_smooth = 1e6  # hard edge
+            size_x = cos_half       # packed in size_x
+            size_y = spot_smooth    # packed in size_y
+            # Negative range with size_x > 0 signals spot light
+            export_range = -estimated_range
         else:
             export_range = estimated_range
 
@@ -2030,12 +2045,25 @@ def _resolve_mix_shader(mix_node, register_image_fn):
     s2_type = shader2_node.type if shader2_node else None
     if s1_type == 'BSDF_TRANSPARENT':
         result = dict(p2)
-        result['transparent_prob'] = (1.0 - fac)  # fac=0 → all transparent, fac=1 → all p2
+        if s2_type == 'BSDF_GLASS':
+            # Glass + Transparent: use passthrough for transparency, Glossy for reflection.
+            # Don't refract — for architectural glass the entry/exit cancel (flat pane).
+            # Set metallic=1 so non-passthrough rays do specular reflection, not diffuse.
+            result['transparent_prob'] = (1.0 - fac)
+            result['transmission'] = 0.0  # no refraction (passthrough handles transparency)
+            result['metallic'] = 1.0      # pure reflection for non-passthrough rays
+        else:
+            result['transparent_prob'] = (1.0 - fac)
         result['flags'] = result.get('flags', 0) | 2
         return result
     if s2_type == 'BSDF_TRANSPARENT':
         result = dict(p1)
-        result['transparent_prob'] = fac  # fac=0 → all p1, fac=1 → all transparent
+        if s1_type == 'BSDF_GLASS':
+            result['transparent_prob'] = fac
+            result['transmission'] = 0.0
+            result['metallic'] = 1.0
+        else:
+            result['transparent_prob'] = fac
         result['flags'] = result.get('flags', 0) | 2
         return result
 
