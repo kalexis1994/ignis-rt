@@ -240,9 +240,11 @@ vec3 proceduralSky(vec3 dir, vec3 sunDirL, vec3 ambColor, vec3 sunTint) {
 }
 
 vec2 directionToEquirectangular(vec3 dir) {
-    // Blender/Cycles convention: Y-up in our engine
-    // phi = atan2(dir.x, -dir.z), theta = acos(dir.y)
-    float u = atan(dir.x, -dir.z) / (2.0 * PI) + 0.5;
+    // Match Cycles' equirectangular mapping (Z-up → our Y-up):
+    // Cycles: u = atan2(cy, cx) / (-2*PI) + 0.5  where cx=dir.x, cy=dir.y (Z-up)
+    // Our Y-up: Cycles.x = our.x, Cycles.y = -our.z, Cycles.z = our.y
+    float phi = atan(-dir.z, dir.x);
+    float u = 0.5 - phi / (2.0 * PI);
     float v = acos(clamp(dir.y, -1.0, 1.0)) / PI;
     return vec2(u, v);
 }
@@ -253,7 +255,10 @@ vec3 evaluateSky(vec3 dir) {
     if (hdriIdx >= 0) {
         float hdriStrength = cam.windParams.y;
         vec2 uv = directionToEquirectangular(dir);
-        vec3 hdriColor = texture(textures[nonuniformEXT(uint(hdriIdx))], uv).rgb;
+        vec3 compressed = texture(textures[nonuniformEXT(uint(hdriIdx))], uv).rgb;
+        // Inverse Reinhard: recover HDR from tonemapped 8-bit texture
+        // original = compressed / (1 - compressed)
+        vec3 hdriColor = compressed / max(vec3(1.0) - compressed, vec3(0.001));
         return hdriColor * hdriStrength;
     }
 
@@ -313,8 +318,17 @@ PBRHit evaluateBlenderMaterial(
     hit.roughness = clamp(mat.ksSpecularEXP, 0.01, 1.0);
     hit.metallic = clamp(mat.fresnelC, 0.0, 1.0);
     hit.specularLevel = mat.fresnelEXP;
-    hit.ior = mat.detailUVMultiplier;
+
+    // If material has stochastic passthrough (Transparent BSDF mix),
+    // disable glass refraction — passthrough IS the transparency.
+    // Remaining rays should evaluate BRDF (reflection), not refract.
+    float transparentProb = mat.multB;
     hit.transmission = mat.multR;
+    if (transparentProb > 0.0) {
+        hit.transmission = 0.0;  // no refraction, passthrough handles transparency
+    }
+    hit.ior = mat.detailUVMultiplier;
+    // transmission already set above (with passthrough override)
 
     // Base color + alpha: texture or scalar fallback
     float texAlpha = 1.0;
@@ -731,9 +745,12 @@ void main() {
         }
 
         // ---- Stochastic transparent passthrough (Cycles-style) ----
-        // mat.multB = transparent_prob: probability that the ray passes straight through.
-        // This handles Transparent BSDF in Mix/Add Shader without refraction.
+        // For materials with Transparent BSDF (tp > 0), use Fresnel to determine
+        // pass-through vs reflection probability. At normal incidence most light
+        // passes through; at grazing angles reflection dominates.
+        // This matches Cycles' behavior for architectural glass (Transparent + Glossy).
         float transparentProb = mat.multB;
+        // transparentProb = mix factor from Blender's Mix Shader (Cycles-style stochastic selection)
         if (transparentProb > 0.0 && rand01() < transparentProb) {
             // Ray passes through — no refraction, no absorption (like Cycles Transparent BSDF)
             rayOrigin = worldPos + rayDir * 0.002;
@@ -1186,24 +1203,26 @@ void main() {
             if (glassBounces >= MAX_GLASS_BOUNCES) break;
 
             float eta = frontFace ? (1.0 / pbrHit.ior) : pbrHit.ior;
-            float alpha = max(pbrHit.roughness * pbrHit.roughness, 0.001);
+            float alpha = pbrHit.roughness * pbrHit.roughness;
 
             // Sample microfacet normal (GGX) for rough glass
+            // Cycles: when alpha² < 2e-10, treat as perfectly specular (H = N, no sampling)
             vec3 V = -rayDir;
             vec3 H;
-            if (alpha > 0.002) {
-                // GGX importance sampling of half-vector
+            bool singularGlass = (alpha < 0.0005);  // ~roughness < 0.022
+            if (!singularGlass && alpha > 0.0) {
+                // GGX importance sampling of half-vector (rough glass)
+                alpha = max(alpha, 0.001);
                 vec2 xi = rand2();
                 float phi = 2.0 * PI * xi.x;
                 float cosTheta = sqrt((1.0 - xi.y) / (1.0 + (alpha * alpha - 1.0) * xi.y));
                 float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
-                // Build TBN from N
                 vec3 up = abs(N.y) < 0.999 ? vec3(0,1,0) : vec3(1,0,0);
                 vec3 tanX = normalize(cross(up, N));
                 vec3 tanY = cross(N, tanX);
                 H = normalize(sinTheta * cos(phi) * tanX + sinTheta * sin(phi) * tanY + cosTheta * N);
             } else {
-                H = N;
+                H = N;  // Perfect specular: no microfacet scatter
             }
 
             // Fresnel at microfacet (use full IOR for correct reflections)

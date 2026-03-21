@@ -711,11 +711,20 @@ def export_world_hdri(depsgraph):
     px = np.empty(w * h * 4, dtype=np.float32)
     image.pixels.foreach_get(px)
     px_rgb = px.reshape(-1, 4)[:, :3]
-    peak = float(np.percentile(px_rgb[px_rgb > 0], 99.5)) if np.any(px_rgb > 0) else 1.0
-    peak = max(peak, 1.0)
-    px_scaled = np.clip(px / peak, 0.0, 1.0)
-    px_u8 = (px_scaled * 255.0 + 0.5).astype(np.uint8).reshape(h, w, 4)
+    # Compress HDR → 8-bit using Reinhard tonemap to preserve color hue.
+    # Linear scaling clips highlights to white (loses warm tones).
+    # Reinhard: out = in / (1 + in) — preserves color ratios.
+    # Shader inverts: hdri_color = tex / (1 - tex) * strength
+    px_rgba = px.reshape(-1, 4)
+    rgb = px_rgba[:, :3].copy()
+    alpha = px_rgba[:, 3:4]
+    # Reinhard per-channel: compressed = rgb / (1 + rgb)
+    rgb_pos = np.maximum(rgb, 0.0)
+    compressed = rgb_pos / (1.0 + rgb_pos)
+    px_out = np.concatenate([compressed, alpha], axis=1)
+    px_u8 = (np.clip(px_out, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8).reshape(h, w, 4)
     px_u8 = px_u8[::-1]  # Blender stores bottom-up, PNG is top-down
+    # strength = 1.0 (Reinhard inverse in shader handles reconstruction)
 
     # Minimal PNG encoder (RGBA8, no filtering)
     def _write_png_chunk(out, chunk_type, chunk_data):
@@ -737,7 +746,7 @@ def export_world_hdri(depsgraph):
     _write_png_chunk(buf, b'IEND', b'')
     data = buf.getvalue()
 
-    strength *= peak
+    # No peak scaling needed — Reinhard inverse in shader recovers full HDR range
 
     return {
         "name": f"__world_hdri__{image.name}",
