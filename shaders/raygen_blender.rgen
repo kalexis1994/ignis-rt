@@ -178,6 +178,7 @@ layout(buffer_reference, scalar) buffer PrimMaterials { uint m[]; };
 #include "include/nrd_encode.glsl"
 #include "include/tonemap.glsl"
 #include "include/gi_reservoir.glsl"
+#include "include/di_reservoir.glsl"
 
 const uint SHADER_BLENDER_PBR = 100u;
 
@@ -962,8 +963,176 @@ void main() {
             }
         }
 
-        // ---- NEE: Point/spot/area lights (bounce 0-1 only) ----
-        if (!skipLocalNEE)
+        // ---- ReSTIR DI: Reservoir-based light sampling (bounce 0 only) ----
+        // Replaces brute-force all-lights loop with weighted reservoir sampling.
+        // Each pixel picks 1 light from M candidates, then temporally reuses.
+        // Result: same quality as sampling ALL lights, but only 1 shadow ray.
+        bool restirDone = false;
+        if (!skipLocalNEE && bounce == 0 && cam.lightCount > 0u) {
+            DIReservoir reservoir = emptyDIReservoir();
+            vec3 V = -rayDir;
+            uint localRng = rngState;
+
+            // Candidate generation: sample M=min(lightCount, 8) random lights
+            uint M = min(cam.lightCount, 8u);
+            float sourcePDF = 1.0 / float(cam.lightCount);
+
+            for (uint m = 0u; m < M; m++) {
+                // Random light index
+                localRng ^= localRng << 13u; localRng ^= localRng >> 17u; localRng ^= localRng << 5u;
+                uint li = uint(float(localRng) / 4294967295.0 * float(cam.lightCount));
+                li = min(li, cam.lightCount - 1u);
+
+                vec4 lPosRange = cam.lights[li * 4u];
+                vec4 lColInt   = cam.lights[li * 4u + 1u];
+                vec4 lDirSizeX = cam.lights[li * 4u + 2u];
+                vec4 lTanSizeY = cam.lights[li * 4u + 3u];
+
+                vec3 lightPos = lPosRange.xyz;
+                vec3 lightColor = lColInt.rgb;
+                float lightInt = lColInt.w;
+                float sizeY = lTanSizeY.w;
+                bool isSpecial = (lPosRange.w < 0.0);
+                bool isSpot = isSpecial && sizeY < 0.0;
+                bool isArea = isSpecial && !isSpot;
+
+                // Compute light direction and attenuation
+                vec3 toLight = lightPos - pbrHit.worldPos;
+                float dist = length(toLight);
+                if (dist < 0.001) continue;
+                vec3 L = toLight / dist;
+                float NdotL = dot(N, L);
+                if (NdotL <= 0.0) continue;
+
+                // Spot light cone attenuation
+                float spotAtten = 1.0;
+                if (isSpot) {
+                    vec3 spotDir = lDirSizeX.xyz;
+                    float cosHalfAngle = lDirSizeX.w;
+                    float spotSmooth = abs(lTanSizeY.w);
+                    float cosAngle = dot(-L, spotDir);
+                    float t = clamp((cosAngle - cosHalfAngle) * spotSmooth, 0.0, 1.0);
+                    spotAtten = t * t * (3.0 - 2.0 * t);
+                    if (spotAtten <= 0.0) continue;
+                }
+
+                float falloff = 1.0 / (dist * dist + 0.001);
+                float attenuation = falloff;
+                vec3 samplePos = lightPos;
+
+                if (isArea) {
+                    vec3 lightNormal = lDirSizeX.xyz;
+                    float lightFacing = dot(-L, lightNormal);
+                    if (lightFacing <= 0.0) continue;
+                    float areaSize = lDirSizeX.w * lTanSizeY.w;
+                    attenuation *= lightFacing * areaSize;
+                }
+
+                vec3 lightRadiance = lightColor * lightInt * attenuation * spotAtten;
+                float pHat = diTargetPDF(N, V, L, NdotL, pbrHit.baseColor,
+                                         pbrHit.roughness, pbrHit.metallic, lightRadiance);
+
+                diReservoirUpdate(reservoir, li, samplePos, pHat, sourcePDF, localRng);
+            }
+
+            // Temporal reuse: merge with previous frame's reservoir
+            uint pixelLinearIdx = uint(pixel.y) * uint(launchSize.x) + uint(pixel.x);
+            uint prevBase = pixelLinearIdx * 3u;
+            DIReservoir prevReservoir = diUnpack(
+                giReservoirPrev.data[prevBase + 0u],
+                giReservoirPrev.data[prevBase + 1u]);
+
+            if (prevReservoir.M > 0.0 && prevReservoir.lightIndex != 0xFFFFFFFFu
+                && prevReservoir.age < 20.0) {
+                // Re-evaluate target PDF of previous sample at current pixel
+                uint prevLi = prevReservoir.lightIndex;
+                if (prevLi < cam.lightCount) {
+                    vec4 pPosRange = cam.lights[prevLi * 4u];
+                    vec4 pColInt   = cam.lights[prevLi * 4u + 1u];
+                    vec3 pToLight = pPosRange.xyz - pbrHit.worldPos;
+                    float pDist = length(pToLight);
+                    vec3 pL = pToLight / max(pDist, 0.001);
+                    float pNdotL = dot(N, pL);
+                    float pFalloff = 1.0 / (pDist * pDist + 0.001);
+                    vec3 pRadiance = pColInt.rgb * pColInt.w * pFalloff;
+                    float prevTargetPDF = diTargetPDF(N, V, pL, max(pNdotL, 0.0),
+                        pbrHit.baseColor, pbrHit.roughness, pbrHit.metallic, pRadiance);
+
+                    // Clamp M to prevent bias buildup
+                    DIReservoir clampedPrev = prevReservoir;
+                    clampedPrev.M = min(clampedPrev.M, 20.0);
+                    diReservoirMerge(reservoir, clampedPrev, prevTargetPDF, localRng);
+                }
+            }
+
+            // Final shading: trace ONE shadow ray to the selected light
+            if (reservoir.lightIndex < cam.lightCount && reservoir.targetPDF > 0.0) {
+                uint finalLi = reservoir.lightIndex;
+                vec4 fPosRange = cam.lights[finalLi * 4u];
+                vec4 fColInt   = cam.lights[finalLi * 4u + 1u];
+                vec4 fDirSizeX = cam.lights[finalLi * 4u + 2u];
+                vec4 fTanSizeY = cam.lights[finalLi * 4u + 3u];
+
+                vec3 fToLight = fPosRange.xyz - pbrHit.worldPos;
+                float fDist = length(fToLight);
+                vec3 fL = fToLight / max(fDist, 0.001);
+
+                // Shadow ray
+                vec3 fShadowOrigin = pbrHit.worldPos + N * 0.002;
+                rayQueryEXT fShadowRQ;
+                rayQueryInitializeEXT(fShadowRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
+                    0xFF, fShadowOrigin, 0.0, fL, fDist - 0.004);
+                while (rayQueryProceedEXT(fShadowRQ)) {}
+                bool fInShadow = (rayQueryGetIntersectionTypeEXT(fShadowRQ, true)
+                    != gl_RayQueryCommittedIntersectionNoneEXT);
+
+                if (!fInShadow) {
+                    float W = diReservoirWeight(reservoir);
+                    float fNdotL = max(dot(N, fL), 0.0);
+                    float fFalloff = 1.0 / (fDist * fDist + 0.001);
+
+                    // Recompute attenuation for the final light
+                    float fAtten = fFalloff;
+                    bool fIsSpecial = (fPosRange.w < 0.0);
+                    bool fIsSpot = fIsSpecial && fTanSizeY.w < 0.0;
+                    bool fIsArea = fIsSpecial && !fIsSpot;
+                    float fSpotAtten = 1.0;
+
+                    if (fIsSpot) {
+                        float cosHalf = fDirSizeX.w;
+                        float sSm = abs(fTanSizeY.w);
+                        float cosA = dot(-fL, fDirSizeX.xyz);
+                        float st = clamp((cosA - cosHalf) * sSm, 0.0, 1.0);
+                        fSpotAtten = st * st * (3.0 - 2.0 * st);
+                    }
+                    if (fIsArea) {
+                        float faceDot = max(dot(-fL, fDirSizeX.xyz), 0.0);
+                        fAtten *= faceDot * fDirSizeX.w * fTanSizeY.w;
+                    }
+
+                    vec3 fRadiance = fColInt.rgb * fColInt.w * fAtten * fSpotAtten;
+                    vec3 fDiffC, fSpecC;
+                    evaluateCookTorrance(N, V, fL, pbrHit.baseColor, pbrHit.roughness,
+                        pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior, fDiffC, fSpecC);
+
+                    vec3 contribution = (fDiffC + fSpecC) * fRadiance * W;
+                    diffuseRadiance += fDiffC * fRadiance * W * throughput;
+                    specularRadiance += fSpecC * fRadiance * W * throughput;
+                }
+            }
+
+            // Write reservoir for next frame
+            reservoir.age += 1.0;
+            uint currBase = pixelLinearIdx * 3u;
+            giReservoirCurr.data[currBase + 0u] = diPackV0(reservoir);
+            giReservoirCurr.data[currBase + 1u] = diPackV1(reservoir);
+            giReservoirCurr.data[currBase + 2u] = vec4(0);
+            rngState = localRng;
+            restirDone = true;
+        }
+
+        // ---- NEE: Point/spot/area lights (fallback for bounce 1+ or when ReSTIR skipped) ----
+        if (!skipLocalNEE && !restirDone)
         for (uint li = neeStart; li < neeEnd; li++) {
             vec4 lightPosRange = cam.lights[li * 4u];
             vec4 lightColInt   = cam.lights[li * 4u + 1u];
