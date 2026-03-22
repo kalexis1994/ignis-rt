@@ -1065,6 +1065,43 @@ void main() {
                 }
             }
 
+            // Spatial reuse: merge with K random neighbor reservoirs
+            // This shares shadow visibility info across pixels, reducing binary noise
+            for (int sn = 0; sn < 3; sn++) {
+                // Random neighbor within 10px radius
+                localRng ^= localRng << 13u; localRng ^= localRng >> 17u; localRng ^= localRng << 5u;
+                float angle = float(localRng) / 4294967295.0 * 6.28318;
+                localRng ^= localRng << 13u; localRng ^= localRng >> 17u; localRng ^= localRng << 5u;
+                float radius = sqrt(float(localRng) / 4294967295.0) * 10.0;
+                ivec2 neighbor = pixel + ivec2(cos(angle) * radius, sin(angle) * radius);
+                neighbor = clamp(neighbor, ivec2(0), ivec2(launchSize) - 1);
+
+                uint nIdx = uint(neighbor.y) * uint(launchSize.x) + uint(neighbor.x);
+                uint nBase = nIdx * 3u;
+                DIReservoir nReservoir = diUnpack(
+                    giReservoirPrev.data[nBase + 0u],
+                    giReservoirPrev.data[nBase + 1u]);
+
+                if (nReservoir.M <= 0.0 || nReservoir.lightIndex >= cam.lightCount) continue;
+
+                // Re-evaluate neighbor's light at THIS pixel's surface
+                uint nLi = nReservoir.lightIndex;
+                vec4 nPosRange = cam.lights[nLi * 4u];
+                vec4 nColInt = cam.lights[nLi * 4u + 1u];
+                vec3 nToLight = nPosRange.xyz - pbrHit.worldPos;
+                float nDist = length(nToLight);
+                vec3 nL = nToLight / max(nDist, 0.001);
+                float nNdotL = dot(N, nL);
+                float nFalloff = 1.0 / (nDist * nDist + 0.001);
+                vec3 nRadiance = nColInt.rgb * nColInt.w * nFalloff;
+                float nTargetPDF = diTargetPDF(N, V, nL, max(nNdotL, 0.0),
+                    pbrHit.baseColor, pbrHit.roughness, pbrHit.metallic, nRadiance);
+
+                DIReservoir clampedN = nReservoir;
+                clampedN.M = min(clampedN.M, 10.0);
+                diReservoirMerge(reservoir, clampedN, nTargetPDF, localRng);
+            }
+
             // Final shading: trace ONE shadow ray to the selected light
             if (reservoir.lightIndex < cam.lightCount && reservoir.targetPDF > 0.0) {
                 uint finalLi = reservoir.lightIndex;

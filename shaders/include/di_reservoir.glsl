@@ -78,7 +78,7 @@ void diReservoirMerge(inout DIReservoir r, DIReservoir other, float otherTargetP
 float diReservoirWeight(DIReservoir r) {
     if (r.targetPDF <= 0.0 || r.M <= 0.0) return 0.0;
     float W = r.weightSum / (r.M * r.targetPDF);
-    return min(W, 5.0);  // clamp to prevent firefly explosions
+    return min(W, 15.0);  // soft clamp — output contribution is also clamped
 }
 
 // Pack/unpack functions use raw vec4 values (caller handles SSBO access)
