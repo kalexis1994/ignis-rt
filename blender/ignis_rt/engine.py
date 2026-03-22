@@ -246,6 +246,11 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             return True
 
         if _ignis_initialized:
+            # Don't reinit on resize during loading — Blender adjusts layout
+            # when opening complex scenes, causing spurious size changes
+            if _load_stage != LOAD_IDLE:
+                _log(f" Resize {_ignis_width}x{_ignis_height} -> {width}x{height} ignored (loading)")
+                return True
             _log(f" Reinit: {_ignis_width}x{_ignis_height} -> {width}x{height}")
             _ignis_shutdown()
 
@@ -1161,10 +1166,12 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         self._last_w, self._last_h = w, h
 
         # ── Resume detection: user switched back from Solid/Wireframe ──
+        # Threshold must be high enough that normal Blender stalls (heavy scenes,
+        # depsgraph evaluation, UI layout changes) don't trigger false resumes.
         now = time.perf_counter()
         if _ignis_initialized and _load_stage == LOAD_IDLE and _ignis_last_draw_time > 0:
             gap = now - _ignis_last_draw_time
-            if gap > 0.5:
+            if gap > 3.0:
                 _log(f"Resume after {gap:.1f}s pause")
                 # Check if restart-worthy settings changed while paused
                 needs_restart = False

@@ -157,8 +157,8 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
 
     # -- Quality --
     max_bounces: IntProperty(
-        name="Max Bounces", default=2, min=1, max=8,
-        description="Path tracing bounces (1=direct only, higher=better GI, slower)",
+        name="Max Bounces", default=2, min=2, max=8,
+        description="Path tracing bounces (2=one GI bounce, higher=better indirect lighting)",
         update=_tag_redraw,
     )
     samples_per_pixel: IntProperty(
