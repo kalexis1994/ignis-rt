@@ -848,11 +848,16 @@ void main() {
             float NdotL = dot(N, sunDir);
             if (NdotL > 0.0) {
                 // Shadow ray with soft penumbra (sun angular radius)
-                // Jitter shadow direction for soft shadows — reduces binary noise
+                // Blue noise + Halton temporal sequence for stable penumbra convergence
                 vec3 shadowDir = sunDir;
                 {
-                    float sunRadius = 0.02;  // ~1.1° angular radius (real sun ≈ 0.27°)
-                    vec2 diskSample = rand2();
+                    float sunRadius = 0.01;  // ~0.57° angular radius (close to real sun)
+                    // Use blue noise for spatial coherence + frame index for temporal variation
+                    ivec2 bnCoord = ivec2((pixel.x + frameIndex * 7) & 63, (pixel.y + frameIndex * 11) & 63);
+                    vec2 diskSample = vec2(
+                        texelFetch(blueNoiseTexture, bnCoord, 0).r,
+                        texelFetch(blueNoiseTexture, ivec2(bnCoord.y, bnCoord.x), 0).r
+                    );
                     float diskR = sqrt(diskSample.x) * sunRadius;
                     float diskAngle = diskSample.y * 2.0 * PI;
                     vec3 sT = abs(sunDir.y) < 0.999 ? normalize(cross(sunDir, vec3(0,1,0))) : normalize(cross(sunDir, vec3(1,0,0)));
