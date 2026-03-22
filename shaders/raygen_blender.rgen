@@ -1430,7 +1430,8 @@ void main() {
         // Demodulate: divide diffuse radiance by albedo before NRD.
         // NRD works better with irradiance (albedo-free) — less noise in color channels.
         // Composite re-modulates by multiplying denoised result * albedo.
-        vec3 albedo = max(primaryAlbedo, vec3(0.01));  // avoid division by zero
+        // Use higher min to prevent noise amplification on dark surfaces.
+        vec3 albedo = max(primaryAlbedo, vec3(0.1));
         vec3 demodDiffuse = diffuseRadiance / albedo;
 
         imageStore(diffuseRadianceImg, pixel, NRD_PackRadiance(demodDiffuse, diffHitDist));
