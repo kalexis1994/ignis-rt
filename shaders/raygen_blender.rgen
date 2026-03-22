@@ -973,7 +973,8 @@ void main() {
         // Each pixel picks 1 light from M candidates, then temporally reuses.
         // Result: same quality as sampling ALL lights, but only 1 shadow ray.
         bool restirDone = false;
-        if (!skipLocalNEE && bounce == 0 && cam.lightCount > 0u) {
+        // ReSTIR DI: enable only for scenes with many lights (>16) where brute force is too expensive
+        if (!skipLocalNEE && bounce == 0 && cam.lightCount > 16u) {
             DIReservoir reservoir = emptyDIReservoir();
             vec3 V = -rayDir;
             uint localRng = rngState;
