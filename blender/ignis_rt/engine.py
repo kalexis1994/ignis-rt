@@ -1325,9 +1325,19 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         dll_wrapper.set_int("reset_history", 1)
                     _ignis_instance_count = count
 
-        # FPS limiter
+        # FPS limiter / V-Sync
         props = context.scene.ignis_rt
         fps_limit = props.fps_limit
+        if props.vsync:
+            # Detect monitor refresh rate (fallback 60Hz)
+            try:
+                import ctypes
+                dm = ctypes.wintypes.DEVMODE()
+                dm.dmSize = ctypes.sizeof(dm)
+                ctypes.windll.user32.EnumDisplaySettingsW(None, -1, ctypes.byref(dm))
+                fps_limit = dm.dmDisplayFrequency if dm.dmDisplayFrequency > 0 else 60
+            except Exception:
+                fps_limit = 60
         if fps_limit > 0:
             min_frame_time = 1.0 / fps_limit
             now = time.perf_counter()

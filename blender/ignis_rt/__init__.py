@@ -218,9 +218,15 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
     )
 
     # -- Performance --
+    vsync: BoolProperty(
+        name="V-Sync",
+        description="Limit FPS to monitor refresh rate to reduce screen tearing",
+        default=False,
+        update=_tag_redraw,
+    )
     fps_limit: IntProperty(
         name="FPS Limit", default=0, min=0, max=240,
-        description="Limit viewport FPS (0 = unlimited)",
+        description="Limit viewport FPS (0 = unlimited, overridden by V-Sync)",
         update=_tag_redraw,
     )
 
@@ -296,6 +302,7 @@ class IGNIS_PT_sampling(bpy.types.Panel):
         layout.prop(props, "restir_di")
         layout.prop(props, "use_wavefront")
         layout.separator()
+        layout.prop(props, "vsync")
         layout.prop(props, "fps_limit")
         layout.prop(props, "show_fps")
         layout.separator()

@@ -5,6 +5,87 @@
 namespace acpt {
 namespace vk {
 
+bool Interop::CreateSharedImageSlot(int idx) {
+    VkDevice device = context_->GetDevice();
+
+    // Create shared image with external memory
+    VkExternalMemoryImageCreateInfo externalInfo{};
+    externalInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+    externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.pNext = &externalInfo;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    imageInfo.extent = {width_, height_, 1};
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    if (vkCreateImage(device, &imageInfo, nullptr, &sharedImage_[idx]) != VK_SUCCESS) {
+        Log(L"[VK Interop] ERROR: Failed to create shared image [%d]\n", idx);
+        return false;
+    }
+
+    // Allocate exportable memory
+    VkMemoryRequirements memReqs;
+    vkGetImageMemoryRequirements(device, sharedImage_[idx], &memReqs);
+
+    VkExportMemoryAllocateInfo exportInfo{};
+    exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+    exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.pNext = &exportInfo;
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = context_->FindMemoryType(memReqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &sharedMemory_[idx]) != VK_SUCCESS) {
+        Log(L"[VK Interop] ERROR: Failed to allocate shared memory [%d]\n", idx);
+        return false;
+    }
+
+    vkBindImageMemory(device, sharedImage_[idx], sharedMemory_[idx], 0);
+    allocationSize_[idx] = memReqs.size;
+
+    // Export NT handle
+    VkMemoryGetWin32HandleInfoKHR handleInfo{};
+    handleInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
+    handleInfo.memory = sharedMemory_[idx];
+    handleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+
+    if (vkGetMemoryWin32HandleKHR_(device, &handleInfo, &ntHandle_[idx]) != VK_SUCCESS) {
+        Log(L"[VK Interop] ERROR: Failed to export NT handle [%d]\n", idx);
+        return false;
+    }
+
+    // Create image view
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = sharedImage_[idx];
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.layerCount = 1;
+
+    if (vkCreateImageView(device, &viewInfo, nullptr, &sharedImageView_[idx]) != VK_SUCCESS) {
+        Log(L"[VK Interop] ERROR: Failed to create shared image view [%d]\n", idx);
+        return false;
+    }
+
+    return true;
+}
+
 bool Interop::Initialize(Context* context, uint32_t width, uint32_t height) {
     context_ = context;
     width_ = width;
@@ -20,88 +101,40 @@ bool Interop::Initialize(Context* context, uint32_t width, uint32_t height) {
         return false;
     }
 
-    // Create shared image with external memory
-    VkExternalMemoryImageCreateInfo externalInfo{};
-    externalInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-    externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-
-    VkImageCreateInfo imageInfo{};
-    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    imageInfo.pNext = &externalInfo;
-    imageInfo.imageType = VK_IMAGE_TYPE_2D;
-    imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
-    imageInfo.extent = {width, height, 1};
-    imageInfo.mipLevels = 1;
-    imageInfo.arrayLayers = 1;
-    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-    if (vkCreateImage(device, &imageInfo, nullptr, &sharedImage_) != VK_SUCCESS) {
-        Log(L"[VK Interop] ERROR: Failed to create shared image\n");
-        return false;
+    // Create double-buffered shared images
+    for (int i = 0; i < 2; i++) {
+        if (!CreateSharedImageSlot(i)) return false;
     }
+    writeIdx_ = 0;
 
-    // Allocate exportable memory
-    VkMemoryRequirements memReqs;
-    vkGetImageMemoryRequirements(device, sharedImage_, &memReqs);
-
-    VkExportMemoryAllocateInfo exportInfo{};
-    exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
-    exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.pNext = &exportInfo;
-    allocInfo.allocationSize = memReqs.size;
-    allocInfo.memoryTypeIndex = context_->FindMemoryType(memReqs.memoryTypeBits,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-
-    if (vkAllocateMemory(device, &allocInfo, nullptr, &sharedMemory_) != VK_SUCCESS) {
-        Log(L"[VK Interop] ERROR: Failed to allocate shared memory\n");
-        return false;
-    }
-
-    vkBindImageMemory(device, sharedImage_, sharedMemory_, 0);
-    allocationSize_ = memReqs.size;
-
-    // Export NT handle
-    VkMemoryGetWin32HandleInfoKHR handleInfo{};
-    handleInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
-    handleInfo.memory = sharedMemory_;
-    handleInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-
-    if (vkGetMemoryWin32HandleKHR_(device, &handleInfo, &ntHandle_) != VK_SUCCESS) {
-        Log(L"[VK Interop] ERROR: Failed to export NT handle\n");
-        return false;
-    }
-
-    // Create image view
-    VkImageViewCreateInfo viewInfo{};
-    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    viewInfo.image = sharedImage_;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
-    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    viewInfo.subresourceRange.levelCount = 1;
-    viewInfo.subresourceRange.layerCount = 1;
-
-    if (vkCreateImageView(device, &viewInfo, nullptr, &sharedImageView_) != VK_SUCCESS) {
-        Log(L"[VK Interop] ERROR: Failed to create shared image view\n");
-        return false;
-    }
-
-    // Initial layout transition
+    // Initial layout transition for both images
     VkCommandBuffer cmd = context_->BeginSingleTimeCommands();
-    TransitionForRTWrite(cmd);
+    for (int i = 0; i < 2; i++) {
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = sharedImage_[i];
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.layerCount = 1;
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+            0, 0, nullptr, 0, nullptr, 1, &barrier);
+    }
     context_->EndSingleTimeCommands(cmd);
 
-    Log(L"[VK Interop] Shared image created (%ux%u), NT handle=%p\n", width, height, ntHandle_);
+    Log(L"[VK Interop] Double-buffered shared images created (%ux%u), handles=%p/%p\n",
+        width, height, ntHandle_[0], ntHandle_[1]);
     return true;
+}
+
+void Interop::SwapBuffers() {
+    writeIdx_ = 1 - writeIdx_;
 }
 
 bool Interop::ImportD3D11Texture(HANDLE ntHandle, uint32_t width, uint32_t height) {
@@ -109,25 +142,28 @@ bool Interop::ImportD3D11Texture(HANDLE ntHandle, uint32_t width, uint32_t heigh
 
     VkDevice device = context_->GetDevice();
 
-    // Destroy existing shared image (we'll replace it with the D3D11-imported one)
-    if (sharedImageView_ != VK_NULL_HANDLE) {
-        vkDestroyImageView(device, sharedImageView_, nullptr);
-        sharedImageView_ = VK_NULL_HANDLE;
+    // Destroy all existing shared images (D3D11 import uses single-buffer on slot 0)
+    for (int i = 0; i < 2; i++) {
+        if (sharedImageView_[i] != VK_NULL_HANDLE) {
+            vkDestroyImageView(device, sharedImageView_[i], nullptr);
+            sharedImageView_[i] = VK_NULL_HANDLE;
+        }
+        if (sharedImage_[i] != VK_NULL_HANDLE) {
+            vkDestroyImage(device, sharedImage_[i], nullptr);
+            sharedImage_[i] = VK_NULL_HANDLE;
+        }
+        if (sharedMemory_[i] != VK_NULL_HANDLE) {
+            vkFreeMemory(device, sharedMemory_[i], nullptr);
+            sharedMemory_[i] = VK_NULL_HANDLE;
+        }
+        if (ntHandle_[i]) {
+            CloseHandle(ntHandle_[i]);
+            ntHandle_[i] = nullptr;
+        }
     }
-    if (sharedImage_ != VK_NULL_HANDLE) {
-        vkDestroyImage(device, sharedImage_, nullptr);
-        sharedImage_ = VK_NULL_HANDLE;
-    }
-    if (sharedMemory_ != VK_NULL_HANDLE) {
-        vkFreeMemory(device, sharedMemory_, nullptr);
-        sharedMemory_ = VK_NULL_HANDLE;
-    }
-    if (ntHandle_) {
-        CloseHandle(ntHandle_);
-        ntHandle_ = nullptr;
-    }
+    writeIdx_ = 0;
 
-    // Create image backed by D3D11 external memory
+    // Create image backed by D3D11 external memory (slot 0 only)
     VkExternalMemoryImageCreateInfo externalInfo{};
     externalInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
     externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
@@ -147,16 +183,14 @@ bool Interop::ImportD3D11Texture(HANDLE ntHandle, uint32_t width, uint32_t heigh
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    if (vkCreateImage(device, &imageInfo, nullptr, &sharedImage_) != VK_SUCCESS) {
+    if (vkCreateImage(device, &imageInfo, nullptr, &sharedImage_[0]) != VK_SUCCESS) {
         Log(L"[VK Interop] ERROR: Failed to create image for D3D11 import\n");
         return false;
     }
 
-    // Get memory requirements
     VkMemoryRequirements memReqs;
-    vkGetImageMemoryRequirements(device, sharedImage_, &memReqs);
+    vkGetImageMemoryRequirements(device, sharedImage_[0], &memReqs);
 
-    // Import the D3D11 NT handle as Vulkan memory
     VkImportMemoryWin32HandleInfoKHR importInfo{};
     importInfo.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
     importInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
@@ -165,7 +199,7 @@ bool Interop::ImportD3D11Texture(HANDLE ntHandle, uint32_t width, uint32_t heigh
     VkMemoryDedicatedAllocateInfo dedicatedInfo{};
     dedicatedInfo.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
     dedicatedInfo.pNext = &importInfo;
-    dedicatedInfo.image = sharedImage_;
+    dedicatedInfo.image = sharedImage_[0];
 
     VkMemoryAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -174,27 +208,26 @@ bool Interop::ImportD3D11Texture(HANDLE ntHandle, uint32_t width, uint32_t heigh
     allocInfo.memoryTypeIndex = context_->FindMemoryType(memReqs.memoryTypeBits,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-    if (vkAllocateMemory(device, &allocInfo, nullptr, &sharedMemory_) != VK_SUCCESS) {
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &sharedMemory_[0]) != VK_SUCCESS) {
         Log(L"[VK Interop] ERROR: Failed to import D3D11 memory (vkAllocateMemory)\n");
-        vkDestroyImage(device, sharedImage_, nullptr);
-        sharedImage_ = VK_NULL_HANDLE;
+        vkDestroyImage(device, sharedImage_[0], nullptr);
+        sharedImage_[0] = VK_NULL_HANDLE;
         return false;
     }
 
-    vkBindImageMemory(device, sharedImage_, sharedMemory_, 0);
-    allocationSize_ = memReqs.size;
+    vkBindImageMemory(device, sharedImage_[0], sharedMemory_[0], 0);
+    allocationSize_[0] = memReqs.size;
 
-    // Create image view
     VkImageViewCreateInfo viewInfo{};
     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    viewInfo.image = sharedImage_;
+    viewInfo.image = sharedImage_[0];
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
     viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     viewInfo.subresourceRange.levelCount = 1;
     viewInfo.subresourceRange.layerCount = 1;
 
-    if (vkCreateImageView(device, &viewInfo, nullptr, &sharedImageView_) != VK_SUCCESS) {
+    if (vkCreateImageView(device, &viewInfo, nullptr, &sharedImageView_[0]) != VK_SUCCESS) {
         Log(L"[VK Interop] ERROR: Failed to create image view for imported texture\n");
         return false;
     }
@@ -214,7 +247,6 @@ bool Interop::ImportD3D11Texture(HANDLE ntHandle, uint32_t width, uint32_t heigh
 void Interop::Shutdown() {
     // Clean up GL interop first (GL objects reference the VK memory)
     ShutdownGL();
-    allocationSize_ = 0;
 
     VkDevice device = context_ ? context_->GetDevice() : VK_NULL_HANDLE;
     if (device == VK_NULL_HANDLE) return;
@@ -233,21 +265,25 @@ void Interop::Shutdown() {
             readbackMemory_[i] = VK_NULL_HANDLE;
         }
     }
-    if (sharedImageView_ != VK_NULL_HANDLE) {
-        vkDestroyImageView(device, sharedImageView_, nullptr);
-        sharedImageView_ = VK_NULL_HANDLE;
-    }
-    if (sharedImage_ != VK_NULL_HANDLE) {
-        vkDestroyImage(device, sharedImage_, nullptr);
-        sharedImage_ = VK_NULL_HANDLE;
-    }
-    if (sharedMemory_ != VK_NULL_HANDLE) {
-        vkFreeMemory(device, sharedMemory_, nullptr);
-        sharedMemory_ = VK_NULL_HANDLE;
-    }
-    if (ntHandle_) {
-        CloseHandle(ntHandle_);
-        ntHandle_ = nullptr;
+
+    for (int i = 0; i < 2; i++) {
+        if (sharedImageView_[i] != VK_NULL_HANDLE) {
+            vkDestroyImageView(device, sharedImageView_[i], nullptr);
+            sharedImageView_[i] = VK_NULL_HANDLE;
+        }
+        if (sharedImage_[i] != VK_NULL_HANDLE) {
+            vkDestroyImage(device, sharedImage_[i], nullptr);
+            sharedImage_[i] = VK_NULL_HANDLE;
+        }
+        if (sharedMemory_[i] != VK_NULL_HANDLE) {
+            vkFreeMemory(device, sharedMemory_[i], nullptr);
+            sharedMemory_[i] = VK_NULL_HANDLE;
+        }
+        if (ntHandle_[i]) {
+            CloseHandle(ntHandle_[i]);
+            ntHandle_[i] = nullptr;
+        }
+        allocationSize_[i] = 0;
     }
 
     Log(L"[VK Interop] Shutdown\n");
@@ -305,7 +341,7 @@ void Interop::RecordReadbackCopy(VkCommandBuffer cmd, VkFence submitFence) {
     barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = sharedImage_;
+    barrier.image = sharedImage_[writeIdx_];
     barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     barrier.subresourceRange.levelCount = 1;
     barrier.subresourceRange.layerCount = 1;
@@ -322,7 +358,7 @@ void Interop::RecordReadbackCopy(VkCommandBuffer cmd, VkFence submitFence) {
     region.imageSubresource.layerCount = 1;
     region.imageExtent = {width_, height_, 1};
 
-    vkCmdCopyImageToBuffer(cmd, sharedImage_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    vkCmdCopyImageToBuffer(cmd, sharedImage_[writeIdx_], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                             readbackBuffer_[readbackWriteIdx_], 1, &region);
 
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -373,7 +409,7 @@ bool Interop::CopyReadbackResult(void* outData, uint32_t bufferSize, VkDevice de
 }
 
 bool Interop::ReadbackPixels(void* outData, uint32_t bufferSize) {
-    if (!context_ || !sharedImage_ || !outData) return false;
+    if (!context_ || !sharedImage_[writeIdx_] || !outData) return false;
     uint32_t imageSize = width_ * height_ * 4;
     if (bufferSize < imageSize) return false;
 
@@ -392,7 +428,7 @@ void Interop::TransitionForRTWrite(VkCommandBuffer cmd) {
     barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = sharedImage_;
+    barrier.image = sharedImage_[writeIdx_];
     barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     barrier.subresourceRange.levelCount = 1;
     barrier.subresourceRange.layerCount = 1;
@@ -412,7 +448,7 @@ void Interop::TransitionForExternalRead(VkCommandBuffer cmd) {
     barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = sharedImage_;
+    barrier.image = sharedImage_[writeIdx_];
     barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     barrier.subresourceRange.levelCount = 1;
     barrier.subresourceRange.layerCount = 1;
@@ -652,70 +688,73 @@ static GLuint CompileGLShader(GLenum type, const char* src) {
 
 bool Interop::InitGLInterop() {
     if (glInteropReady_) return true;
-    if (!sharedImage_ || !ntHandle_ || allocationSize_ == 0) {
+    if (!sharedImage_[0] || !ntHandle_[0] || allocationSize_[0] == 0) {
         Log(L"[GL Interop] No shared image/handle to import\n");
         return false;
     }
 
     if (!LoadGLFunctions()) return false;
 
-    // 1. Import Vulkan memory as GL memory object
-    gl.CreateMemoryObjectsEXT(1, &glMemoryObject_);
-    if (!glMemoryObject_) {
-        Log(L"[GL Interop] Failed to create GL memory object\n");
-        return false;
-    }
-
-    // Duplicate NT handle (GL spec allows driver to consume it)
-    HANDLE dupHandle = nullptr;
-    if (!DuplicateHandle(GetCurrentProcess(), ntHandle_, GetCurrentProcess(),
-                         &dupHandle, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
-        Log(L"[GL Interop] Failed to duplicate NT handle\n");
-        gl.DeleteMemoryObjectsEXT(1, &glMemoryObject_);
-        glMemoryObject_ = 0;
-        return false;
-    }
-
     // Query GL context info for diagnostics
     GLint glMajor = 0, glMinor = 0;
     gl.GetIntegerv(0x821B, &glMajor);  // GL_MAJOR_VERSION
     gl.GetIntegerv(0x821C, &glMinor);  // GL_MINOR_VERSION
-    Log(L"[GL Interop] GL context: %d.%d, memObj=%u, allocSize=%llu, handle=%p\n",
-        glMajor, glMinor, glMemoryObject_, (unsigned long long)allocationSize_, dupHandle);
+    Log(L"[GL Interop] GL context: %d.%d\n", glMajor, glMinor);
 
-    // Clear any pre-existing GL error before import
-    while (gl.GetError()) {}
+    // 1. Import both Vulkan shared images as GL memory objects + textures
+    int numSlots = (sharedImage_[1] != VK_NULL_HANDLE) ? 2 : 1;
+    for (int i = 0; i < numSlots; i++) {
+        gl.CreateMemoryObjectsEXT(1, &glMemoryObject_[i]);
+        if (!glMemoryObject_[i]) {
+            Log(L"[GL Interop] Failed to create GL memory object [%d]\n", i);
+            ShutdownGL();
+            return false;
+        }
 
-    gl.ImportMemoryWin32HandleEXT(glMemoryObject_, (GLuint64)allocationSize_,
-                                  GL_HANDLE_TYPE_OPAQUE_WIN32_EXT, dupHandle);
+        // Duplicate NT handle (GL spec allows driver to consume it)
+        HANDLE dupHandle = nullptr;
+        if (!DuplicateHandle(GetCurrentProcess(), ntHandle_[i], GetCurrentProcess(),
+                             &dupHandle, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            Log(L"[GL Interop] Failed to duplicate NT handle [%d]\n", i);
+            ShutdownGL();
+            return false;
+        }
 
-    GLenum err = gl.GetError();
-    if (err) {
-        Log(L"[GL Interop] glImportMemoryWin32HandleEXT failed (GL error 0x%X)\n", err);
-        gl.DeleteMemoryObjectsEXT(1, &glMemoryObject_);
-        glMemoryObject_ = 0;
-        CloseHandle(dupHandle);
-        return false;
+        while (gl.GetError()) {}
+
+        gl.ImportMemoryWin32HandleEXT(glMemoryObject_[i], (GLuint64)allocationSize_[i],
+                                      GL_HANDLE_TYPE_OPAQUE_WIN32_EXT, dupHandle);
+
+        GLenum err = gl.GetError();
+        if (err) {
+            Log(L"[GL Interop] glImportMemoryWin32HandleEXT failed [%d] (GL error 0x%X)\n", i, err);
+            CloseHandle(dupHandle);
+            ShutdownGL();
+            return false;
+        }
+
+        // Create GL texture backed by imported memory
+        gl.GenTextures(1, &glTexture_[i]);
+        gl.BindTexture(GL_TEXTURE_2D, glTexture_[i]);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        gl.TexStorageMem2DEXT(GL_TEXTURE_2D, 1, GL_RGBA8, width_, height_, glMemoryObject_[i], 0);
+
+        err = gl.GetError();
+        if (err) {
+            Log(L"[GL Interop] glTexStorageMem2DEXT failed [%d] (GL error 0x%X)\n", i, err);
+            ShutdownGL();
+            return false;
+        }
+        gl.BindTexture(GL_TEXTURE_2D, 0);
+
+        Log(L"[GL Interop] Slot %d: GL tex=%u, mem=%u, allocSize=%llu\n",
+            i, glTexture_[i], glMemoryObject_[i], (unsigned long long)allocationSize_[i]);
     }
 
-    // 2. Create GL texture backed by imported memory
-    gl.GenTextures(1, &glTexture_);
-    gl.BindTexture(GL_TEXTURE_2D, glTexture_);
-    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    gl.TexStorageMem2DEXT(GL_TEXTURE_2D, 1, GL_RGBA8, width_, height_, glMemoryObject_, 0);
-
-    err = gl.GetError();
-    if (err) {
-        Log(L"[GL Interop] glTexStorageMem2DEXT failed (GL error 0x%X)\n", err);
-        ShutdownGL();
-        return false;
-    }
-    gl.BindTexture(GL_TEXTURE_2D, 0);
-
-    // 3. Create shader program
+    // 2. Create shader program (shared by both textures)
     GLuint vs = CompileGLShader(GL_VERTEX_SHADER, kGLVertexShaderSrc);
     GLuint fs = CompileGLShader(GL_FRAGMENT_SHADER, kGLFragmentShaderSrc);
     if (!vs || !fs) {
@@ -743,18 +782,17 @@ bool Interop::InitGLInterop() {
         return false;
     }
 
-    // Set texture sampler to unit 0
     gl.UseProgram(glShaderProgram_);
     GLint texLoc = gl.GetUniformLocation(glShaderProgram_, "uTexture");
     gl.Uniform1i(texLoc, 0);
     gl.UseProgram(0);
 
-    // 4. Create empty VAO (required by core profile for gl_VertexID draws)
+    // 3. Create empty VAO (required by core profile for gl_VertexID draws)
     gl.GenVertexArrays(1, &glVAO_);
 
     glInteropReady_ = true;
-    Log(L"[GL Interop] Initialized: shared texture %ux%u, GL tex=%u, mem=%u\n",
-        width_, height_, glTexture_, glMemoryObject_);
+    Log(L"[GL Interop] Double-buffered interop initialized: %ux%u (%d slots)\n",
+        width_, height_, numSlots);
     return true;
 }
 
@@ -777,11 +815,13 @@ void Interop::DrawGL(uint32_t viewportW, uint32_t viewportH) {
     gl.Disable(GL_DEPTH_TEST);
     gl.Disable(GL_SCISSOR_TEST);
 
-    // Draw fullscreen triangle
+    // Draw fullscreen triangle — read from the COMPLETED frame (readIdx)
+    uint32_t readIdx = 1 - writeIdx_;
+    GLuint readTex = glTexture_[readIdx] ? glTexture_[readIdx] : glTexture_[0];
     gl.UseProgram(glShaderProgram_);
     gl.BindVertexArray(glVAO_);
     gl.ActiveTexture(GL_TEXTURE0);
-    gl.BindTexture(GL_TEXTURE_2D, glTexture_);
+    gl.BindTexture(GL_TEXTURE_2D, readTex);
     gl.DrawArrays(GL_TRIANGLES, 0, 3);
 
     // Restore GL state
@@ -796,7 +836,7 @@ void Interop::DrawGL(uint32_t viewportW, uint32_t viewportH) {
 }
 
 void Interop::ShutdownGL() {
-    if (!glInteropReady_ && !glTexture_ && !glShaderProgram_ && !glVAO_ && !glMemoryObject_)
+    if (!glInteropReady_ && !glTexture_[0] && !glShaderProgram_ && !glVAO_ && !glMemoryObject_[0])
         return;
 
     // Check if a GL context is current (safe to call GL functions)
@@ -813,14 +853,16 @@ void Interop::ShutdownGL() {
     if (canCallGL) {
         if (glVAO_) gl.DeleteVertexArrays(1, &glVAO_);
         if (glShaderProgram_) gl.DeleteProgram(glShaderProgram_);
-        if (glTexture_) gl.DeleteTextures(1, &glTexture_);
-        if (glMemoryObject_) gl.DeleteMemoryObjectsEXT(1, &glMemoryObject_);
+        for (int i = 0; i < 2; i++) {
+            if (glTexture_[i]) gl.DeleteTextures(1, &glTexture_[i]);
+            if (glMemoryObject_[i]) gl.DeleteMemoryObjectsEXT(1, &glMemoryObject_[i]);
+        }
     }
 
     glVAO_ = 0;
     glShaderProgram_ = 0;
-    glTexture_ = 0;
-    glMemoryObject_ = 0;
+    glTexture_[0] = 0; glTexture_[1] = 0;
+    glMemoryObject_[0] = 0; glMemoryObject_[1] = 0;
     glInteropReady_ = false;
 }
 

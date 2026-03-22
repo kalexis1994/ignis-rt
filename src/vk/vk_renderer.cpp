@@ -1284,6 +1284,22 @@ void Renderer::RenderFrameRT() {
         rtPipeline_->SwapGIReservoirBuffers();
     }
 
+    // Double-buffer swap: flip write/read indices so GL displays the completed frame
+    // while RT writes to the other buffer next frame
+    if (interop_) {
+        interop_->SwapBuffers();
+        // Update all descriptors that reference the interop image to point to new write slot
+        if (rtPipeline_ && !dlssActive_ && !dlssDebugBypass_) {
+            rtPipeline_->UpdateStorageImage(interop_->GetSharedImageView());
+        }
+        if (tonemapReady_) {
+            UpdateTonemapDescriptors();
+        }
+        if (compositeReady_ && !dlssActive_) {
+            UpdateCompositeDescriptors();
+        }
+    }
+
     frameIndex_++;
     currentFrame_ = (currentFrame_ + 1) % MAX_FRAMES_IN_FLIGHT;
 }
@@ -1413,20 +1429,24 @@ bool Renderer::InitImGui(HWND hwnd, bool forceRasterPath) {
     }
 
     if (useRTPath) {
-        // RT path: single framebuffer using shared image view
-        VkImageView imageView = interop_->GetSharedImageView();
-        VkFramebufferCreateInfo fbInfo{};
-        fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        fbInfo.renderPass = imguiRenderPass_;
-        fbInfo.attachmentCount = 1;
-        fbInfo.pAttachments = &imageView;
-        fbInfo.width = width_;
-        fbInfo.height = height_;
-        fbInfo.layers = 1;
+        // RT path: double-buffered framebuffers (one per interop slot)
+        for (int i = 0; i < 2; i++) {
+            VkImageView imageView = interop_->GetSharedImageView(i);
+            if (!imageView) continue;  // D3D11 import may only have slot 0
 
-        if (vkCreateFramebuffer(device, &fbInfo, nullptr, &imguiFramebuffer_) != VK_SUCCESS) {
-            Log(L"[VK Renderer] Failed to create ImGui framebuffer\n");
-            return false;
+            VkFramebufferCreateInfo fbInfo{};
+            fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+            fbInfo.renderPass = imguiRenderPass_;
+            fbInfo.attachmentCount = 1;
+            fbInfo.pAttachments = &imageView;
+            fbInfo.width = width_;
+            fbInfo.height = height_;
+            fbInfo.layers = 1;
+
+            if (vkCreateFramebuffer(device, &fbInfo, nullptr, &imguiFramebuffer_[i]) != VK_SUCCESS) {
+                Log(L"[VK Renderer] Failed to create ImGui framebuffer [%d]\n", i);
+                return false;
+            }
         }
     } else {
         // Rasterizer path: per-swapchain-image framebuffers
@@ -1477,9 +1497,10 @@ void Renderer::RenderImGuiOverlay(VkCommandBuffer cmd) {
     rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rpBegin.renderPass = imguiRenderPass_;
 
-    if (imguiFramebuffer_ != VK_NULL_HANDLE) {
-        // RT path
-        rpBegin.framebuffer = imguiFramebuffer_;
+    uint32_t writeIdx = interop_ ? interop_->GetWriteIdx() : 0;
+    if (imguiFramebuffer_[writeIdx] != VK_NULL_HANDLE) {
+        // RT path — use framebuffer matching current write image
+        rpBegin.framebuffer = imguiFramebuffer_[writeIdx];
         rpBegin.renderArea.extent = {width_, height_};
     } else if (!imguiSwapchainFramebuffers_.empty()) {
         // Raster path: use current frame's swapchain framebuffer
@@ -2385,7 +2406,10 @@ void Renderer::ShutdownImGui() {
 
     ImGui_Shutdown();
 
-    if (imguiFramebuffer_) vkDestroyFramebuffer(device, imguiFramebuffer_, nullptr);
+    for (int i = 0; i < 2; i++) {
+        if (imguiFramebuffer_[i]) vkDestroyFramebuffer(device, imguiFramebuffer_[i], nullptr);
+        imguiFramebuffer_[i] = VK_NULL_HANDLE;
+    }
     for (auto fb : imguiSwapchainFramebuffers_) {
         if (fb) vkDestroyFramebuffer(device, fb, nullptr);
     }
