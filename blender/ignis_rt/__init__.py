@@ -183,7 +183,7 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
     dlss_enabled: BoolProperty(
         name="DLSS",
         description="Enable NVIDIA DLSS upscaling (requires RTX GPU, restarts renderer)",
-        default=False,
+        default=True,
     )
     dlss_quality: EnumProperty(
         name="DLSS Quality",
@@ -194,14 +194,13 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
             ('3', "Balanced", "1.7x upscaling — balanced quality/performance"),
             ('4', "Quality", "1.5x upscaling — high quality (recommended)"),
             ('5', "Ultra Quality", "1.3x upscaling — may not be available on all GPUs"),
-            ('6', "DLAA", "Native resolution — anti-aliasing only, no upscaling"),
         ],
         default='4',
     )
     dlss_rr_enabled: BoolProperty(
         name="Ray Reconstruction",
         description="Use DLSS Ray Reconstruction (replaces NRD denoiser, requires RTX GPU + driver 535+)",
-        default=False,
+        default=True,
     )
 
     # -- Experimental --
@@ -291,33 +290,14 @@ class IGNIS_PT_sampling(bpy.types.Panel):
         layout.use_property_decorate = False
         layout.prop(props, "max_bounces")
         layout.prop(props, "samples_per_pixel")
-        layout.prop(props, "backface_culling")
-        layout.separator()
-        layout.prop(props, "dlss_enabled")
-        col = layout.column()
-        col.active = props.dlss_enabled
-        col.prop(props, "dlss_quality")
-        col.prop(props, "dlss_rr_enabled")
-        layout.separator()
-        layout.prop(props, "restir_di")
-        layout.prop(props, "use_wavefront")
-        layout.separator()
-        layout.prop(props, "vsync")
-        layout.prop(props, "fps_limit")
-        layout.prop(props, "show_fps")
-        layout.separator()
-        layout.operator("ignis.reload_scene", icon='FILE_REFRESH')
-        layout.separator()
-        layout.prop(props, "debug_view")
 
 
-class IGNIS_PT_status(bpy.types.Panel):
-    bl_label = "Status"
-    bl_idname = "IGNIS_PT_status"
+class IGNIS_PT_dlss(bpy.types.Panel):
+    bl_label = "DLSS"
+    bl_idname = "IGNIS_PT_dlss"
     bl_space_type = 'PROPERTIES'
     bl_region_type = 'WINDOW'
     bl_context = "render"
-    bl_options = {'DEFAULT_CLOSED'}
     COMPAT_ENGINES = {'IGNIS_RT'}
 
     @classmethod
@@ -326,38 +306,10 @@ class IGNIS_PT_status(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        from . import dll_wrapper
-
-        if not dll_wrapper.load():
-            layout.label(text="DLL not loaded", icon='ERROR')
-            return
-
-        dlss = dll_wrapper.get_int("dlss_active")
-        rr = dll_wrapper.get_int("dlss_rr_active")
-        nrd = dll_wrapper.get_int("nrd_active")
-
-        col = layout.column(align=True)
-        if dlss:
-            # Show actual quality mode (may differ from selected if GPU doesn't support it)
-            actual_q = dll_wrapper.get_int("dlss_quality_actual")
-            quality_names = {1: "Ultra Performance", 2: "Performance", 3: "Balanced",
-                             4: "Quality", 5: "Ultra Quality", 6: "DLAA"}
-            q_name = quality_names.get(actual_q, f"Mode {actual_q}")
-            props = context.scene.ignis_rt
-            requested_q = int(props.dlss_quality)
-            if actual_q != requested_q and actual_q > 0:
-                col.label(text=f"DLSS: {q_name} (fallback)", icon='INFO')
-            else:
-                col.label(text=f"DLSS: {q_name}", icon='CHECKMARK')
-        else:
-            col.label(text="DLSS: Off", icon='X')
-
-        if rr:
-            col.label(text="Denoiser: Ray Reconstruction", icon='CHECKMARK')
-        elif nrd:
-            col.label(text="Denoiser: NRD (RELAX + SIGMA)", icon='CHECKMARK')
-        else:
-            col.label(text="Denoiser: None", icon='X')
+        props = context.scene.ignis_rt
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        layout.prop(props, "dlss_quality")
 
 
 class IGNIS_PT_sky(bpy.types.Panel):
@@ -375,11 +327,9 @@ class IGNIS_PT_sky(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         props = context.scene.ignis_rt
-
         layout.use_property_split = True
         layout.use_property_decorate = False
 
-        # Sky
         layout.prop(props, "auto_sky_colors")
 
         col = layout.column()
@@ -395,9 +345,32 @@ class IGNIS_PT_sky(bpy.types.Panel):
         layout.prop(props, "cloud_visibility")
 
 
-class IGNIS_PT_tonemap(bpy.types.Panel):
-    bl_label = "Tonemap"
-    bl_idname = "IGNIS_PT_tonemap"
+class IGNIS_PT_color(bpy.types.Panel):
+    bl_label = "Color"
+    bl_idname = "IGNIS_PT_color"
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = "render"
+    COMPAT_ENGINES = {'IGNIS_RT'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.engine in cls.COMPAT_ENGINES
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.ignis_rt
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        layout.prop(props, "exposure")
+        layout.prop(props, "tonemap_mode")
+        layout.prop(props, "saturation")
+        layout.prop(props, "contrast")
+
+
+class IGNIS_PT_performance(bpy.types.Panel):
+    bl_label = "Performance"
+    bl_idname = "IGNIS_PT_performance"
     bl_space_type = 'PROPERTIES'
     bl_region_type = 'WINDOW'
     bl_context = "render"
@@ -411,28 +384,62 @@ class IGNIS_PT_tonemap(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         props = context.scene.ignis_rt
-
         layout.use_property_split = True
         layout.use_property_decorate = False
+        layout.prop(props, "vsync")
+        layout.prop(props, "fps_limit")
+        layout.prop(props, "show_fps")
 
-        layout.prop(props, "exposure")
-        layout.prop(props, "tonemap_mode")
-        layout.prop(props, "saturation")
-        layout.prop(props, "contrast")
+
+class IGNIS_PT_advanced(bpy.types.Panel):
+    bl_label = "Advanced"
+    bl_idname = "IGNIS_PT_advanced"
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = "render"
+    bl_options = {'DEFAULT_CLOSED'}
+    COMPAT_ENGINES = {'IGNIS_RT'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.engine in cls.COMPAT_ENGINES
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.ignis_rt
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        layout.prop(props, "restir_di")
+        # layout.prop(props, "use_wavefront")  # TODO: not ready yet
+        layout.separator()
+        layout.prop(props, "debug_view")
+        layout.separator()
+        layout.operator("ignis.reload_scene", icon='FILE_REFRESH')
+
 
 
 def _get_compatible_panels():
-    """Find Blender panels to make visible when Ignis RT is the active engine."""
-    exclude = {
-        'VIEWLAYER_PT_filter',
-        'VIEWLAYER_PT_layer_passes',
+    """Find Blender panels that Ignis RT should inherit.
+
+    Only inherit panels for editing scene data (materials, lights, camera,
+    world, objects, etc.). The Render Properties tab is handled entirely by
+    our own IGNIS_PT_* panels.
+    """
+    # Contexts where we want Blender's default panels to appear
+    include_contexts = {
+        'data', 'material', 'world', 'object', 'scene',
+        'constraint', 'modifier', 'particle', 'physics',
+        'bone', 'bone_constraint', 'output',
     }
     panels = []
     for panel in bpy.types.Panel.__subclasses__():
-        if hasattr(panel, 'COMPAT_ENGINES') and panel.__name__ not in exclude:
-            if ('BLENDER_EEVEE' in panel.COMPAT_ENGINES
-                    or 'BLENDER_EEVEE_NEXT' in panel.COMPAT_ENGINES):
-                panels.append(panel)
+        if not hasattr(panel, 'COMPAT_ENGINES'):
+            continue
+        if 'BLENDER_RENDER' not in panel.COMPAT_ENGINES:
+            continue
+        ctx = getattr(panel, 'bl_context', '')
+        if ctx in include_contexts:
+            panels.append(panel)
     return panels
 
 
@@ -448,13 +455,28 @@ def register():
     bpy.utils.register_class(IgnisRTSceneProperties)
     bpy.utils.register_class(IGNIS_OT_reload_scene)
     bpy.utils.register_class(IGNIS_PT_sampling)
-    bpy.utils.register_class(IGNIS_PT_status)
+    bpy.utils.register_class(IGNIS_PT_dlss)
     bpy.utils.register_class(IGNIS_PT_sky)
-    bpy.utils.register_class(IGNIS_PT_tonemap)
+    bpy.utils.register_class(IGNIS_PT_color)
+    bpy.utils.register_class(IGNIS_PT_performance)
+    bpy.utils.register_class(IGNIS_PT_advanced)
     bpy.utils.register_class(engine.IgnisRenderEngine)
     bpy.types.Scene.ignis_rt = bpy.props.PointerProperty(type=IgnisRTSceneProperties)
+
+    # Add IGNIS_RT to generic panels (materials, lights, world, etc.)
     for panel in _get_compatible_panels():
         panel.COMPAT_ENGINES.add('IGNIS_RT')
+
+    # Clean up: remove IGNIS_RT from any render-context panel that isn't ours
+    _own_panels = {
+        'IGNIS_PT_sampling', 'IGNIS_PT_dlss', 'IGNIS_PT_sky', 'IGNIS_PT_color',
+        'IGNIS_PT_performance', 'IGNIS_PT_advanced',
+    }
+    for panel in bpy.types.Panel.__subclasses__():
+        if getattr(panel, 'bl_context', '') == 'render' and panel.__name__ not in _own_panels:
+            compat = getattr(panel, 'COMPAT_ENGINES', None)
+            if compat and 'IGNIS_RT' in compat:
+                compat.discard('IGNIS_RT')
 
 
 
@@ -467,9 +489,11 @@ def unregister():
     for panel in _get_compatible_panels():
         panel.COMPAT_ENGINES.discard('IGNIS_RT')
     bpy.utils.unregister_class(engine.IgnisRenderEngine)
-    bpy.utils.unregister_class(IGNIS_PT_tonemap)
+    bpy.utils.unregister_class(IGNIS_PT_advanced)
+    bpy.utils.unregister_class(IGNIS_PT_performance)
+    bpy.utils.unregister_class(IGNIS_PT_color)
     bpy.utils.unregister_class(IGNIS_PT_sky)
-    bpy.utils.unregister_class(IGNIS_PT_status)
+    bpy.utils.unregister_class(IGNIS_PT_dlss)
     bpy.utils.unregister_class(IGNIS_PT_sampling)
     bpy.utils.unregister_class(IGNIS_OT_reload_scene)
     del bpy.types.Scene.ignis_rt

@@ -518,7 +518,7 @@ void main() {
     // Multi-SPP: configurable samples per pixel (lightPad1 from CPU)
     int spp = clamp(int(cam.lightPad1), 1, 128);
     bool rrModeGlobal = (cam.parameters.w == 2u);
-    bool backfaceCulling = (cam.lightPad2 != 0u);
+    bool backfaceCulling = (cam.lightPad2 & 1u) != 0u;  // bit 0 of lightPad2
 
     // Accumulators across SPP samples
     vec3 accumDiffuse = vec3(0.0);

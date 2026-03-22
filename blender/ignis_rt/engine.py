@@ -278,20 +278,14 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
         dll_wrapper.set_int("shader_mode", 1)
 
+        # DLSS + Ray Reconstruction always enabled (core engine requirement)
+        dll_wrapper.set_int("dlss_enabled", 1)
+        dll_wrapper.set_int("dlss_rr_enabled", 1)
         try:
             props = bpy.context.scene.ignis_rt
-            if props.dlss_enabled:
-                dll_wrapper.set_int("dlss_enabled", 1)
-                quality = int(props.dlss_quality)
-                dll_wrapper.set_int("dlss_quality", quality)
-                # RR works best with upscaling — at DLAA (native res) fall back to NRD
-                if props.dlss_rr_enabled and quality < 6:
-                    dll_wrapper.set_int("dlss_rr_enabled", 1)
-                    _log(f" DLSS {props.dlss_quality} + Ray Reconstruction")
-                elif props.dlss_rr_enabled and quality == 6:
-                    _log(f" DLSS DLAA + NRD (RR needs upscaling, falling back to NRD)")
-                else:
-                    _log(f" DLSS {props.dlss_quality} + NRD")
+            quality = int(props.dlss_quality)
+            dll_wrapper.set_int("dlss_quality", quality)
+            _log(f" DLSS {quality} + Ray Reconstruction")
             if hasattr(props, 'samples_per_pixel') and props.samples_per_pixel > 1:
                 dll_wrapper.set_int("spp", props.samples_per_pixel)
                 _log(f" SPP: {props.samples_per_pixel}")
@@ -325,9 +319,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         global _ignis_init_config
         try:
             _ignis_init_config = {
-                "dlss_enabled": props.dlss_enabled,
                 "dlss_quality": int(props.dlss_quality),
-                "dlss_rr_enabled": props.dlss_rr_enabled,
                 "use_wavefront": props.use_wavefront,
             }
         except Exception:
@@ -428,13 +420,11 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 dll_wrapper.set_log_path(get_log_path())
                 dll_wrapper.set_base_path(get_base_path())
                 dll_wrapper.set_int("shader_mode", 1)
+                dll_wrapper.set_int("dlss_enabled", 1)
+                dll_wrapper.set_int("dlss_rr_enabled", 1)
                 try:
                     props = bpy.context.scene.ignis_rt
-                    if props.dlss_enabled:
-                        dll_wrapper.set_int("dlss_enabled", 1)
-                        dll_wrapper.set_int("dlss_quality", int(props.dlss_quality))
-                        if props.dlss_rr_enabled and int(props.dlss_quality) < 6:
-                            dll_wrapper.set_int("dlss_rr_enabled", 1)
+                    dll_wrapper.set_int("dlss_quality", int(props.dlss_quality))
                     if hasattr(props, 'samples_per_pixel') and props.samples_per_pixel > 1:
                         dll_wrapper.set_int("spp", props.samples_per_pixel)
                     if props.use_wavefront:
@@ -1181,9 +1171,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 try:
                     props = context.scene.ignis_rt
                     cur = {
-                        "dlss_enabled": props.dlss_enabled,
                         "dlss_quality": int(props.dlss_quality),
-                        "dlss_rr_enabled": props.dlss_rr_enabled,
                         "use_wavefront": props.use_wavefront,
                     }
                     if cur != _ignis_init_config:
