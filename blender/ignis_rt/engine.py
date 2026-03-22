@@ -601,13 +601,14 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         data_bytes = tex_info["data"]
                         data_np = np.frombuffer(data_bytes, dtype=np.uint8).copy()
                         _load_tex_buffers.append(data_np)
+                        tex_dxgi = tex_info.get("dxgi_format", 0)
                         dll_wrapper.texture_manager_add(
                             _ignis_tex_manager,
                             tex_info["name"],
                             data_np.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
                             len(data_bytes),
                             tex_info["width"], tex_info["height"],
-                            1, 0,
+                            1, tex_dxgi,
                         )
 
                     _load_tex_idx += 1
@@ -932,13 +933,14 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         data_bytes = tex_info["data"]
                         data_np = np.frombuffer(data_bytes, dtype=np.uint8).copy()
                         tex_buffers.append(data_np)
+                        tex_dxgi = tex_info.get("dxgi_format", 0)
                         dll_wrapper.texture_manager_add(
                             _ignis_tex_manager,
                             tex_info["name"],
                             data_np.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
                             len(data_bytes),
                             tex_info["width"], tex_info["height"],
-                            1, 0,
+                            1, tex_dxgi,
                         )
                     ok = dll_wrapper.texture_manager_upload_all(_ignis_tex_manager)
                     if ok:

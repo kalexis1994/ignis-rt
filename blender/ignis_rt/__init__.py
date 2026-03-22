@@ -435,7 +435,10 @@ def _get_compatible_panels():
     for panel in bpy.types.Panel.__subclasses__():
         if not hasattr(panel, 'COMPAT_ENGINES'):
             continue
-        if 'BLENDER_RENDER' not in panel.COMPAT_ENGINES:
+        has_render = 'BLENDER_RENDER' in panel.COMPAT_ENGINES
+        has_eevee = ('BLENDER_EEVEE' in panel.COMPAT_ENGINES
+                     or 'BLENDER_EEVEE_NEXT' in panel.COMPAT_ENGINES)
+        if not has_render and not has_eevee:
             continue
         ctx = getattr(panel, 'bl_context', '')
         if ctx in include_contexts:

@@ -97,6 +97,11 @@ struct Material {
 
     float sunSpecular;
     float sunSpecularEXP;
+
+    // Node VM bytecode
+    uint nodeVmHeader;       // [7:0]=instrCount, [15:8]=flags
+    uint nodeVmPad[3];
+    uvec4 nodeVmCode[32];    // 32 instructions
 };
 
 layout(binding = 4, set = 0, scalar) buffer MaterialBuffer {
@@ -179,6 +184,7 @@ layout(buffer_reference, scalar) buffer PrimMaterials { uint m[]; };
 #include "include/tonemap.glsl"
 #include "include/gi_reservoir.glsl"
 #include "include/di_reservoir.glsl"
+#include "include/node_vm.glsl"
 
 const uint SHADER_BLENDER_PBR = 100u;
 
@@ -309,7 +315,7 @@ struct PBRHit {
 };
 
 PBRHit evaluateBlenderMaterial(
-    Material mat,
+    Material mat, uint matIdx,
     vec3 worldPos, vec3 geoNormal,
     vec3 v0, vec3 v1, vec3 v2,
     vec2 uv0, vec2 uv1, vec2 uv2,
@@ -328,34 +334,59 @@ PBRHit evaluateBlenderMaterial(
     hit.ior = mat.detailUVMultiplier;
     // transmission already set above (with passthrough override)
 
-    // Base color + alpha: texture or scalar fallback
+    // ── Node VM: per-pixel node tree evaluation ──
+    // When the VM has a program, it handles the ENTIRE material evaluation for
+    // the properties it computes. The legacy pipeline only runs for properties
+    // the VM doesn't override, preventing double-processing.
+    NodeVmResult vm = executeNodeVm(matIdx, uv);
+    bool vmActive = (mat.nodeVmHeader & 0xFFu) > 0u;
+
+    // Base color + alpha: VM or legacy pipeline
     float texAlpha = 1.0;
-    if (mat.diffuseTexIndex != 0xFFFFFFFFu) {
-        vec4 texColor = texture(textures[nonuniformEXT(mat.diffuseTexIndex)], uv);
-        hit.baseColor = texColor.rgb;
-        texAlpha = texColor.a;
-    } else {
-        hit.baseColor = vec3(mat.ksAmbient, mat.ksDiffuse, mat.ksSpecular);
-        // No diffuse texture — read alpha from emission texture if present
-        // (fire/billboard materials use emission texture for both color and alpha)
-        if (mat.detailTexIndex != 0xFFFFFFFFu) {
+    if (vmActive && vm.hasBaseColor) {
+        // VM handled base color (including texture sampling, ColorRamp, Mix, etc.)
+        hit.baseColor = vm.baseColor;
+        // Alpha: VM may override, otherwise read from texture
+        if (vm.hasAlpha) {
+            texAlpha = vm.alpha;
+        } else if (mat.diffuseTexIndex != 0xFFFFFFFFu) {
+            texAlpha = texture(textures[nonuniformEXT(mat.diffuseTexIndex)], uv).a;
+        } else if (mat.detailTexIndex != 0xFFFFFFFFu) {
             texAlpha = texture(textures[nonuniformEXT(mat.detailTexIndex)], uv).a;
+        }
+        // Skip Hue/Sat — VM already evaluated the full node chain
+    } else {
+        // Legacy pipeline: direct texture read + Hue/Sat
+        if (mat.diffuseTexIndex != 0xFFFFFFFFu) {
+            vec4 texColor = texture(textures[nonuniformEXT(mat.diffuseTexIndex)], uv);
+            hit.baseColor = texColor.rgb;
+            texAlpha = texColor.a;
+        } else {
+            hit.baseColor = vec3(mat.ksAmbient, mat.ksDiffuse, mat.ksSpecular);
+            if (mat.detailTexIndex != 0xFFFFFFFFu) {
+                texAlpha = texture(textures[nonuniformEXT(mat.detailTexIndex)], uv).a;
+            }
+        }
+
+        // Hue/Saturation/Value adjustment (legacy path only)
+        float colorValue = mat.detailNMMult;
+        float colorSaturation = mat.detailNMMultV;
+        if (colorValue != 1.0 || colorSaturation != 1.0) {
+            hit.baseColor *= colorValue;
+            if (colorSaturation < 1.0) {
+                float lum = dot(hit.baseColor, vec3(0.2126, 0.7152, 0.0722));
+                hit.baseColor = mix(vec3(lum), hit.baseColor, colorSaturation);
+            }
         }
     }
     hit.alpha = texAlpha * mat.multG;
 
-    // Hue/Saturation/Value adjustment (from HUE_SAT node in Base Color chain)
-    // detailNMMult = color_value (brightness), detailNMMultV = color_saturation
-    float colorValue = mat.detailNMMult;
-    float colorSaturation = mat.detailNMMultV;
-    if (colorValue != 1.0 || colorSaturation != 1.0) {
-        // Apply value (brightness multiplier)
-        hit.baseColor *= colorValue;
-        // Apply saturation (0 = grayscale, 1 = original)
-        if (colorSaturation < 1.0) {
-            float lum = dot(hit.baseColor, vec3(0.2126, 0.7152, 0.0722));
-            hit.baseColor = mix(vec3(lum), hit.baseColor, colorSaturation);
-        }
+    // VM overrides for other properties
+    if (vmActive) {
+        if (vm.hasRoughness)    hit.roughness = clamp(vm.roughness, 0.01, 1.0);
+        if (vm.hasMetallic)     hit.metallic = clamp(vm.metallic, 0.0, 1.0);
+        if (vm.hasIor)          hit.ior = vm.ior;
+        if (vm.hasTransmission) hit.transmission = vm.transmission;
     }
 
     // ORM map: R=occlusion, G=roughness, B=metallic (standard convention)
@@ -716,7 +747,7 @@ void main() {
 
         // Evaluate PBR material
         PBRHit pbrHit = evaluateBlenderMaterial(
-            mat, worldPos, worldN,
+            mat, matIdx, worldPos, worldN,
             wp0, wp1, wp2, uv0_, uv1_, uv2_, hitUV
         );
 
@@ -1539,13 +1570,14 @@ void main() {
             float VdotH = max(dot(V, H), 0.0);
 
             // VNDF sampling weight = F * G2 / G1
-            // Divide by lobe selection probability (specWeight) to compensate:
-            //   Fw/specWeight ≈ 1.0 (both are Fresnel at similar angles)
-            //   so net weight ≈ G2/G1 — energy-correct
+            // This is the correct BRDF/PDF ratio for VNDF importance sampling.
+            // We do NOT divide by lobe selection probability (specWeight) because
+            // that cancels the Fresnel tint and creates overly bright specular
+            // for dark materials (both metals and dielectrics).
             vec3 Fw = fresnelSchlick(VdotH, F0);
             float G2 = SmithG2(NdotL, NdotV, alpha);
             float G1 = SmithG1(NdotV, alpha);
-            throughput *= (Fw / max(specWeight, 0.001)) * (G2 / max(G1, 0.001));
+            throughput *= Fw * (G2 / max(G1, 0.001));
 
             rayDir = newDir;
             if (bounce == 0) { isDiffusePath = false; captureSpecularMV = true; }

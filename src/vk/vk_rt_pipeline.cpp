@@ -1686,6 +1686,12 @@ void RTPipeline::UpdateMaterialBuffer(const GPUMaterial* materials, uint32_t cou
 
     VkDevice device = context_->GetDevice();
     VkDeviceSize bufSize = count * sizeof(GPUMaterial);
+    static bool loggedOnce = false;
+    if (!loggedOnce) {
+        Log(L"[VK RTPipeline] sizeof(GPUMaterial) = %zu, count=%u, bufSize=%llu\n",
+            sizeof(GPUMaterial), count, (unsigned long long)bufSize);
+        loggedOnce = true;
+    }
 
     // Recreate if needed
     if (materialBuffer_) { vkDestroyBuffer(device, materialBuffer_, nullptr); }
