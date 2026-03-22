@@ -441,7 +441,7 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
     cam.lightCount = s_lightCount;
     cam.lightPad[0] = s_emissiveTriCount;
     cam.lightPad[1] = static_cast<uint32_t>(acpt::g_config.samplesPerPixel);
-    cam.lightPad[2] = cfg->backfaceCulling ? 1u : 0u;
+    cam.lightPad[2] = (cfg->backfaceCulling ? 1u : 0u) | (cfg->restirDI ? 2u : 0u);
     // HDRI environment map: pack index and strength into windParams (unused for Blender)
     cam.windParams[0] = static_cast<float>(cfg->hdriTexIndex);  // -1 = no HDRI
     cam.windParams[1] = cfg->hdriStrength;
@@ -602,6 +602,7 @@ IGNIS_API void ignis_set_int(const char* key, int value) {
     else if (strcmp(key, "shader_mode") == 0)       cfg->shaderMode = value;
     else if (strcmp(key, "use_wavefront") == 0)    cfg->useWavefront = (value != 0);
     else if (strcmp(key, "backface_culling") == 0) cfg->backfaceCulling = (value != 0);
+    else if (strcmp(key, "restir_di") == 0)      cfg->restirDI = (value != 0);
     else if (strcmp(key, "hdri_tex_index") == 0)  cfg->hdriTexIndex = value;
     else if (strcmp(key, "reset_history") == 0 && value != 0) {
         if (g_renderer) g_renderer->ResetFrameIndex();

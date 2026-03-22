@@ -205,6 +205,12 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
     )
 
     # -- Experimental --
+    restir_di: BoolProperty(
+        name="ReSTIR DI",
+        description="Reservoir-based light sampling. Better for many lights (16+), may cause noise with few lights",
+        default=False,
+        update=_tag_redraw,
+    )
     use_wavefront: BoolProperty(
         name="Wavefront Path Tracing",
         description="Experimental: compute-based multi-kernel path tracing for better GPU occupancy",
@@ -287,6 +293,7 @@ class IGNIS_PT_sampling(bpy.types.Panel):
         col.prop(props, "dlss_quality")
         col.prop(props, "dlss_rr_enabled")
         layout.separator()
+        layout.prop(props, "restir_di")
         layout.prop(props, "use_wavefront")
         layout.separator()
         layout.prop(props, "fps_limit")
