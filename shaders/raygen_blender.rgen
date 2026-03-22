@@ -1551,6 +1551,9 @@ void main() {
             if (bounce == 0) { isDiffusePath = false; captureSpecularMV = true; }
         }
 
+        // Clamp throughput every bounce to prevent fireflies from specular paths
+        throughput = min(throughput, vec3(MAX_RADIANCE));
+
         // Update ray origin (offset along geometric normal to avoid self-intersection)
         rayOrigin = pbrHit.worldPos + N * 0.002;
     }
