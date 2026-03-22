@@ -116,6 +116,8 @@ _ignis_last_transforms = None  # cached instance transforms hash for change dete
 _ignis_last_light_count = -1   # track light count for emissive re-export
 _ignis_hdri_sun = None         # sun extracted from HDRI (used as fallback when no SUN light)
 _ignis_mat_name_to_index = {}  # persistent material name→index mapping for incremental uploads
+_ignis_last_draw_time = 0.0    # perf_counter of last view_draw (detect pause/resume)
+_ignis_init_config = {}        # settings snapshot at init time (detect restart-worthy changes)
 
 # ── Staged loading state machine ──
 LOAD_IDLE = 0          # no loading in progress
@@ -193,7 +195,7 @@ def _ignis_shutdown():
     global _ignis_frame_index, _ignis_full_dirty, _ignis_materials_dirty, _ignis_tlas_dirty
     global _ignis_last_full_upload, _ignis_instance_count
     global _fps_times, _fps_display
-    global _load_stage
+    global _load_stage, _ignis_last_draw_time
     if _ignis_initialized:
         _log("ignis_destroy()")
         if _ignis_tex_manager is not None:
@@ -216,6 +218,7 @@ def _ignis_shutdown():
         _fps_times = []
         _fps_display = 0.0
         _load_stage = LOAD_IDLE
+        _ignis_last_draw_time = 0.0
 
 
 class IgnisRenderEngine(bpy.types.RenderEngine):
@@ -317,6 +320,18 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             _log(" Denoiser: DLSS SR only (no denoiser)")
         else:
             _log(" Denoiser: None")
+
+        # Snapshot settings that require full restart to change
+        global _ignis_init_config
+        try:
+            _ignis_init_config = {
+                "dlss_enabled": props.dlss_enabled,
+                "dlss_quality": int(props.dlss_quality),
+                "dlss_rr_enabled": props.dlss_rr_enabled,
+                "use_wavefront": props.use_wavefront,
+            }
+        except Exception:
+            _ignis_init_config = {}
 
         _ignis_initialized = True
         _ignis_width = width
@@ -1149,10 +1164,44 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         """Called on every viewport redraw."""
         global _ignis_frame_index, _ignis_full_dirty, _ignis_materials_dirty, _ignis_tlas_dirty
         global _load_stage, _ignis_instance_count, _load_start_time
+        global _ignis_last_draw_time, _ignis_init_config
 
         region = context.region
         w, h = region.width, region.height
         self._last_w, self._last_h = w, h
+
+        # ── Resume detection: user switched back from Solid/Wireframe ──
+        now = time.perf_counter()
+        if _ignis_initialized and _load_stage == LOAD_IDLE and _ignis_last_draw_time > 0:
+            gap = now - _ignis_last_draw_time
+            if gap > 0.5:
+                _log(f"Resume after {gap:.1f}s pause")
+                # Check if restart-worthy settings changed while paused
+                needs_restart = False
+                try:
+                    props = context.scene.ignis_rt
+                    cur = {
+                        "dlss_enabled": props.dlss_enabled,
+                        "dlss_quality": int(props.dlss_quality),
+                        "dlss_rr_enabled": props.dlss_rr_enabled,
+                        "use_wavefront": props.use_wavefront,
+                    }
+                    if cur != _ignis_init_config:
+                        changed = [k for k in cur if cur[k] != _ignis_init_config.get(k)]
+                        _log(f"  Config changed: {changed} — full restart")
+                        needs_restart = True
+                except Exception:
+                    pass
+
+                if needs_restart:
+                    _ignis_shutdown()
+                    # Fall through to first-contact init below
+                else:
+                    # Same config — just reset denoiser for clean start
+                    _ignis_frame_index = 0
+                    dll_wrapper.set_int("reset_history", 1)
+                    _log("  Resumed (denoiser reset)")
+        _ignis_last_draw_time = now
 
         # ── First contact: capture viewport and start cross-fade ──
         if not _ignis_initialized and _load_stage == LOAD_IDLE:
