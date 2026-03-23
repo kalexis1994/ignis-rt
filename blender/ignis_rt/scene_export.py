@@ -1443,6 +1443,7 @@ _OP_OUTPUT_METAL   = 0xF2
 _OP_OUTPUT_EMISSION= 0xF3
 _OP_OUTPUT_ALPHA   = 0xF4
 _OP_LOAD_WORLD_POS = 0x62
+_OP_OUTPUT_UV      = 0xEF
 _OP_OUTPUT_IOR     = 0xF6
 _OP_OUTPUT_TRANSMISSION = 0xF7
 
@@ -1760,26 +1761,44 @@ class _NodeVmCompiler:
             rot_v = rot.default_value if rot else (0, 0, 0)
             scale_v = scale.default_value if scale else (1, 1, 1)
 
-            has_scale = abs(scale_v[0] - 1.0) > 0.001 or abs(scale_v[1] - 1.0) > 0.001
-            has_loc = abs(loc_v[0]) > 0.001 or abs(loc_v[1]) > 0.001
-            has_rot = abs(rot_v[2]) > 0.001  # Z rotation for 2D UVs
+            # Cycles Mapping types:
+            # POINT:   result = Rotation * (UV * Scale) + Location
+            # TEXTURE: result = Rotation^T * (UV - Location) / Scale
+            # VECTOR:  result = Rotation * (UV * Scale)
+            # NORMAL:  result = normalize(Rotation * (UV / Scale))
+            mapping_type = getattr(from_node, 'vector_type', 'POINT')
+            if mapping_type == 'TEXTURE':
+                # TEXTURE mode: divide by scale, subtract location, inverse rotation
+                eff_scale_x = 1.0 / scale_v[0] if abs(scale_v[0]) > 1e-6 else 1.0
+                eff_scale_y = 1.0 / scale_v[1] if abs(scale_v[1]) > 1e-6 else 1.0
+                eff_loc_x = -loc_v[0]
+                eff_loc_y = -loc_v[1]
+                eff_rot = -rot_v[2]  # inverse rotation
+            else:
+                # POINT mode: result = Rotation * (UV * Scale) + Location
+                eff_scale_x = scale_v[0]
+                eff_scale_y = scale_v[1]
+                eff_loc_x = loc_v[0]
+                eff_loc_y = loc_v[1]
+                eff_rot = rot_v[2]
+
+            has_scale = abs(eff_scale_x - 1.0) > 0.001 or abs(eff_scale_y - 1.0) > 0.001
+            has_loc = abs(eff_loc_x) > 0.001 or abs(eff_loc_y) > 0.001
+            has_rot = abs(eff_rot) > 0.001
 
             dst = self._alloc_reg()
 
             if has_scale or has_loc:
                 self._emit(_OP_UV_TRANSFORM, dst, srcA=uv_reg,
-                           imm_y=_floatBits(scale_v[0]),
-                           imm_z=_floatBits(scale_v[1]),
-                           imm_w=_floatBits(loc_v[0]))
-                # Location Y needs a second instruction or pack differently
-                # For now, pack offsetX in imm_w, offsetY will be 0
-                # TODO: handle offsetY (needs OP_UV_TRANSFORM to take 4 floats)
+                           imm_y=_floatBits(eff_scale_x),
+                           imm_z=_floatBits(eff_scale_y),
+                           imm_w=_floatBits(eff_loc_x))
                 uv_reg = dst
 
             if has_rot:
                 rot_dst = self._alloc_reg() if (has_scale or has_loc) else dst
                 self._emit(_OP_UV_ROTATE, rot_dst, srcA=uv_reg,
-                           imm_y=_floatBits(rot_v[2]))
+                           imm_y=_floatBits(eff_rot))
                 return rot_dst
 
             return dst if (has_scale or has_loc) else uv_reg
@@ -1965,9 +1984,19 @@ class _NodeVmCompiler:
         if not needs_vm:
             return None
 
-        # Compile Base Color chain
+        # Emit transformed UV for shared Mapping (used by normal/roughness)
         bc_inp = principled_node.inputs.get('Base Color')
         if bc_inp and bc_inp.is_linked:
+            # Find the Image Texture and compile its UV chain
+            tex_node = _find_image_texture_node(bc_inp)
+            if tex_node:
+                vec_inp = tex_node.inputs.get('Vector')
+                if vec_inp and vec_inp.is_linked:
+                    uv_reg = self._compile_uv_chain(vec_inp)
+                    if uv_reg != 0:  # 0 = default UV, no transform needed
+                        self._emit(_OP_OUTPUT_UV, srcA=uv_reg)
+
+            # Compile Base Color chain
             reg = self._compile_node(bc_inp)
             self._emit(_OP_OUTPUT_COLOR, srcA=reg)
 
@@ -3545,6 +3574,9 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         vm_code = None
         if principled_node is not None:
             vm_code = _compile_node_vm(principled_node, _register_image)
+            if vm_code:
+                mat_key_name = mat.name if mat else "?"
+                print(f"[ignis-vm] '{mat_key_name}': compiled {len(vm_code)} instructions")
 
         all_bytes += _pack_gpu_material(
             base_color=base_color,

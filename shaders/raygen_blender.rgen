@@ -391,9 +391,13 @@ PBRHit evaluateBlenderMaterial(
         if (vm.hasTransmission) hit.transmission = vm.transmission;
     }
 
+    // When VM provides a transformed UV (from shared Mapping node),
+    // use it for all texture sampling (ORM, normal, roughness)
+    vec2 texUV = (vmActive && vm.hasTransformedUV) ? vm.transformedUV : uv;
+
     // ORM map: R=occlusion, G=roughness, B=metallic (standard convention)
     if (mat.mapsTexIndex != 0xFFFFFFFFu) {
-        vec4 orm = texture(textures[nonuniformEXT(mat.mapsTexIndex)], uv);
+        vec4 orm = texture(textures[nonuniformEXT(mat.mapsTexIndex)], texUV);
         hit.roughness = clamp(orm.g, 0.01, 1.0);
         hit.metallic = clamp(orm.b, 0.0, 1.0);
     }
@@ -422,9 +426,9 @@ PBRHit evaluateBlenderMaterial(
 
             ivec2 texDim = textureSize(textures[nonuniformEXT(mat.normalTexIndex)], 0);
             float texelSize = 1.0 / float(max(texDim.x, texDim.y));
-            float h_c = texture(textures[nonuniformEXT(mat.normalTexIndex)], uv).r;
-            float h_x = texture(textures[nonuniformEXT(mat.normalTexIndex)], uv + vec2(texelSize, 0)).r;
-            float h_y = texture(textures[nonuniformEXT(mat.normalTexIndex)], uv + vec2(0, texelSize)).r;
+            float h_c = texture(textures[nonuniformEXT(mat.normalTexIndex)], texUV).r;
+            float h_x = texture(textures[nonuniformEXT(mat.normalTexIndex)], texUV + vec2(texelSize, 0)).r;
+            float h_y = texture(textures[nonuniformEXT(mat.normalTexIndex)], texUV + vec2(0, texelSize)).r;
 
             // Cycles uses ray differentials to auto-scale bump. Without them,
             // we normalize T/B and use a scale that approximates Cycles' result.
@@ -442,7 +446,7 @@ PBRHit evaluateBlenderMaterial(
             N = normalize(bumpStrength * bumpN + (1.0 - bumpStrength) * N);
         } else {
             // Positive strength = RGB normal map
-            vec3 texN = texture(textures[nonuniformEXT(mat.normalTexIndex)], uv).rgb;
+            vec3 texN = texture(textures[nonuniformEXT(mat.normalTexIndex)], texUV).rgb;
             float strength = rawStrength > 0.0 ? rawStrength : 1.0;
             N = applyNormalMap(texN, T, N, B, strength);
         }

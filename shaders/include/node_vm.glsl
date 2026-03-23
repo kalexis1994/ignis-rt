@@ -54,6 +54,7 @@ const uint OP_LOAD_SCALAR    = 0x61u;  // R[dst].x = imm_y
 const uint OP_LOAD_WORLD_POS = 0x62u;  // R[dst] = vec4(worldPos, 1) — for position-based texturing
 
 // Output targets
+const uint OP_OUTPUT_UV      = 0xEFu;  // transformedUV = R[srcA].xy (for shared Mapping)
 const uint OP_OUTPUT_COLOR   = 0xF0u;  // baseColor = R[srcA].rgb
 const uint OP_OUTPUT_ROUGH   = 0xF1u;  // roughness = R[srcA].x
 const uint OP_OUTPUT_METAL   = 0xF2u;  // metallic = R[srcA].x
@@ -103,6 +104,7 @@ struct NodeVmResult {
     float ior;
     float transmission;
     float normalStrength;
+    vec2  transformedUV;   // UV after Mapping transform (for normal/roughness)
     bool  hasBaseColor;
     bool  hasRoughness;
     bool  hasMetallic;
@@ -111,6 +113,7 @@ struct NodeVmResult {
     bool  hasIor;
     bool  hasTransmission;
     bool  hasNormalStrength;
+    bool  hasTransformedUV;
 };
 
 // ── VM Execution ──
@@ -133,6 +136,8 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos) {
     result.hasIor = false;
     result.hasTransmission = false;
     result.hasNormalStrength = false;
+    result.transformedUV = uv;
+    result.hasTransformedUV = false;
 
     uint header = materialBuffer.materials[matIdx].nodeVmHeader;
     uint instrCount = header & 0xFFu;
@@ -307,6 +312,10 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos) {
         }
 
         // ── Output targets ──
+        else if (opcode == OP_OUTPUT_UV) {
+            result.transformedUV = R[srcA].xy;
+            result.hasTransformedUV = true;
+        }
         else if (opcode == OP_OUTPUT_COLOR) {
             result.baseColor = R[srcA].rgb;
             result.hasBaseColor = true;

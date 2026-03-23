@@ -227,6 +227,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
     bl_use_preview = False
     bl_use_eevee_viewport = False
     bl_use_gpu_context = True
+    bl_use_shading_nodes_custom = False  # Use standard Blender shader nodes (Principled BSDF etc.)
 
     # ------------------------------------------------------------------
     # Init
@@ -1245,9 +1246,40 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
         # ── Fast incremental updates (no loading screen needed) ──
         if _ignis_materials_dirty:
-            # Skip auto material update after initial load — prevents material index
-            # reordering that breaks per-BLAS material IDs. Only update on explicit
-            # user action (Reload Scene button) via full_dirty.
+            # Re-export material parameters + Node VM bytecode.
+            # Uses existing material/texture index mapping to keep BLAS IDs valid.
+            # GPU is idle here (vkWaitForFences completed in RenderFrameRT).
+            _log("material live update triggered")
+            global _ignis_mat_name_to_index
+            import ctypes as _ct
+            try:
+                materials_data, mat_map, tex_list = scene_export.export_materials(
+                    depsgraph, hidden_objects=_ignis_hidden_objects,
+                    existing_mapping=_ignis_mat_name_to_index)
+                # Upload material buffer (parameters + VM bytecode)
+                dll_wrapper.upload_materials(materials_data, len(mat_map))
+                # Upload any NEW textures (e.g., ramp bakes from node changes)
+                if _ignis_tex_manager and tex_list:
+                    for tex_info in tex_list:
+                        if tex_info.get("data") is None:
+                            scene_export.extract_texture_bytes(tex_info)
+                        if tex_info.get("data") is not None and tex_info.get("_uploaded") is None:
+                            data_bytes = tex_info["data"]
+                            data_np = np.frombuffer(data_bytes, dtype=np.uint8).copy()
+                            tex_dxgi = tex_info.get("dxgi_format", 0)
+                            dll_wrapper.texture_manager_add(
+                                _ignis_tex_manager, tex_info["name"],
+                                data_np.ctypes.data_as(_ct.POINTER(_ct.c_uint8)),
+                                len(data_bytes), tex_info["width"], tex_info["height"],
+                                1, tex_dxgi)
+                            tex_info["_uploaded"] = True
+                    dll_wrapper.texture_manager_upload_all(_ignis_tex_manager)
+                    dll_wrapper.update_texture_descriptors(_ignis_tex_manager)
+                _ignis_mat_name_to_index = mat_map
+                _ignis_frame_index = 0
+                dll_wrapper.set_int("reset_history", 1)
+            except Exception:
+                _log_exception("material live update")
             _ignis_materials_dirty = False
         elif _ignis_tlas_dirty:
             self._rebuild_tlas(depsgraph)
