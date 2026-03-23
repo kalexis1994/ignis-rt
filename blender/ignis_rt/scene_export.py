@@ -1765,6 +1765,51 @@ class _NodeVmCompiler:
             self.node_reg_cache[node_id] = dst
             return dst
 
+        # ── RGB Curves — evaluate curve at export time, apply as per-channel gamma ──
+        if from_node.type == 'CURVE_RGB':
+            # Compile the Color input
+            color_inp = from_node.inputs.get('Color')
+            col_reg = self._compile_node(color_inp, _depth + 1) if (color_inp and color_inp.is_linked) else None
+            if col_reg is None:
+                c = color_inp.default_value if color_inp else (0.8, 0.8, 0.8, 1.0)
+                col_reg = self._alloc_reg()
+                self._emit(_OP_LOAD_CONST, col_reg, imm_y=_floatBits(c[0]),
+                           imm_z=_floatBits(c[1]), imm_w=_floatBits(c[2]))
+
+            # Evaluate curve at 0.5 to estimate gamma per channel
+            # gamma = log(curve(0.5)) / log(0.5) → power that matches the curve at midpoint
+            mapping = from_node.mapping
+            mapping.initialize()
+            mapping.update()
+            import math as _m
+            gammas = [1.0, 1.0, 1.0]  # R, G, B
+            for ci in range(3):
+                # curves[0]=Combined, curves[1]=R, curves[2]=G, curves[3]=B
+                # Check per-channel first, then combined
+                curve_idx = ci + 1  # 1=R, 2=G, 3=B
+                mid_val = mapping.evaluate(mapping.curves[curve_idx], 0.5)
+                combined_val = mapping.evaluate(mapping.curves[0], 0.5)
+                # Apply combined on top of per-channel
+                effective = mid_val  # per-channel
+                if abs(combined_val - 0.5) > 0.01:
+                    effective = mapping.evaluate(mapping.curves[0], effective)
+                if effective > 0.01 and effective < 0.99:
+                    gammas[ci] = _m.log(max(effective, 0.001)) / _m.log(0.5)
+                elif effective >= 0.99:
+                    gammas[ci] = 0.01  # near-identity → very low gamma (brightens a lot)
+
+            has_curve_effect = any(abs(g - 1.0) > 0.05 for g in gammas)
+            if has_curve_effect:
+                # Apply per-channel gamma: R[dst] = pow(R[col], gamma)
+                # Use OP_GAMMA for overall, but we need per-channel...
+                # Approximate: use a single GAMMA with average gamma for now
+                avg_gamma = sum(gammas) / 3.0
+                self._emit(_OP_GAMMA, dst, srcA=col_reg, imm_y=_floatBits(avg_gamma))
+            else:
+                dst = col_reg  # identity curve → passthrough
+            self.node_reg_cache[node_id] = dst
+            return dst
+
         # ── Other procedural textures — compile as constant fallback ──
         if from_node.type in ('TEX_NOISE', 'TEX_VORONOI', 'TEX_MUSGRAVE',
                                'TEX_WAVE', 'TEX_GRADIENT', 'TEX_MAGIC', 'TEX_BRICK',
@@ -2426,8 +2471,8 @@ def _resolve_color_input(socket, default=(0.8, 0.8, 0.8), _depth=0):
         return c  # return unmodified (curve not evaluated, but at least not black)
 
     # Passthrough for other color-producing nodes
-    _COLOR_PASSTHROUGH = {'CURVE_VEC', 'SEPRGB', 'SEPARATE_XYZ', 'SEPARATE_COLOR',
-                          'COMBRGB', 'COMBINE_COLOR', 'COMBINE_XYZ', 'RGBTOBW',
+    _COLOR_PASSTHROUGH = {'CURVE_VEC', 'SEPRGB', 'SEPARATE_XYZ', 'SEPXYZ', 'SEPARATE_COLOR',
+                          'COMBRGB', 'COMBINE_COLOR', 'COMBINE_XYZ', 'COMBXYZ', 'RGBTOBW',
                           'VECT_MATH', 'NORMAL', 'NORMAL_MAP'}
     if from_node.type in _COLOR_PASSTHROUGH:
         for inp_name in ('Color', 'Color1', 'Vector', 'Image', 'A'):
@@ -2515,7 +2560,7 @@ def _find_image_texture_node(socket, _depth=0):
         return None
 
     # Separate RGB/Color/XYZ — check common input names
-    if from_node.type in ('SEPRGB', 'SEPARATE_XYZ', 'SEPARATE_COLOR'):
+    if from_node.type in ('SEPRGB', 'SEPARATE_XYZ', 'SEPXYZ', 'SEPARATE_COLOR'):
         for inp_name in ('Image', 'Color', 'Vector'):
             inp = from_node.inputs.get(inp_name)
             result = _find_image_texture_node(inp, _depth + 1)
@@ -2535,7 +2580,7 @@ def _find_image_texture_node(socket, _depth=0):
         'MATH',             # Math node
         'VECT_MATH',        # Vector Math
         'CLAMP',            # Clamp
-        'COMBINE_XYZ',      # Combine XYZ
+        'COMBINE_XYZ', 'COMBXYZ',  # Combine XYZ (new + old name)
         'COMBRGB', 'COMBINE_COLOR',  # Combine Color
         'RGBTOBW',          # RGB to BW
         'TEX_NOISE',        # Noise texture (passthrough to find source texture)
