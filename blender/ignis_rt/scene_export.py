@@ -2502,6 +2502,79 @@ def _encode_bmp(rgba_u8, w, h):
     return bytes(hdr) + bytes(pixel_data)
 
 
+class _GroupPrincipledProxy:
+    """Makes a GROUP node look like a Principled BSDF for material export.
+
+    Maps the GROUP's external inputs to the internal Principled BSDF's input names,
+    so code that reads principled_node.inputs.get('Base Color') works transparently.
+    """
+    def __init__(self, group_node, inner_principled):
+        self.type = 'BSDF_PRINCIPLED'
+        self.name = f"{group_node.name} (proxy)"
+        self._group = group_node
+        self._inner = inner_principled
+
+        # Map: inner Principled input name → GROUP external socket
+        self._input_map = {}
+        for inp in inner_principled.inputs:
+            if inp.is_linked:
+                from_node = inp.links[0].from_node
+                if from_node.type == 'GROUP_INPUT':
+                    # The from_socket.name on GROUP_INPUT matches the group's external input name
+                    ext_name = inp.links[0].from_socket.name
+                    ext_inp = group_node.inputs.get(ext_name)
+                    if ext_inp:
+                        self._input_map[inp.name] = ext_inp
+
+        self.inputs = _GroupInputsProxy(self._input_map, inner_principled.inputs)
+
+
+class _GroupInputsProxy:
+    """Dict-like proxy for inputs that resolves GROUP connections."""
+    def __init__(self, mapped, original):
+        self._mapped = mapped  # name → external socket
+        self._original = original  # original NodeInputs
+
+    def get(self, name, default=None):
+        # If this input is mapped through the group, return the external socket
+        if name in self._mapped:
+            return self._mapped[name]
+        # Otherwise return the internal socket (for unconnected inputs with defaults)
+        return self._original.get(name, default)
+
+    def __iter__(self):
+        return iter(self._original)
+
+    def __getitem__(self, idx):
+        return self._original[idx]
+
+
+def _find_principled_in_group(group_node):
+    """Find a Principled BSDF inside a GROUP node and return a proxy.
+
+    Returns a _GroupPrincipledProxy that maps external group inputs to
+    the internal Principled BSDF's inputs, or None if not found.
+    """
+    inner_tree = group_node.node_tree
+    if not inner_tree:
+        return None
+
+    # Find Principled BSDF inside the group
+    for inode in inner_tree.nodes:
+        if inode.type == 'BSDF_PRINCIPLED':
+            return _GroupPrincipledProxy(group_node, inode)
+
+    # Follow GROUP_OUTPUT → shader chain inside the group
+    for inode in inner_tree.nodes:
+        if inode.type == 'GROUP_OUTPUT':
+            for inp in inode.inputs:
+                if inp.is_linked:
+                    src = inp.links[0].from_node
+                    if src.type == 'BSDF_PRINCIPLED':
+                        return _GroupPrincipledProxy(group_node, src)
+    return None
+
+
 def _find_surface_shader(node_tree):
     """Find the shader node connected to Material Output's Surface input."""
     for node in node_tree.nodes:
@@ -3041,12 +3114,17 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         alpha_ref = 0.5
 
         if mat.use_nodes and mat.node_tree:
-            # First try: find Principled BSDF directly
+            # First try: find Principled BSDF directly (or inside a GROUP)
             principled_node = None
             for node in mat.node_tree.nodes:
                 if node.type == 'BSDF_PRINCIPLED':
                     principled_node = node
                     break
+                if node.type == 'GROUP':
+                    proxy = _find_principled_in_group(node)
+                    if proxy:
+                        principled_node = proxy
+                        break
 
             # Fallback: trace from Material Output to resolve any shader node
             if principled_node is None:
@@ -3059,7 +3137,12 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                                               'BSDF_PRINCIPLED'):
                         break  # found a shader node
                     elif surface_node.type == 'GROUP':
-                        # Follow group's internal output → find what's connected
+                        # Try to resolve GROUP as Principled BSDF proxy
+                        proxy = _find_principled_in_group(surface_node)
+                        if proxy:
+                            principled_node = proxy
+                            break
+                        # Fallback: follow group's internal output
                         inner_tree = surface_node.node_tree
                         if inner_tree:
                             for inode in inner_tree.nodes:
