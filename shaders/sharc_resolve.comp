@@ -1,95 +1,96 @@
 #version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_atomic_int64 : require
 
 // SHARC Resolve Compute Shader
-// Merges write buffer into read buffer (exponential moving average),
-// ages out stale entries, and clears write buffer for next frame.
+// Merges per-frame accumulation data into the resolved (temporal) buffer.
+// Based on NVIDIA SHARC algorithm (https://github.com/NVIDIA-RTX/SHARC)
+//
+// Runs after each RT frame. For each hash entry:
+// 1. Read new samples from accumulation (first half of binding 1)
+// 2. Blend with previous resolved data (second half of binding 1)
+// 3. Age out stale entries
+// 4. Clear accumulation for next frame
 
-#define SHARC_TABLE_SIZE 2097152u     // 2^21 entries
-#define SHARC_MAX_AGE 120u            // frames before eviction
-#define SHARC_BLEND_ALPHA 0.05        // exponential moving average blend (5% new)
+layout(binding = 0, set = 0, std430) buffer HashEntries { uint64_t keys[]; } hashEntries;
+layout(binding = 1, set = 0, std430) buffer DataBuffer  { uint data[];     } dataBuffer;
 
-// 32 bytes per entry (8 uints), must match raygen_test.rgen layout
-struct SHARCEntry {
-    uint hashKey;        // 0 = empty sentinel
-    uint sampleCount;
-    float radianceR;
-    float radianceG;
-    float radianceB;
-    uint lastFrame;
-    float pad0;
-    float pad1;
-};
-
-// binding 0: write buffer (RT just wrote into this)
-layout(binding = 0, set = 0, std430) buffer SHARCWriteBuffer {
-    SHARCEntry writeEntries[];
-} sharcWrite;
-
-// binding 1: read buffer (temporal accumulation, what RT reads next frame)
-layout(binding = 1, set = 0, std430) buffer SHARCReadBuffer {
-    SHARCEntry readEntries[];
-} sharcRead;
-
-// Push constant: current frame index
 layout(push_constant) uniform PushConstants {
+    uint capacity;
     uint frameIndex;
+    uint accumulationFrameMax;  // temporal window (e.g., 256)
+    uint staleFrameMax;         // eviction timeout (e.g., 128)
+    float radianceScale;
 } pc;
 
 layout(local_size_x = 256) in;
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    if (idx >= SHARC_TABLE_SIZE) return;
+    if (idx >= pc.capacity) return;
 
-    SHARCEntry writeEntry = sharcWrite.writeEntries[idx];
-    SHARCEntry readEntry = sharcRead.readEntries[idx];
+    uint64_t hashKey = hashEntries.keys[idx];
+    if (hashKey == 0u) return;  // empty slot
 
-    if (writeEntry.hashKey != 0u && writeEntry.sampleCount > 0u) {
-        // New data was written this frame
-        float invCount = 1.0 / float(writeEntry.sampleCount);
-        vec3 newRadiance = vec3(writeEntry.radianceR, writeEntry.radianceG, writeEntry.radianceB) * invCount;
+    // Accumulation region: [0..capacity*4-1]
+    uint aBase = idx * 4u;
+    uint accumR = dataBuffer.data[aBase + 0u];
+    uint accumG = dataBuffer.data[aBase + 1u];
+    uint accumB = dataBuffer.data[aBase + 2u];
+    uint sampleCount = dataBuffer.data[aBase + 3u];
 
-        if (readEntry.hashKey == writeEntry.hashKey && readEntry.sampleCount > 0u) {
-            // Same cell exists in read buffer — exponential moving average
-            float invReadCount = 1.0 / float(readEntry.sampleCount);
-            vec3 oldRadiance = vec3(readEntry.radianceR, readEntry.radianceG, readEntry.radianceB) * invReadCount;
-            vec3 blended = mix(oldRadiance, newRadiance, SHARC_BLEND_ALPHA);
+    // Resolved region: [capacity*4..capacity*8-1]
+    uint rBase = pc.capacity * 4u + idx * 4u;
+    float resolvedR = uintBitsToFloat(dataBuffer.data[rBase + 0u]);
+    float resolvedG = uintBitsToFloat(dataBuffer.data[rBase + 1u]);
+    float resolvedB = uintBitsToFloat(dataBuffer.data[rBase + 2u]);
+    float resolvedSamples = uintBitsToFloat(dataBuffer.data[rBase + 3u]);
 
-            // Store as accumulated (keep count at a reasonable cap for precision)
-            uint newCount = min(readEntry.sampleCount + writeEntry.sampleCount, 1024u);
-            sharcRead.readEntries[idx].radianceR = blended.r * float(newCount);
-            sharcRead.readEntries[idx].radianceG = blended.g * float(newCount);
-            sharcRead.readEntries[idx].radianceB = blended.b * float(newCount);
-            sharcRead.readEntries[idx].sampleCount = newCount;
-            sharcRead.readEntries[idx].lastFrame = pc.frameIndex;
+    // Unpack stale counter from resolved alpha bits
+    uint resolvedMeta = floatBitsToUint(resolvedSamples);
+    uint staleFrames = (resolvedMeta >> 16u) & 0xFFFFu;
+    float prevSampleNum = float(resolvedMeta & 0xFFFFu);
+
+    if (sampleCount > 0u) {
+        // New data this frame — merge with resolved
+        float invScale = 1.0 / pc.radianceScale;
+        vec3 newRadiance = vec3(float(accumR), float(accumG), float(accumB)) * invScale / float(sampleCount);
+
+        // Temporal accumulation with capped frame count
+        uint accFrameNum = min(uint(prevSampleNum) + 1u, pc.accumulationFrameMax);
+        float prevWeight = prevSampleNum / max(prevSampleNum + float(sampleCount), 1.0);
+        float newWeight = float(sampleCount) / max(prevSampleNum + float(sampleCount), 1.0);
+
+        vec3 blended = vec3(resolvedR, resolvedG, resolvedB) * prevWeight + newRadiance * newWeight;
+
+        float totalSamples = min(prevSampleNum + float(sampleCount), 65535.0);
+
+        // Write resolved
+        dataBuffer.data[rBase + 0u] = floatBitsToUint(blended.r);
+        dataBuffer.data[rBase + 1u] = floatBitsToUint(blended.g);
+        dataBuffer.data[rBase + 2u] = floatBitsToUint(blended.b);
+        // Pack: low 16 bits = sample count, high 16 bits = stale counter (reset to 0)
+        dataBuffer.data[rBase + 3u] = uint(totalSamples) & 0xFFFFu;
+
+        // Clear accumulation for next frame
+        dataBuffer.data[aBase + 0u] = 0u;
+        dataBuffer.data[aBase + 1u] = 0u;
+        dataBuffer.data[aBase + 2u] = 0u;
+        dataBuffer.data[aBase + 3u] = 0u;
+    } else {
+        // No new data — increment stale counter
+        staleFrames++;
+        if (staleFrames > pc.staleFrameMax) {
+            // Evict: clear hash entry and resolved data
+            hashEntries.keys[idx] = uint64_t(0u);
+            dataBuffer.data[rBase + 0u] = 0u;
+            dataBuffer.data[rBase + 1u] = 0u;
+            dataBuffer.data[rBase + 2u] = 0u;
+            dataBuffer.data[rBase + 3u] = 0u;
         } else {
-            // New cell or hash collision — overwrite
-            sharcRead.readEntries[idx].hashKey = writeEntry.hashKey;
-            sharcRead.readEntries[idx].radianceR = newRadiance.r;
-            sharcRead.readEntries[idx].radianceG = newRadiance.g;
-            sharcRead.readEntries[idx].radianceB = newRadiance.b;
-            sharcRead.readEntries[idx].sampleCount = 1u;
-            sharcRead.readEntries[idx].lastFrame = pc.frameIndex;
-        }
-    } else if (readEntry.hashKey != 0u) {
-        // No new data — age out old entries
-        if (pc.frameIndex - readEntry.lastFrame > SHARC_MAX_AGE) {
-            // Evict stale entry
-            sharcRead.readEntries[idx].hashKey = 0u;
-            sharcRead.readEntries[idx].sampleCount = 0u;
-            sharcRead.readEntries[idx].radianceR = 0.0;
-            sharcRead.readEntries[idx].radianceG = 0.0;
-            sharcRead.readEntries[idx].radianceB = 0.0;
+            // Update stale counter in resolved metadata
+            uint meta = (staleFrames << 16u) | (uint(prevSampleNum) & 0xFFFFu);
+            dataBuffer.data[rBase + 3u] = meta;
         }
     }
-
-    // Clear write buffer for next frame
-    sharcWrite.writeEntries[idx].hashKey = 0u;
-    sharcWrite.writeEntries[idx].sampleCount = 0u;
-    sharcWrite.writeEntries[idx].radianceR = 0.0;
-    sharcWrite.writeEntries[idx].radianceG = 0.0;
-    sharcWrite.writeEntries[idx].radianceB = 0.0;
-    sharcWrite.writeEntries[idx].lastFrame = 0u;
-    sharcWrite.writeEntries[idx].pad0 = 0.0;
-    sharcWrite.writeEntries[idx].pad1 = 0.0;
 }

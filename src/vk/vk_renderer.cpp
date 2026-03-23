@@ -836,7 +836,7 @@ void Renderer::RenderFrameRT() {
         vkBeginCommandBuffer(cmd, &bi2);
     }
 
-    // SHARC resolve: merge write buffer → read buffer (EMA + aging)
+    // SHARC resolve: merge accumulation → resolved (EMA + aging + eviction)
     if (sharcResolveReady_ && rtPipeline_->HasSHARCBuffers()) {
         VkMemoryBarrier rtToSharc{};
         rtToSharc.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -850,11 +850,20 @@ void Renderer::RenderFrameRT() {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sharcResolvePipeline_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             sharcResolvePipelineLayout_, 0, 1, &sharcResolveDescriptorSet_, 0, nullptr);
-        vkCmdPushConstants(cmd, sharcResolvePipelineLayout_,
-            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &frameIndex_);
 
-        // 2^22 entries / 256 threads per group = 16384 groups
-        vkCmdDispatch(cmd, 16384, 1, 1);
+        // Push constants: capacity, frameIndex, accumulationFrameMax, staleFrameMax, radianceScale
+        struct { uint32_t capacity; uint32_t frameIndex; uint32_t accFrameMax; uint32_t staleMax; float radScale; } sharcPC;
+        sharcPC.capacity = RTPipeline::SHARC_CAPACITY;
+        sharcPC.frameIndex = frameIndex_;
+        sharcPC.accFrameMax = 256;
+        sharcPC.staleMax = 128;
+        sharcPC.radScale = 1000.0f;
+        vkCmdPushConstants(cmd, sharcResolvePipelineLayout_,
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(sharcPC), &sharcPC);
+
+        // capacity / 256 threads per group
+        uint32_t groups = (RTPipeline::SHARC_CAPACITY + 255) / 256;
+        vkCmdDispatch(cmd, groups, 1, 1);
     }
 
     // (SHARC diag flush removed — SHARC is disabled)
@@ -2223,11 +2232,11 @@ bool Renderer::CreateSHARCResolvePipeline() {
         return false;
     }
 
-    // Push constant: frameIndex (uint32_t)
+    // Push constants: capacity, frameIndex, accFrameMax, staleMax, radianceScale
     VkPushConstantRange pushRange{};
     pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pushRange.offset = 0;
-    pushRange.size = sizeof(uint32_t);
+    pushRange.size = 20;  // 4 uints + 1 float = 20 bytes
 
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
     pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -2321,9 +2330,9 @@ void Renderer::UpdateSHARCResolveDescriptors() {
     writeInfo.range = RTPipeline::SHARC_CAPACITY * 8;
 
     VkDescriptorBufferInfo readInfo{};
-    readInfo.buffer = rtPipeline_->GetSHARCBuffer(1);  // accumulation
+    readInfo.buffer = rtPipeline_->GetSHARCBuffer(1);  // combined accum+resolved
     readInfo.offset = 0;
-    readInfo.range = RTPipeline::SHARC_CAPACITY * 16;
+    readInfo.range = RTPipeline::SHARC_CAPACITY * 32;
 
     VkWriteDescriptorSet writes[2] = {};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;

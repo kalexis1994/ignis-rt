@@ -5,9 +5,7 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_nonuniform_qualifier : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_atomic_int64 : require
-#extension GL_EXT_shader_16bit_storage : enable
 #extension GL_GOOGLE_include_directive : require
 
 // ============================================================
@@ -145,11 +143,16 @@ layout(binding = 22, set = 0, r32f) uniform image2D dlssDepthImg;
 // Cloud shadow (declared for layout compatibility)
 layout(binding = 23, set = 0) uniform sampler2D cloudShadowMap;
 
-// SHARC radiance cache — NVIDIA official library (buffer_reference access)
-// Buffers accessed via device addresses in CameraUBO, not descriptor bindings.
-// Legacy bindings 20-21 kept for compatibility but accessed via buffer_reference.
-layout(binding = 20, set = 0, std430) buffer SHARCLegacy0 { uint _sharcLegacy0[]; };
-layout(binding = 21, set = 0, std430) buffer SHARCLegacy1 { uint _sharcLegacy1[]; };
+// SHARC radiance cache — 2 SSBOs (hash entries + combined accum/resolved)
+// Based on NVIDIA SHARC algorithm (https://github.com/NVIDIA-RTX/SHARC)
+// Binding 20: hash entries (uint64 per slot)
+// Binding 21: combined buffer — first half = accumulation (uint×4 per slot),
+//             second half = resolved (uint×4 per slot). Offset = capacity×4.
+layout(binding = 20, set = 0, std430) buffer SHARCHashEntries { uint64_t keys[]; } _sharcHashEntries;
+layout(binding = 21, set = 0, std430) buffer SHARCData        { uint data[];     } _sharcAccum;
+
+// Resolved data accessed via offset into the same buffer
+#define _sharcResolved _sharcAccum  // resolved region starts at capacity*4
 
 #include "include/sharc_setup.glsl"
 
@@ -658,23 +661,24 @@ void main() {
     float reservoirRng = rand01();
     bool giReservoirEnabled = false;  // disable buffer access
 
-    // SHARC radiance cache — NVIDIA official library
-    SharcParameters sharcParams = buildSharcParams();
+    // SHARC radiance cache
+    SharcGridParams sharcGrid;
+    sharcGrid.cameraPosition = vec3(cam.viewInverse[3][0], cam.viewInverse[3][1], cam.viewInverse[3][2]);
+    sharcGrid.sceneScale = cam.sharcSceneScale;
     SharcState sharcState;
     SharcInit(sharcState);
     bool sharcUpdatePixel = isSharcUpdatePixel(pixel, frameIndex);
-    bool sharcEnabled = (cam.sharcCapacity > 0u && cam.sharcHashEntriesAddr != 0u);
-    vec3 prevBounceNormal = vec3(0, 1, 0);  // normal from previous bounce for SHARC query
+    bool sharcEnabled = (cam.sharcCapacity > 0u);
+    uint sharcCapacity = cam.sharcCapacity;
+    vec3 prevBounceNormal = vec3(0, 1, 0);
 
     for (int bounce = 0; bounce < maxBounces; bounce++) {
 
         // ── SHARC cache query (bounce 1+): early path termination ──
         if (sharcEnabled && bounce >= 1) {
-            SharcHitData queryHit;
-            queryHit.positionWorld = rayOrigin;
-            queryHit.normalWorld = prevBounceNormal;
             vec3 cachedRadiance;
-            if (SharcGetCachedRadiance(sharcParams, queryHit, cachedRadiance, false)) {
+            if (SharcGetCachedRadiance(sharcGrid, rayOrigin, prevBounceNormal,
+                                       sharcCapacity, cachedRadiance)) {
                 cachedRadiance *= giIntensity;
                 if (isDiffusePath) {
                     diffuseRadiance += cachedRadiance * throughput;
@@ -696,7 +700,7 @@ void main() {
             // Sky miss — notify SHARC for backpropagation
             vec3 skyColor = evaluateSky(rayDir);
             if (sharcEnabled && sharcUpdatePixel) {
-                SharcUpdateMiss(sharcParams, sharcState, skyColor);
+                SharcUpdateMiss(sharcGrid, sharcState, skyColor, sharcCapacity);
             }
             if (bounce == 0) {
                 totalRadiance += skyColor * throughput;
@@ -1527,19 +1531,14 @@ void main() {
         // ── SHARC update: sparse pixels write direct lighting to cache ──
         if (sharcEnabled && sharcUpdatePixel) {
             vec3 directLighting = (diffuseRadiance + specularRadiance) - preBounceRadiance;
-            // Sanitize
             if (any(isnan(directLighting)) || any(isinf(directLighting)))
                 directLighting = vec3(0.0);
             directLighting = max(directLighting, vec3(0.0));
 
-            SharcHitData hitData;
-            hitData.positionWorld = pbrHit.worldPos;
-            hitData.normalWorld = N;
+            bool continueTracing = SharcUpdateHit(sharcGrid, sharcState,
+                pbrHit.worldPos, N, directLighting, rand01(), sharcCapacity);
+            if (!continueTracing) break;
 
-            bool continueTracing = SharcUpdateHit(sharcParams, sharcState, hitData, directLighting, rand01());
-            if (!continueTracing) break;  // cache already has enough data here
-
-            // Tell SHARC about the throughput for backpropagation
             SharcSetThroughput(sharcState, throughput);
         }
 

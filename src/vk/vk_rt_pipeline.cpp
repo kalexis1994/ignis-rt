@@ -99,21 +99,22 @@ bool RTPipeline::CreateSHARCBuffers() {
 
     VkDevice device = context_->GetDevice();
 
-    // SHARC uses 3 buffers with device addresses (buffer_reference in GLSL):
-    // [0] Hash Entries:  uint64 per entry = 8 bytes
-    // [1] Accumulation:  uvec4 per entry  = 16 bytes (per-frame radiance, scaled uint)
-    // [2] Resolved:      16 bytes per entry (fp16 radiance + sample/frame counters)
+    // SHARC uses 2 buffers on bindings 20-21:
+    // [0] Hash Entries: uint64 per entry = 8 bytes (binding 20)
+    // [1] Combined:     accumulation (uint×4) + resolved (uint×4) = 32 bytes/entry (binding 21)
+    //                   First half = accumulation, second half = resolved
     const VkDeviceSize sizes[3] = {
         SHARC_CAPACITY * 8,   // hash entries (uint64)
-        SHARC_CAPACITY * 16,  // accumulation (uvec4)
-        SHARC_CAPACITY * 16,  // resolved (SharcPackedData)
+        SHARC_CAPACITY * 32,  // combined accum+resolved (2× uint4 per entry)
+        0,                     // unused (resolved is in buffer[1] upper half)
     };
-    const char* names[3] = { "hashEntries", "accumulation", "resolved" };
+    const char* names[3] = { "hashEntries", "accum+resolved", "unused" };
+    const int numBuffers = 2;  // only create 2 buffers
 
     auto vkGetBufferDeviceAddressKHR_ = (PFN_vkGetBufferDeviceAddressKHR)
         vkGetDeviceProcAddr(device, "vkGetBufferDeviceAddressKHR");
 
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < numBuffers; i++) {
         VkBufferCreateInfo bufInfo{};
         bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         bufInfo.size = sizes[i];
@@ -161,8 +162,8 @@ bool RTPipeline::CreateSHARCBuffers() {
 
     sharcCreated_ = true;
 
-    // Update descriptor set bindings 20-21 with first two buffers
-    // (binding 20 = hashEntries for legacy compatibility, binding 21 = accumulation)
+    // Update descriptor set bindings 20-21
+    // binding 20 = hashEntries (uint64), binding 21 = combined accum+resolved
     VkDescriptorBufferInfo bufInfos[2] = {};
     bufInfos[0].buffer = sharcBuffer_[0]; bufInfos[0].offset = 0; bufInfos[0].range = sizes[0];
     bufInfos[1].buffer = sharcBuffer_[1]; bufInfos[1].offset = 0; bufInfos[1].range = sizes[1];
@@ -190,7 +191,7 @@ bool RTPipeline::CreateSHARCBuffers() {
 void RTPipeline::DestroySHARCBuffers() {
     if (!sharcCreated_) return;
     VkDevice device = context_->GetDevice();
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 2; i++) {
         if (sharcBuffer_[i]) { vkDestroyBuffer(device, sharcBuffer_[i], nullptr); sharcBuffer_[i] = VK_NULL_HANDLE; }
         if (sharcMemory_[i]) { vkFreeMemory(device, sharcMemory_[i], nullptr); sharcMemory_[i] = VK_NULL_HANDLE; }
         sharcDeviceAddr_[i] = 0;
