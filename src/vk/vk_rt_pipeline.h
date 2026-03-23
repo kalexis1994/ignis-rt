@@ -274,15 +274,18 @@ private:
     bool CreateGIReservoirBuffers(uint32_t width, uint32_t height);
     void DestroyGIReservoirBuffers();
 
-    // SHARC radiance cache (bindings 20-21)
-    VkBuffer sharcBuffer_[2] = {};       // [0]=write, [1]=read
-    VkDeviceMemory sharcMemory_[2] = {};
+    // SHARC radiance cache (NVIDIA official library)
+    // 3 buffers: hashEntries (uint64), accumulation (uvec4), resolved (f16vec4+uint2)
+    static constexpr uint32_t SHARC_CAPACITY = 1u << 22;  // 2^22 = 4M entries
+    VkBuffer sharcBuffer_[3] = {};       // [0]=hashEntries, [1]=accumulation, [2]=resolved
+    VkDeviceMemory sharcMemory_[3] = {};
+    VkDeviceAddress sharcDeviceAddr_[3] = {};  // buffer device addresses for shader access
     bool sharcCreated_ = false;
-    static constexpr uint32_t SHARC_TABLE_SIZE = 4194304;  // 2^22 (doubled for fewer hash collisions)
-    static constexpr uint32_t SHARC_ENTRY_SIZE = 32;       // 8 uints = 32 bytes
-    static constexpr VkDeviceSize SHARC_BUFFER_SIZE = SHARC_TABLE_SIZE * SHARC_ENTRY_SIZE; // 64 MiB
     bool CreateSHARCBuffers();
     void DestroySHARCBuffers();
+    VkDeviceAddress GetSHARCHashEntriesAddr() const { return sharcDeviceAddr_[0]; }
+    VkDeviceAddress GetSHARCAccumulationAddr() const { return sharcDeviceAddr_[1]; }
+    VkDeviceAddress GetSHARCResolvedAddr() const { return sharcDeviceAddr_[2]; }
 
     // Shadow temporal accumulation (ping-pong, bindings 18-19)
     GBufferImage shadowAccumImage_[2];  // [0] and [1] alternate each frame

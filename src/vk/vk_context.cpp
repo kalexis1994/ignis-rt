@@ -254,6 +254,12 @@ bool Context::CreateLogicalDevice() {
     rqFeatures.rayQuery = VK_TRUE;
     rqFeatures.pNext = &rtpFeatures;
 
+    // Shader atomic int64 (required for SHARC radiance cache)
+    VkPhysicalDeviceShaderAtomicInt64Features atomicInt64Features{};
+    atomicInt64Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES;
+    atomicInt64Features.shaderBufferInt64Atomics = VK_TRUE;
+    rtpFeatures.pNext = &atomicInt64Features;
+
     // Device features
     VkPhysicalDeviceFeatures deviceFeatures{};
     deviceFeatures.samplerAnisotropy = VK_TRUE;
