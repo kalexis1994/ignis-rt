@@ -1,58 +1,89 @@
-"""Check Floor object: modifiers, UV layers, transform, and per-material UV ranges."""
+"""Full analysis of ALL materials on Floor object — complete node chains."""
 import bpy
 
 obj = bpy.data.objects.get("Floor")
 if not obj:
     print("Floor not found")
 else:
-    print(f"=== Object: {obj.name} ===")
-    print(f"  Type: {obj.type}")
-    print(f"  Location: ({obj.location.x:.3f}, {obj.location.y:.3f}, {obj.location.z:.3f})")
-    print(f"  Scale: ({obj.scale.x:.3f}, {obj.scale.y:.3f}, {obj.scale.z:.3f})")
-    print(f"  Rotation: ({obj.rotation_euler.x:.4f}, {obj.rotation_euler.y:.4f}, {obj.rotation_euler.z:.4f})")
+    for slot_idx, slot in enumerate(obj.material_slots):
+        mat = slot.material
+        if not mat or not mat.node_tree:
+            continue
+        print(f"\n{'='*60}")
+        print(f"Material [{slot_idx}]: {mat.name}")
+        print(f"{'='*60}")
 
-    # Modifiers
-    print(f"\n  Modifiers ({len(obj.modifiers)}):")
-    for mod in obj.modifiers:
-        print(f"    - {mod.name} (type={mod.type})")
+        # Find ALL Mapping nodes and their connections
+        for node in mat.node_tree.nodes:
+            if node.type == 'MAPPING':
+                vt = getattr(node, 'vector_type', '?')
+                s = node.inputs.get('Scale')
+                r = node.inputs.get('Rotation')
+                l = node.inputs.get('Location')
+                print(f"\n  MAPPING '{node.name}': vector_type={vt}")
+                if s: print(f"    Scale=({s.default_value[0]:.3f}, {s.default_value[1]:.3f}, {s.default_value[2]:.3f})")
+                if r: print(f"    Rotation=({r.default_value[0]:.4f}, {r.default_value[1]:.4f}, {r.default_value[2]:.4f})")
+                if l: print(f"    Location=({l.default_value[0]:.3f}, {l.default_value[1]:.3f}, {l.default_value[2]:.3f})")
 
-    # UV layers
-    mesh = obj.data
-    print(f"\n  UV Layers ({len(mesh.uv_layers)}):")
-    for uv in mesh.uv_layers:
-        print(f"    - '{uv.name}' active={uv.active}")
+                # What feeds into this Mapping?
+                vec_inp = node.inputs.get('Vector')
+                if vec_inp and vec_inp.is_linked:
+                    src = vec_inp.links[0].from_node
+                    print(f"    Input: {src.name} (type={src.type}).{vec_inp.links[0].from_socket.name}")
 
-    # Materials
-    print(f"\n  Materials ({len(obj.material_slots)}):")
-    for i, slot in enumerate(obj.material_slots):
-        name = slot.material.name if slot.material else "None"
-        print(f"    [{i}] {name}")
+                # What does this Mapping feed into?
+                vec_out = node.outputs.get('Vector')
+                if vec_out and vec_out.is_linked:
+                    for link in vec_out.links:
+                        print(f"    Output → {link.to_node.name} (type={link.to_node.type}).{link.to_socket.name}")
 
-    # Per-material UV ranges (using evaluated mesh)
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    eval_obj = obj.evaluated_get(depsgraph)
-    eval_mesh = eval_obj.data
-    eval_mesh.calc_loop_triangles()
-    uv_layer = eval_mesh.uv_layers.active
+        # Find Principled BSDF and trace Base Color chain
+        for node in mat.node_tree.nodes:
+            if node.type == 'BSDF_PRINCIPLED':
+                print(f"\n  PRINCIPLED BSDF '{node.name}':")
+                for inp_name in ['Base Color', 'Roughness', 'Normal', 'Metallic']:
+                    inp = node.inputs.get(inp_name)
+                    if inp and inp.is_linked:
+                        chain = []
+                        current_socket = inp
+                        depth = 0
+                        while current_socket and current_socket.is_linked and depth < 10:
+                            from_node = current_socket.links[0].from_node
+                            from_sock = current_socket.links[0].from_socket.name
+                            chain.append(f"{from_node.name}({from_node.type}).{from_sock}")
+                            # Follow first color/vector input
+                            next_socket = None
+                            for fi in from_node.inputs:
+                                if fi.is_linked and fi.type in ('RGBA', 'VECTOR', 'VALUE'):
+                                    next_socket = fi
+                                    break
+                            current_socket = next_socket
+                            depth += 1
+                        print(f"    {inp_name}: {' → '.join(chain)}")
+                    elif inp:
+                        try:
+                            v = inp.default_value
+                            if hasattr(v, '__len__'):
+                                print(f"    {inp_name}: ({v[0]:.3f}, {v[1]:.3f}, {v[2]:.3f})")
+                            else:
+                                print(f"    {inp_name}: {v:.3f}")
+                        except:
+                            pass
 
-    if uv_layer:
-        for mat_idx, slot in enumerate(obj.material_slots):
-            mat_name = slot.material.name if slot.material else "None"
-            u_vals = []
-            v_vals = []
-            tri_count = 0
-            for tri in eval_mesh.loop_triangles:
-                if tri.material_index == mat_idx:
-                    tri_count += 1
-                    for loop_idx in tri.loops:
-                        uv = uv_layer.data[loop_idx].uv
-                        u_vals.append(uv[0])
-                        v_vals.append(uv[1])
-            if u_vals:
-                print(f"\n    Material [{mat_idx}] '{mat_name}': {tri_count} tris")
-                print(f"      U: [{min(u_vals):.6f}, {max(u_vals):.6f}] span={max(u_vals)-min(u_vals):.6f}")
-                print(f"      V: [{min(v_vals):.6f}, {max(v_vals):.6f}] span={max(v_vals)-min(v_vals):.6f}")
+        # Check for Mix Shader or other shader nodes
+        for node in mat.node_tree.nodes:
+            if node.type in ('MIX_SHADER', 'ADD_SHADER'):
+                print(f"\n  {node.type} '{node.name}':")
+                for inp in node.inputs:
+                    if inp.is_linked:
+                        print(f"    {inp.name} ← {inp.links[0].from_node.name}")
 
-    # Check if evaluated mesh differs from original (modifiers applied)
-    print(f"\n  Original verts: {len(mesh.vertices)}, Evaluated verts: {len(eval_mesh.vertices)}")
-    print(f"  Original loops: {len(mesh.loops)}, Evaluated loops: {len(eval_mesh.loops)}")
+        # List ALL Image Texture nodes
+        for node in mat.node_tree.nodes:
+            if node.type == 'TEX_IMAGE':
+                img_name = node.image.name if node.image else "None"
+                vec_inp = node.inputs.get('Vector')
+                vec_src = ""
+                if vec_inp and vec_inp.is_linked:
+                    vec_src = f" ← {vec_inp.links[0].from_node.name}.{vec_inp.links[0].from_socket.name}"
+                print(f"\n  TEX_IMAGE '{node.name}': image='{img_name}'{vec_src}")

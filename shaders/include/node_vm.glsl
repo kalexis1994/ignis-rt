@@ -15,7 +15,8 @@ const uint OP_SAMPLE_TEX     = 0x01u;  // R[dst] = texture(tex[imm_z], R[srcA].x
 // UV manipulation (Mapping node)
 const uint OP_UV_TRANSFORM   = 0x10u;  // R[dst].xy = R[srcA].xy * scale + offset
 const uint OP_UV_ROTATE      = 0x11u;  // R[dst].xy = rotate R[srcA].xy by angle
-const uint OP_UV_MATRIX      = 0x12u;  // R[dst].xy = mat2(R[srcB]) * R[srcA].xy + offset (combined scale+rot)
+const uint OP_UV_MATRIX      = 0x12u;  // reserved
+const uint OP_UV_VFLIP       = 0x13u;  // R[dst].y = 1.0 - R[srcA].y (Blender→Vulkan V-flip)
 
 // Color operations
 const uint OP_MIX            = 0x20u;  // R[dst] = mix(R[srcA], R[srcB], imm_y)
@@ -168,9 +169,10 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos) {
         }
 
         // ── UV manipulation ──
+        // ALL UV ops convert to Blender space and STAY there.
+        // V-flip back to Vulkan happens ONCE in OP_SAMPLE_TEX.
         else if (opcode == OP_UV_TRANSFORM) {
-            // Scale + offset. Input is Vulkan UV (V-flipped from mesh export).
-            // Convert to Blender space, apply scale, convert back.
+            // Scale + offset in Blender UV space (undo V-flip, scale, re-flip)
             vec2 scale = vec2(uintBitsToFloat(instr.y), uintBitsToFloat(instr.z));
             vec2 offset = vec2(uintBitsToFloat(instr.w), 0.0);
             vec2 bl = vec2(R[srcA].x, 1.0 - R[srcA].y);
@@ -178,7 +180,7 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos) {
             R[dst] = vec4(result.x, 1.0 - result.y, 0.0, 1.0);
         }
         else if (opcode == OP_UV_ROTATE) {
-            // Rotate in Blender UV space (undo V-flip, rotate, redo V-flip)
+            // Rotate in Blender UV space (undo V-flip, rotate, re-flip)
             float angle = uintBitsToFloat(instr.y);
             vec2 bl = vec2(R[srcA].x, 1.0 - R[srcA].y);
             float c = cos(angle), s = sin(angle);
@@ -187,6 +189,10 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos) {
         }
         else if (opcode == OP_UV_MATRIX) {
             R[dst] = R[srcA];
+        }
+        else if (opcode == OP_UV_VFLIP) {
+            // Convert Blender UV → Vulkan UV (flip V for stb_image top-down textures)
+            R[dst] = vec4(R[srcA].x, 1.0 - R[srcA].y, R[srcA].z, R[srcA].w);
         }
 
         // ── Color operations ──

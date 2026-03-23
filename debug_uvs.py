@@ -1,57 +1,58 @@
-"""Compare UVs: what Blender sees vs what our export would produce."""
-import bpy
-import numpy as np
+"""Test: apply Mapping transform to a UV in Python and compare with expected result."""
+import math
 
-obj = bpy.data.objects.get("Floor")
-if not obj:
-    print("Floor not found")
-else:
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    eval_obj = obj.evaluated_get(depsgraph)
-    mesh = eval_obj.data
-    mesh.calc_loop_triangles()
+# Laminate Mapping: Scale=(15,15,15), Rotation Z=90° (1.5708 rad), Point mode
+scale_x, scale_y = 15.0, 15.0
+rot = 1.5708  # 90 degrees
 
-    uv_layer = mesh.uv_layers.active
-    if not uv_layer:
-        print("No UV layer")
-    else:
-        # Method 1: Direct loop_triangle UV access (what Blender shows)
-        print("=== Method 1: Direct UV from loop_triangles ===")
-        for i, tri in enumerate(mesh.loop_triangles[:5]):
-            uvs = [uv_layer.data[li].uv for li in tri.loops]
-            mat = obj.material_slots[tri.material_index].material.name if tri.material_index < len(obj.material_slots) else "?"
-            print(f"  tri[{i}] mat={mat}: UV0=({uvs[0][0]:.6f},{uvs[0][1]:.6f}) UV1=({uvs[1][0]:.6f},{uvs[1][1]:.6f}) UV2=({uvs[2][0]:.6f},{uvs[2][1]:.6f})")
+# Test UV (first triangle of laminate)
+u, v = 0.532530, 0.421151
 
-        # Method 2: Our export method (foreach_get + indexing)
-        print("\n=== Method 2: Our export (foreach_get + tri_loops indexing) ===")
-        tri_count = len(mesh.loop_triangles)
-        raw_vert_count = tri_count * 3
-        tri_loops = np.empty(raw_vert_count, dtype=np.int32)
-        mesh.loop_triangles.foreach_get("loops", tri_loops)
+# Cycles POINT mode: result = Rotation * (UV * Scale) + Location
+# Step 1: Scale
+scaled_u = u * scale_x  # 0.53253 * 15 = 7.98795
+scaled_v = v * scale_y  # 0.421151 * 15 = 6.31727
 
-        uv_data = mesh.uv_layers.active.data
-        all_loop_uvs = np.empty(len(uv_data) * 2, dtype=np.float32)
-        uv_data.foreach_get("uv", all_loop_uvs)
-        all_loop_uvs = all_loop_uvs.reshape(-1, 2)
-        uvs_export = all_loop_uvs[tri_loops]
+# Step 2: Rotate Z by 90°
+c = math.cos(rot)  # ≈ 0
+s = math.sin(rot)  # ≈ 1
+rot_u = scaled_u * c - scaled_v * s  # ≈ -6.317
+rot_v = scaled_u * s + scaled_v * c  # ≈ 7.988
 
-        for i in range(5):
-            u0, v0 = uvs_export[i*3]
-            u1, v1 = uvs_export[i*3+1]
-            u2, v2 = uvs_export[i*3+2]
-            tri = mesh.loop_triangles[i]
-            mat = obj.material_slots[tri.material_index].material.name if tri.material_index < len(obj.material_slots) else "?"
-            print(f"  tri[{i}] mat={mat}: UV0=({u0:.6f},{v0:.6f}) UV1=({u1:.6f},{v1:.6f}) UV2=({u2:.6f},{v2:.6f})")
+print(f"Input UV: ({u:.6f}, {v:.6f})")
+print(f"Scaled:   ({scaled_u:.6f}, {scaled_v:.6f})")
+print(f"Rotated:  ({rot_u:.6f}, {rot_v:.6f})")
+print(f"Wrapped:  ({rot_u % 1.0:.6f}, {rot_v % 1.0:.6f})")
 
-        # Check: do they match?
-        print("\n=== Comparison ===")
-        match = True
-        for i, tri in enumerate(mesh.loop_triangles):
-            for j, li in enumerate(tri.loops):
-                blender_uv = uv_layer.data[li].uv
-                our_uv = uvs_export[i*3+j]
-                if abs(blender_uv[0] - our_uv[0]) > 0.001 or abs(blender_uv[1] - our_uv[1]) > 0.001:
-                    print(f"  MISMATCH tri[{i}] corner[{j}]: Blender=({blender_uv[0]:.6f},{blender_uv[1]:.6f}) Export=({our_uv[0]:.6f},{our_uv[1]:.6f})")
-                    match = False
-        if match:
-            print("  All UVs MATCH between Blender and our export method")
+print()
+
+# Now simulate what our shader does with V-flip:
+v_vk = 1.0 - v  # V-flip in shader = 0.578849
+
+print(f"=== Shader simulation ===")
+print(f"Vulkan UV: ({u:.6f}, {v_vk:.6f})")
+
+# UV_TRANSFORM: undo flip, scale, redo flip
+bl_u = u
+bl_v = 1.0 - v_vk  # = v = 0.421151
+t_u = bl_u * scale_x  # 7.98795
+t_v = bl_v * scale_y  # 6.31727
+out_u = t_u
+out_v = 1.0 - t_v  # = 1 - 6.31727 = -5.31727
+print(f"After UV_TRANSFORM: ({out_u:.6f}, {out_v:.6f})")
+
+# UV_ROTATE: undo flip, rotate, redo flip
+bl2_u = out_u  # 7.98795
+bl2_v = 1.0 - out_v  # = 1 - (-5.31727) = 6.31727
+r_u = bl2_u * c - bl2_v * s  # ≈ -6.317
+r_v = bl2_u * s + bl2_v * c  # ≈ 7.988
+final_u = r_u
+final_v = 1.0 - r_v  # = 1 - 7.988 = -6.988
+print(f"After UV_ROTATE:    ({final_u:.6f}, {final_v:.6f})")
+print(f"Wrapped:            ({final_u % 1.0:.6f}, {final_v % 1.0:.6f})")
+
+print()
+print(f"=== Comparison ===")
+print(f"Cycles wrapped:  ({rot_u % 1.0:.6f}, {rot_v % 1.0:.6f})")
+print(f"Shader wrapped:  ({final_u % 1.0:.6f}, {final_v % 1.0:.6f})")
+print(f"Match: {abs(rot_u % 1.0 - final_u % 1.0) < 0.001 and abs(rot_v % 1.0 - final_v % 1.0) < 0.001}")

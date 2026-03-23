@@ -246,6 +246,7 @@ int TextureManager::AddTexture(const KN5Texture& kn5Tex) {
 
     if (!isDDS && !isRawHDR) {
         // Try loading as PNG/JPG with stb_image
+        // Try loading as PNG/JPG with stb_image
         int stbChannels = 0;
         stbPixels = stbi_load_from_memory(kn5Tex.data.data(), (int)kn5Tex.data.size(),
                                            &width, &height, &stbChannels, 4); // force RGBA
