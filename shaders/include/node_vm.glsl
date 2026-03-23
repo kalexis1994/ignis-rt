@@ -48,6 +48,9 @@ const uint OP_MAP_RANGE      = 0x48u;  // R[dst].x = mapRange(R[srcA].x, fromMin
 const uint OP_SEPARATE_RGB   = 0x50u;  // R[dst].x = R[srcA][channel]  (channel in imm_y)
 const uint OP_COMBINE_RGB    = 0x51u;  // R[dst].rgb = (R[srcA].x, R[srcB].x, R[imm_y & 0xF].x)
 
+// Procedural textures
+const uint OP_TEX_CHECKER    = 0x58u;  // R[dst] = checker(R[srcA].xy, scale=imm_y, color1=R[srcB], color2 from next)
+
 // Load immediate / special
 const uint OP_LOAD_CONST     = 0x60u;  // R[dst] = vec4(imm_y, imm_z, imm_w, 1)
 const uint OP_LOAD_SCALAR    = 0x61u;  // R[dst].x = imm_y
@@ -298,6 +301,18 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos) {
         else if (opcode == OP_COMBINE_RGB) {
             uint regC = instr.y & 0xFu;
             R[dst] = vec4(R[srcA].x, R[srcB].x, R[regC].x, 1.0);
+        }
+
+        // ── Procedural textures ──
+        else if (opcode == OP_TEX_CHECKER) {
+            // Checker pattern: alternating color1 (R[srcB]) / color2 (packed in imm)
+            float scale = uintBitsToFloat(instr.y);
+            vec2 checkerUV = R[srcA].xy * scale;
+            // Blender checker formula: alternating based on floor
+            float check = mod(floor(checkerUV.x) + floor(checkerUV.y), 2.0);
+            vec4 color2 = vec4(uintBitsToFloat(instr.z), uintBitsToFloat(instr.w),
+                               uintBitsToFloat(instr.w), 1.0);  // approx: B=G for color2
+            R[dst] = (check < 0.5) ? R[srcB] : color2;
         }
 
         // ── Load immediate ──

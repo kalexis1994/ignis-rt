@@ -1442,6 +1442,7 @@ _OP_OUTPUT_ROUGH   = 0xF1
 _OP_OUTPUT_METAL   = 0xF2
 _OP_OUTPUT_EMISSION= 0xF3
 _OP_OUTPUT_ALPHA   = 0xF4
+_OP_TEX_CHECKER    = 0x58
 _OP_LOAD_WORLD_POS = 0x62
 _OP_OUTPUT_UV      = 0xEF
 _OP_OUTPUT_IOR     = 0xF6
@@ -1718,8 +1719,39 @@ class _NodeVmCompiler:
             self.node_reg_cache[node_id] = dst
             return dst
 
-        # ── Procedural textures — compile as constant fallback ──
-        if from_node.type in ('TEX_NOISE', 'TEX_VORONOI', 'TEX_MUSGRAVE', 'TEX_CHECKER',
+        # ── Checker Texture (procedural) ──
+        if from_node.type == 'TEX_CHECKER':
+            # Get UV input
+            vec_inp = from_node.inputs.get('Vector')
+            uv_reg = 0  # default UV
+            if vec_inp and vec_inp.is_linked:
+                uv_reg = self._compile_uv_chain(vec_inp, _depth + 1)
+
+            # Scale
+            scale_inp = from_node.inputs.get('Scale')
+            scale_val = float(scale_inp.default_value) if scale_inp else 5.0
+
+            # Colors
+            c1_inp = from_node.inputs.get('Color1')
+            c2_inp = from_node.inputs.get('Color2')
+            c1 = (0.8, 0.8, 0.8) if not c1_inp else (c1_inp.default_value[0], c1_inp.default_value[1], c1_inp.default_value[2])
+            c2 = (0.2, 0.2, 0.2) if not c2_inp else (c2_inp.default_value[0], c2_inp.default_value[1], c2_inp.default_value[2])
+
+            # Load color1 into a register
+            c1_reg = self._alloc_reg()
+            self._emit(_OP_LOAD_CONST, c1_reg, imm_y=_floatBits(c1[0]),
+                       imm_z=_floatBits(c1[1]), imm_w=_floatBits(c1[2]))
+
+            # OP_TEX_CHECKER: dst=result, srcA=uv, srcB=color1, imm_y=scale, imm_z=c2.r, imm_w=c2.g
+            # (c2.b is 0 for now — pack limitation)
+            self._emit(_OP_TEX_CHECKER, dst, srcA=uv_reg, srcB=c1_reg,
+                       imm_y=_floatBits(scale_val),
+                       imm_z=_floatBits(c2[0]), imm_w=_floatBits(c2[1]))
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+        # ── Other procedural textures — compile as constant fallback ──
+        if from_node.type in ('TEX_NOISE', 'TEX_VORONOI', 'TEX_MUSGRAVE',
                                'TEX_WAVE', 'TEX_GRADIENT', 'TEX_MAGIC', 'TEX_BRICK',
                                'TEX_SKY', 'TEX_ENVIRONMENT',
                                'AMBIENT_OCCLUSION'):
