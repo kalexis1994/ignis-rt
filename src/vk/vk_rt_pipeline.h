@@ -113,6 +113,15 @@ struct CameraUBO {
     uint32_t lightCount;       // number of active lights (0-32)
     uint32_t lightPad[3];
     float lights[512];         // 32 lights × 16 floats: [pos.xyz+range, col.rgb+intensity, dir.xyz+sizeX, tan.xyz+sizeY]
+
+    // SHARC radiance cache parameters (buffer device addresses + grid config)
+    uint64_t sharcHashEntriesAddr;
+    uint64_t sharcAccumulationAddr;
+    uint64_t sharcResolvedAddr;
+    uint32_t sharcCapacity;
+    float    sharcSceneScale;
+    float    sharcRadianceScale;
+    uint32_t sharcPad;
 };
 
 // Pick result from GPU raycast
@@ -204,9 +213,11 @@ public:
 
     // SHARC radiance cache accessors
     bool HasSHARCBuffers() const { return sharcCreated_; }
-    VkBuffer GetSHARCWriteBuffer() const { return sharcBuffer_[0]; }
-    VkBuffer GetSHARCReadBuffer() const { return sharcBuffer_[1]; }
-    static constexpr VkDeviceSize GetSHARCBufferSize() { return SHARC_TABLE_SIZE * SHARC_ENTRY_SIZE; }
+    VkBuffer GetSHARCBuffer(int idx) const { return sharcBuffer_[idx]; }
+    VkDeviceAddress GetSHARCHashEntriesAddr() const { return sharcDeviceAddr_[0]; }
+    VkDeviceAddress GetSHARCAccumulationAddr() const { return sharcDeviceAddr_[1]; }
+    VkDeviceAddress GetSHARCResolvedAddr() const { return sharcDeviceAddr_[2]; }
+    static constexpr uint32_t SHARC_CAPACITY = 1u << 22;
 
 private:
     bool CreateDescriptorSetLayout();
@@ -276,16 +287,12 @@ private:
 
     // SHARC radiance cache (NVIDIA official library)
     // 3 buffers: hashEntries (uint64), accumulation (uvec4), resolved (f16vec4+uint2)
-    static constexpr uint32_t SHARC_CAPACITY = 1u << 22;  // 2^22 = 4M entries
     VkBuffer sharcBuffer_[3] = {};       // [0]=hashEntries, [1]=accumulation, [2]=resolved
     VkDeviceMemory sharcMemory_[3] = {};
     VkDeviceAddress sharcDeviceAddr_[3] = {};  // buffer device addresses for shader access
     bool sharcCreated_ = false;
     bool CreateSHARCBuffers();
     void DestroySHARCBuffers();
-    VkDeviceAddress GetSHARCHashEntriesAddr() const { return sharcDeviceAddr_[0]; }
-    VkDeviceAddress GetSHARCAccumulationAddr() const { return sharcDeviceAddr_[1]; }
-    VkDeviceAddress GetSHARCResolvedAddr() const { return sharcDeviceAddr_[2]; }
 
     // Shadow temporal accumulation (ping-pong, bindings 18-19)
     GBufferImage shadowAccumImage_[2];  // [0] and [1] alternate each frame

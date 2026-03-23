@@ -456,6 +456,17 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
         memcpy(cam.lights, s_lightData, uboLights * 16 * sizeof(float));
     }
 
+    // SHARC radiance cache: pass buffer device addresses + grid parameters
+    if (g_renderer && g_renderer->GetRTPipeline() && g_renderer->GetRTPipeline()->HasSHARCBuffers()) {
+        auto* rtp = g_renderer->GetRTPipeline();
+        cam.sharcHashEntriesAddr = rtp->GetSHARCHashEntriesAddr();
+        cam.sharcAccumulationAddr = rtp->GetSHARCAccumulationAddr();
+        cam.sharcResolvedAddr = rtp->GetSHARCResolvedAddr();
+        cam.sharcCapacity = rtp->SHARC_CAPACITY;
+        cam.sharcSceneScale = 1.0f;     // meters — adjust for scene scale
+        cam.sharcRadianceScale = 1e3f;   // quantization for uint accumulation
+    }
+
     g_renderer->UpdateCamera(cam);
 
     // Store current frame as prev for next frame

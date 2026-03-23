@@ -81,6 +81,7 @@ public:
     int GetActualDLSSQuality() const;
 
     Context* GetContext() const { return context_; }
+    RTPipeline* GetRTPipeline() const { return rtPipeline_; }
     AccelStructureBuilder* GetAccelBuilder() const { return accelBuilder_; }
     Geometry* GetGeometry() const { return geometry_; }
     Rasterizer* GetRasterizer() const { return rasterizer_; }

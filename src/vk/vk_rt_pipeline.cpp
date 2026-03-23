@@ -99,80 +99,101 @@ bool RTPipeline::CreateSHARCBuffers() {
 
     VkDevice device = context_->GetDevice();
 
-    for (int i = 0; i < 2; i++) {
+    // SHARC uses 3 buffers with device addresses (buffer_reference in GLSL):
+    // [0] Hash Entries:  uint64 per entry = 8 bytes
+    // [1] Accumulation:  uvec4 per entry  = 16 bytes (per-frame radiance, scaled uint)
+    // [2] Resolved:      16 bytes per entry (fp16 radiance + sample/frame counters)
+    const VkDeviceSize sizes[3] = {
+        SHARC_CAPACITY * 8,   // hash entries (uint64)
+        SHARC_CAPACITY * 16,  // accumulation (uvec4)
+        SHARC_CAPACITY * 16,  // resolved (SharcPackedData)
+    };
+    const char* names[3] = { "hashEntries", "accumulation", "resolved" };
+
+    auto vkGetBufferDeviceAddressKHR_ = (PFN_vkGetBufferDeviceAddressKHR)
+        vkGetDeviceProcAddr(device, "vkGetBufferDeviceAddressKHR");
+
+    for (int i = 0; i < 3; i++) {
         VkBufferCreateInfo bufInfo{};
         bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        bufInfo.size = SHARC_BUFFER_SIZE;
-        bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bufInfo.size = sizes[i];
+        bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                        VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
         if (vkCreateBuffer(device, &bufInfo, nullptr, &sharcBuffer_[i]) != VK_SUCCESS) {
-            Log(L"[VK RTPipeline] ERROR: Failed to create SHARC buffer[%d]\n", i);
+            Log(L"[VK RTPipeline] ERROR: Failed to create SHARC %S buffer\n", names[i]);
             return false;
         }
 
         VkMemoryRequirements memReqs;
         vkGetBufferMemoryRequirements(device, sharcBuffer_[i], &memReqs);
 
+        VkMemoryAllocateFlagsInfo allocFlags{};
+        allocFlags.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+        allocFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+
         VkMemoryAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.pNext = &allocFlags;
         allocInfo.allocationSize = memReqs.size;
         allocInfo.memoryTypeIndex = context_->FindMemoryType(memReqs.memoryTypeBits,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
         if (vkAllocateMemory(device, &allocInfo, nullptr, &sharcMemory_[i]) != VK_SUCCESS) {
-            Log(L"[VK RTPipeline] ERROR: Failed to allocate SHARC memory[%d]\n", i);
+            Log(L"[VK RTPipeline] ERROR: Failed to allocate SHARC %S memory\n", names[i]);
             return false;
         }
         vkBindBufferMemory(device, sharcBuffer_[i], sharcMemory_[i], 0);
 
-        // Zero-fill the buffer
+        // Get device address for shader buffer_reference access
+        VkBufferDeviceAddressInfo addrInfo{};
+        addrInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+        addrInfo.buffer = sharcBuffer_[i];
+        sharcDeviceAddr_[i] = vkGetBufferDeviceAddressKHR_(device, &addrInfo);
+
+        // Zero-fill
         VkCommandBuffer cmd = context_->BeginSingleTimeCommands();
-        vkCmdFillBuffer(cmd, sharcBuffer_[i], 0, SHARC_BUFFER_SIZE, 0);
+        vkCmdFillBuffer(cmd, sharcBuffer_[i], 0, sizes[i], 0);
         context_->EndSingleTimeCommands(cmd);
     }
 
     sharcCreated_ = true;
 
-    // Update descriptor set with real SHARC buffers
-    VkDescriptorBufferInfo writeInfo{};
-    writeInfo.buffer = sharcBuffer_[0];
-    writeInfo.offset = 0;
-    writeInfo.range = SHARC_BUFFER_SIZE;
-
-    VkDescriptorBufferInfo readInfo{};
-    readInfo.buffer = sharcBuffer_[1];
-    readInfo.offset = 0;
-    readInfo.range = SHARC_BUFFER_SIZE;
+    // Update descriptor set bindings 20-21 with first two buffers
+    // (binding 20 = hashEntries for legacy compatibility, binding 21 = accumulation)
+    VkDescriptorBufferInfo bufInfos[2] = {};
+    bufInfos[0].buffer = sharcBuffer_[0]; bufInfos[0].offset = 0; bufInfos[0].range = sizes[0];
+    bufInfos[1].buffer = sharcBuffer_[1]; bufInfos[1].offset = 0; bufInfos[1].range = sizes[1];
 
     VkWriteDescriptorSet writes[2] = {};
-    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].dstSet = descriptorSet_;
-    writes[0].dstBinding = 20;
-    writes[0].descriptorCount = 1;
-    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[0].pBufferInfo = &writeInfo;
-
-    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[1].dstSet = descriptorSet_;
-    writes[1].dstBinding = 21;
-    writes[1].descriptorCount = 1;
-    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[1].pBufferInfo = &readInfo;
-
+    for (int i = 0; i < 2; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = descriptorSet_;
+        writes[i].dstBinding = 20 + i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
     vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
 
-    Log(L"[VK RTPipeline] SHARC buffers created (2x %u MiB, %u entries)\n",
-        (uint32_t)(SHARC_BUFFER_SIZE / (1024 * 1024)), SHARC_TABLE_SIZE);
+    VkDeviceSize totalMB = (sizes[0] + sizes[1] + sizes[2]) / (1024 * 1024);
+    Log(L"[VK RTPipeline] SHARC buffers created: %u MiB (%u entries), addrs=[%llx, %llx, %llx]\n",
+        (uint32_t)totalMB, SHARC_CAPACITY,
+        (unsigned long long)sharcDeviceAddr_[0],
+        (unsigned long long)sharcDeviceAddr_[1],
+        (unsigned long long)sharcDeviceAddr_[2]);
     return true;
 }
 
 void RTPipeline::DestroySHARCBuffers() {
     if (!sharcCreated_) return;
     VkDevice device = context_->GetDevice();
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         if (sharcBuffer_[i]) { vkDestroyBuffer(device, sharcBuffer_[i], nullptr); sharcBuffer_[i] = VK_NULL_HANDLE; }
         if (sharcMemory_[i]) { vkFreeMemory(device, sharcMemory_[i], nullptr); sharcMemory_[i] = VK_NULL_HANDLE; }
+        sharcDeviceAddr_[i] = 0;
     }
     sharcCreated_ = false;
 }

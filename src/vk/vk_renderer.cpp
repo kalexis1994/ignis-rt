@@ -2316,14 +2316,14 @@ void Renderer::UpdateSHARCResolveDescriptors() {
     VkDevice device = context_->GetDevice();
 
     VkDescriptorBufferInfo writeInfo{};
-    writeInfo.buffer = rtPipeline_->GetSHARCWriteBuffer();
+    writeInfo.buffer = rtPipeline_->GetSHARCBuffer(0);  // hashEntries
     writeInfo.offset = 0;
-    writeInfo.range = RTPipeline::GetSHARCBufferSize();
+    writeInfo.range = RTPipeline::SHARC_CAPACITY * 8;
 
     VkDescriptorBufferInfo readInfo{};
-    readInfo.buffer = rtPipeline_->GetSHARCReadBuffer();
+    readInfo.buffer = rtPipeline_->GetSHARCBuffer(1);  // accumulation
     readInfo.offset = 0;
-    readInfo.range = RTPipeline::GetSHARCBufferSize();
+    readInfo.range = RTPipeline::SHARC_CAPACITY * 16;
 
     VkWriteDescriptorSet writes[2] = {};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
