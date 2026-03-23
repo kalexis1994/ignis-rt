@@ -805,10 +805,25 @@ void main() {
             wp0, wp1, wp2, uv0_, uv1_, uv2_, hitUV
         );
 
-        // Ensure normal faces the ray
+        // Ensure normal faces the ray.
+        // At grazing angles, the normal map can perturb N to face away from
+        // the camera, causing black bands. Fix: if N·V < 0, project N onto
+        // the plane perpendicular to V so it stays in the correct hemisphere.
         vec3 N = pbrHit.worldNormal;
-        bool frontFace = dot(N, -rayDir) >= 0.0;
-        if (!frontFace) N = -N;
+        vec3 gN = geoNormal;  // unperturbed geometric normal
+        bool frontFace = dot(gN, -rayDir) >= 0.0;
+        if (!frontFace) {
+            gN = -gN;
+            N = -N;
+        }
+        // Clamp perturbed normal: if normal map made it face away from camera,
+        // blend back toward geometric normal to avoid black artifacts
+        float NdotV_check = dot(N, -rayDir);
+        if (NdotV_check < 0.01) {
+            // Smoothly blend toward geometric normal as NdotV approaches 0
+            float blend = clamp(-NdotV_check * 50.0 + 0.5, 0.0, 1.0);
+            N = normalize(mix(N, gN, blend));
+        }
 
         // ---- Backface culling ----
         if (backfaceCulling && !frontFace && pbrHit.transmission < 0.5) {
