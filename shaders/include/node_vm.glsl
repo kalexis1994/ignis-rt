@@ -91,6 +91,8 @@ const uint OP_LOAD_NORMAL    = 0x89u;  // R[dst] = vec4(normal, 1)
 const uint OP_LOAD_INCOMING  = 0x8Au;  // R[dst] = vec4(-viewDir, 1) — incoming ray direction
 const uint OP_BACKFACING     = 0x8Bu;  // R[dst].x = backfacing ? 1.0 : 0.0
 const uint OP_LINEAR_LIGHT   = 0x90u;  // R[dst] = A + 2*B - 1
+const uint OP_TEX_MAGIC      = 0x91u;  // R[dst] = magic(R[srcA].xyz, distortion)
+const uint OP_TEX_BRICK       = 0x92u;  // R[dst] = brick(R[srcA].xyz, scale, mortarSize)
 
 // Load immediate / special
 const uint OP_LOAD_CONST     = 0x60u;  // R[dst] = vec4(imm_y, imm_z, imm_w, 1)
@@ -482,6 +484,22 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, ve
             uint waveType = instr.w;
             float w = waveTexture(R[srcA].xyz, scale, distortion, waveType);
             R[dst] = vec4(w, w, w, 1.0);
+        }
+        else if (opcode == OP_TEX_MAGIC) {
+            float distortion = uintBitsToFloat(instr.y);
+            float scale = uintBitsToFloat(instr.z);
+            vec3 p = R[srcA].xyz * scale;
+            float m = magicTexture(p, distortion);
+            R[dst] = vec4(m, m, m, 1.0);
+        }
+        else if (opcode == OP_TEX_BRICK) {
+            float scale = uintBitsToFloat(instr.y);
+            float mortarSize = uintBitsToFloat(instr.z);
+            vec3 col1 = vec3(0.8, 0.8, 0.8);
+            vec3 col2 = vec3(0.4, 0.2, 0.1);
+            vec3 mortarCol = vec3(0.1);
+            vec3 b = brickTexture(R[srcA].xyz, scale, mortarSize, col1, col2, mortarCol);
+            R[dst] = vec4(b, 1.0);
         }
 
         // ── RGB Curves (baked LUT) ──

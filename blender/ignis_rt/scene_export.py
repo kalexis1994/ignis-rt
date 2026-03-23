@@ -1475,6 +1475,8 @@ _OP_FRESNEL_NODE   = 0x65
 _OP_VEC_MATH        = 0x86
 _OP_MAP_RANGE_FULL  = 0x87
 _OP_TEX_WHITE_NOISE = 0x88
+_OP_TEX_MAGIC       = 0x91
+_OP_TEX_BRICK       = 0x92
 _OP_LOAD_NORMAL     = 0x89
 _OP_LOAD_INCOMING   = 0x8A
 _OP_BACKFACING      = 0x8B
@@ -2016,9 +2018,66 @@ class _NodeVmCompiler:
             self.node_reg_cache[node_id] = dst
             return dst
 
+        # ── Magic Texture ──
+        if from_node.type == 'TEX_MAGIC':
+            vec_inp = from_node.inputs.get('Vector')
+            uv_reg = 0
+            if vec_inp and vec_inp.is_linked:
+                uv_reg = self._compile_uv_chain(vec_inp, _depth + 1)
+            else:
+                uv_reg = self._alloc_reg()
+                self._emit(_OP_LOAD_WORLD_POS, uv_reg)
+
+            scale_inp = from_node.inputs.get('Scale')
+            scale = float(scale_inp.default_value) if scale_inp and not scale_inp.is_linked else 5.0
+            dist_inp = from_node.inputs.get('Distortion')
+            distortion = float(dist_inp.default_value) if dist_inp and not dist_inp.is_linked else 1.0
+
+            self._emit(_OP_TEX_MAGIC, dst, srcA=uv_reg,
+                       imm_y=_floatBits(distortion), imm_z=_floatBits(scale))
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+        # ── Brick Texture ──
+        if from_node.type == 'TEX_BRICK':
+            vec_inp = from_node.inputs.get('Vector')
+            uv_reg = 0
+            if vec_inp and vec_inp.is_linked:
+                uv_reg = self._compile_uv_chain(vec_inp, _depth + 1)
+            else:
+                uv_reg = self._alloc_reg()
+                self._emit(_OP_LOAD_WORLD_POS, uv_reg)
+
+            scale_inp = from_node.inputs.get('Scale')
+            scale = float(scale_inp.default_value) if scale_inp and not scale_inp.is_linked else 5.0
+            mortar_inp = from_node.inputs.get('Mortar Size')
+            mortar = float(mortar_inp.default_value) if mortar_inp and not mortar_inp.is_linked else 0.02
+
+            self._emit(_OP_TEX_BRICK, dst, srcA=uv_reg,
+                       imm_y=_floatBits(scale), imm_z=_floatBits(mortar))
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+        # ── Musgrave Texture (deprecated in Blender 4.0, treat as Noise) ──
+        if from_node.type == 'TEX_MUSGRAVE':
+            vec_inp = from_node.inputs.get('Vector')
+            uv_reg = 0
+            if vec_inp and vec_inp.is_linked:
+                uv_reg = self._compile_uv_chain(vec_inp, _depth + 1)
+            else:
+                uv_reg = self._alloc_reg()
+                self._emit(_OP_LOAD_WORLD_POS, uv_reg)
+            scale_inp = from_node.inputs.get('Scale')
+            scale = float(scale_inp.default_value) if scale_inp and not scale_inp.is_linked else 5.0
+            detail_inp = from_node.inputs.get('Detail')
+            detail = float(detail_inp.default_value) if detail_inp and not detail_inp.is_linked else 2.0
+            self._emit(0x80, dst, srcA=uv_reg,  # _OP_TEX_NOISE
+                       imm_y=_floatBits(scale), imm_z=_floatBits(detail), imm_w=_floatBits(0.5))
+            self.node_reg_cache[node_id] = dst
+            return dst
+
         # ── Other procedural textures — compile as constant fallback ──
-        if from_node.type in ('TEX_MUSGRAVE', 'TEX_MAGIC', 'TEX_BRICK',
-                               'TEX_SKY', 'TEX_ENVIRONMENT'):
+        if from_node.type in ('TEX_SKY', 'TEX_ENVIRONMENT'):
             self._emit(_OP_LOAD_CONST, dst, imm_y=_floatBits(0.5),
                        imm_z=_floatBits(0.5), imm_w=_floatBits(0.5))
             self.node_reg_cache[node_id] = dst

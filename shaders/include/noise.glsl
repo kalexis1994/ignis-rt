@@ -178,4 +178,44 @@ float waveTexture(vec3 p, float scale, float distortion, uint waveType) {
     }
 }
 
+// ============================================================
+// Magic texture — iterative sine distortion (Cycles-compatible)
+// ============================================================
+
+float magicTexture(vec3 p, float distortion) {
+    // Cycles magic texture: iterative sine distortion
+    float x = sin((p.x + p.y + p.z) * 5.0);
+    float y = sin((p.x - p.y + p.z) * 5.0);
+    float z = sin((p.x + p.y - p.z) * 5.0);
+    if (distortion > 0.0) {
+        x = sin(x * distortion);
+        y = sin(y * distortion);
+        z = sin(z * distortion);
+    }
+    return (x + y + z) / 3.0 * 0.5 + 0.5;
+}
+
+// ============================================================
+// Brick texture — procedural brick pattern with mortar
+// ============================================================
+
+vec3 brickTexture(vec3 p, float scale, float mortarSize, vec3 color1, vec3 color2, vec3 mortarColor) {
+    vec2 uv = p.xy * scale;
+    // Offset every other row
+    float row = floor(uv.y);
+    if (mod(row, 2.0) > 0.5) {
+        uv.x += 0.5;
+    }
+    vec2 brick = fract(uv);
+    // Mortar
+    float mx = step(mortarSize, brick.x) * step(brick.x, 1.0 - mortarSize);
+    float my = step(mortarSize, brick.y) * step(brick.y, 1.0 - mortarSize);
+    float isBrick = mx * my;
+    // Alternate colors based on brick hash
+    vec2 brickId = floor(uv);
+    float h = fract(sin(dot(brickId, vec2(127.1, 311.7))) * 43758.5453);
+    vec3 brickColor = mix(color1, color2, step(0.5, h));
+    return mix(mortarColor, brickColor, isBrick);
+}
+
 #endif // NOISE_GLSL
