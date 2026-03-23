@@ -211,7 +211,12 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, ve
         // ── Texture sampling ──
         if (opcode == OP_SAMPLE_TEX) {
             uint texIdx = instr.z;
+            uint isSRGB = instr.y;  // 1 = sRGB color texture, 0 = linear data
             R[dst] = texture(textures[nonuniformEXT(texIdx)], R[srcA].xy);
+            if (isSRGB != 0u) {
+                // sRGB → linear (matching Cycles texture decoding)
+                R[dst].rgb = pow(max(R[dst].rgb, vec3(0.0)), vec3(2.2));
+            }
         }
 
         // ── UV manipulation ──

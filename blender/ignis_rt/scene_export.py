@@ -1551,7 +1551,10 @@ class _NodeVmCompiler:
                     vec_inp = from_node.inputs.get('Vector')
                     if vec_inp and vec_inp.is_linked:
                         uv_reg = self._compile_uv_chain(vec_inp, _depth + 1)
-                    self._emit(_OP_SAMPLE_TEX, dst, srcA=uv_reg, imm_z=tex_idx)
+                    # sRGB flag: color textures need gamma decoding, data textures don't
+                    cs = getattr(from_node.image, 'colorspace_settings', None)
+                    is_srgb = 1 if (cs and cs.name in ('sRGB', 'Filmic sRGB', 'Filmic Log')) else 0
+                    self._emit(_OP_SAMPLE_TEX, dst, srcA=uv_reg, imm_y=is_srgb, imm_z=tex_idx)
                     self.node_reg_cache[node_id] = dst
                     return dst
             # Fallback: gray

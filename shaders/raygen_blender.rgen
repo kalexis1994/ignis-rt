@@ -383,8 +383,9 @@ PBRHit evaluateBlenderMaterial(
         // No VM or VM didn't compile base color — legacy fallback
         if (mat.diffuseTexIndex != 0xFFFFFFFFu) {
             vec4 texColor = texture(textures[nonuniformEXT(mat.diffuseTexIndex)], uv);
-            hit.baseColor = texColor.rgb;
-            texAlpha = texColor.a;
+            // sRGB → linear for color textures (matching Cycles)
+            hit.baseColor = pow(max(texColor.rgb, vec3(0.0)), vec3(2.2));
+            texAlpha = texColor.a;  // alpha stays linear
         } else {
             hit.baseColor = vec3(mat.ksAmbient, mat.ksDiffuse, mat.ksSpecular);
             if (mat.detailTexIndex != 0xFFFFFFFFu) {
