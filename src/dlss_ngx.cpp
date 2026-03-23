@@ -747,6 +747,7 @@ void DLSS_NGX::EvaluateRR(
     evalParams.GBufferSurface.pInAttrib[NVSDK_NGX_GBUFFER_ROUGHNESS] = &normalsResource;
     evalParams.InJitterOffsetX = jitterX;
     evalParams.InJitterOffsetY = jitterY;
+    // MVs are in UV space (prevUV - currUV), scaled to pixel space
     evalParams.InMVScaleX = (float)m_renderWidth;
     evalParams.InMVScaleY = (float)m_renderHeight;
     evalParams.InReset = (reset || m_frameIndex <= 1) ? 1 : 0;
