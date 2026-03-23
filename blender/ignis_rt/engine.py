@@ -759,10 +759,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             hdri_sun = None
             try:
                 hdri = scene_export.export_world_hdri(depsgraph)
-                if hdri:
+                if hdri and "data" in hdri:
+                    # HDRI environment texture
                     _log(f"Stage FINALIZE: HDRI '{hdri['name']}' {hdri['width']}x{hdri['height']}, strength={hdri['strength']:.2f}")
                     hdri_sun = hdri.get("extracted_sun")
-                    # Upload as texture via the texture manager
                     if _ignis_tex_manager:
                         data_np = np.frombuffer(hdri["data"], dtype=np.uint8).copy()
                         hdri_dxgi = hdri.get("dxgi_format", 0)
@@ -780,6 +780,15 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                             _log("Stage FINALIZE: HDRI texture add failed")
                     else:
                         _log("Stage FINALIZE: No texture manager for HDRI")
+                elif hdri and "bg_color" in hdri:
+                    # No HDRI texture — use Background node color as sky fallback
+                    c = hdri["bg_color"]
+                    s = hdri["bg_strength"]
+                    dll_wrapper.set_int("hdri_tex_index", -1)
+                    dll_wrapper.set_float("world_bg_r", c[0] * s)
+                    dll_wrapper.set_float("world_bg_g", c[1] * s)
+                    dll_wrapper.set_float("world_bg_b", c[2] * s)
+                    _log(f"Stage FINALIZE: World background color=({c[0]:.3f},{c[1]:.3f},{c[2]:.3f}) strength={s:.2f}")
                 else:
                     dll_wrapper.set_int("hdri_tex_index", -1)
             except Exception:
@@ -1405,6 +1414,23 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             dll_wrapper.set_float("ambient_color_r", props.ambient_color[0])
             dll_wrapper.set_float("ambient_color_g", props.ambient_color[1])
             dll_wrapper.set_float("ambient_color_b", props.ambient_color[2])
+        # Sync World background color (from Surface → Background node)
+        try:
+            world = context.scene.world
+            if world and world.node_tree:
+                for wnode in world.node_tree.nodes:
+                    if wnode.type == 'BACKGROUND':
+                        wc = wnode.inputs.get('Color')
+                        ws = wnode.inputs.get('Strength')
+                        if wc and ws:
+                            s = float(ws.default_value)
+                            dll_wrapper.set_float("world_bg_r", float(wc.default_value[0]) * s)
+                            dll_wrapper.set_float("world_bg_g", float(wc.default_value[1]) * s)
+                            dll_wrapper.set_float("world_bg_b", float(wc.default_value[2]) * s)
+                        break
+        except Exception:
+            pass
+
         dll_wrapper.set_float("sky_refl_intensity", props.sky_refl_intensity)
         dll_wrapper.set_float("sky_bounce_intensity", props.sky_bounce_intensity)
         dll_wrapper.set_float("cloud_visibility", props.cloud_visibility)

@@ -788,6 +788,16 @@ def export_world_hdri(depsgraph):
             break
 
     if env_tex_node is None or env_tex_node.image is None:
+        # No HDRI texture — but return the Background color + strength
+        # so the shader can use it as ambient environment instead of hardcoded gray
+        if bg_node:
+            color_inp = bg_node.inputs.get('Color')
+            if color_inp and not color_inp.is_linked:
+                c = color_inp.default_value
+                return {
+                    "bg_color": (float(c[0]), float(c[1]), float(c[2])),
+                    "bg_strength": strength,
+                }
         return None
 
     image = env_tex_node.image

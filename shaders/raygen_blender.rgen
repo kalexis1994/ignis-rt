@@ -271,10 +271,12 @@ vec3 evaluateSky(vec3 dir) {
     // Fallback: procedural sky
     float sunIntensitySky = cam.sunLight.w;
 
-    // No sun in scene → return Blender's default World background color.
-    // Cycles uses RGB(0.05, 0.05, 0.05) — a neutral dark gray that fills
-    // shadows with subtle indirect light via bounced rays.
-    if (sunIntensitySky <= 0.0) return vec3(0.05);
+    // No sun in scene → return World background color from Blender's
+    // World → Surface → Background node (color × strength).
+    // Default is 0.05 gray (set in ignis_config.h when no World exists).
+    if (sunIntensitySky <= 0.0) {
+        return vec3(cam.windParams.z, cam.windParams.w, cam.rainParams.w);
+    }
 
     vec3 sunDir = normalize(cam.sunLight.xyz);
     vec3 ambColor = cam.ambientLight.rgb;
