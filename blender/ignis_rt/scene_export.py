@@ -1000,9 +1000,9 @@ def export_lights(depsgraph):
         estimated_range = max(math.sqrt(energy / 0.01), 1.0) if energy > 0 else 10.0
         estimated_range = min(estimated_range, 100.0)
 
-        # Cycles: point light radiance = strength / (4*PI) / r^2
-        # Our shader: radiance = color * intensity / r^2
-        intensity = energy / math.pi
+        # Point/spot lights emit into the full sphere (4π steradians).
+        # Radiant intensity = power / (4π). Matches Cycles: strength / (4*PI) / r^2.
+        intensity = energy / (4.0 * math.pi)
 
         # Direction and tangent (for area lights)
         # Area light emits along -Z local axis in Blender
