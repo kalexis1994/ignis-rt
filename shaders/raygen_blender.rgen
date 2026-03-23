@@ -145,49 +145,13 @@ layout(binding = 22, set = 0, r32f) uniform image2D dlssDepthImg;
 // Cloud shadow (declared for layout compatibility)
 layout(binding = 23, set = 0) uniform sampler2D cloudShadowMap;
 
-// SHARC radiance cache (Spatial Hash Automatic Radiance Caching)
-// Write buffer: RT writes radiance at bounce hit points this frame
-// Read buffer: resolved cache from previous frames (temporal accumulation)
-layout(binding = 20, set = 0, std430) buffer SHARCWriteBuffer { uint sharcWriteData[]; } sharcWrite;
-layout(binding = 21, set = 0, std430) buffer SHARCReadBuffer  { uint sharcReadData[];  } sharcRead;
+// SHARC radiance cache — NVIDIA official library (buffer_reference access)
+// Buffers accessed via device addresses in CameraUBO, not descriptor bindings.
+// Legacy bindings 20-21 kept for compatibility but accessed via buffer_reference.
+layout(binding = 20, set = 0, std430) buffer SHARCLegacy0 { uint _sharcLegacy0[]; };
+layout(binding = 21, set = 0, std430) buffer SHARCLegacy1 { uint _sharcLegacy1[]; };
 
-#include "sharc.glsl"
-
-// SHARC read: lookup cached radiance at a world position
-// Returns true if cache hit (valid data), false if miss
-bool sharcLookup(vec3 worldPos, out vec3 radiance) {
-    uint key = sharcHash(worldPos);
-    uint idx = (key & SHARC_TABLE_MASK) * 8u;  // 8 uints per entry
-
-    uint storedKey = sharcRead.sharcReadData[idx + 0];
-    uint sampleCount = sharcRead.sharcReadData[idx + 1];
-
-    if (storedKey == key && sampleCount >= SHARC_MIN_SAMPLES) {
-        float invCount = 1.0 / float(sampleCount);
-        radiance = vec3(
-            uintBitsToFloat(sharcRead.sharcReadData[idx + 2]),
-            uintBitsToFloat(sharcRead.sharcReadData[idx + 3]),
-            uintBitsToFloat(sharcRead.sharcReadData[idx + 4])
-        ) * invCount;
-        return true;
-    }
-    radiance = vec3(0.0);
-    return false;
-}
-
-// SHARC write: store radiance at a world position
-// Non-atomic: last writer wins. The resolve shader's EMA smooths over frames.
-void sharcStore(vec3 worldPos, vec3 radiance, uint frameIdx) {
-    uint key = sharcHash(worldPos);
-    uint idx = (key & SHARC_TABLE_MASK) * 8u;
-
-    sharcWrite.sharcWriteData[idx + 0] = key;
-    sharcWrite.sharcWriteData[idx + 1] = 1u;  // sample count
-    sharcWrite.sharcWriteData[idx + 2] = floatBitsToUint(radiance.r);
-    sharcWrite.sharcWriteData[idx + 3] = floatBitsToUint(radiance.g);
-    sharcWrite.sharcWriteData[idx + 4] = floatBitsToUint(radiance.b);
-    sharcWrite.sharcWriteData[idx + 5] = frameIdx;
-}
+#include "include/sharc_setup.glsl"
 
 // GI Reservoir buffers for ReSTIR temporal reuse (3 vec4s per pixel)
 layout(binding = 24, set = 0, std430) buffer GIReservoirCurrBuf { vec4 data[]; } giReservoirCurr;
@@ -694,17 +658,23 @@ void main() {
     float reservoirRng = rand01();
     bool giReservoirEnabled = false;  // disable buffer access
 
-    bool sharcEnabled = false;  // SHARC radiance cache — WIP, disable until stable
+    // SHARC radiance cache — NVIDIA official library
+    SharcParameters sharcParams = buildSharcParams();
+    SharcState sharcState;
+    SharcInit(sharcState);
+    bool sharcUpdatePixel = isSharcUpdatePixel(pixel, frameIndex);
+    bool sharcEnabled = (cam.sharcCapacity > 0u && cam.sharcHashEntriesAddr != 0u);
+    vec3 prevBounceNormal = vec3(0, 1, 0);  // normal from previous bounce for SHARC query
 
     for (int bounce = 0; bounce < maxBounces; bounce++) {
 
-        // ── SHARC cache lookup (bounce 1+): use cached radiance instead of tracing ──
-        // First frames: cache is empty, all misses → traces normally and fills cache.
-        // After a few frames: cache hits replace expensive ray tracing with instant lookups.
+        // ── SHARC cache query (bounce 1+): early path termination ──
         if (sharcEnabled && bounce >= 1) {
+            SharcHitData queryHit;
+            queryHit.positionWorld = rayOrigin;
+            queryHit.normalWorld = prevBounceNormal;
             vec3 cachedRadiance;
-            if (sharcLookup(rayOrigin, cachedRadiance)) {
-                // Cache hit — use cached indirect radiance and stop bouncing
+            if (SharcGetCachedRadiance(sharcParams, queryHit, cachedRadiance, false)) {
                 cachedRadiance *= giIntensity;
                 if (isDiffusePath) {
                     diffuseRadiance += cachedRadiance * throughput;
@@ -723,8 +693,11 @@ void main() {
         while (rayQueryProceedEXT(rq)) {}
 
         if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
-            // Sky miss
+            // Sky miss — notify SHARC for backpropagation
             vec3 skyColor = evaluateSky(rayDir);
+            if (sharcEnabled && sharcUpdatePixel) {
+                SharcUpdateMiss(sharcParams, sharcState, skyColor);
+            }
             if (bounce == 0) {
                 totalRadiance += skyColor * throughput;
             } else {
@@ -1551,47 +1524,23 @@ void main() {
             }
         }
 
-        // ── SHARC cache write: store local surface radiance directly to READ buffer ──
-        // Bypasses the resolve pipeline — each frame's writes are immediately
-        // available for the next frame's reads. Simple and effective.
-        if (sharcEnabled) {
-            vec3 localRadiance = (diffuseRadiance + specularRadiance) - preBounceRadiance;
-            // Remove throughput to get intrinsic surface radiance
-            vec3 invThroughput = vec3(1.0) / max(throughput, vec3(0.001));
-            vec3 surfaceRadiance = localRadiance * invThroughput;
+        // ── SHARC update: sparse pixels write direct lighting to cache ──
+        if (sharcEnabled && sharcUpdatePixel) {
+            vec3 directLighting = (diffuseRadiance + specularRadiance) - preBounceRadiance;
+            // Sanitize
+            if (any(isnan(directLighting)) || any(isinf(directLighting)))
+                directLighting = vec3(0.0);
+            directLighting = max(directLighting, vec3(0.0));
 
-            float lum = dot(surfaceRadiance, vec3(0.2126, 0.7152, 0.0722));
-            if (lum > 0.001 && lum < 100.0 && !any(isnan(surfaceRadiance)) && !any(isinf(surfaceRadiance))) {
-                uint key = sharcHash(pbrHit.worldPos);
-                uint idx = (key & SHARC_TABLE_MASK) * 8u;
+            SharcHitData hitData;
+            hitData.positionWorld = pbrHit.worldPos;
+            hitData.normalWorld = N;
 
-                uint existingKey = sharcRead.sharcReadData[idx + 0];
-                uint existingCount = sharcRead.sharcReadData[idx + 1];
+            bool continueTracing = SharcUpdateHit(sharcParams, sharcState, hitData, directLighting, rand01());
+            if (!continueTracing) break;  // cache already has enough data here
 
-                if (existingKey == key && existingCount > 0u) {
-                    // Same cell — blend with existing (exponential moving average)
-                    float invCount = 1.0 / float(existingCount);
-                    vec3 oldRad = vec3(
-                        uintBitsToFloat(sharcRead.sharcReadData[idx + 2]),
-                        uintBitsToFloat(sharcRead.sharcReadData[idx + 3]),
-                        uintBitsToFloat(sharcRead.sharcReadData[idx + 4])
-                    ) * invCount;
-                    vec3 blended = mix(oldRad, surfaceRadiance, 0.1);  // 10% new
-                    uint newCount = min(existingCount + 1u, 512u);
-                    sharcRead.sharcReadData[idx + 2] = floatBitsToUint(blended.r * float(newCount));
-                    sharcRead.sharcReadData[idx + 3] = floatBitsToUint(blended.g * float(newCount));
-                    sharcRead.sharcReadData[idx + 4] = floatBitsToUint(blended.b * float(newCount));
-                    sharcRead.sharcReadData[idx + 1] = newCount;
-                } else if (existingKey == 0u) {
-                    // Empty cell — write new entry
-                    sharcRead.sharcReadData[idx + 0] = key;
-                    sharcRead.sharcReadData[idx + 1] = 1u;
-                    sharcRead.sharcReadData[idx + 2] = floatBitsToUint(surfaceRadiance.r);
-                    sharcRead.sharcReadData[idx + 3] = floatBitsToUint(surfaceRadiance.g);
-                    sharcRead.sharcReadData[idx + 4] = floatBitsToUint(surfaceRadiance.b);
-                    sharcRead.sharcReadData[idx + 5] = frameIndex;
-                }
-            }
+            // Tell SHARC about the throughput for backpropagation
+            SharcSetThroughput(sharcState, throughput);
         }
 
         // ---- Russian roulette (Cycles-style: sqrt perceptual, min bounce guard) ----
@@ -1713,6 +1662,7 @@ void main() {
 
         // Update ray origin (offset along geometric normal to avoid self-intersection)
         rayOrigin = pbrHit.worldPos + N * 0.002;
+        prevBounceNormal = N;  // store for SHARC query on next bounce
     }
 
     // ---- ReSTIR GI: temporal reuse from previous frame ----
