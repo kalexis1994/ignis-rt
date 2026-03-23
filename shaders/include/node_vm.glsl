@@ -48,9 +48,10 @@ const uint OP_MAP_RANGE      = 0x48u;  // R[dst].x = mapRange(R[srcA].x, fromMin
 const uint OP_SEPARATE_RGB   = 0x50u;  // R[dst].x = R[srcA][channel]  (channel in imm_y)
 const uint OP_COMBINE_RGB    = 0x51u;  // R[dst].rgb = (R[srcA].x, R[srcB].x, R[imm_y & 0xF].x)
 
-// Load immediate
+// Load immediate / special
 const uint OP_LOAD_CONST     = 0x60u;  // R[dst] = vec4(imm_y, imm_z, imm_w, 1)
 const uint OP_LOAD_SCALAR    = 0x61u;  // R[dst].x = imm_y
+const uint OP_LOAD_WORLD_POS = 0x62u;  // R[dst] = vec4(worldPos, 1) — for position-based texturing
 
 // Output targets
 const uint OP_OUTPUT_COLOR   = 0xF0u;  // baseColor = R[srcA].rgb
@@ -113,7 +114,7 @@ struct NodeVmResult {
 };
 
 // ── VM Execution ──
-NodeVmResult executeNodeVm(uint matIdx, vec2 uv) {
+NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos) {
     NodeVmResult result;
     result.baseColor = vec3(0.8);
     result.roughness = 0.5;
@@ -300,6 +301,9 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv) {
         }
         else if (opcode == OP_LOAD_SCALAR) {
             R[dst] = vec4(uintBitsToFloat(instr.y));
+        }
+        else if (opcode == OP_LOAD_WORLD_POS) {
+            R[dst] = vec4(worldPos, 1.0);
         }
 
         // ── Output targets ──

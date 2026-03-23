@@ -338,7 +338,7 @@ PBRHit evaluateBlenderMaterial(
     // When the VM has a program, it handles the ENTIRE material evaluation for
     // the properties it computes. The legacy pipeline only runs for properties
     // the VM doesn't override, preventing double-processing.
-    NodeVmResult vm = executeNodeVm(matIdx, uv);
+    NodeVmResult vm = executeNodeVm(matIdx, uv, worldPos);
     bool vmActive = (mat.nodeVmHeader & 0xFFu) > 0u;
 
     // Base color + alpha: VM or legacy pipeline

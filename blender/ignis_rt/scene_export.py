@@ -1425,6 +1425,7 @@ _OP_OUTPUT_ROUGH   = 0xF1
 _OP_OUTPUT_METAL   = 0xF2
 _OP_OUTPUT_EMISSION= 0xF3
 _OP_OUTPUT_ALPHA   = 0xF4
+_OP_LOAD_WORLD_POS = 0x62
 _OP_OUTPUT_IOR     = 0xF6
 _OP_OUTPUT_TRANSMISSION = 0xF7
 
@@ -1774,6 +1775,90 @@ class _NodeVmCompiler:
             inp = from_node.inputs[0] if from_node.inputs else None
             return self._compile_uv_chain(inp, _depth + 1) if inp else 0
 
+        # Geometry node (Position output) — use world position for texturing
+        if from_node.type == 'NEW_GEOMETRY':
+            dst = self._alloc_reg()
+            self._emit(_OP_LOAD_WORLD_POS, dst)
+            return dst
+
+        # Combine XYZ — reconstruct vector from 3 scalar inputs
+        # Common pattern: Separate XYZ → Math(mul) → Combine XYZ (scaled world pos)
+        if from_node.type in ('COMBXYZ', 'COMBINE_XYZ'):
+            x_inp = from_node.inputs.get('X') or from_node.inputs[0]
+            y_inp = from_node.inputs.get('Y') or from_node.inputs[1]
+            z_inp = from_node.inputs.get('Z') or from_node.inputs[2]
+
+            # Check if all 3 follow the pattern: Math(MULTIPLY, axis, scale)
+            # which means it's just worldPos * scale
+            scale = [1.0, 1.0, 1.0]
+            uses_world_pos = True
+            for i, inp in enumerate([x_inp, y_inp, z_inp]):
+                if inp and inp.is_linked:
+                    math_node = inp.links[0].from_node
+                    if math_node.type == 'MATH' and getattr(math_node, 'operation', '') == 'MULTIPLY':
+                        # One input should trace back to Geometry.Position (via Separate XYZ)
+                        # The other is the scale factor
+                        for mi, m_inp in enumerate(math_node.inputs[:2]):
+                            if m_inp.is_linked:
+                                src = m_inp.links[0].from_node
+                                if src.type in ('SEPXYZ', 'SEPARATE_XYZ'):
+                                    # This is the position component — check the other input for scale
+                                    other = math_node.inputs[1 - mi]
+                                    if other.is_linked:
+                                        scale_src = other.links[0].from_node
+                                        if scale_src.type == 'REROUTE':
+                                            # Follow reroute chain
+                                            r = scale_src
+                                            for _ in range(8):
+                                                if r.type == 'REROUTE' and r.inputs[0].is_linked:
+                                                    r = r.inputs[0].links[0].from_node
+                                                else:
+                                                    break
+                                            if r.type == 'MATH':
+                                                # Math node producing the scale
+                                                scale[i] = _resolve_scalar_input(other, 1.0)
+                                            elif r.type == 'VALUE':
+                                                scale[i] = float(r.outputs[0].default_value)
+                                            else:
+                                                scale[i] = _resolve_scalar_input(other, 1.0)
+                                        else:
+                                            scale[i] = _resolve_scalar_input(other, 1.0)
+                                    else:
+                                        scale[i] = float(other.default_value)
+                                    break
+                        else:
+                            uses_world_pos = False
+                    else:
+                        uses_world_pos = False
+                else:
+                    uses_world_pos = False
+
+            if uses_world_pos:
+                # Emit: R[dst] = worldPos * scale
+                pos_reg = self._alloc_reg()
+                self._emit(_OP_LOAD_WORLD_POS, pos_reg)
+                scale_reg = self._alloc_reg()
+                self._emit(_OP_LOAD_CONST, scale_reg,
+                           imm_y=_floatBits(scale[0]),
+                           imm_z=_floatBits(scale[1]),
+                           imm_w=_floatBits(scale[2]))
+                dst = self._alloc_reg()
+                self._emit(_OP_MULTIPLY, dst, srcA=pos_reg, srcB=scale_reg)
+                return dst
+
+            # Fallback: compile each input separately
+            return self._compile_uv_chain(x_inp, _depth + 1) if x_inp else 0
+
+        # Separate XYZ — typically means Geometry.Position was separated
+        if from_node.type in ('SEPXYZ', 'SEPARATE_XYZ'):
+            vec_inp = from_node.inputs.get('Vector') or from_node.inputs[0]
+            return self._compile_uv_chain(vec_inp, _depth + 1) if vec_inp else 0
+
+        # Math node in UV chain — follow first input
+        if from_node.type == 'MATH':
+            inp = from_node.inputs[0] if from_node.inputs else None
+            return self._compile_uv_chain(inp, _depth + 1) if inp else 0
+
         return 0
 
     def _compile_scalar_input(self, socket, default=0.5, _depth=0):
@@ -1791,6 +1876,36 @@ class _NodeVmCompiler:
 
         # Linked — compile the node chain (reuses color compiler)
         return self._compile_node(socket, _depth)
+
+    def _has_nontrivial_mapping(self, tex_node):
+        """Check if an Image Texture node has a Mapping with rotation or non-UV source."""
+        vec_inp = tex_node.inputs.get('Vector')
+        if not vec_inp or not vec_inp.is_linked:
+            return False
+        node = vec_inp.links[0].from_node
+        # Follow reroutes
+        while node.type == 'REROUTE' and node.inputs[0].is_linked:
+            node = node.inputs[0].links[0].from_node
+        if node.type == 'MAPPING':
+            rot = node.inputs.get('Rotation')
+            if rot and (abs(rot.default_value[0]) > 0.001 or
+                        abs(rot.default_value[1]) > 0.001 or
+                        abs(rot.default_value[2]) > 0.001):
+                return True
+            loc = node.inputs.get('Location')
+            if loc and (abs(loc.default_value[0]) > 0.001 or
+                        abs(loc.default_value[1]) > 0.001):
+                return True
+            # Check if Mapping is fed by Geometry.Position (not UV)
+            v_inp = node.inputs.get('Vector')
+            if v_inp and v_inp.is_linked:
+                src = v_inp.links[0].from_node
+                if src.type == 'NEW_GEOMETRY':
+                    return True
+        # Non-UV source (Geometry, Object, etc.)
+        if node.type == 'NEW_GEOMETRY':
+            return True
+        return False
 
     def _has_colorramp_in_chain(self, socket, _depth=0):
         """Check if there's a ColorRamp between a socket and an Image Texture."""
@@ -1822,8 +1937,10 @@ class _NodeVmCompiler:
             inp = principled_node.inputs.get(input_name)
             if inp and inp.is_linked:
                 from_node = inp.links[0].from_node
-                # Direct Image Texture is handled by legacy pipeline
+                # Direct Image Texture — check if it has a non-trivial Mapping node
                 if from_node.type == 'TEX_IMAGE':
+                    if self._has_nontrivial_mapping(from_node):
+                        needs_vm = True
                     continue
                 # Any intermediate node → need VM
                 needs_vm = True
