@@ -21,8 +21,12 @@ vec4 NRD_PackNormalRoughness(vec3 N, float roughness) {
 
 // Pack radiance + hit distance for NRD input
 vec4 NRD_PackRadiance(vec3 radiance, float hitDist) {
-    radiance = clamp(radiance, vec3(0.0), vec3(MAX_RADIANCE));
+    // Sanitize: NaN/Inf from degenerate paths would poison the denoiser
+    radiance = max(radiance, vec3(0.0));
+    if (any(isnan(radiance)) || any(isinf(radiance))) radiance = vec3(0.0);
+    radiance = min(radiance, vec3(MAX_RADIANCE));
     hitDist = clamp(hitDist, 0.0, 65504.0);
+    if (isnan(hitDist) || isinf(hitDist)) hitDist = 0.0;
     return vec4(radiance, hitDist);
 }
 

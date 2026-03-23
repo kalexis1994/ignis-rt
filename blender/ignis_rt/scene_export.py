@@ -788,6 +788,16 @@ def export_world_hdri(depsgraph):
             break
 
     if env_tex_node is None or env_tex_node.image is None:
+        # No HDRI texture — but return the Background color + strength
+        # so the shader can use it as ambient environment instead of hardcoded gray
+        if bg_node:
+            color_inp = bg_node.inputs.get('Color')
+            if color_inp and not color_inp.is_linked:
+                c = color_inp.default_value
+                return {
+                    "bg_color": (float(c[0]), float(c[1]), float(c[2])),
+                    "bg_strength": strength,
+                }
         return None
 
     image = env_tex_node.image
@@ -990,9 +1000,9 @@ def export_lights(depsgraph):
         estimated_range = max(math.sqrt(energy / 0.01), 1.0) if energy > 0 else 10.0
         estimated_range = min(estimated_range, 100.0)
 
-        # Cycles: point light radiance = strength / (4*PI) / r^2
-        # Our shader: radiance = color * intensity / r^2
-        intensity = energy / math.pi
+        # Point/spot lights emit into the full sphere (4π steradians).
+        # Radiant intensity = power / (4π). Matches Cycles: strength / (4*PI) / r^2.
+        intensity = energy / (4.0 * math.pi)
 
         # Direction and tangent (for area lights)
         # Area light emits along -Z local axis in Blender
@@ -1013,8 +1023,15 @@ def export_lights(depsgraph):
         size_y = 0.0
 
         if light.type == 'AREA':
-            size_x = light.size if hasattr(light, 'size') else 1.0
-            size_y = light.size_y if light.shape in ('RECTANGLE', 'ELLIPSE') else size_x
+            # Cycles multiplies light dimensions by object scale (from matrix_world).
+            # Extract scale from the transform's basis vectors, like Cycles does:
+            # extentu = transform_column(tfm, 0) * sizeu → len_u = length(extentu)
+            scale_x = mat_w.col[0].xyz.length
+            scale_y = mat_w.col[1].xyz.length
+            base_size_x = light.size if hasattr(light, 'size') else 1.0
+            base_size_y = light.size_y if light.shape in ('RECTANGLE', 'ELLIPSE') else base_size_x
+            size_x = base_size_x * scale_x
+            size_y = base_size_y * scale_y
             # Negative range signals area light to shader
             export_range = -max(size_x, size_y) * 0.5
             # Cycles area light: energy is total power (Watts).
@@ -1039,13 +1056,7 @@ def export_lights(depsgraph):
         else:
             export_range = estimated_range
 
-        print(f"[ignis_rt] export_light: '{obj.name}' type={light.type} "
-              f"pos=({vk_x:.2f},{vk_y:.2f},{vk_z:.2f}) "
-              f"energy={energy:.1f}W intensity={intensity:.2f} "
-              f"range={estimated_range:.1f} "
-              f"dir=({dir_x:.2f},{dir_y:.2f},{dir_z:.2f}) "
-              f"size=({size_x:.2f},{size_y:.2f}) "
-              f"color=({color[0]:.2f},{color[1]:.2f},{color[2]:.2f})")
+        # Light export logging removed (was too verbose for scenes with many lights)
 
         lights.extend([
             vk_x, vk_y, vk_z, export_range,
@@ -1392,16 +1403,715 @@ def export_emissive_triangles(depsgraph):
     return result
 
 
-# ---- GPUMaterial struct layout (140 bytes, scalar) ----
+# ============================================================================
+# Node VM Compiler — translates Blender node trees to bytecode
+# ============================================================================
+
+import struct as _struct
+
+def _floatBits(f):
+    """Convert float to uint32 (matching GLSL floatBitsToUint)."""
+    return _struct.unpack('<I', _struct.pack('<f', float(f)))[0]
+
+# Opcode constants (must match node_vm.glsl)
+_OP_NOP            = 0x00
+_OP_SAMPLE_TEX     = 0x01
+_OP_UV_TRANSFORM   = 0x10
+_OP_UV_ROTATE      = 0x11
+_OP_MIX            = 0x20
+_OP_MIX_REG        = 0x21
+_OP_MULTIPLY       = 0x22
+_OP_ADD            = 0x23
+_OP_SUBTRACT       = 0x24
+_OP_SCREEN         = 0x25
+_OP_OVERLAY        = 0x26
+_OP_INVERT         = 0x28
+_OP_GAMMA          = 0x29
+_OP_BRIGHT_CONTRAST= 0x2A
+_OP_HUE_SAT_VAL    = 0x2B
+_OP_COLORRAMP      = 0x30
+_OP_RAMP_DATA      = 0x31
+_OP_LUMINANCE      = 0x40
+_OP_MATH_MUL       = 0x42
+_OP_MATH_CLAMP     = 0x47
+_OP_SEPARATE_RGB   = 0x50
+_OP_LOAD_CONST     = 0x60
+_OP_LOAD_SCALAR    = 0x61
+_OP_OUTPUT_COLOR   = 0xF0
+_OP_OUTPUT_ROUGH   = 0xF1
+_OP_OUTPUT_METAL   = 0xF2
+_OP_OUTPUT_EMISSION= 0xF3
+_OP_OUTPUT_ALPHA   = 0xF4
+_OP_TEX_CHECKER    = 0x58
+_OP_LOAD_WORLD_POS = 0x62
+_OP_OUTPUT_UV      = 0xEF
+_OP_OUTPUT_IOR     = 0xF6
+_OP_OUTPUT_TRANSMISSION = 0xF7
+
+
+def _make_instr(opcode, dst=0, srcA=0, srcB=0, imm_y=0, imm_z=0, imm_w=0):
+    """Pack one VM instruction as a 4-tuple of uint32."""
+    x = (opcode & 0xFF) | ((dst & 0xF) << 8) | ((srcA & 0xF) << 16) | ((srcB & 0xF) << 24)
+    return (x, imm_y, imm_z, imm_w)
+
+
+class _NodeVmCompiler:
+    """Compiles a Blender Principled BSDF node tree into VM bytecode."""
+
+    def __init__(self, register_image_fn):
+        self.instructions = []
+        self.register_image = register_image_fn
+        self.next_reg = 1  # R0 = UV
+        self.node_reg_cache = {}  # id(node) → register
+
+    def _alloc_reg(self):
+        r = self.next_reg
+        self.next_reg = min(self.next_reg + 1, 15)
+        return r
+
+    def _emit(self, opcode, dst=0, srcA=0, srcB=0, imm_y=0, imm_z=0, imm_w=0):
+        if len(self.instructions) < 32:
+            self.instructions.append(_make_instr(opcode, dst, srcA, srcB, imm_y, imm_z, imm_w))
+        return dst
+
+    def _compile_node(self, socket, _depth=0):
+        """Compile the node chain feeding into a socket. Returns register index."""
+        if socket is None or _depth > 8:
+            r = self._alloc_reg()
+            self._emit(_OP_LOAD_CONST, r, imm_y=_floatBits(0.8),
+                       imm_z=_floatBits(0.8), imm_w=_floatBits(0.8))
+            return r
+
+        if not socket.is_linked:
+            # Constant value
+            r = self._alloc_reg()
+            v = socket.default_value
+            if hasattr(v, '__len__') and len(v) >= 3:
+                self._emit(_OP_LOAD_CONST, r, imm_y=_floatBits(v[0]),
+                           imm_z=_floatBits(v[1]), imm_w=_floatBits(v[2]))
+            else:
+                self._emit(_OP_LOAD_SCALAR, r, imm_y=_floatBits(float(v)))
+            return r
+
+        from_node = socket.links[0].from_node
+        node_id = id(from_node)
+
+        # Check cache — avoid re-compiling the same node
+        if node_id in self.node_reg_cache:
+            return self.node_reg_cache[node_id]
+
+        dst = self._alloc_reg()
+
+        # ── Image Texture ──
+        if from_node.type == 'TEX_IMAGE':
+            if from_node.image:
+                tex_idx = self.register_image(from_node.image)
+                if tex_idx != _NO_TEX:
+                    # Check for Mapping node on Vector input
+                    uv_reg = 0  # default UV
+                    vec_inp = from_node.inputs.get('Vector')
+                    if vec_inp and vec_inp.is_linked:
+                        uv_reg = self._compile_uv_chain(vec_inp, _depth + 1)
+                    self._emit(_OP_SAMPLE_TEX, dst, srcA=uv_reg, imm_z=tex_idx)
+                    self.node_reg_cache[node_id] = dst
+                    return dst
+            # Fallback: gray
+            self._emit(_OP_LOAD_CONST, dst, imm_y=_floatBits(0.5),
+                       imm_z=_floatBits(0.5), imm_w=_floatBits(0.5))
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+        # ── ColorRamp ──
+        if from_node.type == 'VALTORGB':
+            # Compile the factor input
+            fac_inp = from_node.inputs.get('Fac')
+            fac_reg = self._compile_node(fac_inp, _depth + 1)
+            # Need luminance if factor comes from a color
+            if fac_inp and fac_inp.is_linked and fac_inp.links[0].from_socket.type in ('RGBA', 'VECTOR'):
+                lum_reg = self._alloc_reg()
+                self._emit(_OP_LUMINANCE, lum_reg, srcA=fac_reg)
+                fac_reg = lum_reg
+
+            ramp = from_node.color_ramp
+            elements = sorted(ramp.elements, key=lambda e: e.position)
+            stop_count = min(len(elements), 8)
+
+            self._emit(_OP_COLORRAMP, dst, srcA=fac_reg, imm_y=stop_count)
+
+            # Emit ramp data instructions (1 per stop: pos, R, G, B)
+            for el in elements[:8]:
+                self._emit(_OP_RAMP_DATA, imm_y=_floatBits(el.position),
+                           imm_z=_floatBits(el.color[0]),
+                           imm_w=_floatBits(el.color[1]))
+                # Pack blue into x field of a second approach — actually we have 4 uints per instr
+                # Let me redefine: each RAMP_DATA carries pos, R, G, B in y,z,w and x=opcode
+                # Wait, x has opcode+dst+srcA+srcB. For data instructions, we can put B in srcB bits
+                # Actually, let's use the instruction format properly:
+                # x = OP_RAMP_DATA | (0 << 8), y = pos, z = R, w = G
+                # But we need B too. Pack R,G,B into y,z,w by redefining the data format.
+                # Actually the node_vm.glsl reads: pos from d.x, R from d.y, G from d.z, B from d.w
+                # So we need: x=floatBits(pos), y=floatBits(R), z=floatBits(G), w=floatBits(B)
+                # But x also has the opcode... Let me fix this.
+                pass
+
+            # I need to fix the ramp data format. Let me redesign:
+            # The GLSL reads: uvec4 di = nodeVmCode[dataOffset + i]
+            # di.x = pos (float as uint), di.y = R, di.z = G, di.w = B
+            # But the instruction format packs opcode into di.x!
+            # Solution: for RAMP_DATA, use x as raw float (pos), not as opcode+regs
+            # The VM skips these via pc advance, so the opcode field doesn't matter.
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+        # ── RGB Constant ──
+        if from_node.type == 'RGB':
+            out = from_node.outputs.get('Color')
+            if out:
+                c = out.default_value
+                self._emit(_OP_LOAD_CONST, dst, imm_y=_floatBits(c[0]),
+                           imm_z=_floatBits(c[1]), imm_w=_floatBits(c[2]))
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+        # ── Blackbody ──
+        if from_node.type == 'BLACKBODY':
+            temp_inp = from_node.inputs.get('Temperature')
+            temp = float(temp_inp.default_value) if temp_inp else 5000.0
+            rgb = _blackbody_to_rgb(temp)
+            self._emit(_OP_LOAD_CONST, dst, imm_y=_floatBits(rgb[0]),
+                       imm_z=_floatBits(rgb[1]), imm_w=_floatBits(rgb[2]))
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+        # ── MixRGB / Mix ──
+        if from_node.type in ('MIX_RGB', 'MIX'):
+            fac_inp = from_node.inputs.get('Fac') or from_node.inputs[0]
+            if from_node.type == 'MIX':
+                rgba_inputs = [inp for inp in from_node.inputs if inp.type == 'RGBA']
+                c1_inp = rgba_inputs[0] if len(rgba_inputs) > 0 else None
+                c2_inp = rgba_inputs[1] if len(rgba_inputs) > 1 else None
+            else:
+                c1_inp = from_node.inputs.get('Color1')
+                c2_inp = from_node.inputs.get('Color2')
+
+            c1_reg = self._compile_node(c1_inp, _depth + 1)
+            c2_reg = self._compile_node(c2_inp, _depth + 1)
+
+            blend_type = getattr(from_node, 'blend_type', 'MIX')
+
+            # Get factor value
+            fac_is_linked = fac_inp and fac_inp.is_linked
+            fac_val = float(fac_inp.default_value) if (fac_inp and not fac_is_linked) else 0.5
+
+            # Cycles formula: result = mix(A, blend(A,B), factor)
+            # With factor=0 → result = A (unchanged) for ALL blend modes.
+            # Only compile the blend op if factor > 0.
+            if not fac_is_linked and abs(fac_val) < 0.001:
+                # Factor is zero — result is just A, skip blend entirely
+                self.node_reg_cache[node_id] = c1_reg
+                return c1_reg
+
+            if blend_type == 'MIX':
+                if fac_is_linked:
+                    fac_reg = self._compile_node(fac_inp, _depth + 1)
+                    self._emit(_OP_MIX_REG, dst, srcA=c1_reg, srcB=c2_reg, imm_y=fac_reg)
+                else:
+                    self._emit(_OP_MIX, dst, srcA=c1_reg, srcB=c2_reg, imm_y=_floatBits(fac_val))
+            else:
+                # Non-MIX blends: compute blend(A,B), then mix(A, blended, fac)
+                blended_reg = self._alloc_reg()
+                if blend_type == 'MULTIPLY':
+                    self._emit(_OP_MULTIPLY, blended_reg, srcA=c1_reg, srcB=c2_reg)
+                elif blend_type == 'ADD':
+                    self._emit(_OP_ADD, blended_reg, srcA=c1_reg, srcB=c2_reg)
+                elif blend_type == 'SUBTRACT':
+                    self._emit(_OP_SUBTRACT, blended_reg, srcA=c1_reg, srcB=c2_reg)
+                elif blend_type == 'SCREEN':
+                    self._emit(_OP_SCREEN, blended_reg, srcA=c1_reg, srcB=c2_reg)
+                elif blend_type == 'OVERLAY':
+                    self._emit(_OP_OVERLAY, blended_reg, srcA=c1_reg, srcB=c2_reg)
+                else:
+                    blended_reg = c2_reg  # fallback to B
+
+                # mix(A, blended, factor) — Cycles always applies factor
+                if fac_is_linked:
+                    fac_reg = self._compile_node(fac_inp, _depth + 1)
+                    self._emit(_OP_MIX_REG, dst, srcA=c1_reg, srcB=blended_reg, imm_y=fac_reg)
+                else:
+                    self._emit(_OP_MIX, dst, srcA=c1_reg, srcB=blended_reg, imm_y=_floatBits(fac_val))
+
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+        # ── Invert ──
+        if from_node.type == 'INVERT':
+            fac = _resolve_scalar_input(from_node.inputs.get('Fac'), 1.0)
+            col_reg = self._compile_node(from_node.inputs.get('Color'), _depth + 1)
+            self._emit(_OP_INVERT, dst, srcA=col_reg, imm_y=_floatBits(fac))
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+        # ── Gamma ──
+        if from_node.type == 'GAMMA':
+            col_reg = self._compile_node(from_node.inputs.get('Color'), _depth + 1)
+            gamma = _resolve_scalar_input(from_node.inputs.get('Gamma'), 1.0)
+            self._emit(_OP_GAMMA, dst, srcA=col_reg, imm_y=_floatBits(gamma))
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+        # ── Bright/Contrast ──
+        if from_node.type == 'BRIGHTCONTRAST':
+            col_reg = self._compile_node(from_node.inputs.get('Color'), _depth + 1)
+            bright = _resolve_scalar_input(from_node.inputs.get('Bright'), 0.0)
+            contrast = _resolve_scalar_input(from_node.inputs.get('Contrast'), 0.0)
+            self._emit(_OP_BRIGHT_CONTRAST, dst, srcA=col_reg,
+                       imm_y=_floatBits(bright), imm_z=_floatBits(contrast))
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+        # ── Hue/Saturation/Value ──
+        if from_node.type == 'HUE_SAT':
+            col_reg = self._compile_node(from_node.inputs.get('Color'), _depth + 1)
+            hue = _resolve_scalar_input(from_node.inputs.get('Hue'), 0.5)
+            sat = _resolve_scalar_input(from_node.inputs.get('Saturation'), 1.0)
+            val = _resolve_scalar_input(from_node.inputs.get('Value'), 1.0)
+            self._emit(_OP_HUE_SAT_VAL, dst, srcA=col_reg,
+                       imm_y=_floatBits(hue), imm_z=_floatBits(sat), imm_w=_floatBits(val))
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+        # ── Separate RGB ──
+        if from_node.type in ('SEPRGB', 'SEPARATE_COLOR'):
+            col_reg = self._compile_node(from_node.inputs[0], _depth + 1)
+            # Which output socket was linked? Check the from_socket name
+            from_socket = socket.links[0].from_socket
+            ch = {'Red': 0, 'Green': 1, 'Blue': 2, 'R': 0, 'G': 1, 'B': 2}.get(from_socket.name, 0)
+            self._emit(_OP_SEPARATE_RGB, dst, srcA=col_reg, imm_y=ch)
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+        # ── RGB to BW ──
+        if from_node.type == 'RGBTOBW':
+            col_reg = self._compile_node(from_node.inputs.get('Color'), _depth + 1)
+            self._emit(_OP_LUMINANCE, dst, srcA=col_reg)
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+        # ── Value node ──
+        if from_node.type == 'VALUE':
+            out = from_node.outputs.get('Value')
+            val = float(out.default_value) if out else 0.0
+            self._emit(_OP_LOAD_SCALAR, dst, imm_y=_floatBits(val))
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+        # ── Math node ──
+        if from_node.type == 'MATH':
+            a_reg = self._compile_node(from_node.inputs[0], _depth + 1)
+            b_reg = self._compile_node(from_node.inputs[1], _depth + 1) if len(from_node.inputs) > 1 else a_reg
+            op = from_node.operation
+            math_ops = {
+                'ADD': 0x41, 'MULTIPLY': 0x42, 'DIVIDE': 0x43,
+                'POWER': 0x44, 'MINIMUM': 0x45, 'MAXIMUM': 0x46,
+            }
+            opcode = math_ops.get(op, 0x42)  # default to multiply
+            self._emit(opcode, dst, srcA=a_reg, srcB=b_reg)
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+        # ── Checker Texture (procedural) ──
+        if from_node.type == 'TEX_CHECKER':
+            # Get UV input
+            vec_inp = from_node.inputs.get('Vector')
+            uv_reg = 0  # default UV
+            if vec_inp and vec_inp.is_linked:
+                uv_reg = self._compile_uv_chain(vec_inp, _depth + 1)
+
+            # Scale
+            scale_inp = from_node.inputs.get('Scale')
+            scale_val = float(scale_inp.default_value) if scale_inp else 5.0
+
+            # Colors
+            c1_inp = from_node.inputs.get('Color1')
+            c2_inp = from_node.inputs.get('Color2')
+            c1 = (0.8, 0.8, 0.8) if not c1_inp else (c1_inp.default_value[0], c1_inp.default_value[1], c1_inp.default_value[2])
+            c2 = (0.2, 0.2, 0.2) if not c2_inp else (c2_inp.default_value[0], c2_inp.default_value[1], c2_inp.default_value[2])
+
+            # Load color1 into a register
+            c1_reg = self._alloc_reg()
+            self._emit(_OP_LOAD_CONST, c1_reg, imm_y=_floatBits(c1[0]),
+                       imm_z=_floatBits(c1[1]), imm_w=_floatBits(c1[2]))
+
+            # OP_TEX_CHECKER: dst=result, srcA=uv, srcB=color1, imm_y=scale, imm_z=c2.r, imm_w=c2.g
+            # (c2.b is 0 for now — pack limitation)
+            self._emit(_OP_TEX_CHECKER, dst, srcA=uv_reg, srcB=c1_reg,
+                       imm_y=_floatBits(scale_val),
+                       imm_z=_floatBits(c2[0]), imm_w=_floatBits(c2[1]))
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+        # ── Other procedural textures — compile as constant fallback ──
+        if from_node.type in ('TEX_NOISE', 'TEX_VORONOI', 'TEX_MUSGRAVE',
+                               'TEX_WAVE', 'TEX_GRADIENT', 'TEX_MAGIC', 'TEX_BRICK',
+                               'TEX_SKY', 'TEX_ENVIRONMENT',
+                               'AMBIENT_OCCLUSION'):
+            self._emit(_OP_LOAD_CONST, dst, imm_y=_floatBits(0.5),
+                       imm_z=_floatBits(0.5), imm_w=_floatBits(0.5))
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+        # ── Fallback: try to follow first linked color input ──
+        for inp in from_node.inputs:
+            if inp.is_linked and inp.type in ('RGBA', 'VALUE', 'VECTOR'):
+                result = self._compile_node(inp, _depth + 1)
+                self.node_reg_cache[node_id] = result
+                return result
+
+        # Ultimate fallback
+        self._emit(_OP_LOAD_CONST, dst, imm_y=_floatBits(0.8),
+                   imm_z=_floatBits(0.8), imm_w=_floatBits(0.8))
+        self.node_reg_cache[node_id] = dst
+        return dst
+
+    def _compile_uv_chain(self, socket, _depth=0):
+        """Compile UV manipulation chain (Mapping, Texture Coordinate)."""
+        if not socket or not socket.is_linked or _depth > 8:
+            return 0  # default UV register
+
+        from_node = socket.links[0].from_node
+
+        if from_node.type == 'MAPPING':
+            # Get UV input
+            vec_inp = from_node.inputs.get('Vector')
+            uv_reg = self._compile_uv_chain(vec_inp, _depth + 1) if vec_inp else 0
+
+            loc = from_node.inputs.get('Location')
+            rot = from_node.inputs.get('Rotation')
+            scale = from_node.inputs.get('Scale')
+
+            loc_v = loc.default_value if loc else (0, 0, 0)
+            rot_v = rot.default_value if rot else (0, 0, 0)
+            scale_v = scale.default_value if scale else (1, 1, 1)
+
+            # Cycles Mapping types:
+            # POINT:   result = Rotation * (UV * Scale) + Location
+            # TEXTURE: result = Rotation^T * (UV - Location) / Scale
+            # VECTOR:  result = Rotation * (UV * Scale)
+            # NORMAL:  result = normalize(Rotation * (UV / Scale))
+            mapping_type = getattr(from_node, 'vector_type', 'POINT')
+            if mapping_type == 'TEXTURE':
+                # TEXTURE mode: divide by scale, subtract location, inverse rotation
+                eff_scale_x = 1.0 / scale_v[0] if abs(scale_v[0]) > 1e-6 else 1.0
+                eff_scale_y = 1.0 / scale_v[1] if abs(scale_v[1]) > 1e-6 else 1.0
+                eff_loc_x = -loc_v[0]
+                eff_loc_y = -loc_v[1]
+                eff_rot = -rot_v[2]  # inverse rotation
+            else:
+                # POINT mode: result = Rotation * (UV * Scale) + Location
+                eff_scale_x = scale_v[0]
+                eff_scale_y = scale_v[1]
+                eff_loc_x = loc_v[0]
+                eff_loc_y = loc_v[1]
+                eff_rot = rot_v[2]
+
+            has_scale = abs(eff_scale_x - 1.0) > 0.001 or abs(eff_scale_y - 1.0) > 0.001
+            has_loc = abs(eff_loc_x) > 0.001 or abs(eff_loc_y) > 0.001
+            has_rot = abs(eff_rot) > 0.001
+
+            dst = self._alloc_reg()
+
+            if has_scale or has_loc:
+                self._emit(_OP_UV_TRANSFORM, dst, srcA=uv_reg,
+                           imm_y=_floatBits(eff_scale_x),
+                           imm_z=_floatBits(eff_scale_y),
+                           imm_w=_floatBits(eff_loc_x))
+                uv_reg = dst
+
+            if has_rot:
+                rot_dst = self._alloc_reg() if (has_scale or has_loc) else dst
+                self._emit(_OP_UV_ROTATE, rot_dst, srcA=uv_reg,
+                           imm_y=_floatBits(eff_rot))
+                return rot_dst
+
+            return dst if (has_scale or has_loc) else uv_reg
+
+        if from_node.type == 'TEX_COORD':
+            return 0  # default UVs
+
+        # Reroute — follow through
+        if from_node.type == 'REROUTE':
+            inp = from_node.inputs[0] if from_node.inputs else None
+            return self._compile_uv_chain(inp, _depth + 1) if inp else 0
+
+        # Geometry node (Position output) — use world position for texturing
+        if from_node.type == 'NEW_GEOMETRY':
+            dst = self._alloc_reg()
+            self._emit(_OP_LOAD_WORLD_POS, dst)
+            return dst
+
+        # Combine XYZ — reconstruct vector from 3 scalar inputs
+        # Common pattern: Separate XYZ → Math(mul) → Combine XYZ (scaled world pos)
+        if from_node.type in ('COMBXYZ', 'COMBINE_XYZ'):
+            x_inp = from_node.inputs.get('X') or from_node.inputs[0]
+            y_inp = from_node.inputs.get('Y') or from_node.inputs[1]
+            z_inp = from_node.inputs.get('Z') or from_node.inputs[2]
+
+            # Check if all 3 follow the pattern: Math(MULTIPLY, axis, scale)
+            # which means it's just worldPos * scale
+            scale = [1.0, 1.0, 1.0]
+            uses_world_pos = True
+            for i, inp in enumerate([x_inp, y_inp, z_inp]):
+                if inp and inp.is_linked:
+                    math_node = inp.links[0].from_node
+                    if math_node.type == 'MATH' and getattr(math_node, 'operation', '') == 'MULTIPLY':
+                        # One input should trace back to Geometry.Position (via Separate XYZ)
+                        # The other is the scale factor
+                        for mi, m_inp in enumerate(math_node.inputs[:2]):
+                            if m_inp.is_linked:
+                                src = m_inp.links[0].from_node
+                                if src.type in ('SEPXYZ', 'SEPARATE_XYZ'):
+                                    # This is the position component — check the other input for scale
+                                    other = math_node.inputs[1 - mi]
+                                    if other.is_linked:
+                                        scale_src = other.links[0].from_node
+                                        if scale_src.type == 'REROUTE':
+                                            # Follow reroute chain
+                                            r = scale_src
+                                            for _ in range(8):
+                                                if r.type == 'REROUTE' and r.inputs[0].is_linked:
+                                                    r = r.inputs[0].links[0].from_node
+                                                else:
+                                                    break
+                                            if r.type == 'MATH':
+                                                # Math node producing the scale
+                                                scale[i] = _resolve_scalar_input(other, 1.0)
+                                            elif r.type == 'VALUE':
+                                                scale[i] = float(r.outputs[0].default_value)
+                                            else:
+                                                scale[i] = _resolve_scalar_input(other, 1.0)
+                                        else:
+                                            scale[i] = _resolve_scalar_input(other, 1.0)
+                                    else:
+                                        scale[i] = float(other.default_value)
+                                    break
+                        else:
+                            uses_world_pos = False
+                    else:
+                        uses_world_pos = False
+                else:
+                    uses_world_pos = False
+
+            if uses_world_pos:
+                # Emit: R[dst] = worldPos * scale
+                pos_reg = self._alloc_reg()
+                self._emit(_OP_LOAD_WORLD_POS, pos_reg)
+                scale_reg = self._alloc_reg()
+                self._emit(_OP_LOAD_CONST, scale_reg,
+                           imm_y=_floatBits(scale[0]),
+                           imm_z=_floatBits(scale[1]),
+                           imm_w=_floatBits(scale[2]))
+                dst = self._alloc_reg()
+                self._emit(_OP_MULTIPLY, dst, srcA=pos_reg, srcB=scale_reg)
+                return dst
+
+            # Fallback: compile each input separately
+            return self._compile_uv_chain(x_inp, _depth + 1) if x_inp else 0
+
+        # Separate XYZ — typically means Geometry.Position was separated
+        if from_node.type in ('SEPXYZ', 'SEPARATE_XYZ'):
+            vec_inp = from_node.inputs.get('Vector') or from_node.inputs[0]
+            return self._compile_uv_chain(vec_inp, _depth + 1) if vec_inp else 0
+
+        # Math node in UV chain — follow first input
+        if from_node.type == 'MATH':
+            inp = from_node.inputs[0] if from_node.inputs else None
+            return self._compile_uv_chain(inp, _depth + 1) if inp else 0
+
+        return 0
+
+    def _compile_scalar_input(self, socket, default=0.5, _depth=0):
+        """Compile a scalar socket (Roughness, Metallic, etc.)."""
+        if socket is None or _depth > 8:
+            r = self._alloc_reg()
+            self._emit(_OP_LOAD_SCALAR, r, imm_y=_floatBits(default))
+            return r
+
+        if not socket.is_linked:
+            r = self._alloc_reg()
+            val = float(socket.default_value) if not hasattr(socket.default_value, '__len__') else default
+            self._emit(_OP_LOAD_SCALAR, r, imm_y=_floatBits(val))
+            return r
+
+        # Linked — compile the node chain (reuses color compiler)
+        return self._compile_node(socket, _depth)
+
+    def _has_nontrivial_mapping(self, tex_node):
+        """Check if an Image Texture node has a Mapping with rotation or non-UV source."""
+        vec_inp = tex_node.inputs.get('Vector')
+        if not vec_inp or not vec_inp.is_linked:
+            return False
+        node = vec_inp.links[0].from_node
+        # Follow reroutes
+        while node.type == 'REROUTE' and node.inputs[0].is_linked:
+            node = node.inputs[0].links[0].from_node
+        if node.type == 'MAPPING':
+            rot = node.inputs.get('Rotation')
+            if rot and (abs(rot.default_value[0]) > 0.001 or
+                        abs(rot.default_value[1]) > 0.001 or
+                        abs(rot.default_value[2]) > 0.001):
+                return True
+            loc = node.inputs.get('Location')
+            if loc and (abs(loc.default_value[0]) > 0.001 or
+                        abs(loc.default_value[1]) > 0.001):
+                return True
+            # Check if Mapping is fed by Geometry.Position (not UV)
+            v_inp = node.inputs.get('Vector')
+            if v_inp and v_inp.is_linked:
+                src = v_inp.links[0].from_node
+                if src.type == 'NEW_GEOMETRY':
+                    return True
+        # Non-UV source (Geometry, Object, etc.)
+        if node.type == 'NEW_GEOMETRY':
+            return True
+        return False
+
+    def _has_colorramp_in_chain(self, socket, _depth=0):
+        """Check if there's a ColorRamp between a socket and an Image Texture."""
+        if not socket or not socket.is_linked or _depth > 8:
+            return False
+        from_node = socket.links[0].from_node
+        if from_node.type == 'VALTORGB':
+            return True
+        # Follow through passthrough nodes
+        for inp in from_node.inputs:
+            if inp.is_linked and self._has_colorramp_in_chain(inp, _depth + 1):
+                return True
+        return False
+
+    def compile(self, principled_node):
+        """Compile a Principled BSDF node's input chains. Returns instruction list or None.
+
+        Only activates when the node tree has intermediate nodes that the
+        legacy pipeline can't evaluate per-pixel (ColorRamp, MixRGB with
+        two textures, Mapping with rotation, etc.). Direct Image Texture →
+        BSDF is handled by the legacy pipeline and doesn't need the VM.
+        """
+        if principled_node is None:
+            return None
+
+        # Check if any input has nodes that need per-pixel VM evaluation
+        needs_vm = False
+        for input_name in ('Base Color',):  # Start with Base Color, expand later
+            inp = principled_node.inputs.get(input_name)
+            if inp and inp.is_linked:
+                from_node = inp.links[0].from_node
+                # Direct Image Texture — check if it has a non-trivial Mapping node
+                if from_node.type == 'TEX_IMAGE':
+                    if self._has_nontrivial_mapping(from_node):
+                        needs_vm = True
+                    continue
+                # Any intermediate node → need VM
+                needs_vm = True
+
+        if not needs_vm:
+            return None
+
+        # Emit transformed UV for shared Mapping (used by normal/roughness)
+        bc_inp = principled_node.inputs.get('Base Color')
+        if bc_inp and bc_inp.is_linked:
+            # Find the Image Texture and compile its UV chain
+            tex_node = _find_image_texture_node(bc_inp)
+            if tex_node:
+                vec_inp = tex_node.inputs.get('Vector')
+                if vec_inp and vec_inp.is_linked:
+                    uv_reg = self._compile_uv_chain(vec_inp)
+                    if uv_reg != 0:  # 0 = default UV, no transform needed
+                        self._emit(_OP_OUTPUT_UV, srcA=uv_reg)
+
+            # Compile Base Color chain
+            reg = self._compile_node(bc_inp)
+            self._emit(_OP_OUTPUT_COLOR, srcA=reg)
+
+        return self.instructions if self.instructions else None
+
+
+def _compile_node_vm(principled_node, register_image_fn):
+    """Compile a Blender Principled BSDF node tree into VM bytecode.
+
+    Returns a list of instruction tuples [(x,y,z,w), ...] or None if no VM needed.
+    """
+    compiler = _NodeVmCompiler(register_image_fn)
+    return compiler.compile(principled_node)
+
+
+# Now fix the ColorRamp data format issue.
+# The GLSL reads nodeVmCode[offset+i] as: .x=pos, .y=R, .z=G, .w=B
+# But our _emit puts opcode in .x. For RAMP_DATA, we override directly.
+# Patch: rewrite _NodeVmCompiler's ColorRamp emission to produce correct data.
+
+# Actually let me fix the ColorRamp compilation above. The issue is that
+# _emit() packs opcode into .x, but RAMP_DATA needs .x = float(position).
+# Solution: bypass _emit() and append raw data tuples.
+
+_orig_compile_node = _NodeVmCompiler._compile_node
+
+def _patched_compile_node(self, socket, _depth=0):
+    if socket and socket.is_linked:
+        from_node = socket.links[0].from_node
+        if from_node.type == 'VALTORGB':
+            node_id = id(from_node)
+            if node_id in self.node_reg_cache:
+                return self.node_reg_cache[node_id]
+
+            dst = self._alloc_reg()
+
+            # Compile factor input
+            fac_inp = from_node.inputs.get('Fac')
+            fac_reg = self._compile_node(fac_inp, _depth + 1)
+            # Luminance if factor comes from color
+            if fac_inp and fac_inp.is_linked and fac_inp.links[0].from_socket.type in ('RGBA', 'VECTOR'):
+                lum_reg = self._alloc_reg()
+                self._emit(_OP_LUMINANCE, lum_reg, srcA=fac_reg)
+                fac_reg = lum_reg
+
+            ramp = from_node.color_ramp
+            elements = sorted(ramp.elements, key=lambda e: e.position)
+            stop_count = min(len(elements), 8)
+
+            # Emit COLORRAMP opcode
+            self._emit(_OP_COLORRAMP, dst, srcA=fac_reg, imm_y=stop_count)
+
+            # Emit raw ramp data (pos, R, G, B per stop) — bypasses opcode packing
+            for el in elements[:8]:
+                if len(self.instructions) < 32:
+                    self.instructions.append((
+                        _floatBits(el.position),
+                        _floatBits(el.color[0]),
+                        _floatBits(el.color[1]),
+                        _floatBits(el.color[2]),
+                    ))
+
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+    return _orig_compile_node(self, socket, _depth)
+
+_NodeVmCompiler._compile_node = _patched_compile_node
+
+
+# ---- GPUMaterial struct layout (672 bytes, scalar) ----
 # Must match GPUMaterial in vk_rt_pipeline.h exactly.
-# 35 fields x 4 bytes = 140 bytes total.
-_GPU_MATERIAL_STRUCT = struct.Struct('<' + 'I' * 5 + 'f' * 3  # tex indices (4) + normalDetail + ks (3)
-                                    + 'f' * 4                  # ksSpecularEXP + emissive RGB
-                                    + 'f' * 4                  # fresnelC/EXP + detailUVMult + detailNBlend
-                                    + 'I' + 'f' + 'I' + 'f'   # flags + alphaRef + shaderType + fresnelMaxLevel
-                                    + 'I' * 6                  # multilayer tex indices (6)
-                                    + 'f' * 7                  # multilayer mults (7)
-                                    + 'f' * 2)                 # sunSpecular + sunSpecularEXP
+# 35 base fields (140 bytes) + nodeVmHeader(4) + pad(12) + nodeVmCode(512) = 668 → pad to 672
+_GPU_MATERIAL_BASE = struct.Struct('<' + 'I' * 5 + 'f' * 3  # tex indices (4) + normalDetail + ks (3)
+                                   + 'f' * 4                  # ksSpecularEXP + emissive RGB
+                                   + 'f' * 4                  # fresnelC/EXP + detailUVMult + detailNBlend
+                                   + 'I' + 'f' + 'I' + 'f'   # flags + alphaRef + shaderType + fresnelMaxLevel
+                                   + 'I' * 6                  # multilayer tex indices (6)
+                                   + 'f' * 7                  # multilayer mults (7)
+                                   + 'f' * 2)                 # sunSpecular + sunSpecularEXP
+# Node VM: header(1 uint) + pad(3 uints) + code(128 uints) = 132 uints = 528 bytes
+_GPU_MATERIAL_VM = struct.Struct('<' + 'I' * 132)
+_GPU_MATERIAL_SIZE = _GPU_MATERIAL_BASE.size + _GPU_MATERIAL_VM.size  # 140 + 528 = 668
 
 _NO_TEX = 0xFFFFFFFF
 
@@ -1428,9 +2138,10 @@ def _pack_gpu_material(
     uv_scale_y=1.0,
     color_value=1.0,
     color_saturation=1.0,
+    node_vm_code=None,
 ):
-    """Pack one material into 140 bytes matching GPUMaterial."""
-    return _GPU_MATERIAL_STRUCT.pack(
+    """Pack one material into 668 bytes matching GPUMaterial."""
+    base = _GPU_MATERIAL_BASE.pack(
         # Texture indices
         diffuse_tex,        # diffuseTexIndex
         normal_tex,         # normalTexIndex
@@ -1456,6 +2167,18 @@ def _pack_gpu_material(
         # sunSpecular, sunSpecularEXP
         0.0, 0.0,
     )
+
+    # Node VM bytecode
+    vm_uints = [0] * 132  # header(1) + pad(3) + code(128)
+    if node_vm_code:
+        instr_count = min(len(node_vm_code), 32)
+        vm_uints[0] = instr_count  # nodeVmHeader
+        # Pack instructions: each is 4 uints (uvec4)
+        for i, instr in enumerate(node_vm_code[:32]):
+            for j in range(4):
+                vm_uints[4 + i * 4 + j] = instr[j] if j < len(instr) else 0
+
+    return base + _GPU_MATERIAL_VM.pack(*vm_uints)
 
 
 def _blackbody_to_rgb(temperature):
@@ -1816,6 +2539,67 @@ def _find_image_texture_node(socket, _depth=0):
     return None
 
 
+def _find_color_ramp_in_chain(socket, _depth=0):
+    """Find a ColorRamp node in the chain between a BSDF input and an Image Texture."""
+    if not socket or not socket.is_linked or _depth > 8:
+        return None
+    from_node = socket.links[0].from_node
+    if from_node.type == 'VALTORGB':
+        # Verify there's an Image Texture feeding into this ColorRamp
+        fac_inp = from_node.inputs.get('Fac')
+        if fac_inp and _find_image_texture_node(fac_inp, _depth + 1) is not None:
+            return from_node
+    return None
+
+
+def _bake_ramp_into_pixels(image, ramp_elements):
+    """Read image pixels, apply ColorRamp, return raw RGBA8 bytes (top-down)."""
+    import numpy as np
+    w, h = image.size[0], image.size[1]
+    # Read all pixels as float array [R,G,B,A, R,G,B,A, ...]
+    px = np.array(image.pixels[:], dtype=np.float32)
+    ch = len(px) // (w * h)
+    px = px.reshape(h, w, ch)
+
+    # Compute luminance as ramp factor
+    if ch >= 3:
+        lum = 0.2126 * px[:, :, 0] + 0.7152 * px[:, :, 1] + 0.0722 * px[:, :, 2]
+    else:
+        lum = px[:, :, 0]
+
+    # Sort ramp elements by position
+    elements = sorted(ramp_elements, key=lambda e: e[0])
+    positions = [e[0] for e in elements]
+    colors = [np.array(e[1], dtype=np.float32) for e in elements]  # each is [R,G,B,A]
+
+    flat_lum = lum.flatten()
+    out = np.zeros((len(flat_lum), 4), dtype=np.float32)
+
+    # Below first stop
+    out[flat_lum <= positions[0]] = colors[0]
+    # Above last stop
+    out[flat_lum >= positions[-1]] = colors[-1]
+    # Interpolate between stops
+    for i in range(len(positions) - 1):
+        p0, p1 = positions[i], positions[i + 1]
+        if p1 <= p0:
+            continue
+        mask = (flat_lum > p0) & (flat_lum < p1)
+        if np.any(mask):
+            t = ((flat_lum[mask] - p0) / (p1 - p0))[:, None]
+            out[mask] = colors[i] * (1.0 - t) + colors[i + 1] * t
+
+    # Preserve original alpha if available
+    if ch >= 4:
+        out[:, 3] = px[:, :, 3].flatten()
+
+    # Flip both axes: Blender image.pixels[] is bottom-up + left-to-right,
+    # but stb_image (normal texture path) delivers top-down. The horizontal
+    # flip compensates for UV coordinate convention differences.
+    out = out.reshape(h, w, 4)[::-1, ::-1].copy()
+    return (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8).tobytes()
+
+
 _image_bytes_cache = {}  # image.name → bytes (persists across export_materials calls)
 
 
@@ -1911,6 +2695,79 @@ def _encode_bmp(rgba_u8, w, h):
     struct.pack_into('<I', hdr, 34, len(pixel_data))
 
     return bytes(hdr) + bytes(pixel_data)
+
+
+class _GroupPrincipledProxy:
+    """Makes a GROUP node look like a Principled BSDF for material export.
+
+    Maps the GROUP's external inputs to the internal Principled BSDF's input names,
+    so code that reads principled_node.inputs.get('Base Color') works transparently.
+    """
+    def __init__(self, group_node, inner_principled):
+        self.type = 'BSDF_PRINCIPLED'
+        self.name = f"{group_node.name} (proxy)"
+        self._group = group_node
+        self._inner = inner_principled
+
+        # Map: inner Principled input name → GROUP external socket
+        self._input_map = {}
+        for inp in inner_principled.inputs:
+            if inp.is_linked:
+                from_node = inp.links[0].from_node
+                if from_node.type == 'GROUP_INPUT':
+                    # The from_socket.name on GROUP_INPUT matches the group's external input name
+                    ext_name = inp.links[0].from_socket.name
+                    ext_inp = group_node.inputs.get(ext_name)
+                    if ext_inp:
+                        self._input_map[inp.name] = ext_inp
+
+        self.inputs = _GroupInputsProxy(self._input_map, inner_principled.inputs)
+
+
+class _GroupInputsProxy:
+    """Dict-like proxy for inputs that resolves GROUP connections."""
+    def __init__(self, mapped, original):
+        self._mapped = mapped  # name → external socket
+        self._original = original  # original NodeInputs
+
+    def get(self, name, default=None):
+        # If this input is mapped through the group, return the external socket
+        if name in self._mapped:
+            return self._mapped[name]
+        # Otherwise return the internal socket (for unconnected inputs with defaults)
+        return self._original.get(name, default)
+
+    def __iter__(self):
+        return iter(self._original)
+
+    def __getitem__(self, idx):
+        return self._original[idx]
+
+
+def _find_principled_in_group(group_node):
+    """Find a Principled BSDF inside a GROUP node and return a proxy.
+
+    Returns a _GroupPrincipledProxy that maps external group inputs to
+    the internal Principled BSDF's inputs, or None if not found.
+    """
+    inner_tree = group_node.node_tree
+    if not inner_tree:
+        return None
+
+    # Find Principled BSDF inside the group
+    for inode in inner_tree.nodes:
+        if inode.type == 'BSDF_PRINCIPLED':
+            return _GroupPrincipledProxy(group_node, inode)
+
+    # Follow GROUP_OUTPUT → shader chain inside the group
+    for inode in inner_tree.nodes:
+        if inode.type == 'GROUP_OUTPUT':
+            for inp in inode.inputs:
+                if inp.is_linked:
+                    src = inp.links[0].from_node
+                    if src.type == 'BSDF_PRINCIPLED':
+                        return _GroupPrincipledProxy(group_node, src)
+    return None
 
 
 def _find_surface_shader(node_tree):
@@ -2257,6 +3114,8 @@ def extract_texture_bytes(tex_info):
     """Read pixel data for one deferred texture entry. Call once per frame for smooth loading.
 
     Modifies tex_info in place: fills 'data' with bytes, removes 'image_ref'.
+    If 'ramp_elements' is present, bakes the ColorRamp into raw RGBA8 pixels
+    and sets dxgi_format=28 to bypass stb_image decoding on the C++ side.
     Returns True if data was extracted, False on failure.
     """
     if tex_info.get("data") is not None:
@@ -2264,13 +3123,32 @@ def extract_texture_bytes(tex_info):
     image = tex_info.get("image_ref")
     if image is None:
         return False
-    data = _get_image_bytes(image)
-    if data is None:
-        return False
-    tex_info["data"] = data
+
+    ramp_elements = tex_info.get("ramp_elements")
+    if ramp_elements:
+        # Bake ColorRamp into raw RGBA8 pixels
+        try:
+            data = _bake_ramp_into_pixels(image, ramp_elements)
+            tex_info["data"] = data
+            tex_info["dxgi_format"] = 28  # RGBA8 raw — skip stb_image
+        except Exception:
+            # Fallback: use original image without ramp
+            data = _get_image_bytes(image)
+            if data is None:
+                return False
+            tex_info["data"] = data
+    else:
+        data = _get_image_bytes(image)
+        if data is None:
+            return False
+        tex_info["data"] = data
+
     tex_info["width"] = image.size[0]
     tex_info["height"] = image.size[1]
-    del tex_info["image_ref"]  # free Blender reference
+    if "image_ref" in tex_info:
+        del tex_info["image_ref"]
+    if "ramp_elements" in tex_info:
+        del tex_info["ramp_elements"]
     return True
 
 
@@ -2339,26 +3217,36 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
     texture_registry = {}
     textures_list = []
 
-    def _register_image(image):
-        """Register an image and return its texture index, or _NO_TEX if unavailable."""
+    def _register_image(image, color_ramp_node=None):
+        """Register an image and return its texture index, or _NO_TEX if unavailable.
+
+        If color_ramp_node is provided, the ramp will be baked into the texture
+        pixels during extraction (uploaded as raw RGBA8, bypassing stb_image).
+        """
         if image is None:
             return _NO_TEX
-        key = image.name
+        # Unique key: include ramp id to avoid sharing baked vs raw versions
+        ramp_id = f"__ramp_{id(color_ramp_node)}" if color_ramp_node else ""
+        key = image.name + ramp_id
         if key in texture_registry:
             return texture_registry[key]["index"]
-        # Don't read pixel data yet — defer to per-frame extraction for smooth loading.
-        # Store the image reference; engine.py will call extract_texture_bytes() later.
         if image.size[0] == 0 or image.size[1] == 0:
             return _NO_TEX
         idx = len(textures_list)
         entry = {
             "index": idx,
-            "name": key,
-            "data": None,  # deferred — filled by extract_texture_bytes()
-            "image_ref": image,  # Blender image reference for lazy loading
+            "name": image.name + (" [ramp]" if color_ramp_node else ""),
+            "data": None,
+            "image_ref": image,
             "width": image.size[0],
             "height": image.size[1],
         }
+        if color_ramp_node:
+            ramp = color_ramp_node.color_ramp
+            entry["ramp_elements"] = [
+                (e.position, (e.color[0], e.color[1], e.color[2], e.color[3]))
+                for e in ramp.elements
+            ]
         texture_registry[key] = entry
         textures_list.append(entry)
         return idx
@@ -2421,12 +3309,17 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         alpha_ref = 0.5
 
         if mat.use_nodes and mat.node_tree:
-            # First try: find Principled BSDF directly
+            # First try: find Principled BSDF directly (or inside a GROUP)
             principled_node = None
             for node in mat.node_tree.nodes:
                 if node.type == 'BSDF_PRINCIPLED':
                     principled_node = node
                     break
+                if node.type == 'GROUP':
+                    proxy = _find_principled_in_group(node)
+                    if proxy:
+                        principled_node = proxy
+                        break
 
             # Fallback: trace from Material Output to resolve any shader node
             if principled_node is None:
@@ -2439,7 +3332,12 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                                               'BSDF_PRINCIPLED'):
                         break  # found a shader node
                     elif surface_node.type == 'GROUP':
-                        # Follow group's internal output → find what's connected
+                        # Try to resolve GROUP as Principled BSDF proxy
+                        proxy = _find_principled_in_group(surface_node)
+                        if proxy:
+                            principled_node = proxy
+                            break
+                        # Fallback: follow group's internal output
                         inner_tree = surface_node.node_tree
                         if inner_tree:
                             for inode in inner_tree.nodes:
@@ -2541,12 +3439,17 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
 
             if principled_node is not None:
                 node = principled_node
-                # Base Color (scalar + texture)
-                bc = _get_principled_input(node, 'Base Color', (0.8, 0.8, 0.8, 1.0))
-                base_color = (bc[0], bc[1], bc[2])
+                # Base Color (resolve node chain if linked, otherwise use default)
+                bc_inp = node.inputs.get('Base Color')
+                if bc_inp and bc_inp.is_linked:
+                    base_color = _resolve_color_input(bc_inp, (0.8, 0.8, 0.8))
+                else:
+                    bc = _get_principled_input(node, 'Base Color', (0.8, 0.8, 0.8, 1.0))
+                    base_color = (bc[0], bc[1], bc[2])
                 bc_node = _find_image_texture_node(node.inputs.get('Base Color'))
                 if bc_node and bc_node.image:
-                    diffuse_tex = _register_image(bc_node.image)
+                    bc_ramp = _find_color_ramp_in_chain(node.inputs.get('Base Color'))
+                    diffuse_tex = _register_image(bc_node.image, bc_ramp)
 
                 # UV scale from Mapping node (applies to all textures)
                 uv_scale = _find_uv_scale(node.inputs.get('Base Color'))
@@ -2600,9 +3503,13 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                     spec_inp = node.inputs.get('Specular')
                 specular_level = float(spec_inp.default_value) if spec_inp else 0.5
 
-                # Emission Color
-                ec = _get_principled_input(node, 'Emission Color', (0.0, 0.0, 0.0, 1.0))
-                emission = (ec[0], ec[1], ec[2])
+                # Emission Color (resolve node chain if linked)
+                ec_inp = node.inputs.get('Emission Color')
+                if ec_inp and ec_inp.is_linked:
+                    emission = _resolve_color_input(ec_inp, (1.0, 1.0, 1.0))
+                else:
+                    ec = _get_principled_input(node, 'Emission Color', (0.0, 0.0, 0.0, 1.0))
+                    emission = (ec[0], ec[1], ec[2])
                 emission_strength = float(_get_principled_input(node, 'Emission Strength', 0.0))
 
                 # Normal/Bump map texture
@@ -2695,6 +3602,14 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         except Exception:
             pass
 
+        # Compile Node VM bytecode for materials with non-trivial node chains
+        vm_code = None
+        if principled_node is not None:
+            vm_code = _compile_node_vm(principled_node, _register_image)
+            if vm_code:
+                mat_key_name = mat.name if mat else "?"
+                print(f"[ignis-vm] '{mat_key_name}': compiled {len(vm_code)} instructions")
+
         all_bytes += _pack_gpu_material(
             base_color=base_color,
             roughness=roughness,
@@ -2717,6 +3632,7 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
             uv_scale_y=uv_scale_y,
             color_value=color_value,
             color_saturation=color_saturation,
+            node_vm_code=vm_code,
         )
 
         _mat_dt = _time.perf_counter() - _mat_t0

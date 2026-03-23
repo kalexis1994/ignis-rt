@@ -441,10 +441,15 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
     cam.lightCount = s_lightCount;
     cam.lightPad[0] = s_emissiveTriCount;
     cam.lightPad[1] = static_cast<uint32_t>(acpt::g_config.samplesPerPixel);
-    cam.lightPad[2] = cfg->backfaceCulling ? 1u : 0u;
-    // HDRI environment map: pack index and strength into windParams (unused for Blender)
+    cam.lightPad[2] = (cfg->backfaceCulling ? 1u : 0u) | (cfg->restirDI ? 2u : 0u);
+    // HDRI environment map: pack index and strength into windParams
     cam.windParams[0] = static_cast<float>(cfg->hdriTexIndex);  // -1 = no HDRI
     cam.windParams[1] = cfg->hdriStrength;
+    // World background color (from Blender's World → Surface → Background)
+    // Pack as RGB into windParams[2] and rainParams[3]
+    cam.windParams[2] = cfg->worldBgR;
+    cam.windParams[3] = cfg->worldBgG;
+    cam.rainParams[3] = cfg->worldBgB;
     if (s_lightCount > 0) {
         uint32_t uboLights = (s_lightCount > 32) ? 32 : s_lightCount;
         cam.lightCount = uboLights;
@@ -562,6 +567,9 @@ IGNIS_API void ignis_set_float(const char* key, float value) {
     else if (strcmp(key, "ambient_color_r") == 0)    cfg->ambientColorR = value;
     else if (strcmp(key, "ambient_color_g") == 0)    cfg->ambientColorG = value;
     else if (strcmp(key, "ambient_color_b") == 0)    cfg->ambientColorB = value;
+    else if (strcmp(key, "world_bg_r") == 0)          cfg->worldBgR = value;
+    else if (strcmp(key, "world_bg_g") == 0)          cfg->worldBgG = value;
+    else if (strcmp(key, "world_bg_b") == 0)          cfg->worldBgB = value;
     else if (strcmp(key, "sky_refl_intensity") == 0) cfg->ptSkyReflIntensity = value;
     else if (strcmp(key, "sky_bounce_intensity") == 0) cfg->ptSkyBounceIntensity = value;
     else if (strcmp(key, "auto_exposure_key") == 0)  cfg->ptAutoExposureKey = value;
@@ -602,6 +610,7 @@ IGNIS_API void ignis_set_int(const char* key, int value) {
     else if (strcmp(key, "shader_mode") == 0)       cfg->shaderMode = value;
     else if (strcmp(key, "use_wavefront") == 0)    cfg->useWavefront = (value != 0);
     else if (strcmp(key, "backface_culling") == 0) cfg->backfaceCulling = (value != 0);
+    else if (strcmp(key, "restir_di") == 0)      cfg->restirDI = (value != 0);
     else if (strcmp(key, "hdri_tex_index") == 0)  cfg->hdriTexIndex = value;
     else if (strcmp(key, "reset_history") == 0 && value != 0) {
         if (g_renderer) g_renderer->ResetFrameIndex();

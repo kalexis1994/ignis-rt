@@ -112,9 +112,18 @@ struct PathTracerConfig {
     // Backface culling
     bool  backfaceCulling    = false;
 
+    // ReSTIR DI (reservoir-based light sampling)
+    bool  restirDI           = false;
+
     // HDRI environment map
     int   hdriTexIndex       = -1;     // texture index (-1 = no HDRI, use procedural sky)
     float hdriStrength       = 1.0f;   // environment intensity multiplier
+
+    // World background color (from Blender's World → Surface → Background node)
+    // Used as sky fallback when no HDRI and no sun. Default = Blender's default (0.05 gray).
+    float worldBgR           = 0.05f;
+    float worldBgG           = 0.05f;
+    float worldBgB           = 0.05f;
 };
 
 } // namespace acpt

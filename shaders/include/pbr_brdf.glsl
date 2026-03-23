@@ -6,11 +6,21 @@
 #ifndef PBR_BRDF_GLSL
 #define PBR_BRDF_GLSL
 
-// Fresnel (Schlick approximation)
+// Fresnel — F82-Tint model (matches Cycles' Principled BSDF)
+// Adds a correction term that reduces reflectivity around ~82° incidence,
+// preventing dark metals from looking overly chrome at grazing angles.
+// Reference: "Novel aspects of the Adobe Standard Material" (Kutz et al.)
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     float t = 1.0 - cosTheta;
     float t2 = t * t;
-    return F0 + (1.0 - F0) * (t2 * t2 * t);
+    vec3 schlick = F0 + (1.0 - F0) * (t2 * t2 * t);
+
+    // F82-Tint correction: B * cosTheta * (1 - cosTheta)^6
+    // B = (1 - F0) * 25.0 / 24.0 for white tint (default)
+    // This darkens reflections around 82° for low-F0 (dark) metals
+    vec3 B = (1.0 - F0) * (25.0 / 24.0);
+    float t6 = t2 * t2 * t2;  // (1-cos)^6
+    return max(schlick - B * cosTheta * t6, vec3(0.0));
 }
 
 // GGX Normal Distribution Function

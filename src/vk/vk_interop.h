@@ -17,12 +17,18 @@ public:
     bool Initialize(Context* context, uint32_t width, uint32_t height);
     void Shutdown();
 
-    // Get the Vulkan image that the RT pipeline writes to
-    VkImage GetSharedImage() const { return sharedImage_; }
-    VkImageView GetSharedImageView() const { return sharedImageView_; }
+    // Get the Vulkan image that the RT pipeline writes to (current write buffer)
+    VkImage GetSharedImage() const { return sharedImage_[writeIdx_]; }
+    VkImageView GetSharedImageView() const { return sharedImageView_[writeIdx_]; }
+    VkImageView GetSharedImageView(uint32_t idx) const { return sharedImageView_[idx]; }
 
     // Get NT handle for D3D11 to open via OpenSharedResource1()
-    HANDLE GetNTHandle() const { return ntHandle_; }
+    HANDLE GetNTHandle() const { return ntHandle_[writeIdx_]; }
+
+    // Double-buffer swap: call at end of frame to prevent tearing
+    void SwapBuffers();
+    uint32_t GetWriteIdx() const { return writeIdx_; }
+    uint32_t GetReadIdx() const { return 1 - writeIdx_; }
 
     // Transition shared image for RT write or D3D11 read
     void TransitionForRTWrite(VkCommandBuffer cmd);
@@ -58,10 +64,15 @@ private:
     uint32_t width_ = 0;
     uint32_t height_ = 0;
 
-    VkImage sharedImage_ = VK_NULL_HANDLE;
-    VkDeviceMemory sharedMemory_ = VK_NULL_HANDLE;
-    VkImageView sharedImageView_ = VK_NULL_HANDLE;
-    HANDLE ntHandle_ = nullptr;
+    bool CreateSharedImageSlot(int idx);  // helper: create one shared image + memory + view + NT handle
+
+    // Double-buffered shared images (ping-pong for tear-free display)
+    VkImage sharedImage_[2] = {};
+    VkDeviceMemory sharedMemory_[2] = {};
+    VkImageView sharedImageView_[2] = {};
+    HANDLE ntHandle_[2] = {};
+    uint64_t allocationSize_[2] = {};   // Vulkan memory allocation size (for GL import)
+    uint32_t writeIdx_ = 0;            // index currently being written by RT
 
     // Double-buffered readback staging (persistent mapped)
     VkBuffer readbackBuffer_[2] = {};
@@ -74,12 +85,11 @@ private:
     PFN_vkGetMemoryWin32HandleKHR vkGetMemoryWin32HandleKHR_ = nullptr;
 
     // GL interop state (use raw unsigned int to avoid GL header dependency)
-    unsigned int glMemoryObject_ = 0;
-    unsigned int glTexture_ = 0;
+    unsigned int glMemoryObject_[2] = {};   // double-buffered GL memory objects
+    unsigned int glTexture_[2] = {};        // double-buffered GL textures
     unsigned int glShaderProgram_ = 0;
     unsigned int glVAO_ = 0;
     bool glInteropReady_ = false;
-    uint64_t allocationSize_ = 0;   // Vulkan memory allocation size (for GL import)
 };
 
 } // namespace vk

@@ -228,7 +228,7 @@ private:
 
     // ImGui overlay
     VkRenderPass imguiRenderPass_ = VK_NULL_HANDLE;
-    VkFramebuffer imguiFramebuffer_ = VK_NULL_HANDLE;
+    VkFramebuffer imguiFramebuffer_[2] = {};
     std::vector<VkFramebuffer> imguiSwapchainFramebuffers_;
     uint32_t imguiCurrentImageIndex_ = 0;
     VkDescriptorPool imguiDescriptorPool_ = VK_NULL_HANDLE;

@@ -116,6 +116,8 @@ _ignis_last_transforms = None  # cached instance transforms hash for change dete
 _ignis_last_light_count = -1   # track light count for emissive re-export
 _ignis_hdri_sun = None         # sun extracted from HDRI (used as fallback when no SUN light)
 _ignis_mat_name_to_index = {}  # persistent material name→index mapping for incremental uploads
+_ignis_last_draw_time = 0.0    # perf_counter of last view_draw (detect pause/resume)
+_ignis_init_config = {}        # settings snapshot at init time (detect restart-worthy changes)
 
 # ── Staged loading state machine ──
 LOAD_IDLE = 0          # no loading in progress
@@ -193,7 +195,7 @@ def _ignis_shutdown():
     global _ignis_frame_index, _ignis_full_dirty, _ignis_materials_dirty, _ignis_tlas_dirty
     global _ignis_last_full_upload, _ignis_instance_count
     global _fps_times, _fps_display
-    global _load_stage
+    global _load_stage, _ignis_last_draw_time
     if _ignis_initialized:
         _log("ignis_destroy()")
         if _ignis_tex_manager is not None:
@@ -216,6 +218,7 @@ def _ignis_shutdown():
         _fps_times = []
         _fps_display = 0.0
         _load_stage = LOAD_IDLE
+        _ignis_last_draw_time = 0.0
 
 
 class IgnisRenderEngine(bpy.types.RenderEngine):
@@ -224,6 +227,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
     bl_use_preview = False
     bl_use_eevee_viewport = False
     bl_use_gpu_context = True
+    bl_use_shading_nodes_custom = False  # Use standard Blender shader nodes (Principled BSDF etc.)
 
     # ------------------------------------------------------------------
     # Init
@@ -243,6 +247,11 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             return True
 
         if _ignis_initialized:
+            # Don't reinit on resize during loading — Blender adjusts layout
+            # when opening complex scenes, causing spurious size changes
+            if _load_stage != LOAD_IDLE:
+                _log(f" Resize {_ignis_width}x{_ignis_height} -> {width}x{height} ignored (loading)")
+                return True
             _log(f" Reinit: {_ignis_width}x{_ignis_height} -> {width}x{height}")
             _ignis_shutdown()
 
@@ -275,20 +284,14 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
         dll_wrapper.set_int("shader_mode", 1)
 
+        # DLSS + Ray Reconstruction always enabled (core engine requirement)
+        dll_wrapper.set_int("dlss_enabled", 1)
+        dll_wrapper.set_int("dlss_rr_enabled", 1)
         try:
             props = bpy.context.scene.ignis_rt
-            if props.dlss_enabled:
-                dll_wrapper.set_int("dlss_enabled", 1)
-                quality = int(props.dlss_quality)
-                dll_wrapper.set_int("dlss_quality", quality)
-                # RR works best with upscaling — at DLAA (native res) fall back to NRD
-                if props.dlss_rr_enabled and quality < 6:
-                    dll_wrapper.set_int("dlss_rr_enabled", 1)
-                    _log(f" DLSS {props.dlss_quality} + Ray Reconstruction")
-                elif props.dlss_rr_enabled and quality == 6:
-                    _log(f" DLSS DLAA + NRD (RR needs upscaling, falling back to NRD)")
-                else:
-                    _log(f" DLSS {props.dlss_quality} + NRD")
+            quality = int(props.dlss_quality)
+            dll_wrapper.set_int("dlss_quality", quality)
+            _log(f" DLSS {quality} + Ray Reconstruction")
             if hasattr(props, 'samples_per_pixel') and props.samples_per_pixel > 1:
                 dll_wrapper.set_int("spp", props.samples_per_pixel)
                 _log(f" SPP: {props.samples_per_pixel}")
@@ -317,6 +320,16 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             _log(" Denoiser: DLSS SR only (no denoiser)")
         else:
             _log(" Denoiser: None")
+
+        # Snapshot settings that require full restart to change
+        global _ignis_init_config
+        try:
+            _ignis_init_config = {
+                "dlss_quality": int(props.dlss_quality),
+                "use_wavefront": props.use_wavefront,
+            }
+        except Exception:
+            _ignis_init_config = {}
 
         _ignis_initialized = True
         _ignis_width = width
@@ -413,13 +426,11 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 dll_wrapper.set_log_path(get_log_path())
                 dll_wrapper.set_base_path(get_base_path())
                 dll_wrapper.set_int("shader_mode", 1)
+                dll_wrapper.set_int("dlss_enabled", 1)
+                dll_wrapper.set_int("dlss_rr_enabled", 1)
                 try:
                     props = bpy.context.scene.ignis_rt
-                    if props.dlss_enabled:
-                        dll_wrapper.set_int("dlss_enabled", 1)
-                        dll_wrapper.set_int("dlss_quality", int(props.dlss_quality))
-                        if props.dlss_rr_enabled and int(props.dlss_quality) < 6:
-                            dll_wrapper.set_int("dlss_rr_enabled", 1)
+                    dll_wrapper.set_int("dlss_quality", int(props.dlss_quality))
                     if hasattr(props, 'samples_per_pixel') and props.samples_per_pixel > 1:
                         dll_wrapper.set_int("spp", props.samples_per_pixel)
                     if props.use_wavefront:
@@ -591,13 +602,14 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         data_bytes = tex_info["data"]
                         data_np = np.frombuffer(data_bytes, dtype=np.uint8).copy()
                         _load_tex_buffers.append(data_np)
+                        tex_dxgi = tex_info.get("dxgi_format", 0)
                         dll_wrapper.texture_manager_add(
                             _ignis_tex_manager,
                             tex_info["name"],
                             data_np.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
                             len(data_bytes),
                             tex_info["width"], tex_info["height"],
-                            1, 0,
+                            1, tex_dxgi,
                         )
 
                     _load_tex_idx += 1
@@ -748,10 +760,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             hdri_sun = None
             try:
                 hdri = scene_export.export_world_hdri(depsgraph)
-                if hdri:
+                if hdri and "data" in hdri:
+                    # HDRI environment texture
                     _log(f"Stage FINALIZE: HDRI '{hdri['name']}' {hdri['width']}x{hdri['height']}, strength={hdri['strength']:.2f}")
                     hdri_sun = hdri.get("extracted_sun")
-                    # Upload as texture via the texture manager
                     if _ignis_tex_manager:
                         data_np = np.frombuffer(hdri["data"], dtype=np.uint8).copy()
                         hdri_dxgi = hdri.get("dxgi_format", 0)
@@ -769,6 +781,15 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                             _log("Stage FINALIZE: HDRI texture add failed")
                     else:
                         _log("Stage FINALIZE: No texture manager for HDRI")
+                elif hdri and "bg_color" in hdri:
+                    # No HDRI texture — use Background node color as sky fallback
+                    c = hdri["bg_color"]
+                    s = hdri["bg_strength"]
+                    dll_wrapper.set_int("hdri_tex_index", -1)
+                    dll_wrapper.set_float("world_bg_r", c[0] * s)
+                    dll_wrapper.set_float("world_bg_g", c[1] * s)
+                    dll_wrapper.set_float("world_bg_b", c[2] * s)
+                    _log(f"Stage FINALIZE: World background color=({c[0]:.3f},{c[1]:.3f},{c[2]:.3f}) strength={s:.2f}")
                 else:
                     dll_wrapper.set_int("hdri_tex_index", -1)
             except Exception:
@@ -922,13 +943,14 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         data_bytes = tex_info["data"]
                         data_np = np.frombuffer(data_bytes, dtype=np.uint8).copy()
                         tex_buffers.append(data_np)
+                        tex_dxgi = tex_info.get("dxgi_format", 0)
                         dll_wrapper.texture_manager_add(
                             _ignis_tex_manager,
                             tex_info["name"],
                             data_np.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
                             len(data_bytes),
                             tex_info["width"], tex_info["height"],
-                            1, 0,
+                            1, tex_dxgi,
                         )
                     ok = dll_wrapper.texture_manager_upload_all(_ignis_tex_manager)
                     if ok:
@@ -1149,10 +1171,44 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         """Called on every viewport redraw."""
         global _ignis_frame_index, _ignis_full_dirty, _ignis_materials_dirty, _ignis_tlas_dirty
         global _load_stage, _ignis_instance_count, _load_start_time
+        global _ignis_last_draw_time, _ignis_init_config
 
         region = context.region
         w, h = region.width, region.height
         self._last_w, self._last_h = w, h
+
+        # ── Resume detection: user switched back from Solid/Wireframe ──
+        # Threshold must be high enough that normal Blender stalls (heavy scenes,
+        # depsgraph evaluation, UI layout changes) don't trigger false resumes.
+        now = time.perf_counter()
+        if _ignis_initialized and _load_stage == LOAD_IDLE and _ignis_last_draw_time > 0:
+            gap = now - _ignis_last_draw_time
+            if gap > 3.0:
+                _log(f"Resume after {gap:.1f}s pause")
+                # Check if restart-worthy settings changed while paused
+                needs_restart = False
+                try:
+                    props = context.scene.ignis_rt
+                    cur = {
+                        "dlss_quality": int(props.dlss_quality),
+                        "use_wavefront": props.use_wavefront,
+                    }
+                    if cur != _ignis_init_config:
+                        changed = [k for k in cur if cur[k] != _ignis_init_config.get(k)]
+                        _log(f"  Config changed: {changed} — full restart")
+                        needs_restart = True
+                except Exception:
+                    pass
+
+                if needs_restart:
+                    _ignis_shutdown()
+                    # Fall through to first-contact init below
+                else:
+                    # Same config — just reset denoiser for clean start
+                    _ignis_frame_index = 0
+                    dll_wrapper.set_int("reset_history", 1)
+                    _log("  Resumed (denoiser reset)")
+        _ignis_last_draw_time = now
 
         # ── First contact: capture viewport and start cross-fade ──
         if not _ignis_initialized and _load_stage == LOAD_IDLE:
@@ -1190,9 +1246,40 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
         # ── Fast incremental updates (no loading screen needed) ──
         if _ignis_materials_dirty:
-            # Skip auto material update after initial load — prevents material index
-            # reordering that breaks per-BLAS material IDs. Only update on explicit
-            # user action (Reload Scene button) via full_dirty.
+            # Re-export material parameters + Node VM bytecode.
+            # Uses existing material/texture index mapping to keep BLAS IDs valid.
+            # GPU is idle here (vkWaitForFences completed in RenderFrameRT).
+            _log("material live update triggered")
+            global _ignis_mat_name_to_index
+            import ctypes as _ct
+            try:
+                materials_data, mat_map, tex_list = scene_export.export_materials(
+                    depsgraph, hidden_objects=_ignis_hidden_objects,
+                    existing_mapping=_ignis_mat_name_to_index)
+                # Upload material buffer (parameters + VM bytecode)
+                dll_wrapper.upload_materials(materials_data, len(mat_map))
+                # Upload any NEW textures (e.g., ramp bakes from node changes)
+                if _ignis_tex_manager and tex_list:
+                    for tex_info in tex_list:
+                        if tex_info.get("data") is None:
+                            scene_export.extract_texture_bytes(tex_info)
+                        if tex_info.get("data") is not None and tex_info.get("_uploaded") is None:
+                            data_bytes = tex_info["data"]
+                            data_np = np.frombuffer(data_bytes, dtype=np.uint8).copy()
+                            tex_dxgi = tex_info.get("dxgi_format", 0)
+                            dll_wrapper.texture_manager_add(
+                                _ignis_tex_manager, tex_info["name"],
+                                data_np.ctypes.data_as(_ct.POINTER(_ct.c_uint8)),
+                                len(data_bytes), tex_info["width"], tex_info["height"],
+                                1, tex_dxgi)
+                            tex_info["_uploaded"] = True
+                    dll_wrapper.texture_manager_upload_all(_ignis_tex_manager)
+                    dll_wrapper.update_texture_descriptors(_ignis_tex_manager)
+                _ignis_mat_name_to_index = mat_map
+                _ignis_frame_index = 0
+                dll_wrapper.set_int("reset_history", 1)
+            except Exception:
+                _log_exception("material live update")
             _ignis_materials_dirty = False
         elif _ignis_tlas_dirty:
             self._rebuild_tlas(depsgraph)
@@ -1325,9 +1412,19 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         dll_wrapper.set_int("reset_history", 1)
                     _ignis_instance_count = count
 
-        # FPS limiter
+        # FPS limiter / V-Sync
         props = context.scene.ignis_rt
         fps_limit = props.fps_limit
+        if props.vsync:
+            # Detect monitor refresh rate (fallback 60Hz)
+            try:
+                import ctypes
+                dm = ctypes.wintypes.DEVMODE()
+                dm.dmSize = ctypes.sizeof(dm)
+                ctypes.windll.user32.EnumDisplaySettingsW(None, -1, ctypes.byref(dm))
+                fps_limit = dm.dmDisplayFrequency if dm.dmDisplayFrequency > 0 else 60
+            except Exception:
+                fps_limit = 60
         if fps_limit > 0:
             min_frame_time = 1.0 / fps_limit
             now = time.perf_counter()
@@ -1341,6 +1438,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         dll_wrapper.set_int("max_bounces", props.max_bounces)
         dll_wrapper.set_int("spp", props.samples_per_pixel)
         dll_wrapper.set_int("backface_culling", 1 if props.backface_culling else 0)
+        dll_wrapper.set_int("restir_di", 1 if props.restir_di else 0)
         dll_wrapper.set_int("debug_view", props.debug_view)
         dll_wrapper.set_int("auto_sky_colors", 1 if props.auto_sky_colors else 0)
         if not props.auto_sky_colors:
@@ -1348,6 +1446,23 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             dll_wrapper.set_float("ambient_color_r", props.ambient_color[0])
             dll_wrapper.set_float("ambient_color_g", props.ambient_color[1])
             dll_wrapper.set_float("ambient_color_b", props.ambient_color[2])
+        # Sync World background color (from Surface → Background node)
+        try:
+            world = context.scene.world
+            if world and world.node_tree:
+                for wnode in world.node_tree.nodes:
+                    if wnode.type == 'BACKGROUND':
+                        wc = wnode.inputs.get('Color')
+                        ws = wnode.inputs.get('Strength')
+                        if wc and ws:
+                            s = float(ws.default_value)
+                            dll_wrapper.set_float("world_bg_r", float(wc.default_value[0]) * s)
+                            dll_wrapper.set_float("world_bg_g", float(wc.default_value[1]) * s)
+                            dll_wrapper.set_float("world_bg_b", float(wc.default_value[2]) * s)
+                        break
+        except Exception:
+            pass
+
         dll_wrapper.set_float("sky_refl_intensity", props.sky_refl_intensity)
         dll_wrapper.set_float("sky_bounce_intensity", props.sky_bounce_intensity)
         dll_wrapper.set_float("cloud_visibility", props.cloud_visibility)

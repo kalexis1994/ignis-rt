@@ -97,6 +97,11 @@ struct Material {
 
     float sunSpecular;
     float sunSpecularEXP;
+
+    // Node VM bytecode
+    uint nodeVmHeader;       // [7:0]=instrCount, [15:8]=flags
+    uint nodeVmPad[3];
+    uvec4 nodeVmCode[32];    // 32 instructions
 };
 
 layout(binding = 4, set = 0, scalar) buffer MaterialBuffer {
@@ -178,6 +183,8 @@ layout(buffer_reference, scalar) buffer PrimMaterials { uint m[]; };
 #include "include/nrd_encode.glsl"
 #include "include/tonemap.glsl"
 #include "include/gi_reservoir.glsl"
+#include "include/di_reservoir.glsl"
+#include "include/node_vm.glsl"
 
 const uint SHADER_BLENDER_PBR = 100u;
 
@@ -264,8 +271,12 @@ vec3 evaluateSky(vec3 dir) {
     // Fallback: procedural sky
     float sunIntensitySky = cam.sunLight.w;
 
-    // No sun in scene → black sky (no procedural sky without a sun)
-    if (sunIntensitySky <= 0.0) return vec3(0.0);
+    // No sun in scene → return World background color from Blender's
+    // World → Surface → Background node (color × strength).
+    // Default is 0.05 gray (set in ignis_config.h when no World exists).
+    if (sunIntensitySky <= 0.0) {
+        return vec3(cam.windParams.z, cam.windParams.w, cam.rainParams.w);
+    }
 
     vec3 sunDir = normalize(cam.sunLight.xyz);
     vec3 ambColor = cam.ambientLight.rgb;
@@ -306,7 +317,7 @@ struct PBRHit {
 };
 
 PBRHit evaluateBlenderMaterial(
-    Material mat,
+    Material mat, uint matIdx,
     vec3 worldPos, vec3 geoNormal,
     vec3 v0, vec3 v1, vec3 v2,
     vec2 uv0, vec2 uv1, vec2 uv2,
@@ -325,39 +336,68 @@ PBRHit evaluateBlenderMaterial(
     hit.ior = mat.detailUVMultiplier;
     // transmission already set above (with passthrough override)
 
-    // Base color + alpha: texture or scalar fallback
+    // ── Node VM: per-pixel node tree evaluation ──
+    // When the VM has a program, it handles the ENTIRE material evaluation for
+    // the properties it computes. The legacy pipeline only runs for properties
+    // the VM doesn't override, preventing double-processing.
+    NodeVmResult vm = executeNodeVm(matIdx, uv, worldPos);
+    bool vmActive = (mat.nodeVmHeader & 0xFFu) > 0u;
+
+    // Base color + alpha: VM or legacy pipeline
     float texAlpha = 1.0;
-    if (mat.diffuseTexIndex != 0xFFFFFFFFu) {
-        vec4 texColor = texture(textures[nonuniformEXT(mat.diffuseTexIndex)], uv);
-        hit.baseColor = texColor.rgb;
-        texAlpha = texColor.a;
-    } else {
-        hit.baseColor = vec3(mat.ksAmbient, mat.ksDiffuse, mat.ksSpecular);
-        // No diffuse texture — read alpha from emission texture if present
-        // (fire/billboard materials use emission texture for both color and alpha)
-        if (mat.detailTexIndex != 0xFFFFFFFFu) {
+    if (vmActive && vm.hasBaseColor) {
+        // VM handled base color (including texture sampling, ColorRamp, Mix, etc.)
+        hit.baseColor = vm.baseColor;
+        // Alpha: VM may override, otherwise read from texture
+        if (vm.hasAlpha) {
+            texAlpha = vm.alpha;
+        } else if (mat.diffuseTexIndex != 0xFFFFFFFFu) {
+            texAlpha = texture(textures[nonuniformEXT(mat.diffuseTexIndex)], uv).a;
+        } else if (mat.detailTexIndex != 0xFFFFFFFFu) {
             texAlpha = texture(textures[nonuniformEXT(mat.detailTexIndex)], uv).a;
+        }
+        // Skip Hue/Sat — VM already evaluated the full node chain
+    } else {
+        // Legacy pipeline: direct texture read + Hue/Sat
+        if (mat.diffuseTexIndex != 0xFFFFFFFFu) {
+            vec4 texColor = texture(textures[nonuniformEXT(mat.diffuseTexIndex)], uv);
+            hit.baseColor = texColor.rgb;
+            texAlpha = texColor.a;
+        } else {
+            hit.baseColor = vec3(mat.ksAmbient, mat.ksDiffuse, mat.ksSpecular);
+            if (mat.detailTexIndex != 0xFFFFFFFFu) {
+                texAlpha = texture(textures[nonuniformEXT(mat.detailTexIndex)], uv).a;
+            }
+        }
+
+        // Hue/Saturation/Value adjustment (legacy path only)
+        float colorValue = mat.detailNMMult;
+        float colorSaturation = mat.detailNMMultV;
+        if (colorValue != 1.0 || colorSaturation != 1.0) {
+            hit.baseColor *= colorValue;
+            if (colorSaturation < 1.0) {
+                float lum = dot(hit.baseColor, vec3(0.2126, 0.7152, 0.0722));
+                hit.baseColor = mix(vec3(lum), hit.baseColor, colorSaturation);
+            }
         }
     }
     hit.alpha = texAlpha * mat.multG;
 
-    // Hue/Saturation/Value adjustment (from HUE_SAT node in Base Color chain)
-    // detailNMMult = color_value (brightness), detailNMMultV = color_saturation
-    float colorValue = mat.detailNMMult;
-    float colorSaturation = mat.detailNMMultV;
-    if (colorValue != 1.0 || colorSaturation != 1.0) {
-        // Apply value (brightness multiplier)
-        hit.baseColor *= colorValue;
-        // Apply saturation (0 = grayscale, 1 = original)
-        if (colorSaturation < 1.0) {
-            float lum = dot(hit.baseColor, vec3(0.2126, 0.7152, 0.0722));
-            hit.baseColor = mix(vec3(lum), hit.baseColor, colorSaturation);
-        }
+    // VM overrides for other properties
+    if (vmActive) {
+        if (vm.hasRoughness)    hit.roughness = clamp(vm.roughness, 0.01, 1.0);
+        if (vm.hasMetallic)     hit.metallic = clamp(vm.metallic, 0.0, 1.0);
+        if (vm.hasIor)          hit.ior = vm.ior;
+        if (vm.hasTransmission) hit.transmission = vm.transmission;
     }
+
+    // When VM provides a transformed UV (from shared Mapping node),
+    // use it for all texture sampling (ORM, normal, roughness)
+    vec2 texUV = (vmActive && vm.hasTransformedUV) ? vm.transformedUV : uv;
 
     // ORM map: R=occlusion, G=roughness, B=metallic (standard convention)
     if (mat.mapsTexIndex != 0xFFFFFFFFu) {
-        vec4 orm = texture(textures[nonuniformEXT(mat.mapsTexIndex)], uv);
+        vec4 orm = texture(textures[nonuniformEXT(mat.mapsTexIndex)], texUV);
         hit.roughness = clamp(orm.g, 0.01, 1.0);
         hit.metallic = clamp(orm.b, 0.0, 1.0);
     }
@@ -386,9 +426,9 @@ PBRHit evaluateBlenderMaterial(
 
             ivec2 texDim = textureSize(textures[nonuniformEXT(mat.normalTexIndex)], 0);
             float texelSize = 1.0 / float(max(texDim.x, texDim.y));
-            float h_c = texture(textures[nonuniformEXT(mat.normalTexIndex)], uv).r;
-            float h_x = texture(textures[nonuniformEXT(mat.normalTexIndex)], uv + vec2(texelSize, 0)).r;
-            float h_y = texture(textures[nonuniformEXT(mat.normalTexIndex)], uv + vec2(0, texelSize)).r;
+            float h_c = texture(textures[nonuniformEXT(mat.normalTexIndex)], texUV).r;
+            float h_x = texture(textures[nonuniformEXT(mat.normalTexIndex)], texUV + vec2(texelSize, 0)).r;
+            float h_y = texture(textures[nonuniformEXT(mat.normalTexIndex)], texUV + vec2(0, texelSize)).r;
 
             // Cycles uses ray differentials to auto-scale bump. Without them,
             // we normalize T/B and use a scale that approximates Cycles' result.
@@ -406,7 +446,7 @@ PBRHit evaluateBlenderMaterial(
             N = normalize(bumpStrength * bumpN + (1.0 - bumpStrength) * N);
         } else {
             // Positive strength = RGB normal map
-            vec3 texN = texture(textures[nonuniformEXT(mat.normalTexIndex)], uv).rgb;
+            vec3 texN = texture(textures[nonuniformEXT(mat.normalTexIndex)], texUV).rgb;
             float strength = rawStrength > 0.0 ? rawStrength : 1.0;
             N = applyNormalMap(texN, T, N, B, strength);
         }
@@ -517,7 +557,7 @@ void main() {
     // Multi-SPP: configurable samples per pixel (lightPad1 from CPU)
     int spp = clamp(int(cam.lightPad1), 1, 128);
     bool rrModeGlobal = (cam.parameters.w == 2u);
-    bool backfaceCulling = (cam.lightPad2 != 0u);
+    bool backfaceCulling = (cam.lightPad2 & 1u) != 0u;  // bit 0 of lightPad2
 
     // Accumulators across SPP samples
     vec3 accumDiffuse = vec3(0.0);
@@ -556,7 +596,7 @@ void main() {
     float blueNoise = texelFetch(blueNoiseTexture, bnCoord, 0).r;
     rngState += uint(blueNoise * 4294967295.0);
 
-    // Sub-pixel jitter
+    // Sub-pixel jitter (NRD mode only — DLSS RR uses Halton from projInverse)
     vec2 pixelCenter = vec2(pixel) + 0.5;
     if (!rrModeGlobal) {
         pixelCenter += vec2(rand01() - 0.5, rand01() - 0.5);
@@ -713,7 +753,7 @@ void main() {
 
         // Evaluate PBR material
         PBRHit pbrHit = evaluateBlenderMaterial(
-            mat, worldPos, worldN,
+            mat, matIdx, worldPos, worldN,
             wp0, wp1, wp2, uv0_, uv1_, uv2_, hitUV
         );
 
@@ -846,15 +886,31 @@ void main() {
         if (!skipSunNEE && sunIntensity > 0.0 && sunDir.y > -0.01) {
             float NdotL = dot(N, sunDir);
             if (NdotL > 0.0) {
-                // Shadow ray with alpha test support
+                // Shadow ray with soft penumbra (sun angular radius)
+                // Blue noise + Halton temporal sequence for stable penumbra convergence
+                vec3 shadowDir = sunDir;
+                {
+                    float sunRadius = 0.01;  // ~0.57° angular radius (close to real sun)
+                    // Use blue noise for spatial coherence + frame index for temporal variation
+                    ivec2 bnCoord = ivec2((pixel.x + frameIndex * 7) & 63, (pixel.y + frameIndex * 11) & 63);
+                    vec2 diskSample = vec2(
+                        texelFetch(blueNoiseTexture, bnCoord, 0).r,
+                        texelFetch(blueNoiseTexture, ivec2(bnCoord.y, bnCoord.x), 0).r
+                    );
+                    float diskR = sqrt(diskSample.x) * sunRadius;
+                    float diskAngle = diskSample.y * 2.0 * PI;
+                    vec3 sT = abs(sunDir.y) < 0.999 ? normalize(cross(sunDir, vec3(0,1,0))) : normalize(cross(sunDir, vec3(1,0,0)));
+                    vec3 sB = cross(sunDir, sT);
+                    shadowDir = normalize(sunDir + sT * (cos(diskAngle) * diskR) + sB * (sin(diskAngle) * diskR));
+                }
                 vec3 shadowOrigin = pbrHit.worldPos + N * 0.002;
                 bool inShadow = false;
-                float shadowHitDist = 65504.0;  // no occluder = far
+                float shadowHitDist = 65504.0;
                 for (int shadowSkip = 0; shadowSkip < 16; shadowSkip++) {
                     rayQueryEXT shadowRQ;
                     rayQueryInitializeEXT(shadowRQ, topLevelAS,
                         gl_RayFlagsOpaqueEXT,
-                        0xFF, shadowOrigin, 0.0, sunDir, 10000.0);
+                        0xFF, shadowOrigin, 0.0, shadowDir, 10000.0);
                     while (rayQueryProceedEXT(shadowRQ)) {}
 
                     if (rayQueryGetIntersectionTypeEXT(shadowRQ, true)
@@ -951,8 +1007,216 @@ void main() {
             }
         }
 
-        // ---- NEE: Point/spot/area lights (bounce 0-1 only) ----
-        if (!skipLocalNEE)
+        // ---- ReSTIR DI: Reservoir-based light sampling (bounce 0 only) ----
+        // Replaces brute-force all-lights loop with weighted reservoir sampling.
+        // Each pixel picks 1 light from M candidates, then temporally reuses.
+        // Result: same quality as sampling ALL lights, but only 1 shadow ray.
+        bool restirDone = false;
+        // ReSTIR DI: reservoir-based light sampling (opt-in via UI toggle)
+        // Better for scenes with many lights (16+), may cause splotches with few lights
+        bool restirEnabled = (cam.lightPad2 >> 1u) != 0u;  // bit 1 of lightPad2
+        if (restirEnabled && !skipLocalNEE && bounce == 0 && cam.lightCount > 0u) {
+            DIReservoir reservoir = emptyDIReservoir();
+            vec3 V = -rayDir;
+            uint localRng = rngState;
+
+            // Candidate generation: sample M=min(lightCount, 8) random lights
+            uint M = min(cam.lightCount, 8u);
+            float sourcePDF = 1.0 / float(cam.lightCount);
+
+            for (uint m = 0u; m < M; m++) {
+                // Random light index
+                localRng ^= localRng << 13u; localRng ^= localRng >> 17u; localRng ^= localRng << 5u;
+                uint li = uint(float(localRng) / 4294967295.0 * float(cam.lightCount));
+                li = min(li, cam.lightCount - 1u);
+
+                vec4 lPosRange = cam.lights[li * 4u];
+                vec4 lColInt   = cam.lights[li * 4u + 1u];
+                vec4 lDirSizeX = cam.lights[li * 4u + 2u];
+                vec4 lTanSizeY = cam.lights[li * 4u + 3u];
+
+                vec3 lightPos = lPosRange.xyz;
+                vec3 lightColor = lColInt.rgb;
+                float lightInt = lColInt.w;
+                float sizeY = lTanSizeY.w;
+                bool isSpecial = (lPosRange.w < 0.0);
+                bool isSpot = isSpecial && sizeY < 0.0;
+                bool isArea = isSpecial && !isSpot;
+
+                // Compute light direction and attenuation
+                vec3 toLight = lightPos - pbrHit.worldPos;
+                float dist = length(toLight);
+                if (dist < 0.001) continue;
+                vec3 L = toLight / dist;
+                float NdotL = dot(N, L);
+                if (NdotL <= 0.0) continue;
+
+                // Spot light cone attenuation
+                float spotAtten = 1.0;
+                if (isSpot) {
+                    vec3 spotDir = lDirSizeX.xyz;
+                    float cosHalfAngle = lDirSizeX.w;
+                    float spotSmooth = abs(lTanSizeY.w);
+                    float cosAngle = dot(-L, spotDir);
+                    float t = clamp((cosAngle - cosHalfAngle) * spotSmooth, 0.0, 1.0);
+                    spotAtten = t * t * (3.0 - 2.0 * t);
+                    if (spotAtten <= 0.0) continue;
+                }
+
+                float falloff = 1.0 / (dist * dist + 0.001);
+                float attenuation = falloff;
+                vec3 samplePos = lightPos;
+
+                if (isArea) {
+                    vec3 lightNormal = lDirSizeX.xyz;
+                    float lightFacing = dot(-L, lightNormal);
+                    if (lightFacing <= 0.0) continue;
+                    float areaSize = lDirSizeX.w * lTanSizeY.w;
+                    attenuation *= lightFacing * areaSize;
+                }
+
+                vec3 lightRadiance = lightColor * lightInt * attenuation * spotAtten;
+                float pHat = diTargetPDF(N, V, L, NdotL, pbrHit.baseColor,
+                                         pbrHit.roughness, pbrHit.metallic, lightRadiance);
+
+                diReservoirUpdate(reservoir, li, samplePos, pHat, sourcePDF, localRng);
+            }
+
+            // Temporal reuse: merge with previous frame's reservoir
+            uint pixelLinearIdx = uint(pixel.y) * uint(launchSize.x) + uint(pixel.x);
+            uint prevBase = pixelLinearIdx * 3u;
+            DIReservoir prevReservoir = diUnpack(
+                giReservoirPrev.data[prevBase + 0u],
+                giReservoirPrev.data[prevBase + 1u]);
+
+            if (prevReservoir.M > 0.0 && prevReservoir.lightIndex != 0xFFFFFFFFu
+                && prevReservoir.age < 20.0) {
+                // Re-evaluate target PDF of previous sample at current pixel
+                uint prevLi = prevReservoir.lightIndex;
+                if (prevLi < cam.lightCount) {
+                    vec4 pPosRange = cam.lights[prevLi * 4u];
+                    vec4 pColInt   = cam.lights[prevLi * 4u + 1u];
+                    vec3 pToLight = pPosRange.xyz - pbrHit.worldPos;
+                    float pDist = length(pToLight);
+                    vec3 pL = pToLight / max(pDist, 0.001);
+                    float pNdotL = dot(N, pL);
+                    float pFalloff = 1.0 / (pDist * pDist + 0.001);
+                    vec3 pRadiance = pColInt.rgb * pColInt.w * pFalloff;
+                    float prevTargetPDF = diTargetPDF(N, V, pL, max(pNdotL, 0.0),
+                        pbrHit.baseColor, pbrHit.roughness, pbrHit.metallic, pRadiance);
+
+                    // Clamp M to prevent bias buildup
+                    DIReservoir clampedPrev = prevReservoir;
+                    clampedPrev.M = min(clampedPrev.M, 20.0);
+                    diReservoirMerge(reservoir, clampedPrev, prevTargetPDF, localRng);
+                }
+            }
+
+            // Spatial reuse: merge with K random neighbor reservoirs
+            // This shares shadow visibility info across pixels, reducing binary noise
+            for (int sn = 0; sn < 3; sn++) {
+                // Random neighbor within 10px radius
+                localRng ^= localRng << 13u; localRng ^= localRng >> 17u; localRng ^= localRng << 5u;
+                float angle = float(localRng) / 4294967295.0 * 6.28318;
+                localRng ^= localRng << 13u; localRng ^= localRng >> 17u; localRng ^= localRng << 5u;
+                float radius = sqrt(float(localRng) / 4294967295.0) * 10.0;
+                ivec2 neighbor = pixel + ivec2(cos(angle) * radius, sin(angle) * radius);
+                neighbor = clamp(neighbor, ivec2(0), ivec2(launchSize) - 1);
+
+                uint nIdx = uint(neighbor.y) * uint(launchSize.x) + uint(neighbor.x);
+                uint nBase = nIdx * 3u;
+                DIReservoir nReservoir = diUnpack(
+                    giReservoirPrev.data[nBase + 0u],
+                    giReservoirPrev.data[nBase + 1u]);
+
+                if (nReservoir.M <= 0.0 || nReservoir.lightIndex >= cam.lightCount) continue;
+
+                // Re-evaluate neighbor's light at THIS pixel's surface
+                uint nLi = nReservoir.lightIndex;
+                vec4 nPosRange = cam.lights[nLi * 4u];
+                vec4 nColInt = cam.lights[nLi * 4u + 1u];
+                vec3 nToLight = nPosRange.xyz - pbrHit.worldPos;
+                float nDist = length(nToLight);
+                vec3 nL = nToLight / max(nDist, 0.001);
+                float nNdotL = dot(N, nL);
+                float nFalloff = 1.0 / (nDist * nDist + 0.001);
+                vec3 nRadiance = nColInt.rgb * nColInt.w * nFalloff;
+                float nTargetPDF = diTargetPDF(N, V, nL, max(nNdotL, 0.0),
+                    pbrHit.baseColor, pbrHit.roughness, pbrHit.metallic, nRadiance);
+
+                DIReservoir clampedN = nReservoir;
+                clampedN.M = min(clampedN.M, 10.0);
+                diReservoirMerge(reservoir, clampedN, nTargetPDF, localRng);
+            }
+
+            // Final shading: trace ONE shadow ray to the selected light
+            if (reservoir.lightIndex < cam.lightCount && reservoir.targetPDF > 0.0) {
+                uint finalLi = reservoir.lightIndex;
+                vec4 fPosRange = cam.lights[finalLi * 4u];
+                vec4 fColInt   = cam.lights[finalLi * 4u + 1u];
+                vec4 fDirSizeX = cam.lights[finalLi * 4u + 2u];
+                vec4 fTanSizeY = cam.lights[finalLi * 4u + 3u];
+
+                vec3 fToLight = fPosRange.xyz - pbrHit.worldPos;
+                float fDist = length(fToLight);
+                vec3 fL = fToLight / max(fDist, 0.001);
+
+                // Shadow ray
+                vec3 fShadowOrigin = pbrHit.worldPos + N * 0.002;
+                rayQueryEXT fShadowRQ;
+                rayQueryInitializeEXT(fShadowRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
+                    0xFF, fShadowOrigin, 0.0, fL, fDist - 0.004);
+                while (rayQueryProceedEXT(fShadowRQ)) {}
+                bool fInShadow = (rayQueryGetIntersectionTypeEXT(fShadowRQ, true)
+                    != gl_RayQueryCommittedIntersectionNoneEXT);
+
+                if (!fInShadow) {
+                    float W = diReservoirWeight(reservoir);
+                    float fNdotL = max(dot(N, fL), 0.0);
+                    float fFalloff = 1.0 / (fDist * fDist + 0.001);
+
+                    // Recompute attenuation for the final light
+                    float fAtten = fFalloff;
+                    bool fIsSpecial = (fPosRange.w < 0.0);
+                    bool fIsSpot = fIsSpecial && fTanSizeY.w < 0.0;
+                    bool fIsArea = fIsSpecial && !fIsSpot;
+                    float fSpotAtten = 1.0;
+
+                    if (fIsSpot) {
+                        float cosHalf = fDirSizeX.w;
+                        float sSm = abs(fTanSizeY.w);
+                        float cosA = dot(-fL, fDirSizeX.xyz);
+                        float st = clamp((cosA - cosHalf) * sSm, 0.0, 1.0);
+                        fSpotAtten = st * st * (3.0 - 2.0 * st);
+                    }
+                    if (fIsArea) {
+                        float faceDot = max(dot(-fL, fDirSizeX.xyz), 0.0);
+                        fAtten *= faceDot * fDirSizeX.w * fTanSizeY.w;
+                    }
+
+                    vec3 fRadiance = fColInt.rgb * fColInt.w * fAtten * fSpotAtten;
+                    vec3 fDiffC, fSpecC;
+                    evaluateCookTorrance(N, V, fL, pbrHit.baseColor, pbrHit.roughness,
+                        pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior, fDiffC, fSpecC);
+
+                    vec3 contribution = (fDiffC + fSpecC) * fRadiance * W;
+                    diffuseRadiance += fDiffC * fRadiance * W * throughput;
+                    specularRadiance += fSpecC * fRadiance * W * throughput;
+                }
+            }
+
+            // Write reservoir for next frame
+            reservoir.age += 1.0;
+            uint currBase = pixelLinearIdx * 3u;
+            giReservoirCurr.data[currBase + 0u] = diPackV0(reservoir);
+            giReservoirCurr.data[currBase + 1u] = diPackV1(reservoir);
+            giReservoirCurr.data[currBase + 2u] = vec4(0);
+            rngState = localRng;
+            restirDone = true;
+        }
+
+        // ---- NEE: Point/spot/area lights (fallback for bounce 1+ or when ReSTIR skipped) ----
+        if (!skipLocalNEE && !restirDone)
         for (uint li = neeStart; li < neeEnd; li++) {
             vec4 lightPosRange = cam.lights[li * 4u];
             vec4 lightColInt   = cam.lights[li * 4u + 1u];
@@ -973,7 +1237,12 @@ void main() {
             bool isAreaLight = isSpecialLight && !isSpotLight;
             float lightRange;
             if (isAreaLight) {
-                lightRange = max(sqrt(lightInt / 0.01), 1.0);
+                // Range must cover the light's own diagonal plus falloff distance
+                float sizeX = lightDirSizeX.w;
+                float sizeY = lightTanSizeY.w;
+                float diagonal = sqrt(sizeX * sizeX + sizeY * sizeY) * 0.5;
+                float falloffRange = max(sqrt(lightInt * sizeX * sizeY / 0.01), 1.0);
+                lightRange = diagonal + falloffRange;
             } else if (isSpotLight) {
                 lightRange = -rawRange;
             } else {
@@ -986,7 +1255,10 @@ void main() {
             if (dist > lightRange || dist < 0.001) continue;
             vec3 L = toLight / dist;
             float NdotL_pt = dot(N, L);
-            if (NdotL_pt <= 0.0) continue;
+            // For area lights: don't cull by center NdotL — parts of the light
+            // can illuminate the surface even when the center is near/below horizon.
+            // The per-sample NdotL is checked later in the BRDF evaluation.
+            if (!isAreaLight && NdotL_pt <= 0.0) continue;
 
             // Spot light: cone attenuation (Cycles formula)
             if (isSpotLight) {
@@ -1001,7 +1273,9 @@ void main() {
                 lightInt *= spotAtten;
             }
 
-            // Area light: check direction cull and sample on the light plane
+            // Area light: uniform area sampling with correct geometric term.
+            // Each sample tests one random point on the rectangle.
+            // The rectangular illumination pattern converges with temporal accumulation.
             vec3 jitteredTarget;
             if (isAreaLight) {
                 vec3 lightNormal = lightDirSizeX.xyz;
@@ -1009,12 +1283,7 @@ void main() {
                 float sizeX = lightDirSizeX.w;
                 float sizeY = lightTanSizeY.w;
 
-                // Area light only emits from front face (toward -normal in Blender convention)
-                // Skip if shading point is behind the light
-                float lightFacing = dot(-L, lightNormal);
-                if (lightFacing <= 0.0) continue;
-
-                // Sample a random point on the area light rectangle
+                // Don't hard-cull by center facing — check individual sample instead
                 vec3 lightBitangent = cross(lightNormal, lightTangent);
                 vec2 areaRnd = rand2() * 2.0 - 1.0;
                 jitteredTarget = lightPos
@@ -1036,19 +1305,16 @@ void main() {
             vec3 shadowDir = toSample / sampleDist;
             float shadowDist = sampleDist;
 
-            // For area lights: use distance to sampled point for uniform emission
-            // For point lights: use distance to center (jitter is just for soft shadows)
+            // Attenuation
             float effectiveDist = isAreaLight ? sampleDist : dist;
-
-            // Inverse-square falloff (physically correct, like Cycles)
             float falloff = 1.0 / (effectiveDist * effectiveDist + 0.001);
             float attenuation = falloff;
 
-            // Area light: multiply by area (uniform sampling PDF = 1/area)
-            // and cosine at light surface for correct geometric term
             if (isAreaLight) {
                 vec3 lightNormal = lightDirSizeX.xyz;
+                // Cosine at light surface — per sampled point, not center
                 float cosAtLight = max(dot(-shadowDir, lightNormal), 0.0);
+                if (cosAtLight <= 0.0) continue;  // sample is behind light
                 float areaSize = lightDirSizeX.w * lightTanSizeY.w;
                 attenuation *= cosAtLight * areaSize;
             }
@@ -1312,17 +1578,21 @@ void main() {
             float VdotH = max(dot(V, H), 0.0);
 
             // VNDF sampling weight = F * G2 / G1
-            // Divide by lobe selection probability (specWeight) to compensate:
-            //   Fw/specWeight ≈ 1.0 (both are Fresnel at similar angles)
-            //   so net weight ≈ G2/G1 — energy-correct
+            // This is the correct BRDF/PDF ratio for VNDF importance sampling.
+            // We do NOT divide by lobe selection probability (specWeight) because
+            // that cancels the Fresnel tint and creates overly bright specular
+            // for dark materials (both metals and dielectrics).
             vec3 Fw = fresnelSchlick(VdotH, F0);
             float G2 = SmithG2(NdotL, NdotV, alpha);
             float G1 = SmithG1(NdotV, alpha);
-            throughput *= (Fw / max(specWeight, 0.001)) * (G2 / max(G1, 0.001));
+            throughput *= Fw * (G2 / max(G1, 0.001));
 
             rayDir = newDir;
             if (bounce == 0) { isDiffusePath = false; captureSpecularMV = true; }
         }
+
+        // Clamp throughput every bounce to prevent fireflies from specular paths
+        throughput = min(throughput, vec3(MAX_RADIANCE));
 
         // Update ray origin (offset along geometric normal to avoid self-intersection)
         rayOrigin = pbrHit.worldPos + N * 0.002;
@@ -1427,10 +1697,9 @@ void main() {
         float diffHitDist = primaryHitDist;
         float specHitDist = primaryHitDist;
 
-        // Demodulate: divide diffuse radiance by albedo before NRD.
-        // NRD works better with irradiance (albedo-free) — less noise in color channels.
-        // Composite re-modulates by multiplying denoised result * albedo.
-        vec3 albedo = max(primaryAlbedo, vec3(0.01));  // avoid division by zero
+        // Demodulate diffuse for DLSS RR (separate albedo buffer is also passed).
+        // Floor albedo at 0.1 to prevent noise amplification on very dark surfaces.
+        vec3 albedo = max(primaryAlbedo, vec3(0.1));
         vec3 demodDiffuse = diffuseRadiance / albedo;
 
         imageStore(diffuseRadianceImg, pixel, NRD_PackRadiance(demodDiffuse, diffHitDist));
