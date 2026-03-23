@@ -837,8 +837,7 @@ void Renderer::RenderFrameRT() {
     }
 
     // SHARC resolve: merge write buffer → read buffer (EMA + aging)
-    // TODO: SHARC causes VK_ERROR_DEVICE_LOST on complex scenes — disabled until investigated
-    if (false && sharcResolveReady_ && rtPipeline_->HasSHARCBuffers()) {
+    if (sharcResolveReady_ && rtPipeline_->HasSHARCBuffers()) {
         VkMemoryBarrier rtToSharc{};
         rtToSharc.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         rtToSharc.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;

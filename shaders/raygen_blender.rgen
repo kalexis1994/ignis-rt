@@ -134,9 +134,49 @@ layout(binding = 22, set = 0, r32f) uniform image2D dlssDepthImg;
 // Cloud shadow (declared for layout compatibility)
 layout(binding = 23, set = 0) uniform sampler2D cloudShadowMap;
 
-// SHARC (declared for layout compatibility)
+// SHARC radiance cache (Spatial Hash Automatic Radiance Caching)
+// Write buffer: RT writes radiance at bounce hit points this frame
+// Read buffer: resolved cache from previous frames (temporal accumulation)
 layout(binding = 20, set = 0, std430) buffer SHARCWriteBuffer { uint sharcWriteData[]; } sharcWrite;
 layout(binding = 21, set = 0, std430) buffer SHARCReadBuffer  { uint sharcReadData[];  } sharcRead;
+
+#include "sharc.glsl"
+
+// SHARC read: lookup cached radiance at a world position
+// Returns true if cache hit (valid data), false if miss
+bool sharcLookup(vec3 worldPos, out vec3 radiance) {
+    uint key = sharcHash(worldPos);
+    uint idx = (key & SHARC_TABLE_MASK) * 8u;  // 8 uints per entry
+
+    uint storedKey = sharcRead.sharcReadData[idx + 0];
+    uint sampleCount = sharcRead.sharcReadData[idx + 1];
+
+    if (storedKey == key && sampleCount >= SHARC_MIN_SAMPLES) {
+        float invCount = 1.0 / float(sampleCount);
+        radiance = vec3(
+            uintBitsToFloat(sharcRead.sharcReadData[idx + 2]),
+            uintBitsToFloat(sharcRead.sharcReadData[idx + 3]),
+            uintBitsToFloat(sharcRead.sharcReadData[idx + 4])
+        ) * invCount;
+        return true;
+    }
+    radiance = vec3(0.0);
+    return false;
+}
+
+// SHARC write: store radiance at a world position
+// Non-atomic: last writer wins. The resolve shader's EMA smooths over frames.
+void sharcStore(vec3 worldPos, vec3 radiance, uint frameIdx) {
+    uint key = sharcHash(worldPos);
+    uint idx = (key & SHARC_TABLE_MASK) * 8u;
+
+    sharcWrite.sharcWriteData[idx + 0] = key;
+    sharcWrite.sharcWriteData[idx + 1] = 1u;  // sample count
+    sharcWrite.sharcWriteData[idx + 2] = floatBitsToUint(radiance.r);
+    sharcWrite.sharcWriteData[idx + 3] = floatBitsToUint(radiance.g);
+    sharcWrite.sharcWriteData[idx + 4] = floatBitsToUint(radiance.b);
+    sharcWrite.sharcWriteData[idx + 5] = frameIdx;
+}
 
 // GI Reservoir buffers for ReSTIR temporal reuse (3 vec4s per pixel)
 layout(binding = 24, set = 0, std430) buffer GIReservoirCurrBuf { vec4 data[]; } giReservoirCurr;
@@ -643,7 +683,25 @@ void main() {
     float reservoirRng = rand01();
     bool giReservoirEnabled = false;  // disable buffer access
 
+    bool sharcEnabled = true;  // SHARC radiance cache for indirect bounces
+
     for (int bounce = 0; bounce < maxBounces; bounce++) {
+
+        // ── SHARC cache lookup (bounce 2+): use cached radiance instead of tracing ──
+        if (sharcEnabled && bounce >= 2) {
+            vec3 cachedRadiance;
+            if (sharcLookup(rayOrigin, cachedRadiance)) {
+                // Cache hit — use cached indirect radiance and stop bouncing
+                cachedRadiance *= giIntensity;
+                if (isDiffusePath) {
+                    diffuseRadiance += cachedRadiance * throughput;
+                } else {
+                    specularRadiance += cachedRadiance * throughput;
+                }
+                break;
+            }
+        }
+
         // Trace ray
         rayQueryEXT rq;
         rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT,
@@ -1474,6 +1532,16 @@ void main() {
             float pHat = giTargetPDF(primaryNormal, primaryWorldPos, newSample);
             if (pHat > 0.0) {
                 reservoirUpdate(reservoir, newSample, pHat, reservoirRng);
+            }
+        }
+
+        // ── SHARC cache write (bounce 1+): store radiance for future frames ──
+        if (sharcEnabled && bounce >= 1) {
+            // Compute outgoing radiance at this hit point (NEE + emission)
+            vec3 hitRadiance = diffuseRadiance + specularRadiance;
+            float lum = dot(hitRadiance, vec3(0.2126, 0.7152, 0.0722));
+            if (lum > 0.001 && !any(isnan(hitRadiance)) && !any(isinf(hitRadiance))) {
+                sharcStore(pbrHit.worldPos, hitRadiance, frameIndex);
             }
         }
 
