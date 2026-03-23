@@ -101,14 +101,14 @@ bool RTPipeline::CreateSHARCBuffers() {
 
     // SHARC uses 2 buffers on bindings 20-21:
     // [0] Hash Entries: uint64 per entry = 8 bytes (binding 20)
-    // [1] Combined:     accumulation (uint×4) + resolved (uint×4) = 32 bytes/entry (binding 21)
-    //                   First half = accumulation, second half = resolved
+    // [1] Combined: accum (uint×4) + resolved (uint×4) + guide bins (uint×6) = 56 bytes/entry
+    //   Layout: [accum: cap×4] [resolved: cap×4] [guide: cap×6]
     const VkDeviceSize sizes[3] = {
         SHARC_CAPACITY * 8,   // hash entries (uint64)
-        SHARC_CAPACITY * 32,  // combined accum+resolved (2× uint4 per entry)
-        0,                     // unused (resolved is in buffer[1] upper half)
+        SHARC_CAPACITY * 56,  // combined accum+resolved+guide (14 uints per entry)
+        0,                     // unused
     };
-    const char* names[3] = { "hashEntries", "accum+resolved", "unused" };
+    const char* names[3] = { "hashEntries", "accum+resolved+guide", "unused" };
     const int numBuffers = 2;  // only create 2 buffers
 
     auto vkGetBufferDeviceAddressKHR_ = (PFN_vkGetBufferDeviceAddressKHR)

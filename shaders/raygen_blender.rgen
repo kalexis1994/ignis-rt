@@ -1528,12 +1528,23 @@ void main() {
             }
         }
 
-        // ── SHARC update: sparse pixels write direct lighting to cache ──
+        // ── SHARC update + Path Guiding recording ──
         if (sharcEnabled && sharcUpdatePixel) {
             vec3 directLighting = (diffuseRadiance + specularRadiance) - preBounceRadiance;
             if (any(isnan(directLighting)) || any(isinf(directLighting)))
                 directLighting = vec3(0.0);
             directLighting = max(directLighting, vec3(0.0));
+
+            // Record radiance direction into guide bins
+            float lum = dot(directLighting, vec3(0.2126, 0.7152, 0.0722));
+            if (lum > 0.001) {
+                uint64_t guideKey = sharcHashKey(pbrHit.worldPos, N, sharcGrid);
+                uint guideSlot = sharcInsert(guideKey, sharcCapacity);
+                if (guideSlot != 0xFFFFFFFFu) {
+                    // Record which direction the light came FROM (negative ray dir)
+                    guideAccumulate(guideSlot, -rayDir, lum, sharcCapacity);
+                }
+            }
 
             bool continueTracing = SharcUpdateHit(sharcGrid, sharcState,
                 pbrHit.worldPos, N, directLighting, rand01(), sharcCapacity);
@@ -1622,11 +1633,34 @@ void main() {
         bool chooseDiffuse = (rand01() > specWeight);
 
         if (chooseDiffuse && pbrHit.metallic < 1.0) {
-            // Diffuse lobe — chosen with probability (1 - specWeight)
-            vec3 newDir = sampleCosineHemisphere(rand2(), N);
-            // BRDF/pdf = baseColor * (1-metallic) * (1-F) / (1-specWeight)
-            // Since (1-F)/(1-specWeight) ≈ 1.0, simplify:
-            throughput *= pbrHit.baseColor * (1.0 - pbrHit.metallic);
+            // Diffuse lobe — with path guiding when available
+            vec3 newDir;
+
+            // Try path guiding: sample toward where light was found in previous frames
+            bool useGuide = false;
+            if (sharcEnabled && bounce >= 1) {
+                uint64_t guideKey = sharcHashKey(pbrHit.worldPos, N, sharcGrid);
+                uint guideSlot = sharcFind(guideKey, sharcCapacity);
+                if (guideSlot != 0xFFFFFFFFu) {
+                    float guidePdf;
+                    vec3 guideDir = guideSampleDirection(guideSlot, N, rand01(), rand01(),
+                                                         sharcCapacity, guidePdf);
+                    if (guidePdf > 0.0 && dot(guideDir, N) > 0.0) {
+                        newDir = guideDir;
+                        // MIS: weight the guided sample against cosine hemisphere
+                        float cosinePdf = max(dot(newDir, N), 0.0) * INV_PI;
+                        float misWeight = guideMISWeight(cosinePdf, guidePdf, 0.5);
+                        throughput *= pbrHit.baseColor * (1.0 - pbrHit.metallic) * misWeight;
+                        useGuide = true;
+                    }
+                }
+            }
+
+            if (!useGuide) {
+                // Standard cosine hemisphere sampling
+                newDir = sampleCosineHemisphere(rand2(), N);
+                throughput *= pbrHit.baseColor * (1.0 - pbrHit.metallic);
+            }
 
             rayDir = newDir;
             if (bounce == 0) isDiffusePath = true;

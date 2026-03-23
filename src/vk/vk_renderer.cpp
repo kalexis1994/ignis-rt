@@ -2332,7 +2332,7 @@ void Renderer::UpdateSHARCResolveDescriptors() {
     VkDescriptorBufferInfo readInfo{};
     readInfo.buffer = rtPipeline_->GetSHARCBuffer(1);  // combined accum+resolved
     readInfo.offset = 0;
-    readInfo.range = RTPipeline::SHARC_CAPACITY * 32;
+    readInfo.range = RTPipeline::SHARC_CAPACITY * 56;  // accum+resolved+guide
 
     VkWriteDescriptorSet writes[2] = {};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;

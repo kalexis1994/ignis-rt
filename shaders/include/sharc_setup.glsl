@@ -248,4 +248,97 @@ bool isSharcUpdatePixel(uvec2 pixel, uint frameIndex) {
     return (pixel.x == selectedX && pixel.y == selectedY);
 }
 
+// ============================================================
+// Path Guiding — 6 directional bins per SHARC cell
+// Stores accumulated radiance per cube-face direction.
+// Used to importance-sample bounce directions toward light.
+// ============================================================
+
+// 6 bins: +X, -X, +Y, -Y, +Z, -Z
+uint guideDirToBin(vec3 dir) {
+    vec3 a = abs(dir);
+    if (a.x > a.y && a.x > a.z) return dir.x > 0.0 ? 0u : 1u;
+    if (a.y > a.z)              return dir.y > 0.0 ? 2u : 3u;
+    return                             dir.z > 0.0 ? 4u : 5u;
+}
+
+// Bin center directions
+vec3 guideBinCenter(uint bin) {
+    if (bin == 0u) return vec3( 1, 0, 0);
+    if (bin == 1u) return vec3(-1, 0, 0);
+    if (bin == 2u) return vec3( 0, 1, 0);
+    if (bin == 3u) return vec3( 0,-1, 0);
+    if (bin == 4u) return vec3( 0, 0, 1);
+    return                  vec3( 0, 0,-1);
+}
+
+// Guide bins offset in the data buffer: after accum (capacity*4) + resolved (capacity*4)
+uint guideBinOffset(uint slot, uint capacity) {
+    return capacity * 8u + slot * 6u;
+}
+
+// Accumulate radiance into the directional bin matching incomingDir
+void guideAccumulate(uint slot, vec3 incomingDir, float luminance, uint capacity) {
+    uint bin = guideDirToBin(incomingDir);
+    uint scaled = uint(luminance * float(SHARC_RADIANCE_SCALE));
+    if (scaled > 0u) {
+        atomicAdd(_sharcAccum.data[guideBinOffset(slot, capacity) + bin], scaled);
+    }
+}
+
+// Sample a direction guided by the radiance bins
+// Returns the sampled direction and the PDF
+// If no guide data, falls back to cosine hemisphere
+vec3 guideSampleDirection(uint slot, vec3 N, float rand1, float rand2,
+                          uint capacity, out float guidePdf) {
+    uint bOff = guideBinOffset(slot, capacity);
+
+    // Read 6 bins (from resolved region — shifted by capacity*4 after accum guide bins)
+    // Actually guide bins are accumulated and resolved in the same region.
+    // We read directly from the accum data for simplicity (current frame's data).
+    float bins[6];
+    float total = 0.0;
+    for (uint i = 0u; i < 6u; i++) {
+        bins[i] = max(float(_sharcAccum.data[bOff + i]) / float(SHARC_RADIANCE_SCALE), 0.0);
+        total += bins[i];
+    }
+
+    // Not enough data → fall back
+    if (total < 0.001) {
+        guidePdf = 0.0;
+        return vec3(0.0);
+    }
+
+    // Inverse CDF sampling
+    float cdf = 0.0;
+    uint selected = 0u;
+    for (uint i = 0u; i < 6u; i++) {
+        cdf += bins[i] / total;
+        if (rand1 < cdf) { selected = i; break; }
+    }
+
+    // Sample direction within the selected cube face cone
+    vec3 center = guideBinCenter(selected);
+    // Perturb within ~60° cone around bin center
+    vec3 tangent = abs(center.y) < 0.999 ? normalize(cross(center, vec3(0,1,0)))
+                                          : normalize(cross(center, vec3(1,0,0)));
+    vec3 bitangent = cross(center, tangent);
+    float angle = rand2 * 0.9;  // ~51° max deviation
+    float r = sqrt(angle);
+    float phi = rand1 * 6.2831853;  // reuse rand1 for phi (already consumed for bin)
+    vec3 dir = normalize(center + tangent * (r * cos(phi)) + bitangent * (r * sin(phi)));
+
+    // Flip to same hemisphere as normal
+    if (dot(dir, N) < 0.0) dir = -dir;
+
+    guidePdf = (bins[selected] / total) * (6.0 / 6.2831853);
+    return dir;
+}
+
+// MIS weight: balance heuristic between BSDF pdf and guide pdf
+float guideMISWeight(float bsdfPdf, float guidePdf, float guideProb) {
+    float combinedPdf = guideProb * guidePdf + (1.0 - guideProb) * bsdfPdf;
+    return bsdfPdf / max(combinedPdf, 1e-6);
+}
+
 #endif // SHARC_SETUP_GLSL
