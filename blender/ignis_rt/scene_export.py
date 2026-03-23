@@ -1013,8 +1013,15 @@ def export_lights(depsgraph):
         size_y = 0.0
 
         if light.type == 'AREA':
-            size_x = light.size if hasattr(light, 'size') else 1.0
-            size_y = light.size_y if light.shape in ('RECTANGLE', 'ELLIPSE') else size_x
+            # Cycles multiplies light dimensions by object scale (from matrix_world).
+            # Extract scale from the transform's basis vectors, like Cycles does:
+            # extentu = transform_column(tfm, 0) * sizeu → len_u = length(extentu)
+            scale_x = mat_w.col[0].xyz.length
+            scale_y = mat_w.col[1].xyz.length
+            base_size_x = light.size if hasattr(light, 'size') else 1.0
+            base_size_y = light.size_y if light.shape in ('RECTANGLE', 'ELLIPSE') else base_size_x
+            size_x = base_size_x * scale_x
+            size_y = base_size_y * scale_y
             # Negative range signals area light to shader
             export_range = -max(size_x, size_y) * 0.5
             # Cycles area light: energy is total power (Watts).
