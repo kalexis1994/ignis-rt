@@ -325,13 +325,41 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, ve
             R[dst] = vec4(c, R[srcA].a);
         }
         else if (opcode == OP_HUE_SAT_VAL) {
-            // Simplified HSV adjustment (hue shift, saturation mult, value mult)
-            float sat = uintBitsToFloat(instr.z);
-            float val = uintBitsToFloat(instr.w);
+            // Proper RGB→HSV→adjust→HSV→RGB (matching Cycles svm_node_hsv)
+            float hue = uintBitsToFloat(instr.y);      // 0.5 = neutral
+            float sat = uintBitsToFloat(instr.z);       // 1.0 = neutral
+            float val = uintBitsToFloat(instr.w);       // 1.0 = neutral
             vec3 c = R[srcA].rgb;
-            float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
-            c = mix(vec3(lum), c, sat);  // saturation
-            c *= val;                     // value
+            // RGB to HSV
+            float cmax = max(c.r, max(c.g, c.b));
+            float cmin = min(c.r, min(c.g, c.b));
+            float d = cmax - cmin;
+            float h = 0.0, s = 0.0, v = cmax;
+            if (cmax > 0.0) s = d / cmax;
+            if (d > 1e-6) {
+                if (cmax == c.r)      h = (c.g - c.b) / d;
+                else if (cmax == c.g) h = 2.0 + (c.b - c.r) / d;
+                else                  h = 4.0 + (c.r - c.g) / d;
+                h /= 6.0;
+                if (h < 0.0) h += 1.0;
+            }
+            // Apply adjustments (Cycles: hue is offset from 0.5, sat/val are multipliers)
+            h = fract(h + hue - 0.5);
+            s = clamp(s * sat, 0.0, 1.0);
+            v = v * val;
+            // HSV to RGB
+            float hi = floor(h * 6.0);
+            float f = h * 6.0 - hi;
+            float p = v * (1.0 - s);
+            float q = v * (1.0 - s * f);
+            float t_v = v * (1.0 - s * (1.0 - f));
+            int i_h = int(hi) % 6;
+            if (i_h == 0)      c = vec3(v, t_v, p);
+            else if (i_h == 1) c = vec3(q, v, p);
+            else if (i_h == 2) c = vec3(p, v, t_v);
+            else if (i_h == 3) c = vec3(p, q, v);
+            else if (i_h == 4) c = vec3(t_v, p, v);
+            else               c = vec3(v, p, q);
             R[dst] = vec4(c, R[srcA].a);
         }
 
@@ -502,33 +530,35 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, ve
             R[dst] = vec4(b, 1.0);
         }
 
-        // ── RGB Curves (baked LUT) ──
+        // ── RGB Curves (baked LUT, Cycles-matching) ──
         else if (opcode == OP_RGB_CURVES) {
-            // Baked LUT: 8 samples per channel (R,G,B) packed in next 6 instructions
-            // 6 uvec4s = 24 floats: floats 0-7 = R, 8-15 = G, 16-23 = B
+            float fac = uintBitsToFloat(instr.y);
+            float min_x = uintBitsToFloat(instr.z);
+            float max_x = uintBitsToFloat(instr.w);
+            float range_x = max(max_x - min_x, 1e-6);
+
             float samples[24];
             for (uint i = 0u; i < 6u; i++) {
                 uvec4 d = materialBuffer.materials[matIdx].nodeVmCode[pc + 1u + i];
-                samples[i*4u + 0u] = uintBitsToFloat(d.x);
-                samples[i*4u + 1u] = uintBitsToFloat(d.y);
-                samples[i*4u + 2u] = uintBitsToFloat(d.z);
-                samples[i*4u + 3u] = uintBitsToFloat(d.w);
+                samples[i*4u] = uintBitsToFloat(d.x);
+                samples[i*4u+1u] = uintBitsToFloat(d.y);
+                samples[i*4u+2u] = uintBitsToFloat(d.z);
+                samples[i*4u+3u] = uintBitsToFloat(d.w);
             }
 
-            vec3 c = R[srcA].rgb;
-            // Linear interpolation in the baked LUT per channel
+            vec3 original = R[srcA].rgb;
+            vec3 c = original;
             for (int ch = 0; ch < 3; ch++) {
-                float v = clamp(c[ch], 0.0, 1.0);
-                float pos = v * 7.0;  // 8 samples, indices 0-7
+                float v = clamp((c[ch] - min_x) / range_x, 0.0, 1.0);
+                float pos = v * 7.0;
                 uint idx0 = min(uint(pos), 6u);
                 uint idx1 = idx0 + 1u;
-                float frac = pos - float(idx0);
-                float s0 = samples[ch * 8 + idx0];
-                float s1 = samples[ch * 8 + idx1];
-                c[ch] = mix(s0, s1, frac);
+                float frac_v = pos - float(idx0);
+                c[ch] = mix(samples[ch * 8 + idx0], samples[ch * 8 + idx1], frac_v);
             }
-            R[dst] = vec4(c, R[srcA].a);
-            pc += 6u;  // skip data instructions
+            // Factor: (1-fac)*original + fac*curved (matching Cycles)
+            R[dst] = vec4(mix(original, c, fac), R[srcA].a);
+            pc += 6u;
         }
         else if (opcode == OP_CURVE_DATA) {
             // Data instruction — skipped by OP_RGB_CURVES's pc advance

@@ -1865,7 +1865,10 @@ class _NodeVmCompiler:
             self.node_reg_cache[node_id] = dst
             return dst
 
-        # ── RGB Curves — passthrough (baked LUT disabled, needs Cycles color space matching) ──
+        # ── RGB Curves — passthrough ──
+        # Baked LUT is correct per Cycles algorithm, but our textures lack sRGB→linear
+        # decoding, producing different input values to the curves. Re-enable when
+        # texture pipeline handles color space correctly.
         if from_node.type == 'CURVE_RGB':
             color_inp = from_node.inputs.get('Color')
             if color_inp and color_inp.is_linked:
@@ -1875,6 +1878,19 @@ class _NodeVmCompiler:
             c = color_inp.default_value if color_inp else (0.8, 0.8, 0.8, 1.0)
             self._emit(_OP_LOAD_CONST, dst, imm_y=_floatBits(c[0]),
                        imm_z=_floatBits(c[1]), imm_w=_floatBits(c[2]))
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+            # Dead code — baked LUT implementation preserved for when sRGB is fixed:
+
+            self._emit(_OP_RGB_CURVES, dst, srcA=col_reg,
+                       imm_y=_floatBits(fac), imm_z=_floatBits(min_x), imm_w=_floatBits(max_x))
+            for i in range(6):
+                f0 = samples[i*4] if i*4 < len(samples) else 0.0
+                f1 = samples[i*4+1] if i*4+1 < len(samples) else 0.0
+                f2 = samples[i*4+2] if i*4+2 < len(samples) else 0.0
+                f3 = samples[i*4+3] if i*4+3 < len(samples) else 0.0
+                self.instructions.append((_floatBits(f0), _floatBits(f1), _floatBits(f2), _floatBits(f3)))
             self.node_reg_cache[node_id] = dst
             return dst
 
