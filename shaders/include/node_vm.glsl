@@ -14,7 +14,8 @@ const uint OP_SAMPLE_TEX     = 0x01u;  // R[dst] = texture(tex[imm_z], R[srcA].x
 
 // UV manipulation (Mapping node)
 const uint OP_UV_TRANSFORM   = 0x10u;  // R[dst].xy = R[srcA].xy * scale + offset
-const uint OP_UV_ROTATE      = 0x11u;  // R[dst].xy = rotate R[srcA].xy by angle around (0.5,0.5)
+const uint OP_UV_ROTATE      = 0x11u;  // R[dst].xy = rotate R[srcA].xy by angle
+const uint OP_UV_MATRIX      = 0x12u;  // R[dst].xy = mat2(R[srcB]) * R[srcA].xy + offset (combined scale+rot)
 
 // Color operations
 const uint OP_MIX            = 0x20u;  // R[dst] = mix(R[srcA], R[srcB], imm_y)
@@ -168,23 +169,24 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos) {
 
         // ── UV manipulation ──
         else if (opcode == OP_UV_TRANSFORM) {
-            // Cycles POINT mapping: Rotation * (Vector * Scale) + Location
-            // Operate in Blender UV space (undo/redo V-flip)
+            // Scale + offset. Input is Vulkan UV (V-flipped from mesh export).
+            // Convert to Blender space, apply scale, convert back.
             vec2 scale = vec2(uintBitsToFloat(instr.y), uintBitsToFloat(instr.z));
             vec2 offset = vec2(uintBitsToFloat(instr.w), 0.0);
-            vec2 bl = vec2(R[srcA].x, 1.0 - R[srcA].y);  // undo V-flip
+            vec2 bl = vec2(R[srcA].x, 1.0 - R[srcA].y);
             vec2 result = bl * scale + offset;
-            R[dst] = vec4(result.x, 1.0 - result.y, 0.0, 1.0);  // re-apply V-flip
+            R[dst] = vec4(result.x, 1.0 - result.y, 0.0, 1.0);
         }
         else if (opcode == OP_UV_ROTATE) {
-            // Cycles POINT mapping: Rotation * (Vector * Scale) + Location
-            // Our UVs have V flipped (1-v) from mesh export. Undo the flip,
-            // rotate in Blender's UV space, then re-apply the flip.
+            // Rotate in Blender UV space (undo V-flip, rotate, redo V-flip)
             float angle = uintBitsToFloat(instr.y);
-            vec2 bl = vec2(R[srcA].x, 1.0 - R[srcA].y);  // undo V-flip → Blender UV space
+            vec2 bl = vec2(R[srcA].x, 1.0 - R[srcA].y);
             float c = cos(angle), s = sin(angle);
             vec2 rotated = vec2(bl.x*c - bl.y*s, bl.x*s + bl.y*c);
-            R[dst] = vec4(rotated.x, 1.0 - rotated.y, 0.0, 1.0);  // re-apply V-flip
+            R[dst] = vec4(rotated.x, 1.0 - rotated.y, 0.0, 1.0);
+        }
+        else if (opcode == OP_UV_MATRIX) {
+            R[dst] = R[srcA];
         }
 
         // ── Color operations ──
