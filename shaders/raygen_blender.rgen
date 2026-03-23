@@ -683,12 +683,14 @@ void main() {
     float reservoirRng = rand01();
     bool giReservoirEnabled = false;  // disable buffer access
 
-    bool sharcEnabled = true;  // SHARC radiance cache for indirect bounces
+    bool sharcEnabled = false;  // SHARC radiance cache — WIP, disable until stable
 
     for (int bounce = 0; bounce < maxBounces; bounce++) {
 
-        // ── SHARC cache lookup (bounce 2+): use cached radiance instead of tracing ──
-        if (sharcEnabled && bounce >= 2) {
+        // ── SHARC cache lookup (bounce 1+): use cached radiance instead of tracing ──
+        // First frames: cache is empty, all misses → traces normally and fills cache.
+        // After a few frames: cache hits replace expensive ray tracing with instant lookups.
+        if (sharcEnabled && bounce >= 1) {
             vec3 cachedRadiance;
             if (sharcLookup(rayOrigin, cachedRadiance)) {
                 // Cache hit — use cached indirect radiance and stop bouncing
@@ -935,6 +937,9 @@ void main() {
             neeEnd = randIdx + 1u;
             neeScale = float(cam.lightCount);
         }
+
+        // Snapshot radiance BEFORE NEE (for SHARC: compute local contribution)
+        vec3 preBounceRadiance = diffuseRadiance + specularRadiance;
 
         // ---- NEE: Direct sun light ----
         vec3 sunDir = normalize(cam.sunLight.xyz);
@@ -1535,13 +1540,46 @@ void main() {
             }
         }
 
-        // ── SHARC cache write (bounce 1+): store radiance for future frames ──
-        if (sharcEnabled && bounce >= 1) {
-            // Compute outgoing radiance at this hit point (NEE + emission)
-            vec3 hitRadiance = diffuseRadiance + specularRadiance;
-            float lum = dot(hitRadiance, vec3(0.2126, 0.7152, 0.0722));
-            if (lum > 0.001 && !any(isnan(hitRadiance)) && !any(isinf(hitRadiance))) {
-                sharcStore(pbrHit.worldPos, hitRadiance, frameIndex);
+        // ── SHARC cache write: store local surface radiance directly to READ buffer ──
+        // Bypasses the resolve pipeline — each frame's writes are immediately
+        // available for the next frame's reads. Simple and effective.
+        if (sharcEnabled) {
+            vec3 localRadiance = (diffuseRadiance + specularRadiance) - preBounceRadiance;
+            // Remove throughput to get intrinsic surface radiance
+            vec3 invThroughput = vec3(1.0) / max(throughput, vec3(0.001));
+            vec3 surfaceRadiance = localRadiance * invThroughput;
+
+            float lum = dot(surfaceRadiance, vec3(0.2126, 0.7152, 0.0722));
+            if (lum > 0.001 && lum < 100.0 && !any(isnan(surfaceRadiance)) && !any(isinf(surfaceRadiance))) {
+                uint key = sharcHash(pbrHit.worldPos);
+                uint idx = (key & SHARC_TABLE_MASK) * 8u;
+
+                uint existingKey = sharcRead.sharcReadData[idx + 0];
+                uint existingCount = sharcRead.sharcReadData[idx + 1];
+
+                if (existingKey == key && existingCount > 0u) {
+                    // Same cell — blend with existing (exponential moving average)
+                    float invCount = 1.0 / float(existingCount);
+                    vec3 oldRad = vec3(
+                        uintBitsToFloat(sharcRead.sharcReadData[idx + 2]),
+                        uintBitsToFloat(sharcRead.sharcReadData[idx + 3]),
+                        uintBitsToFloat(sharcRead.sharcReadData[idx + 4])
+                    ) * invCount;
+                    vec3 blended = mix(oldRad, surfaceRadiance, 0.1);  // 10% new
+                    uint newCount = min(existingCount + 1u, 512u);
+                    sharcRead.sharcReadData[idx + 2] = floatBitsToUint(blended.r * float(newCount));
+                    sharcRead.sharcReadData[idx + 3] = floatBitsToUint(blended.g * float(newCount));
+                    sharcRead.sharcReadData[idx + 4] = floatBitsToUint(blended.b * float(newCount));
+                    sharcRead.sharcReadData[idx + 1] = newCount;
+                } else if (existingKey == 0u) {
+                    // Empty cell — write new entry
+                    sharcRead.sharcReadData[idx + 0] = key;
+                    sharcRead.sharcReadData[idx + 1] = 1u;
+                    sharcRead.sharcReadData[idx + 2] = floatBitsToUint(surfaceRadiance.r);
+                    sharcRead.sharcReadData[idx + 3] = floatBitsToUint(surfaceRadiance.g);
+                    sharcRead.sharcReadData[idx + 4] = floatBitsToUint(surfaceRadiance.b);
+                    sharcRead.sharcReadData[idx + 5] = frameIndex;
+                }
             }
         }
 

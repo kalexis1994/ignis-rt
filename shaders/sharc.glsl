@@ -1,7 +1,7 @@
 // SHARC (Spatial Hashing of Approximate Radiance Cache)
 // Shared definitions for raygen and resolve shaders
 
-#define SHARC_GRID_SIZE 0.5           // meters per cell
+#define SHARC_GRID_SIZE 0.1           // meters per cell (finer = smoother, more collisions)
 #define SHARC_TABLE_SIZE 2097152u     // 2^21 entries
 #define SHARC_TABLE_MASK (SHARC_TABLE_SIZE - 1u)
 #define SHARC_MAX_AGE 120u            // frames before eviction
