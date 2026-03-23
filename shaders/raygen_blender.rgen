@@ -1251,7 +1251,10 @@ void main() {
             if (dist > lightRange || dist < 0.001) continue;
             vec3 L = toLight / dist;
             float NdotL_pt = dot(N, L);
-            if (NdotL_pt <= 0.0) continue;
+            // For area lights: don't cull by center NdotL — parts of the light
+            // can illuminate the surface even when the center is near/below horizon.
+            // The per-sample NdotL is checked later in the BRDF evaluation.
+            if (!isAreaLight && NdotL_pt <= 0.0) continue;
 
             // Spot light: cone attenuation (Cycles formula)
             if (isSpotLight) {
@@ -1266,67 +1269,24 @@ void main() {
                 lightInt *= spotAtten;
             }
 
-            // Area light: analytical solid angle (Girard's spherical excess theorem)
-            // + random shadow ray. The solid angle weight captures the rectangular
-            // geometry directly — no Monte Carlo needed for the illumination shape.
+            // Area light: uniform area sampling with correct geometric term.
+            // Each sample tests one random point on the rectangle.
+            // The rectangular illumination pattern converges with temporal accumulation.
             vec3 jitteredTarget;
-            float attenuation;
             if (isAreaLight) {
                 vec3 lightNormal = lightDirSizeX.xyz;
                 vec3 lightTangent = lightTanSizeY.xyz;
                 float sizeX = lightDirSizeX.w;
                 float sizeY = lightTanSizeY.w;
 
-                float lightFacing = dot(-L, lightNormal);
-                if (lightFacing <= 0.0) continue;
-
+                // Don't hard-cull by center facing — check individual sample instead
                 vec3 lightBitangent = cross(lightNormal, lightTangent);
-                vec3 ex = lightTangent * sizeX * 0.5;
-                vec3 ey = lightBitangent * sizeY * 0.5;
-
-                // Unit vectors from shading point to each corner (CCW order)
-                vec3 d0 = normalize(lightPos - ex - ey - pbrHit.worldPos);
-                vec3 d1 = normalize(lightPos + ex - ey - pbrHit.worldPos);
-                vec3 d2 = normalize(lightPos + ex + ey - pbrHit.worldPos);
-                vec3 d3 = normalize(lightPos - ex + ey - pbrHit.worldPos);
-
-                // Edge plane normals (Girard's theorem)
-                vec3 n01 = normalize(cross(d0, d1));
-                vec3 n12 = normalize(cross(d1, d2));
-                vec3 n23 = normalize(cross(d2, d3));
-                vec3 n30 = normalize(cross(d3, d0));
-
-                // Interior angles of the spherical quadrilateral
-                float a0 = acos(clamp(-dot(n30, n01), -1.0, 1.0));
-                float a1 = acos(clamp(-dot(n01, n12), -1.0, 1.0));
-                float a2 = acos(clamp(-dot(n12, n23), -1.0, 1.0));
-                float a3 = acos(clamp(-dot(n23, n30), -1.0, 1.0));
-
-                // Solid angle = spherical excess = sum of angles - 2π
-                float solidAngle = max(a0 + a1 + a2 + a3 - 2.0 * PI, 0.0);
-
-                // Attenuation = radiance × solid angle
-                // intensity = energy / (π × area), so:
-                // irradiance = intensity × solidAngle × area
-                // But area is already factored out of intensity, so we need to
-                // re-multiply: contribution = (energy/(π×area)) × solidAngle × ...
-                // Actually: E = L × Ω where L = energy/(π×area)
-                // Each pixel receives E = L × Ω, and L is already our lightInt.
-                // But lightInt = energy/(π×area), and we want E = (energy/π) × (Ω/area)...
-                // No: E = L × Ω = (energy/(π×area)) × Ω
-                // The area in L is the light's physical area, Ω is the solid angle.
-                // These are independent. So: attenuation = solidAngle.
-                attenuation = solidAngle;
-
-                // Shadow ray: random point on the rectangle
                 vec2 areaRnd = rand2() * 2.0 - 1.0;
                 jitteredTarget = lightPos
                     + lightTangent * (areaRnd.x * sizeX * 0.5)
                     + lightBitangent * (areaRnd.y * sizeY * 0.5);
             } else {
-                // Point/spot light
-                attenuation = 1.0 / (dist * dist + 0.001);
-
+                // Point/spot light: small jitter for soft shadows
                 float softRadius = clamp(dist * 0.015, 0.01, 0.3);
                 vec2 diskSample = rand2();
                 float diskR = sqrt(diskSample.x) * softRadius;
@@ -1340,6 +1300,20 @@ void main() {
             float sampleDist = length(toSample);
             vec3 shadowDir = toSample / sampleDist;
             float shadowDist = sampleDist;
+
+            // Attenuation
+            float effectiveDist = isAreaLight ? sampleDist : dist;
+            float falloff = 1.0 / (effectiveDist * effectiveDist + 0.001);
+            float attenuation = falloff;
+
+            if (isAreaLight) {
+                vec3 lightNormal = lightDirSizeX.xyz;
+                // Cosine at light surface — per sampled point, not center
+                float cosAtLight = max(dot(-shadowDir, lightNormal), 0.0);
+                if (cosAtLight <= 0.0) continue;  // sample is behind light
+                float areaSize = lightDirSizeX.w * lightTanSizeY.w;
+                attenuation *= cosAtLight * areaSize;
+            }
 
             // Shadow ray to jittered target (skip glass surfaces)
             vec3 ptShadowOrigin = pbrHit.worldPos + N * 0.002;
