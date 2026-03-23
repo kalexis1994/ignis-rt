@@ -13,7 +13,17 @@ const float MIN_HIT_DIST = 0.001;
 const float MAX_RADIANCE = 30.0;  // clamp fireflies but allow HDR headroom for bright lights
 
 // ============================================================
-// RNG — PCG hash + R2 quasi-random sequence for low-discrepancy sampling
+// ============================================================
+// Sampling — Hybrid quasi-random + PCG fallback
+//
+// Uses R2 low-discrepancy sequence with Cranley-Patterson rotation
+// for deterministic, noise-free sampling. Each pixel gets a unique
+// offset (from blue noise or hash), and each frame advances the
+// sequence index. This covers the sample space uniformly without
+// the random noise of pure Monte Carlo.
+//
+// PCG is kept as fallback for operations that need true randomness
+// (Russian Roulette, stochastic decisions).
 // ============================================================
 
 uint rngState;
@@ -24,26 +34,59 @@ uint pcg(inout uint state) {
     return (word >> 22u) ^ word;
 }
 
-float rand01() {
-    return float(pcg(rngState)) / 4294967296.0;
-}
-
-vec2 rand2() {
-    return vec2(rand01(), rand01());
-}
-
-// R2 quasi-random sequence (Robertstheta) — better stratification than PCG
-// for importance sampling. Based on generalized golden ratio.
-// Use: r2Sample(sampleIndex) returns vec2 in [0,1)²
+// R2 quasi-random sequence (generalized golden ratio)
+// Produces low-discrepancy points in [0,1)² — much better coverage than random
 const float R2_G = 1.32471795724;  // plastic constant
 const float R2_A1 = 1.0 / R2_G;
 const float R2_A2 = 1.0 / (R2_G * R2_G);
+
+// Per-pixel state for blue-noise-scrambled sampling
+uint _sampleDimension;
+uvec2 _pixel;
+
+void initDeterministicSampling(uvec2 pixel, uint frameIndex) {
+    _sampleDimension = 0u;
+    _pixel = pixel;
+    // PCG with blue noise scramble: random numbers with better spatial distribution.
+    // Blue noise decorrelates neighboring pixels → smoother noise for the denoiser.
+    rngState = pixel.x * 1973u + pixel.y * 9277u + frameIndex * 26699u;
+}
+
+// Random sample in [0,1) — PCG base + blue noise spatial scramble
+// Produces random numbers that are spatially well-distributed across pixels.
+// DLSS RR works better with this than pure random (smoother input noise).
+float rand01() {
+    uint dim = _sampleDimension++;
+    float pcgVal = float(pcg(rngState)) / 4294967296.0;
+    // Blue noise scramble: shift PCG output by a per-pixel blue noise value
+    // This decorrelates neighboring pixels without creating structured patterns
+    ivec2 bnCoord = ivec2((_pixel.x + dim * 7u) & 63, (_pixel.y + dim * 11u) & 63);
+    float bn = texelFetch(blueNoiseTexture, bnCoord, 0).r;
+    return fract(pcgVal + bn);
+}
+
+// Random 2D sample with blue noise spatial scramble
+vec2 rand2() {
+    uint dim = _sampleDimension++;
+    float pcg1 = float(pcg(rngState)) / 4294967296.0;
+    float pcg2 = float(pcg(rngState)) / 4294967296.0;
+    ivec2 bn1 = ivec2((_pixel.x + dim * 7u) & 63, (_pixel.y + dim * 11u) & 63);
+    ivec2 bn2 = ivec2((_pixel.y + dim * 5u) & 63, (_pixel.x + dim * 3u) & 63);
+    return vec2(
+        fract(pcg1 + texelFetch(blueNoiseTexture, bn1, 0).r),
+        fract(pcg2 + texelFetch(blueNoiseTexture, bn2, 0).r)
+    );
+}
+
+// Pure PCG random (no blue noise) for stochastic decisions
+float randPCG() {
+    return float(pcg(rngState)) / 4294967296.0;
+}
 
 vec2 r2Sample(uint idx) {
     return fract(vec2(R2_A1 * float(idx), R2_A2 * float(idx)));
 }
 
-// Cranley-Patterson rotation: combine R2 with random offset for each pixel
 vec2 stratifiedSample(uint sampleIdx, vec2 randomOffset) {
     return fract(r2Sample(sampleIdx) + randomOffset);
 }

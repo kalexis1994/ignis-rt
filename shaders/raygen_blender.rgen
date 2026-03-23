@@ -588,9 +588,8 @@ void main() {
 
     for (int sampleIdx = 0; sampleIdx < spp; sampleIdx++) {
 
-    // Initialize RNG: hash pixel + frame + sample index + blue noise
-    rngState = pixel.x * 1973u + pixel.y * 9277u + frameIndex * 26699u + uint(sampleIdx) * 12347u;
-    pcg(rngState);
+    // Initialize deterministic sampling: R2 quasi-random with per-pixel offset
+    initDeterministicSampling(pixel, frameIndex + uint(sampleIdx) * 1031u);
 
     ivec2 bnCoord = ivec2(pixel.x & 63, pixel.y & 63);
     float blueNoise = texelFetch(blueNoiseTexture, bnCoord, 0).r;
@@ -795,7 +794,7 @@ void main() {
             float fresnelRefl = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
             transparentProb = 1.0 - fresnelRefl;  // Fresnel transmission probability
         }
-        if (transparentProb > 0.0 && rand01() < transparentProb) {
+        if (transparentProb > 0.0 && randPCG() < transparentProb) {
             // Ray passes through — no refraction, no absorption (like Cycles Transparent BSDF)
             rayOrigin = worldPos + rayDir * 0.002;
             bounce--;  // doesn't count as a bounce
@@ -1481,7 +1480,7 @@ void main() {
         if (bounce >= 2) {
             float maxC = max(throughput.r, max(throughput.g, throughput.b));
             float p = min(sqrt(maxC), 1.0);
-            if (rand01() > p) break;
+            if (randPCG() > p) break;  // RR needs true randomness
             throughput /= p;
             // Clamp throughput to prevent firefly explosion from RR compensation
             throughput = min(throughput, vec3(MAX_RADIANCE));
@@ -1527,7 +1526,7 @@ void main() {
             vec3 refracted = refract(-V, H, eta);
             bool canRefract = dot(refracted, refracted) > 0.0001;
 
-            if (!canRefract || rand01() < fresnel) {
+            if (!canRefract || randPCG() < fresnel) {
                 // Reflection off microfacet
                 rayDir = reflect(rayDir, H);
                 rayOrigin = pbrHit.worldPos + N * 0.003;
@@ -1554,7 +1553,7 @@ void main() {
         float specWeight = (F.r + F.g + F.b) / 3.0;
         // For metals, specWeight is high; for dielectrics at normal incidence, ~4%
 
-        bool chooseDiffuse = (rand01() > specWeight);
+        bool chooseDiffuse = (randPCG() > specWeight);
 
         if (chooseDiffuse && pbrHit.metallic < 1.0) {
             // Diffuse lobe — chosen with probability (1 - specWeight)
