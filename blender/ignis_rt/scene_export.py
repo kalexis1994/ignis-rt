@@ -1533,7 +1533,8 @@ class _NodeVmCompiler:
             return r
 
         from_node = socket.links[0].from_node
-        node_id = id(from_node)
+        # Use node name as cache key — id() can be reused by Python GC
+        node_id = (from_node.type, from_node.name)
 
         # Check cache — avoid re-compiling the same node
         if node_id in self.node_reg_cache:
@@ -2375,8 +2376,18 @@ class _NodeVmCompiler:
         for input_name, output_op in _EXTRA_INPUTS.items():
             inp = principled_node.inputs.get(input_name)
             if inp and inp.is_linked:
+                _before = len(self.instructions)
                 reg = self._compile_node(inp)
                 self._emit(output_op, srcA=reg)
+                _after = len(self.instructions)
+                import os
+                try:
+                    with open(os.path.join(os.path.expanduser("~"), "ignis-rt.log"), "a") as _f:
+                        from_n = inp.links[0].from_node
+                        _f.write(f"[ignis-vm-extra] {input_name}: linked to {from_n.type}:{from_n.name}"
+                                 f" image={getattr(from_n, 'image', None)}"
+                                 f" reg={reg} instrs={_before}->{_after}\n")
+                except: pass
 
         return self.instructions if self.instructions else None
 
@@ -2405,7 +2416,7 @@ def _patched_compile_node(self, socket, _depth=0):
     if socket and socket.is_linked:
         from_node = socket.links[0].from_node
         if from_node.type == 'VALTORGB':
-            node_id = id(from_node)
+            node_id = (from_node.type, from_node.name)
             if node_id in self.node_reg_cache:
                 return self.node_reg_cache[node_id]
 
@@ -3843,12 +3854,20 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                 metallic = float(_get_principled_input(node, 'Metallic', 0.0))
 
                 # Check for ORM-style texture on Roughness or Metallic inputs
+                # Only use as ORM if BOTH come from the SAME texture (packed ORM),
+                # or if only one is textured (assume it's a combined map).
                 rough_node = _find_image_texture_node(node.inputs.get('Roughness'))
                 metal_node = _find_image_texture_node(node.inputs.get('Metallic'))
                 orm_image = None
-                if rough_node and rough_node.image:
+                if rough_node and metal_node and rough_node.image and metal_node.image:
+                    if rough_node.image == metal_node.image:
+                        # Same texture = packed ORM
+                        orm_image = rough_node.image
+                    # Different textures = separate maps, VM handles them individually
+                elif rough_node and rough_node.image and not (metal_node and metal_node.image):
+                    # Only roughness textured, metallic is scalar — use as ORM
                     orm_image = rough_node.image
-                elif metal_node and metal_node.image:
+                elif metal_node and metal_node.image and not (rough_node and rough_node.image):
                     orm_image = metal_node.image
                 if orm_image:
                     orm_tex = _register_image(orm_image)

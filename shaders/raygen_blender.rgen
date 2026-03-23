@@ -414,11 +414,11 @@ PBRHit evaluateBlenderMaterial(
     }
 
     // ORM map: R=occlusion, G=roughness, B=metallic (standard convention)
-    // Skip if VM already provided roughness/metallic (VM has priority)
-    if (mat.mapsTexIndex != 0xFFFFFFFFu && !(vmActive && vm.hasRoughness)) {
+    // Read per-channel: VM overrides individual channels, ORM fills the rest
+    if (mat.mapsTexIndex != 0xFFFFFFFFu) {
         vec4 orm = texture(textures[nonuniformEXT(mat.mapsTexIndex)], texUV);
-        hit.roughness = clamp(orm.g, 0.01, 1.0);
-        hit.metallic = clamp(orm.b, 0.0, 1.0);
+        if (!(vmActive && vm.hasRoughness)) hit.roughness = clamp(orm.g, 0.01, 1.0);
+        if (!(vmActive && vm.hasMetallic))  hit.metallic = clamp(orm.b, 0.0, 1.0);
     }
 
     // Normal map
