@@ -26,10 +26,15 @@ const uint OP_ADD            = 0x23u;  // R[dst] = R[srcA] + R[srcB]
 const uint OP_SUBTRACT       = 0x24u;  // R[dst] = R[srcA] - R[srcB]
 const uint OP_SCREEN         = 0x25u;  // R[dst] = 1 - (1-A)*(1-B)
 const uint OP_OVERLAY        = 0x26u;  // R[dst] = overlay blend
+const uint OP_DARKEN         = 0x27u;  // R[dst] = min(R[srcA], R[srcB])
 const uint OP_INVERT         = 0x28u;  // R[dst] = mix(R[srcA], 1-R[srcA], imm_y)
 const uint OP_GAMMA          = 0x29u;  // R[dst] = pow(R[srcA], imm_y)
 const uint OP_BRIGHT_CONTRAST= 0x2Au;  // R[dst] = brightContrast(R[srcA], imm_y, imm_z)
 const uint OP_HUE_SAT_VAL    = 0x2Bu;  // R[dst] = hueSatVal(R[srcA], hue=imm_y, sat=imm_z, val=imm_w)
+const uint OP_LIGHTEN        = 0x2Cu;  // R[dst] = max(R[srcA], R[srcB])
+const uint OP_COLOR_DODGE    = 0x2Du;  // R[dst] = A / (1 - B)
+const uint OP_COLOR_BURN     = 0x2Eu;  // R[dst] = 1 - (1-A) / B
+const uint OP_SOFT_LIGHT     = 0x2Fu;  // soft light blend
 
 // ColorRamp
 const uint OP_COLORRAMP      = 0x30u;  // R[dst] = ramp(R[srcA].x, N stops, data follows)
@@ -45,6 +50,21 @@ const uint OP_MATH_MIN       = 0x45u;  // R[dst].x = min(R[srcA].x, R[srcB].x)
 const uint OP_MATH_MAX       = 0x46u;  // R[dst].x = max(R[srcA].x, R[srcB].x)
 const uint OP_MATH_CLAMP     = 0x47u;  // R[dst].x = clamp(R[srcA].x, imm_y, imm_z)
 const uint OP_MAP_RANGE      = 0x48u;  // R[dst].x = mapRange(R[srcA].x, fromMin/Max, toMin/Max)
+const uint OP_MATH_SUB       = 0x49u;  // R[dst].x = R[srcA].x - R[srcB].x
+const uint OP_MATH_ABS       = 0x4Au;  // R[dst].x = abs(R[srcA].x)
+const uint OP_MATH_SQRT      = 0x4Bu;  // R[dst].x = sqrt(max(R[srcA].x, 0))
+const uint OP_MATH_MOD       = 0x4Cu;  // R[dst].x = mod(R[srcA].x, R[srcB].x)
+const uint OP_MATH_FLOOR     = 0x4Du;  // R[dst].x = floor(R[srcA].x)
+const uint OP_MATH_CEIL      = 0x4Eu;  // R[dst].x = ceil(R[srcA].x)
+const uint OP_MATH_FRACT     = 0x4Fu;  // R[dst].x = fract(R[srcA].x)
+const uint OP_MATH_SIN       = 0x70u;  // R[dst].x = sin(R[srcA].x)
+const uint OP_MATH_COS       = 0x71u;  // R[dst].x = cos(R[srcA].x)
+const uint OP_MATH_TAN       = 0x72u;  // R[dst].x = tan(R[srcA].x)
+const uint OP_MATH_LESS      = 0x73u;  // R[dst].x = (R[srcA].x < R[srcB].x) ? 1.0 : 0.0
+const uint OP_MATH_GREATER   = 0x74u;  // R[dst].x = (R[srcA].x > R[srcB].x) ? 1.0 : 0.0
+const uint OP_MATH_ROUND     = 0x75u;  // R[dst].x = round(R[srcA].x)
+const uint OP_MATH_SIGN      = 0x76u;  // R[dst].x = sign(R[srcA].x)
+const uint OP_MATH_SMOOTH_MIN = 0x77u; // R[dst].x = smoothMin(R[srcA].x, R[srcB].x, k)
 
 // Channel manipulation
 const uint OP_SEPARATE_RGB   = 0x50u;  // R[dst].x = R[srcA][channel]  (channel in imm_y)
@@ -53,10 +73,32 @@ const uint OP_COMBINE_RGB    = 0x51u;  // R[dst].rgb = (R[srcA].x, R[srcB].x, R[
 // Procedural textures
 const uint OP_TEX_CHECKER    = 0x58u;  // R[dst] = checker(R[srcA].xy, scale=imm_y, color1=R[srcB], color2 from next)
 
+// Procedural textures (extended)
+const uint OP_TEX_NOISE      = 0x80u;  // R[dst] = noise(R[srcA].xyz * scale, detail, roughness)
+const uint OP_TEX_GRADIENT   = 0x81u;  // R[dst].x = gradient(R[srcA].xyz, type)
+const uint OP_TEX_VORONOI    = 0x82u;  // R[dst].x = voronoi(R[srcA].xyz * scale)
+const uint OP_TEX_WAVE       = 0x83u;  // R[dst].x = wave(R[srcA].xyz, scale, distortion, type)
+
+// RGB Curves (baked LUT)
+const uint OP_RGB_CURVES     = 0x84u;  // R[dst] = rgbCurves(R[srcA], 8 samples per channel in next 6 instrs)
+const uint OP_CURVE_DATA     = 0x85u;  // inline curve LUT data (not executed)
+
+// Vector math / extended ops
+const uint OP_VEC_MATH       = 0x86u;  // R[dst] = vecMath(R[srcA], R[srcB], op=imm_y)
+const uint OP_MAP_RANGE_FULL = 0x87u;  // R[dst].x = mapRange(R[srcA].x, params in next instr)
+const uint OP_TEX_WHITE_NOISE = 0x88u; // R[dst] = whiteNoise(R[srcA].xyz)
+const uint OP_LOAD_NORMAL    = 0x89u;  // R[dst] = vec4(normal, 1)
+const uint OP_LOAD_INCOMING  = 0x8Au;  // R[dst] = vec4(-viewDir, 1) — incoming ray direction
+const uint OP_BACKFACING     = 0x8Bu;  // R[dst].x = backfacing ? 1.0 : 0.0
+const uint OP_LINEAR_LIGHT   = 0x90u;  // R[dst] = A + 2*B - 1
+
 // Load immediate / special
 const uint OP_LOAD_CONST     = 0x60u;  // R[dst] = vec4(imm_y, imm_z, imm_w, 1)
 const uint OP_LOAD_SCALAR    = 0x61u;  // R[dst].x = imm_y
 const uint OP_LOAD_WORLD_POS = 0x62u;  // R[dst] = vec4(worldPos, 1) — for position-based texturing
+const uint OP_LOAD_VIEW_DIR  = 0x63u;  // R[dst] = vec4(viewDir, 1) — camera-to-surface direction
+const uint OP_LAYER_WEIGHT   = 0x64u;  // R[dst].x = layer weight (Fresnel or Facing)
+const uint OP_FRESNEL        = 0x65u;  // R[dst].x = Fresnel(IOR, NdotV)
 
 // Output targets
 const uint OP_OUTPUT_UV      = 0xEFu;  // transformedUV = R[srcA].xy (for shared Mapping)
@@ -68,6 +110,8 @@ const uint OP_OUTPUT_ALPHA   = 0xF4u;  // alpha = R[srcA].x
 const uint OP_OUTPUT_NORMAL  = 0xF5u;  // normalStrength = R[srcA].x
 const uint OP_OUTPUT_IOR     = 0xF6u;  // ior = R[srcA].x
 const uint OP_OUTPUT_TRANSMISSION = 0xF7u; // transmission = R[srcA].x
+
+#include "noise.glsl"
 
 // ── ColorRamp evaluation ──
 vec4 nodeVmEvalColorRamp(uint matIdx, uint dataOffset, uint stopCount, float factor) {
@@ -122,7 +166,7 @@ struct NodeVmResult {
 };
 
 // ── VM Execution ──
-NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos) {
+NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 normal) {
     NodeVmResult result;
     result.baseColor = vec3(0.8);
     result.roughness = 0.5;
@@ -153,7 +197,7 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos) {
     vec4 R[16];
     R[0] = vec4(uv, 0.0, 1.0);  // R0 = UV input
 
-    for (uint pc = 0u; pc < min(instrCount, 32u); pc++) {
+    for (uint pc = 0u; pc < min(instrCount, 64u); pc++) {
         uvec4 instr = materialBuffer.materials[matIdx].nodeVmCode[pc];
         uint opcode = instr.x & 0xFFu;
         uint dst    = (instr.x >> 8u)  & 0xFu;  // 4 bits = 0-15
@@ -224,6 +268,40 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos) {
                 R[dst][ch] = (a[ch] < 0.5) ? 2.0*a[ch]*b[ch] : 1.0 - 2.0*(1.0-a[ch])*(1.0-b[ch]);
             }
             R[dst].w = a.w;
+        }
+        else if (opcode == OP_DARKEN) {
+            R[dst] = vec4(min(R[srcA].rgb, R[srcB].rgb), R[srcA].a);
+        }
+        else if (opcode == OP_LIGHTEN) {
+            R[dst] = vec4(max(R[srcA].rgb, R[srcB].rgb), R[srcA].a);
+        }
+        else if (opcode == OP_COLOR_DODGE) {
+            vec3 a = R[srcA].rgb, b = R[srcB].rgb;
+            R[dst] = vec4(
+                b.x < 1.0 ? min(a.x / max(1.0 - b.x, 1e-6), 1.0) : 1.0,
+                b.y < 1.0 ? min(a.y / max(1.0 - b.y, 1e-6), 1.0) : 1.0,
+                b.z < 1.0 ? min(a.z / max(1.0 - b.z, 1e-6), 1.0) : 1.0,
+                R[srcA].a);
+        }
+        else if (opcode == OP_COLOR_BURN) {
+            vec3 a = R[srcA].rgb, b = R[srcB].rgb;
+            R[dst] = vec4(
+                b.x > 0.0 ? max(1.0 - (1.0 - a.x) / b.x, 0.0) : 0.0,
+                b.y > 0.0 ? max(1.0 - (1.0 - a.y) / b.y, 0.0) : 0.0,
+                b.z > 0.0 ? max(1.0 - (1.0 - a.z) / b.z, 0.0) : 0.0,
+                R[srcA].a);
+        }
+        else if (opcode == OP_SOFT_LIGHT) {
+            vec3 a = R[srcA].rgb, b = R[srcB].rgb;
+            vec3 r;
+            for (int i = 0; i < 3; i++) {
+                if (b[i] < 0.5) r[i] = a[i] - (1.0 - 2.0*b[i]) * a[i] * (1.0 - a[i]);
+                else r[i] = a[i] + (2.0*b[i] - 1.0) * (sqrt(a[i]) - a[i]);
+            }
+            R[dst] = vec4(r, R[srcA].a);
+        }
+        else if (opcode == OP_LINEAR_LIGHT) {
+            R[dst] = vec4(R[srcA].rgb + 2.0 * R[srcB].rgb - 1.0, R[srcA].a);
         }
         else if (opcode == OP_INVERT) {
             float fac = uintBitsToFloat(instr.y);
@@ -300,6 +378,56 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos) {
             float t = clamp((R[srcA].x - fromMin) / max(fromMax - fromMin, 1e-6), 0.0, 1.0);
             R[dst].x = mix(toMin, 1.0, t);  // simplified
         }
+        else if (opcode == OP_MATH_SUB) {
+            R[dst].x = R[srcA].x - R[srcB].x;
+        }
+        else if (opcode == OP_MATH_ABS) {
+            R[dst].x = abs(R[srcA].x);
+        }
+        else if (opcode == OP_MATH_SQRT) {
+            R[dst].x = sqrt(max(R[srcA].x, 0.0));
+        }
+        else if (opcode == OP_MATH_MOD) {
+            R[dst].x = (abs(R[srcB].x) > 1e-6) ? mod(R[srcA].x, R[srcB].x) : 0.0;
+        }
+        else if (opcode == OP_MATH_FLOOR) {
+            R[dst].x = floor(R[srcA].x);
+        }
+        else if (opcode == OP_MATH_CEIL) {
+            R[dst].x = ceil(R[srcA].x);
+        }
+        else if (opcode == OP_MATH_FRACT) {
+            R[dst].x = fract(R[srcA].x);
+        }
+        else if (opcode == OP_MATH_SIN) {
+            R[dst].x = sin(R[srcA].x);
+        }
+        else if (opcode == OP_MATH_COS) {
+            R[dst].x = cos(R[srcA].x);
+        }
+        else if (opcode == OP_MATH_TAN) {
+            R[dst].x = tan(R[srcA].x);
+        }
+        else if (opcode == OP_MATH_LESS) {
+            R[dst].x = (R[srcA].x < R[srcB].x) ? 1.0 : 0.0;
+        }
+        else if (opcode == OP_MATH_GREATER) {
+            R[dst].x = (R[srcA].x > R[srcB].x) ? 1.0 : 0.0;
+        }
+        else if (opcode == OP_MATH_ROUND) {
+            R[dst].x = round(R[srcA].x);
+        }
+        else if (opcode == OP_MATH_SIGN) {
+            R[dst].x = sign(R[srcA].x);
+        }
+        else if (opcode == OP_MATH_SMOOTH_MIN) {
+            float k = uintBitsToFloat(instr.y);  // smoothness
+            if (k <= 0.0) { R[dst].x = min(R[srcA].x, R[srcB].x); }
+            else {
+                float h = max(k - abs(R[srcA].x - R[srcB].x), 0.0) / k;
+                R[dst].x = min(R[srcA].x, R[srcB].x) - h*h*h*k*(1.0/6.0);
+            }
+        }
 
         // ── Channel manipulation ──
         else if (opcode == OP_SEPARATE_RGB) {
@@ -323,6 +451,135 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos) {
             R[dst] = (check < 0.5) ? R[srcB] : color2;
         }
 
+        // ── Procedural textures (extended) ──
+        else if (opcode == OP_TEX_NOISE) {
+            float scale = uintBitsToFloat(instr.y);
+            float detail = uintBitsToFloat(instr.z);
+            float roughness = uintBitsToFloat(instr.w);
+            vec3 p = R[srcA].xyz * scale;
+            float n = fbm3D(p, detail, roughness, 2.0);
+            R[dst] = vec4(n, n, n, 1.0);
+        }
+        else if (opcode == OP_TEX_GRADIENT) {
+            uint gradType = instr.y;  // 0=linear, 1=quadratic, 2=radial, 3=spherical
+            vec3 p = R[srcA].xyz;
+            float f;
+            if (gradType == 1u) f = gradientQuadratic(p);
+            else if (gradType == 2u) f = gradientRadial(p);
+            else if (gradType == 3u) f = gradientSpherical(p);
+            else f = gradientLinear(p);
+            R[dst] = vec4(f, f, f, 1.0);
+        }
+        else if (opcode == OP_TEX_VORONOI) {
+            float scale = uintBitsToFloat(instr.y);
+            vec3 p = R[srcA].xyz * scale;
+            float d = voronoiF1(p, 1.0);
+            R[dst] = vec4(d, d, d, 1.0);
+        }
+        else if (opcode == OP_TEX_WAVE) {
+            float scale = uintBitsToFloat(instr.y);
+            float distortion = uintBitsToFloat(instr.z);
+            uint waveType = instr.w;
+            float w = waveTexture(R[srcA].xyz, scale, distortion, waveType);
+            R[dst] = vec4(w, w, w, 1.0);
+        }
+
+        // ── RGB Curves (baked LUT) ──
+        else if (opcode == OP_RGB_CURVES) {
+            // Baked LUT: 8 samples per channel (R,G,B) packed in next 6 instructions
+            // 6 uvec4s = 24 floats: floats 0-7 = R, 8-15 = G, 16-23 = B
+            float samples[24];
+            for (uint i = 0u; i < 6u; i++) {
+                uvec4 d = materialBuffer.materials[matIdx].nodeVmCode[pc + 1u + i];
+                samples[i*4u + 0u] = uintBitsToFloat(d.x);
+                samples[i*4u + 1u] = uintBitsToFloat(d.y);
+                samples[i*4u + 2u] = uintBitsToFloat(d.z);
+                samples[i*4u + 3u] = uintBitsToFloat(d.w);
+            }
+
+            vec3 c = R[srcA].rgb;
+            // Linear interpolation in the baked LUT per channel
+            for (int ch = 0; ch < 3; ch++) {
+                float v = clamp(c[ch], 0.0, 1.0);
+                float pos = v * 7.0;  // 8 samples, indices 0-7
+                uint idx0 = min(uint(pos), 6u);
+                uint idx1 = idx0 + 1u;
+                float frac = pos - float(idx0);
+                float s0 = samples[ch * 8 + idx0];
+                float s1 = samples[ch * 8 + idx1];
+                c[ch] = mix(s0, s1, frac);
+            }
+            R[dst] = vec4(c, R[srcA].a);
+            pc += 6u;  // skip data instructions
+        }
+        else if (opcode == OP_CURVE_DATA) {
+            // Data instruction — skipped by OP_RGB_CURVES's pc advance
+            continue;
+        }
+
+        // ── Vector Math ──
+        else if (opcode == OP_VEC_MATH) {
+            uint vop = instr.y;
+            vec3 a = R[srcA].xyz, b = R[srcB].xyz;
+            if (vop == 0u) R[dst] = vec4(a + b, 0);           // ADD
+            else if (vop == 1u) R[dst] = vec4(a - b, 0);      // SUBTRACT
+            else if (vop == 2u) R[dst] = vec4(a * b, 0);      // MULTIPLY
+            else if (vop == 3u) R[dst] = vec4(                 // DIVIDE (safe)
+                a.x / max(abs(b.x), 1e-6),
+                a.y / max(abs(b.y), 1e-6),
+                a.z / max(abs(b.z), 1e-6), 0);
+            else if (vop == 4u) R[dst] = vec4(cross(a, b), 0); // CROSS
+            else if (vop == 5u) R[dst].x = dot(a, b);          // DOT
+            else if (vop == 6u) R[dst].x = length(a);          // LENGTH
+            else if (vop == 7u) R[dst].x = distance(a, b);     // DISTANCE
+            else if (vop == 8u) R[dst] = vec4(normalize(a), 0); // NORMALIZE
+            else if (vop == 9u) { float s = uintBitsToFloat(instr.z); R[dst] = vec4(a * s, 0); } // SCALE
+            else if (vop == 10u) R[dst] = vec4(reflect(a, normalize(b)), 0); // REFLECT
+            else if (vop == 11u) R[dst] = vec4(abs(a), 0);     // ABSOLUTE
+            else if (vop == 12u) R[dst] = vec4(min(a, b), 0);  // MINIMUM
+            else if (vop == 13u) R[dst] = vec4(max(a, b), 0);  // MAXIMUM
+            else if (vop == 14u) R[dst] = vec4(floor(a), 0);   // FLOOR
+            else if (vop == 15u) R[dst] = vec4(fract(a), 0);   // FRACT
+            else if (vop == 16u) R[dst] = vec4(mod(a, b), 0);  // MODULO
+            else if (vop == 17u) R[dst] = vec4(sign(a), 0);    // SIGN
+            else R[dst] = vec4(a, 0);
+        }
+
+        // ── Map Range (full 5-param) ──
+        else if (opcode == OP_MAP_RANGE_FULL) {
+            float fromMin = uintBitsToFloat(instr.y);
+            float fromMax = uintBitsToFloat(instr.z);
+            float toMin = uintBitsToFloat(instr.w);
+            // toMax in next instruction's .x
+            uvec4 next = materialBuffer.materials[matIdx].nodeVmCode[pc + 1u];
+            float toMax = uintBitsToFloat(next.x);
+            float t = clamp((R[srcA].x - fromMin) / max(fromMax - fromMin, 1e-6), 0.0, 1.0);
+            R[dst].x = mix(toMin, toMax, t);
+            pc += 1u;  // skip data instruction
+        }
+
+        // ── White Noise Texture ──
+        else if (opcode == OP_TEX_WHITE_NOISE) {
+            // Simple hash-based white noise from 3D position
+            uvec3 p = uvec3(floatBitsToUint(R[srcA].x), floatBitsToUint(R[srcA].y), floatBitsToUint(R[srcA].z));
+            uint h = hash3(p);
+            float r = float(h) / 4294967295.0;
+            float g = float(h * 2654435761u) / 4294967295.0;
+            float b = float(h * 340573321u) / 4294967295.0;
+            R[dst] = vec4(r, g, b, 1.0);
+        }
+
+        // ── Geometry node outputs ──
+        else if (opcode == OP_LOAD_NORMAL) {
+            R[dst] = vec4(normal, 1.0);
+        }
+        else if (opcode == OP_LOAD_INCOMING) {
+            R[dst] = vec4(-viewDir, 1.0);  // Blender Incoming = direction TO surface
+        }
+        else if (opcode == OP_BACKFACING) {
+            R[dst].x = dot(normal, -viewDir) < 0.0 ? 1.0 : 0.0;
+        }
+
         // ── Load immediate ──
         else if (opcode == OP_LOAD_CONST) {
             R[dst] = vec4(uintBitsToFloat(instr.y), uintBitsToFloat(instr.z), uintBitsToFloat(instr.w), 1.0);
@@ -332,6 +589,31 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos) {
         }
         else if (opcode == OP_LOAD_WORLD_POS) {
             R[dst] = vec4(worldPos, 1.0);
+        }
+        else if (opcode == OP_LOAD_VIEW_DIR) {
+            R[dst] = vec4(viewDir, 1.0);
+        }
+
+        // ── Layer Weight / Fresnel ──
+        else if (opcode == OP_LAYER_WEIGHT) {
+            // srcA=normal register (or use built-in normal), imm_y=blend, imm_z=mode
+            float blend = uintBitsToFloat(instr.y);
+            uint mode = instr.z;  // 0=Fresnel, 1=Facing
+            float NdotV = abs(dot(normal, -viewDir));
+            if (mode == 0u) {
+                // Fresnel
+                float f0 = pow((1.0 - blend) / (1.0 + blend), 2.0);
+                R[dst].x = f0 + (1.0 - f0) * pow(1.0 - NdotV, 5.0);
+            } else {
+                // Facing
+                R[dst].x = 1.0 - NdotV;
+            }
+        }
+        else if (opcode == OP_FRESNEL) {
+            float ior = uintBitsToFloat(instr.y);
+            float NdotV = abs(dot(normal, -viewDir));
+            float f0 = pow((ior - 1.0) / (ior + 1.0), 2.0);
+            R[dst].x = f0 + (1.0 - f0) * pow(1.0 - NdotV, 5.0);
         }
 
         // ── Output targets ──

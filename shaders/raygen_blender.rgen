@@ -110,7 +110,7 @@ struct Material {
     // Node VM bytecode
     uint nodeVmHeader;       // [7:0]=instrCount, [15:8]=flags
     uint nodeVmPad[3];
-    uvec4 nodeVmCode[32];    // 32 instructions
+    uvec4 nodeVmCode[64];    // 64 instructions
 };
 
 layout(binding = 4, set = 0, scalar) buffer MaterialBuffer {
@@ -339,7 +339,7 @@ PBRHit evaluateBlenderMaterial(
     vec3 worldPos, vec3 geoNormal,
     vec3 v0, vec3 v1, vec3 v2,
     vec2 uv0, vec2 uv1, vec2 uv2,
-    vec2 uv
+    vec2 uv, vec3 rayDir
 ) {
     PBRHit hit;
     hit.worldPos = worldPos;
@@ -358,25 +358,29 @@ PBRHit evaluateBlenderMaterial(
     // When the VM has a program, it handles the ENTIRE material evaluation for
     // the properties it computes. The legacy pipeline only runs for properties
     // the VM doesn't override, preventing double-processing.
-    NodeVmResult vm = executeNodeVm(matIdx, uv, worldPos);
+    NodeVmResult vm = executeNodeVm(matIdx, uv, worldPos, rayDir, geoNormal);
     bool vmActive = (mat.nodeVmHeader & 0xFFu) > 0u;
 
-    // Base color + alpha: VM or legacy pipeline
+    // ── Material evaluation: VM is the single authority ──
+    // VM always runs. When it provides a property, that's final.
+    // Legacy pipeline only fills in what the VM doesn't provide.
     float texAlpha = 1.0;
+    vec2 texUV = (vmActive && vm.hasTransformedUV) ? vm.transformedUV : uv;
+
     if (vmActive && vm.hasBaseColor) {
-        // VM handled base color (including texture sampling, ColorRamp, Mix, etc.)
+        // VM provided base color (texture sampling, ColorRamp, Mix, etc.)
         hit.baseColor = vm.baseColor;
-        // Alpha: VM may override, otherwise read from texture
+        // Alpha: read from legacy diffuse texture (VM doesn't extract alpha
+        // because intermediate nodes like Mix/ColorRamp don't preserve .w)
         if (vm.hasAlpha) {
             texAlpha = vm.alpha;
         } else if (mat.diffuseTexIndex != 0xFFFFFFFFu) {
-            texAlpha = texture(textures[nonuniformEXT(mat.diffuseTexIndex)], uv).a;
+            texAlpha = texture(textures[nonuniformEXT(mat.diffuseTexIndex)], texUV).a;
         } else if (mat.detailTexIndex != 0xFFFFFFFFu) {
-            texAlpha = texture(textures[nonuniformEXT(mat.detailTexIndex)], uv).a;
+            texAlpha = texture(textures[nonuniformEXT(mat.detailTexIndex)], texUV).a;
         }
-        // Skip Hue/Sat — VM already evaluated the full node chain
     } else {
-        // Legacy pipeline: direct texture read + Hue/Sat
+        // No VM or VM didn't compile base color — legacy fallback
         if (mat.diffuseTexIndex != 0xFFFFFFFFu) {
             vec4 texColor = texture(textures[nonuniformEXT(mat.diffuseTexIndex)], uv);
             hit.baseColor = texColor.rgb;
@@ -387,7 +391,6 @@ PBRHit evaluateBlenderMaterial(
                 texAlpha = texture(textures[nonuniformEXT(mat.detailTexIndex)], uv).a;
             }
         }
-
         // Hue/Saturation/Value adjustment (legacy path only)
         float colorValue = mat.detailNMMult;
         float colorSaturation = mat.detailNMMultV;
@@ -401,7 +404,7 @@ PBRHit evaluateBlenderMaterial(
     }
     hit.alpha = texAlpha * mat.multG;
 
-    // VM overrides for other properties
+    // VM overrides for roughness/metallic/etc.
     if (vmActive) {
         if (vm.hasRoughness)    hit.roughness = clamp(vm.roughness, 0.01, 1.0);
         if (vm.hasMetallic)     hit.metallic = clamp(vm.metallic, 0.0, 1.0);
@@ -409,12 +412,9 @@ PBRHit evaluateBlenderMaterial(
         if (vm.hasTransmission) hit.transmission = vm.transmission;
     }
 
-    // When VM provides a transformed UV (from shared Mapping node),
-    // use it for all texture sampling (ORM, normal, roughness)
-    vec2 texUV = (vmActive && vm.hasTransformedUV) ? vm.transformedUV : uv;
-
     // ORM map: R=occlusion, G=roughness, B=metallic (standard convention)
-    if (mat.mapsTexIndex != 0xFFFFFFFFu) {
+    // Skip if VM already provided roughness/metallic (VM has priority)
+    if (mat.mapsTexIndex != 0xFFFFFFFFu && !(vmActive && vm.hasRoughness)) {
         vec4 orm = texture(textures[nonuniformEXT(mat.mapsTexIndex)], texUV);
         hit.roughness = clamp(orm.g, 0.01, 1.0);
         hit.metallic = clamp(orm.b, 0.0, 1.0);
@@ -802,7 +802,7 @@ void main() {
         // Evaluate PBR material
         PBRHit pbrHit = evaluateBlenderMaterial(
             mat, matIdx, worldPos, worldN,
-            wp0, wp1, wp2, uv0_, uv1_, uv2_, hitUV
+            wp0, wp1, wp2, uv0_, uv1_, uv2_, hitUV, rayDir
         );
 
         // Ensure normal faces the ray.
