@@ -1751,11 +1751,24 @@ class _NodeVmCompiler:
             self.node_reg_cache[node_id] = dst
             return dst
 
+        # ── Ambient Occlusion — passthrough Color input (AO handled by GI) ──
+        if from_node.type == 'AMBIENT_OCCLUSION':
+            color_inp = from_node.inputs.get('Color')
+            if color_inp and color_inp.is_linked:
+                result = self._compile_node(color_inp, _depth + 1)
+                self.node_reg_cache[node_id] = result
+                return result
+            # Unlinked — use the default color value
+            c = color_inp.default_value if color_inp else (0.8, 0.8, 0.8, 1.0)
+            self._emit(_OP_LOAD_CONST, dst, imm_y=_floatBits(c[0]),
+                       imm_z=_floatBits(c[1]), imm_w=_floatBits(c[2]))
+            self.node_reg_cache[node_id] = dst
+            return dst
+
         # ── Other procedural textures — compile as constant fallback ──
         if from_node.type in ('TEX_NOISE', 'TEX_VORONOI', 'TEX_MUSGRAVE',
                                'TEX_WAVE', 'TEX_GRADIENT', 'TEX_MAGIC', 'TEX_BRICK',
-                               'TEX_SKY', 'TEX_ENVIRONMENT',
-                               'AMBIENT_OCCLUSION'):
+                               'TEX_SKY', 'TEX_ENVIRONMENT'):
             self._emit(_OP_LOAD_CONST, dst, imm_y=_floatBits(0.5),
                        imm_z=_floatBits(0.5), imm_w=_floatBits(0.5))
             self.node_reg_cache[node_id] = dst
@@ -2399,6 +2412,13 @@ def _resolve_color_input(socket, default=(0.8, 0.8, 0.8), _depth=0):
                            'TEX_WAVE', 'TEX_GRADIENT', 'TEX_MAGIC', 'TEX_BRICK'):
         return (0.5, 0.5, 0.5)  # neutral gray for procedurals
 
+    # Ambient Occlusion — passthrough Color input (AO handled by GI bounces)
+    if from_node.type == 'AMBIENT_OCCLUSION':
+        color_inp = from_node.inputs.get('Color')
+        if color_inp:
+            return _resolve_color_input(color_inp, default, _depth + 1)
+        return default
+
     # RGB Curves — passthrough Color input (curve evaluation too complex for CPU)
     if from_node.type == 'CURVE_RGB':
         fac = _resolve_scalar_input(from_node.inputs.get('Fac'), 1.0, _depth + 1)
@@ -2524,6 +2544,7 @@ def _find_image_texture_node(socket, _depth=0):
         'TEX_CHECKER',      # Checker texture
         'TEX_WAVE',         # Wave texture
         'TEX_GRADIENT',     # Gradient texture
+        'AMBIENT_OCCLUSION',  # AO — passthrough Color input
     }
     if from_node.type in _PASSTHROUGH_TYPES:
         # For Blender 5.x MIX node: search RGBA inputs first (avoid float/vector 'A'/'B')
