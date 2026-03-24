@@ -1536,8 +1536,12 @@ class _NodeVmCompiler:
             return r
 
         from_node = socket.links[0].from_node
-        # Use node name as cache key — id() can be reused by Python GC
-        node_id = (from_node.type, from_node.name)
+        from_socket = socket.links[0].from_socket
+        # Cache key: (type, name, socket_identifier) — unique per output socket.
+        # Needed for GROUP_INPUT which has one node but multiple outputs mapping
+        # to different Group external inputs.
+        _sock_id = getattr(from_socket, 'identifier', from_socket.name)
+        node_id = (from_node.type, from_node.name, _sock_id)
 
         # Check cache — avoid re-compiling the same node
         if node_id in self.node_reg_cache:
@@ -2094,8 +2098,14 @@ class _NodeVmCompiler:
 
         # ── GROUP_INPUT — cross Group boundary to external input ──
         if from_node.type == 'GROUP_INPUT' and self._group_context:
-            ext_name = socket.links[0].from_socket.name
-            ext_inp = self._group_context.inputs.get(ext_name)
+            # Match by socket INDEX (not name — multiple inputs can have same name)
+            from_socket = socket.links[0].from_socket
+            try:
+                sock_idx = list(from_node.outputs).index(from_socket)
+            except (ValueError, TypeError):
+                sock_idx = -1
+            ext_inputs = list(self._group_context.inputs)
+            ext_inp = ext_inputs[sock_idx] if 0 <= sock_idx < len(ext_inputs) else None
             if ext_inp and ext_inp.is_linked:
                 # Follow the external link (back in main tree)
                 old_ctx = self._group_context
@@ -2197,7 +2207,13 @@ class _NodeVmCompiler:
             return uv_reg
 
         if from_node.type == 'TEX_COORD':
-            return 0  # default UVs
+            # Check which output is connected (UV, Object, Generated, etc.)
+            out_name = socket.links[0].from_socket.name if socket.is_linked else 'UV'
+            if out_name in ('Object', 'Generated', 'Camera', 'Window'):
+                dst = self._alloc_reg()
+                self._emit(_OP_LOAD_WORLD_POS, dst)
+                return dst
+            return 0  # UV output → default UV register
 
         # Reroute — follow through
         if from_node.type == 'REROUTE':
@@ -2288,10 +2304,15 @@ class _NodeVmCompiler:
             inp = from_node.inputs[0] if from_node.inputs else None
             return self._compile_uv_chain(inp, _depth + 1) if inp else 0
 
-        # GROUP_INPUT — cross Group boundary
+        # GROUP_INPUT — cross Group boundary (use index, not name)
         if from_node.type == 'GROUP_INPUT' and self._group_context:
-            ext_name = socket.links[0].from_socket.name
-            ext_inp = self._group_context.inputs.get(ext_name)
+            from_socket = socket.links[0].from_socket
+            try:
+                sock_idx = list(from_node.outputs).index(from_socket)
+            except (ValueError, TypeError):
+                sock_idx = -1
+            ext_inputs = list(self._group_context.inputs)
+            ext_inp = ext_inputs[sock_idx] if 0 <= sock_idx < len(ext_inputs) else None
             if ext_inp and ext_inp.is_linked:
                 old_ctx = self._group_context
                 self._group_context = None
@@ -2382,34 +2403,41 @@ class _NodeVmCompiler:
         return self._compile_principled(principled_node)
 
     def _find_principled_in_shader(self, shader_inp):
-        """Find Principled BSDF from a Mix Shader's shader input.
+        """Find Principled BSDF (or internal Mix Shader) from a shader input.
 
-        Returns (principled_node, group_node_or_None). For nodes inside a Group,
-        returns the ACTUAL internal node (not proxy) + the Group for context.
+        Returns (principled_node, group_node_or_None, internal_mix_or_None).
+        For Groups with internal Mix Shaders, returns the internal Mix Shader
+        as the third element for recursive compilation.
         """
         if not shader_inp or not shader_inp.is_linked:
-            return None, None
+            return None, None, None
         node = shader_inp.links[0].from_node
         if node.type == 'BSDF_PRINCIPLED':
-            return node, None
+            return node, None, None
         if node.type == 'GROUP':
             inner_tree = node.node_tree
             if inner_tree:
-                for inode in inner_tree.nodes:
-                    if inode.type == 'BSDF_PRINCIPLED':
-                        return inode, node  # Return ACTUAL internal node + Group context
-                # Follow GROUP_OUTPUT
+                # Follow GROUP_OUTPUT to find what the Group actually outputs
                 for inode in inner_tree.nodes:
                     if inode.type == 'GROUP_OUTPUT':
                         for inp in inode.inputs:
-                            if inp.is_linked and inp.links[0].from_node.type == 'BSDF_PRINCIPLED':
-                                return inp.links[0].from_node, node
-            return None, None
+                            if inp.is_linked:
+                                out_node = inp.links[0].from_node
+                                if out_node.type == 'BSDF_PRINCIPLED':
+                                    return out_node, node, None
+                                if out_node.type == 'MIX_SHADER':
+                                    # Group outputs a Mix Shader — needs recursive compilation
+                                    return None, node, out_node
+                # Fallback: find any Principled inside
+                for inode in inner_tree.nodes:
+                    if inode.type == 'BSDF_PRINCIPLED':
+                        return inode, node, None
+            return None, None, None
         if node.type == 'MIX_SHADER':
             for si in (1, 2):
-                p, g = self._find_principled_in_shader(node.inputs[si] if len(node.inputs) > si else None)
-                if p: return p, g
-        return None, None
+                p, g, m = self._find_principled_in_shader(node.inputs[si] if len(node.inputs) > si else None)
+                if p or m: return p, g, m
+        return None, None, None
 
     def _compile_principled_color(self, principled):
         """Compile Base Color from a Principled BSDF, return register."""
@@ -2461,11 +2489,41 @@ class _NodeVmCompiler:
         """Compile Mix Shader: both branches blended per-pixel.
         Supports Group nodes — crosses Group boundary for internal node compilation.
         """
-        # Find Principled BSDF in each branch (+ Group context if inside a Group)
+        # Find Principled BSDF in each branch (+ Group context + internal Mix)
         s1_inp = mix_node.inputs[1] if len(mix_node.inputs) > 1 else None
         s2_inp = mix_node.inputs[2] if len(mix_node.inputs) > 2 else None
-        p1, g1 = self._find_principled_in_shader(s1_inp)
-        p2, g2 = self._find_principled_in_shader(s2_inp)
+        p1, g1, m1 = self._find_principled_in_shader(s1_inp)
+        p2, g2, m2 = self._find_principled_in_shader(s2_inp)
+
+        # If a branch is an internal Mix Shader inside a Group, compile it recursively
+        if m1 and g1:
+            old_ctx = self._group_context
+            self._group_context = g1
+            result = self._compile_mix_shader(m1)
+            self._group_context = old_ctx
+            return result if not p2 else result  # TODO: blend with other branch
+        if m2 and g2:
+            # Compile the Group's internal Mix Shader with Group context
+            old_ctx = self._group_context
+            self._group_context = g2
+            # If p1 exists (outer Principled), compile both and blend at outer level
+            if p1:
+                # Compile outer Principled as one branch
+                color_a = self._compile_principled_color_ctx(p1, g1)
+                rough_a = self._compile_principled_scalar_ctx(p1, 'Roughness', 0.5, g1)
+                metal_a = self._compile_principled_scalar_ctx(p1, 'Metallic', 0.0, g1)
+                # Compile inner Mix Shader (recursive — it outputs its own mixed values)
+                self._group_context = g2
+                inner_result = self._compile_mix_shader(m2)
+                self._group_context = old_ctx
+                # The inner Mix already emitted OUTPUT_COLOR/ROUGH/METAL.
+                # We need to re-blend with the outer Principled at the outer factor.
+                # For now, the inner Mix Shader's outputs take priority (it's the complex one)
+                return inner_result
+            else:
+                result = self._compile_mix_shader(m2)
+                self._group_context = old_ctx
+                return result
 
         # If one side is Transparent BSDF, use the other side directly
         s1_node = s1_inp.links[0].from_node if (s1_inp and s1_inp.is_linked) else None
@@ -4321,6 +4379,43 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
             if vm_code:
                 mat_key_name = mat.name if mat else "?"
                 print(f"[ignis-vm] '{mat_key_name}': compiled {len(vm_code)} instructions")
+                # Dump VM instructions + Group internals for debugging
+                import os as _os3
+                try:
+                    _opnames = {0x01:'SAMPLE_TEX',0x10:'UV_TRANSFORM',0x11:'UV_ROTATE',
+                        0x20:'MIX',0x21:'MIX_REG',0x22:'MULTIPLY',0x2B:'HUE_SAT',
+                        0x41:'MATH_ADD',0x42:'MATH_MUL',0x60:'LOAD_CONST',0x61:'LOAD_SCALAR',
+                        0x62:'LOAD_WORLD_POS',0x80:'TEX_NOISE',0x93:'NOISE_BUMP',
+                        0xEF:'OUTPUT_UV',0xF0:'OUTPUT_COLOR',0xF1:'OUTPUT_ROUGH',
+                        0xF2:'OUTPUT_METAL',0xF3:'OUTPUT_EMISSION',0xF8:'OUTPUT_BUMP'}
+                    with open(_os3.path.join(_os3.path.expanduser("~"), "ignis-rt.log"), "a") as _f:
+                        _f.write(f"[ignis-vm-dump] '{mat_key_name}' ({len(vm_code)} instrs):\n")
+                        for _i, _instr in enumerate(vm_code):
+                            _op = _instr[0] & 0xFF
+                            _opn = _opnames.get(_op, f'0x{_op:02X}')
+                            _dst = (_instr[0] >> 8) & 0xF
+                            _srcA = (_instr[0] >> 16) & 0xF
+                            _f.write(f"  [{_i:2d}] {_opn} dst=R[{_dst}] srcA=R[{_srcA}]\n")
+                        # Dump Group internal tree if Mix Shader
+                        if _vm_surface and _vm_surface.type == 'MIX_SHADER':
+                            for si in (1, 2):
+                                sinp = _vm_surface.inputs[si] if len(_vm_surface.inputs) > si else None
+                                if sinp and sinp.is_linked:
+                                    sn = sinp.links[0].from_node
+                                    if sn.type == 'GROUP' and sn.node_tree:
+                                        _f.write(f"  [Group '{sn.name}' internal tree]:\n")
+                                        for gn in sn.node_tree.nodes:
+                                            _f.write(f"    {gn.type}: '{gn.name}'\n")
+                                            for gi in gn.inputs:
+                                                lnk = f" <- {gi.links[0].from_node.name}:{gi.links[0].from_socket.name}" if gi.is_linked else ""
+                                                gv = ""
+                                                if not gi.is_linked:
+                                                    try:
+                                                        v = gi.default_value
+                                                        gv = f" = {v:.4f}" if not hasattr(v, '__len__') else f" = ({','.join(f'{x:.3f}' for x in v)})"
+                                                    except: pass
+                                                _f.write(f"      in: '{gi.name}'{gv}{lnk}\n")
+                except: pass
                 # Only disable legacy UV scale when VM emits UV transforms
                 # (OP_OUTPUT_UV = 0xEF). Otherwise legacy scale is still needed.
                 if any((instr[0] & 0xFF) == 0xEF for instr in vm_code):
