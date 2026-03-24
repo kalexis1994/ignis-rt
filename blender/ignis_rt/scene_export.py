@@ -3903,6 +3903,11 @@ def _resolve_mix_shader(mix_node, register_image_fn):
         return result
 
     # Blend properties by mix factor
+    # Specular level: Diffuse BSDF has NO specular (0), Glossy/Principled have specular (0.5)
+    # Blend proportionally so Mix(0.02, Diffuse, Glossy) gives specular_level=0.01 not 0.5
+    spec1 = p1.get('specular_level', 0.0 if s1_type == 'BSDF_DIFFUSE' else 0.5)
+    spec2 = p2.get('specular_level', 0.0 if s2_type == 'BSDF_DIFFUSE' else 0.5)
+
     blended = {
         'base_color': _lerp_color(p1['base_color'], p2['base_color'], fac),
         'roughness': p1['roughness'] * (1 - fac) + p2['roughness'] * fac,
@@ -3912,6 +3917,7 @@ def _resolve_mix_shader(mix_node, register_image_fn):
         'transmission': p1.get('transmission', 0.0) * (1 - fac) + p2.get('transmission', 0.0) * fac,
         'ior': p1['ior'] * (1 - fac) + p2['ior'] * fac,
         'transparent_prob': blended_tp,
+        'specular_level': spec1 * (1 - fac) + spec2 * fac,
         # Texture: prefer the dominant shader's texture
         'diffuse_tex': p1['diffuse_tex'] if fac <= 0.5 else p2['diffuse_tex'],
         'emission_tex': p1['emission_tex'] if p1['emission_tex'] != _NO_TEX else p2['emission_tex'],
@@ -4165,6 +4171,7 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                     if 'flags' in props: flags = props['flags']
                     if 'transparent_prob' in props: transparent_prob = props['transparent_prob']
                     if 'alpha_ref' in props: alpha_ref = props['alpha_ref']
+                    if 'specular_level' in props: specular_level = props['specular_level']
                     _mix_shader_resolved = True
                     import os
                     try:
