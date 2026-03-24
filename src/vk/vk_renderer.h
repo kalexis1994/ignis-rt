@@ -175,6 +175,12 @@ private:
     VkDescriptorSet tonemapDescSet_ = VK_NULL_HANDLE;
     VkSampler tonemapSampler_ = VK_NULL_HANDLE;
     bool tonemapReady_ = false;
+    // AgX 3D LUT
+    VkImage agxLutImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory agxLutMemory_ = VK_NULL_HANDLE;
+    VkImageView agxLutView_ = VK_NULL_HANDLE;
+    VkSampler agxLutSampler_ = VK_NULL_HANDLE;
+    bool LoadAgXLut();
 
     bool CreateTonemapPipeline();
     void UpdateTonemapDescriptors();

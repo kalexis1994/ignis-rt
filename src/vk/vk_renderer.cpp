@@ -2041,6 +2041,143 @@ void Renderer::ShutdownExposureResolve() {
     Log(L"[VK Renderer] Auto-exposure resolve shutdown\n");
 }
 
+bool Renderer::LoadAgXLut() {
+    // Parse AgX_Base_sRGB.cube and upload as 3D texture
+    std::string lutPath = IgnisResolvePath("shaders/AgX_Base_sRGB.cube");
+    std::ifstream lutFile(lutPath);
+    if (!lutFile.is_open()) {
+        Log(L"[VK Renderer] WARNING: AgX LUT not found at %S\n", lutPath.c_str());
+        return false;
+    }
+
+    int lutSize = 0;
+    std::vector<float> lutData;
+    std::string line;
+    while (std::getline(lutFile, line)) {
+        if (line.empty() || line[0] == '#' || line[0] == 'T' || line[0] == 'D') {
+            // Parse LUT_3D_SIZE
+            if (line.find("LUT_3D_SIZE") != std::string::npos) {
+                sscanf(line.c_str(), "LUT_3D_SIZE %d", &lutSize);
+            }
+            continue;
+        }
+        float r, g, b;
+        if (sscanf(line.c_str(), "%f %f %f", &r, &g, &b) == 3) {
+            lutData.push_back(r);
+            lutData.push_back(g);
+            lutData.push_back(b);
+            lutData.push_back(1.0f);  // RGBA padding
+        }
+    }
+    lutFile.close();
+
+    if (lutSize == 0 || lutData.size() != (size_t)lutSize * lutSize * lutSize * 4) {
+        Log(L"[VK Renderer] WARNING: AgX LUT parse error (size=%d, data=%zu)\n",
+            lutSize, lutData.size());
+        return false;
+    }
+
+    VkDevice device = context_->GetDevice();
+
+    // Create 3D image
+    VkImageCreateInfo imgInfo{};
+    imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imgInfo.imageType = VK_IMAGE_TYPE_3D;
+    imgInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    imgInfo.extent = {(uint32_t)lutSize, (uint32_t)lutSize, (uint32_t)lutSize};
+    imgInfo.mipLevels = 1;
+    imgInfo.arrayLayers = 1;
+    imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imgInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateImage(device, &imgInfo, nullptr, &agxLutImage_) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements memReqs;
+    vkGetImageMemoryRequirements(device, agxLutImage_, &memReqs);
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = context_->FindMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    vkAllocateMemory(device, &allocInfo, nullptr, &agxLutMemory_);
+    vkBindImageMemory(device, agxLutImage_, agxLutMemory_, 0);
+
+    // Staging buffer
+    VkDeviceSize dataSize = lutData.size() * sizeof(float);
+    VkBuffer stagingBuf;
+    VkDeviceMemory stagingMem;
+    VkBufferCreateInfo bufInfo{};
+    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufInfo.size = dataSize;
+    bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    vkCreateBuffer(device, &bufInfo, nullptr, &stagingBuf);
+    VkMemoryRequirements bufReqs;
+    vkGetBufferMemoryRequirements(device, stagingBuf, &bufReqs);
+    VkMemoryAllocateInfo bufAlloc{};
+    bufAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    bufAlloc.allocationSize = bufReqs.size;
+    bufAlloc.memoryTypeIndex = context_->FindMemoryType(bufReqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    vkAllocateMemory(device, &bufAlloc, nullptr, &stagingMem);
+    vkBindBufferMemory(device, stagingBuf, stagingMem, 0);
+    void* mapped;
+    vkMapMemory(device, stagingMem, 0, dataSize, 0, &mapped);
+    memcpy(mapped, lutData.data(), dataSize);
+    vkUnmapMemory(device, stagingMem);
+
+    // Copy to 3D image
+    VkCommandBuffer cmd = context_->BeginSingleTimeCommands();
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.image = agxLutImage_;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {(uint32_t)lutSize, (uint32_t)lutSize, (uint32_t)lutSize};
+    vkCmdCopyBufferToImage(cmd, stagingBuf, agxLutImage_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+    context_->EndSingleTimeCommands(cmd);
+
+    vkDestroyBuffer(device, stagingBuf, nullptr);
+    vkFreeMemory(device, stagingMem, nullptr);
+
+    // Image view
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = agxLutImage_;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_3D;
+    viewInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCreateImageView(device, &viewInfo, nullptr, &agxLutView_);
+
+    // Sampler (trilinear for smooth interpolation)
+    VkSamplerCreateInfo sampInfo{};
+    sampInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sampInfo.magFilter = VK_FILTER_LINEAR;
+    sampInfo.minFilter = VK_FILTER_LINEAR;
+    sampInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    vkCreateSampler(device, &sampInfo, nullptr, &agxLutSampler_);
+
+    Log(L"[VK Renderer] AgX 3D LUT loaded: %dx%dx%d (%zu KB)\n",
+        lutSize, lutSize, lutSize, dataSize / 1024);
+    return true;
+}
+
 bool Renderer::CreateTonemapPipeline() {
     VkDevice device = context_->GetDevice();
 
@@ -2057,8 +2194,14 @@ bool Renderer::CreateTonemapPipeline() {
         return false;
     }
 
-    // Descriptor set layout: binding 0 = sampler (HDR input), binding 1 = storage image (LDR output)
-    VkDescriptorSetLayoutBinding bindings[2] = {};
+    // Load AgX 3D LUT
+    if (!LoadAgXLut()) {
+        Log(L"[VK Renderer] WARNING: AgX LUT not loaded, falling back to polynomial\n");
+    }
+
+    // Descriptor set layout: binding 0 = sampler (HDR input), binding 1 = storage image (LDR output),
+    // binding 2 = 3D LUT sampler (AgX color grading)
+    VkDescriptorSetLayoutBinding bindings[3] = {};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindings[0].descriptorCount = 1;
@@ -2067,10 +2210,14 @@ bool Renderer::CreateTonemapPipeline() {
     bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     bindings[1].descriptorCount = 1;
     bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[2].binding = 2;
+    bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[2].descriptorCount = 1;
+    bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 2;
+    layoutInfo.bindingCount = 3;
     layoutInfo.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &tonemapDescSetLayout_) != VK_SUCCESS) {
         return false;
@@ -2135,7 +2282,7 @@ bool Renderer::CreateTonemapPipeline() {
 
     // Descriptor pool
     VkDescriptorPoolSize poolSizes[] = {
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},  // HDR input + AgX LUT
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
     };
     VkDescriptorPoolCreateInfo poolInfo{};
@@ -2178,7 +2325,13 @@ void Renderer::UpdateTonemapDescriptors() {
     ldrInfo.imageView = interop_->GetSharedImageView();
     ldrInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-    VkWriteDescriptorSet writes[2] = {};
+    // binding 2: AgX 3D LUT (sampler3D)
+    VkDescriptorImageInfo lutInfo{};
+    lutInfo.imageView = agxLutView_ ? agxLutView_ : dlssHdrOutputView_; // fallback
+    lutInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    lutInfo.sampler = agxLutSampler_ ? agxLutSampler_ : tonemapSampler_;
+
+    VkWriteDescriptorSet writes[3] = {};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = tonemapDescSet_;
     writes[0].dstBinding = 0;
@@ -2193,7 +2346,14 @@ void Renderer::UpdateTonemapDescriptors() {
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     writes[1].pImageInfo = &ldrInfo;
 
-    vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[2].dstSet = tonemapDescSet_;
+    writes[2].dstBinding = 2;
+    writes[2].descriptorCount = 1;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[2].pImageInfo = &lutInfo;
+
+    vkUpdateDescriptorSets(device, agxLutView_ ? 3u : 2u, writes, 0, nullptr);
 }
 
 void Renderer::ShutdownTonemap() {
