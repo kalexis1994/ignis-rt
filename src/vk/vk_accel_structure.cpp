@@ -551,9 +551,9 @@ bool AccelStructureBuilder::RefitBLAS(int blasIndex, const float* vertices, uint
     return true;
 }
 
-bool AccelStructureBuilder::UploadBLASAttributes(int blasIndex, const float* normals, const float* uvs, uint32_t vertexCount) {
+bool AccelStructureBuilder::UploadBLASAttributes(int blasIndex, const float* normals, const float* uvs, uint32_t vertexCount, const float* colors) {
     if (blasIndex < 0 || blasIndex >= (int)blasList_.size()) return false;
-    if (!normals && !uvs) return false;
+    if (!normals && !uvs && !colors) return false;
     if (vertexCount == 0) return false;
 
     auto& blas = blasList_[blasIndex];
@@ -595,9 +595,13 @@ bool AccelStructureBuilder::UploadBLASAttributes(int blasIndex, const float* nor
         DestroyAccelBuffer(blas.uvBuf);
         blas.uvBuf = uploadBuffer(uvs, vertexCount * 2 * sizeof(float));
     }
+    if (colors) {
+        DestroyAccelBuffer(blas.colorBuf);
+        blas.colorBuf = uploadBuffer(colors, vertexCount * 4 * sizeof(float));  // RGBA per vertex
+    }
 
-    Log(L"[VK AccelStruct] BLAS[%d] attributes uploaded: normals=%s uvs=%s (%u verts)\n",
-        blasIndex, normals ? L"yes" : L"no", uvs ? L"yes" : L"no", vertexCount);
+    Log(L"[VK AccelStruct] BLAS[%d] attributes uploaded: normals=%s uvs=%s colors=%s (%u verts)\n",
+        blasIndex, normals ? L"yes" : L"no", uvs ? L"yes" : L"no", colors ? L"yes" : L"no", vertexCount);
     return true;
 }
 

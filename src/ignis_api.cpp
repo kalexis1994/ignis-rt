@@ -272,9 +272,10 @@ IGNIS_API int ignis_upload_mesh(const float* vertices, uint32_t vertexCount,
 
 IGNIS_API bool ignis_upload_mesh_attributes(int blasHandle,
                                             const float* normals, const float* uvs,
-                                            uint32_t vertexCount) {
+                                            uint32_t vertexCount,
+                                            const float* colors) {
     if (!g_renderer) return false;
-    return g_renderer->UploadBLASAttributes(blasHandle, normals, uvs, vertexCount);
+    return g_renderer->UploadBLASAttributes(blasHandle, normals, uvs, vertexCount, colors);
 }
 
 IGNIS_API bool ignis_upload_mesh_primitive_materials(int blasHandle,

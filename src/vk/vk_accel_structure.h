@@ -28,6 +28,7 @@ struct BLAS {
     AccelBuffer indexBuf;
     AccelBuffer normalBuf;  // float3 normals (SHADER_DEVICE_ADDRESS)
     AccelBuffer uvBuf;       // float2 UVs (SHADER_DEVICE_ADDRESS)
+    AccelBuffer colorBuf;    // float4 vertex colors (RGBA linear), device address
     AccelBuffer primMaterialBuf; // uint32 per primitive: materialId (SHADER_DEVICE_ADDRESS)
     AccelBuffer primYBoundsBuf; // float2 per primitive: (nodeMinY, nodeMaxY) for canopy AO
     float minY = 0.0f;  // Bounding box min Y (for canopy AO gradient)
@@ -76,8 +77,8 @@ public:
     // Build TLAS with custom per-instance transforms (for static/dynamic split)
     bool BuildTLAS(const std::vector<TLASInstance>& instances);
 
-    // Upload normal/UV attribute buffers directly into a BLAS entry
-    bool UploadBLASAttributes(int blasIndex, const float* normals, const float* uvs, uint32_t vertexCount);
+    // Upload normal/UV/color attribute buffers directly into a BLAS entry
+    bool UploadBLASAttributes(int blasIndex, const float* normals, const float* uvs, uint32_t vertexCount, const float* colors = nullptr);
 
     // Upload per-primitive material IDs for a BLAS
     bool UploadBLASPrimitiveMaterials(int blasIndex, const uint32_t* materialIds, uint32_t primitiveCount);

@@ -534,6 +534,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                     _ignis_blas_handles[mesh_key] = blas
                     dll_wrapper.upload_mesh_attributes(
                         blas, m["normals"], m["uvs"], m["vertex_count"],
+                        m.get("vcols"),
                     )
                 except Exception:
                     _log_exception(f"LOAD_MESHES uploading '{mesh_key}'")
@@ -1069,10 +1070,13 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 _log(f"  BLAS upload failed for '{mesh_key}'")
                 continue
 
-            # Upload attributes (normals + UVs)
+            # Upload attributes (normals + UVs + vertex colors)
             normals = np.ascontiguousarray(mdata["normals"], dtype=np.float32)
             uvs = np.ascontiguousarray(mdata["uvs"], dtype=np.float32)
-            dll_wrapper.upload_mesh_attributes(blas_handle, normals, uvs, mdata["vertex_count"])
+            vcols = mdata.get("vcols")
+            if vcols is not None:
+                vcols = np.ascontiguousarray(vcols, dtype=np.float32)
+            dll_wrapper.upload_mesh_attributes(blas_handle, normals, uvs, mdata["vertex_count"], vcols)
 
             # Upload per-primitive material IDs
             for inst_data in instances:

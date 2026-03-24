@@ -43,6 +43,7 @@ struct GeometryMetadata {
     uint64_t primMaterialBufferAddress;
     uint64_t bitangentBufferAddress;
     uint64_t primYBoundsAddress;
+    uint64_t colorBufferAddress;
     uint vertexCount;
     uint indexCount;
 };

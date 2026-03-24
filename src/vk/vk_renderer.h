@@ -44,7 +44,7 @@ public:
                   const uint32_t* indices, uint32_t indexCount);
     bool RefitBLAS(int blasIndex, const float* vertices, uint32_t vertexCount,
                    const uint32_t* indices, uint32_t indexCount);
-    bool UploadBLASAttributes(int blasIndex, const float* normals, const float* uvs, uint32_t vertexCount);
+    bool UploadBLASAttributes(int blasIndex, const float* normals, const float* uvs, uint32_t vertexCount, const float* colors = nullptr);
     bool UploadBLASPrimitiveMaterials(int blasIndex, const uint32_t* materialIds, uint32_t primitiveCount);
     bool UploadBLASPrimitiveYBounds(int blasIndex, const float* yBounds, uint32_t primitiveCount);
     void ClearGeometry();

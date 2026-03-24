@@ -68,9 +68,12 @@ struct GeometryMetadata {
     uint64_t indexBufferAddress;
     uint64_t normalBufferAddress;
     uint64_t uvBufferAddress;
+    uint64_t primMaterialBufferAddress;
+    uint64_t bitangentBufferAddress;
+    uint64_t primYBoundsAddress;
+    uint64_t colorBufferAddress;
     uint vertexCount;
     uint indexCount;
-    uint padding[2];
 };
 
 // Material data structure (matches C++ struct)

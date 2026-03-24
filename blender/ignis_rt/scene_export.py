@@ -451,13 +451,37 @@ def export_meshes(depsgraph):
                 all_loop_uvs = all_loop_uvs.reshape(-1, 2)
                 uvs = all_loop_uvs[tri_loops]
 
+            # Vertex Colors
+            vcols = np.ones((raw_vert_count, 4), dtype=np.float32)  # default white RGBA
+            if mesh.color_attributes and len(mesh.color_attributes) > 0:
+                try:
+                    color_attr = mesh.color_attributes.active_color
+                    if color_attr is None:
+                        color_attr = mesh.color_attributes[0]
+                    if color_attr.domain == 'CORNER':
+                        all_colors = np.empty(len(color_attr.data) * 4, dtype=np.float32)
+                        color_attr.data.foreach_get("color", all_colors)
+                        all_colors = all_colors.reshape(-1, 4)
+                        vcols = all_colors[tri_loops]
+                    elif color_attr.domain == 'POINT':
+                        all_colors = np.empty(len(color_attr.data) * 4, dtype=np.float32)
+                        color_attr.data.foreach_get("color", all_colors)
+                        all_colors = all_colors.reshape(-1, 4)
+                        # Map point colors to triangle corners via vertex indices
+                        tri_verts = mesh.loops  # loop -> vertex mapping
+                        loop_to_vert = np.empty(len(tri_verts), dtype=np.int32)
+                        tri_verts.foreach_get("vertex_index", loop_to_vert)
+                        vcols = all_colors[loop_to_vert[tri_loops]]
+                except Exception:
+                    pass  # Keep default white
+
             # ---- Vertex deduplication ----
             # Skip dedup for large meshes (>50K tris) — np.unique is O(N log N)
             # and takes seconds on multi-million triangle meshes
             DEDUP_THRESHOLD = 500000
             if tri_count <= DEDUP_THRESHOLD:
                 combined = np.ascontiguousarray(
-                    np.hstack([positions, normals, uvs]), dtype=np.float32)
+                    np.hstack([positions, normals, uvs, vcols]), dtype=np.float32)  # pos(3)+norm(3)+uv(2)+color(4)=12
                 void_dt = np.dtype((np.void, combined.dtype.itemsize * combined.shape[1]))
                 _, unique_idx, inverse = np.unique(
                     combined.view(void_dt).ravel(),
@@ -465,6 +489,7 @@ def export_meshes(depsgraph):
                 dedup_pos = combined[unique_idx, :3]
                 dedup_nrm = combined[unique_idx, 3:6]
                 dedup_uvs = combined[unique_idx, 6:8]
+                dedup_vcols = combined[unique_idx, 8:12]
                 dedup_indices = inverse.astype(np.uint32)
                 dedup_vert_count = len(unique_idx)
             else:
@@ -472,6 +497,7 @@ def export_meshes(depsgraph):
                 dedup_pos = positions
                 dedup_nrm = normals
                 dedup_uvs = uvs
+                dedup_vcols = vcols
                 dedup_indices = np.arange(raw_vert_count, dtype=np.uint32)
                 dedup_vert_count = raw_vert_count
 
@@ -484,6 +510,7 @@ def export_meshes(depsgraph):
                 "positions": np.ascontiguousarray(dedup_pos.flatten(), dtype=np.float32),
                 "normals": np.ascontiguousarray(dedup_nrm.flatten(), dtype=np.float32),
                 "uvs": np.ascontiguousarray(dedup_uvs.flatten(), dtype=np.float32),
+                "vcols": np.ascontiguousarray(dedup_vcols.flatten(), dtype=np.float32),
                 "indices": np.ascontiguousarray(dedup_indices, dtype=np.uint32),
                 "vertex_count": dedup_vert_count,
                 "index_count": len(dedup_indices),
@@ -1487,6 +1514,7 @@ _OP_COLOR_BURN      = 0x2E
 _OP_SOFT_LIGHT      = 0x2F
 _OP_LINEAR_LIGHT    = 0x90
 _OP_NOISE_BUMP      = 0x93
+_OP_LOAD_VERTEX_COLOR = 0x94
 _OP_OUTPUT_BUMP     = 0xF8
 
 
@@ -2089,13 +2117,9 @@ class _NodeVmCompiler:
             self.node_reg_cache[node_id] = dst
             return dst
 
-        # ── Attribute / Vertex Color — TODO: implement per-vertex color buffer ──
-        # VM must compile this properly with vertex color data from mesh export.
-        # For now, return white (1,1,1) as default — vertex colors are typically
-        # surface colors and white is less wrong than black (0,0,0).
+        # ── Attribute / Vertex Color — load per-vertex color from GPU buffer ──
         if from_node.type in ('ATTRIBUTE', 'VERTEX_COLOR'):
-            self._emit(_OP_LOAD_CONST, dst, imm_y=_floatBits(1.0),
-                       imm_z=_floatBits(1.0), imm_w=_floatBits(1.0))
+            self._emit(_OP_LOAD_VERTEX_COLOR, dst)
             self.node_reg_cache[node_id] = dst
             return dst
 

@@ -103,7 +103,7 @@ def load():
     _lib.ignis_upload_mesh.restype = c_int
 
     _lib.ignis_upload_mesh_attributes.argtypes = [
-        c_int, POINTER(c_float), POINTER(c_float), c_uint32,
+        c_int, POINTER(c_float), POINTER(c_float), c_uint32, POINTER(c_float),
     ]
     _lib.ignis_upload_mesh_attributes.restype = c_bool
 
@@ -243,14 +243,19 @@ def upload_mesh(vertices, vertex_count: int, indices, index_count: int) -> int:
         i.ctypes.data_as(POINTER(c_uint32)), c_uint32(index_count))
 
 
-def upload_mesh_attributes(blas_handle: int, normals, uvs, vertex_count: int) -> bool:
+def upload_mesh_attributes(blas_handle: int, normals, uvs, vertex_count: int, colors=None) -> bool:
     n = _np_f32(normals)
     u = _np_f32(uvs)
+    c_ptr = None
+    if colors is not None:
+        c = _np_f32(colors)
+        c_ptr = c.ctypes.data_as(POINTER(c_float))
     return _lib.ignis_upload_mesh_attributes(
         c_int(blas_handle),
         n.ctypes.data_as(POINTER(c_float)),
         u.ctypes.data_as(POINTER(c_float)),
-        c_uint32(vertex_count))
+        c_uint32(vertex_count),
+        c_ptr)
 
 
 def build_tlas(instances_array, count: int) -> bool:

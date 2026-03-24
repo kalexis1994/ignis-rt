@@ -27,7 +27,8 @@ IGNIS_API int    ignis_upload_mesh(const float* vertices, uint32_t vertexCount,
                                    const uint32_t* indices, uint32_t indexCount);
 IGNIS_API bool   ignis_upload_mesh_attributes(int blasHandle,
                                                const float* normals, const float* uvs,
-                                               uint32_t vertexCount);
+                                               uint32_t vertexCount,
+                                               const float* colors);
 IGNIS_API bool   ignis_upload_mesh_primitive_materials(int blasHandle,
                                                        const uint32_t* materialIds,
                                                        uint32_t primitiveCount);

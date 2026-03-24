@@ -197,7 +197,7 @@ int main() {
         1.0f, 1.0f,
     };
 
-    if (!ignis_upload_mesh_attributes(blasHandle, normals, uvs, 3)) {
+    if (!ignis_upload_mesh_attributes(blasHandle, normals, uvs, 3, nullptr)) {
         printf("WARN: ignis_upload_mesh_attributes() failed (non-fatal)\n");
     } else {
         printf("  OK\n");

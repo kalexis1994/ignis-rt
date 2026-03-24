@@ -55,6 +55,7 @@ struct GeometryMetadata {
     uint64_t primMaterialBufferAddress;
     uint64_t bitangentBufferAddress;
     uint64_t primYBoundsAddress;
+    uint64_t colorBufferAddress;    // float4 RGBA vertex colors
     uint vertexCount;
     uint indexCount;
 };
@@ -189,6 +190,7 @@ layout(buffer_reference, scalar) buffer Vertices { float v[]; };
 layout(buffer_reference, scalar) buffer Indices { uint i[]; };
 layout(buffer_reference, scalar) buffer Normals { float n[]; };
 layout(buffer_reference, scalar) buffer UVs { float uv[]; };
+layout(buffer_reference, scalar) buffer Colors { float c[]; };  // float4 RGBA per vertex
 layout(buffer_reference, scalar) buffer PrimMaterials { uint m[]; };
 
 // ============================================================
@@ -339,7 +341,8 @@ PBRHit evaluateBlenderMaterial(
     vec3 worldPos, vec3 geoNormal,
     vec3 v0, vec3 v1, vec3 v2,
     vec2 uv0, vec2 uv1, vec2 uv2,
-    vec2 uv, vec3 rayDir
+    vec2 uv, vec3 rayDir,
+    vec4 vertexColor
 ) {
     PBRHit hit;
     hit.worldPos = worldPos;
@@ -358,7 +361,7 @@ PBRHit evaluateBlenderMaterial(
     // When the VM has a program, it handles the ENTIRE material evaluation for
     // the properties it computes. The legacy pipeline only runs for properties
     // the VM doesn't override, preventing double-processing.
-    NodeVmResult vm = executeNodeVm(matIdx, uv, worldPos, rayDir, geoNormal);
+    NodeVmResult vm = executeNodeVm(matIdx, uv, worldPos, rayDir, geoNormal, vertexColor);
     bool vmActive = (mat.nodeVmHeader & 0xFFu) > 0u;
 
     // ── Material evaluation: VM is the single authority ──
@@ -785,6 +788,16 @@ void main() {
         vec2 uv2_ = vec2(uvData.uv[i2*2+0], 1.0 - uvData.uv[i2*2+1]);
         vec2 hitUV = uv0_ * bary.x + uv1_ * bary.y + uv2_ * bary.z;
 
+        // Vertex Colors (RGBA, linear space)
+        vec4 hitVertexColor = vec4(1.0);  // default white
+        if (geo.colorBufferAddress != 0u) {
+            Colors colorData = Colors(geo.colorBufferAddress);
+            vec4 vc0 = vec4(colorData.c[i0*4+0], colorData.c[i0*4+1], colorData.c[i0*4+2], colorData.c[i0*4+3]);
+            vec4 vc1 = vec4(colorData.c[i1*4+0], colorData.c[i1*4+1], colorData.c[i1*4+2], colorData.c[i1*4+3]);
+            vec4 vc2 = vec4(colorData.c[i2*4+0], colorData.c[i2*4+1], colorData.c[i2*4+2], colorData.c[i2*4+3]);
+            hitVertexColor = vc0 * bary.x + vc1 * bary.y + vc2 * bary.z;
+        }
+
         // Fetch material (need matIdx before UV scale)
         uint matIdx = 0u;
         if (geo.primMaterialBufferAddress != 0u) {
@@ -814,7 +827,8 @@ void main() {
         // Evaluate PBR material
         PBRHit pbrHit = evaluateBlenderMaterial(
             mat, matIdx, worldPos, worldN,
-            wp0, wp1, wp2, uv0_, uv1_, uv2_, hitUV, rayDir
+            wp0, wp1, wp2, uv0_, uv1_, uv2_, hitUV, rayDir,
+            hitVertexColor
         );
 
         // Ensure normal faces the ray.

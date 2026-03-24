@@ -1545,7 +1545,7 @@ void RTPipeline::UpdateTLASDescriptor() {
     // Create geometry metadata buffer from BLAS vertex/index addresses
     const auto& blasList = accelBuilder_->GetBLASList();
     if (!blasList.empty()) {
-        // Shader struct: 7 x uint64 addresses + 2 x uint32 counts = 64 bytes per entry
+        // Shader struct: 8 x uint64 addresses + 2 x uint32 counts = 72 bytes per entry
         struct GPUGeometryMetadata {
             uint64_t vertexBufferAddress;
             uint64_t indexBufferAddress;
@@ -1554,6 +1554,7 @@ void RTPipeline::UpdateTLASDescriptor() {
             uint64_t primMaterialBufferAddress;
             uint64_t bitangentBufferAddress;
             uint64_t primYBoundsAddress;
+            uint64_t colorBufferAddress;
             uint32_t vertexCount;
             uint32_t indexCount;
         };
@@ -1567,6 +1568,7 @@ void RTPipeline::UpdateTLASDescriptor() {
             metaData[i].primMaterialBufferAddress = blasList[i].primMaterialBuf.deviceAddress;
             metaData[i].bitangentBufferAddress = 0;
             metaData[i].primYBoundsAddress = blasList[i].primYBoundsBuf.deviceAddress;
+            metaData[i].colorBufferAddress = blasList[i].colorBuf.deviceAddress;
             metaData[i].vertexCount = blasList[i].vertexCount;
             metaData[i].indexCount = blasList[i].indexCount;
         }

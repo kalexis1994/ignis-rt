@@ -648,9 +648,9 @@ bool Renderer::RefitBLAS(int blasIndex, const float* vertices, uint32_t vertexCo
     return accelBuilder_->RefitBLAS(blasIndex, vertices, vertexCount, indices, indexCount);
 }
 
-bool Renderer::UploadBLASAttributes(int blasIndex, const float* normals, const float* uvs, uint32_t vertexCount) {
+bool Renderer::UploadBLASAttributes(int blasIndex, const float* normals, const float* uvs, uint32_t vertexCount, const float* colors) {
     if (!accelBuilder_) return false;
-    return accelBuilder_->UploadBLASAttributes(blasIndex, normals, uvs, vertexCount);
+    return accelBuilder_->UploadBLASAttributes(blasIndex, normals, uvs, vertexCount, colors);
 }
 
 bool Renderer::UploadBLASPrimitiveMaterials(int blasIndex, const uint32_t* materialIds, uint32_t primitiveCount) {
