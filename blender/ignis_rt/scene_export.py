@@ -2448,6 +2448,10 @@ class _NodeVmCompiler:
         node = shader_inp.links[0].from_node
         if node.type == 'BSDF_PRINCIPLED':
             return node, None, None
+        # Diffuse/Glossy BSDFs: treat as pseudo-Principled for VM compilation.
+        # Their 'Color' input maps to 'Base Color', 'Roughness' maps directly.
+        if node.type in ('BSDF_DIFFUSE', 'BSDF_GLOSSY'):
+            return node, None, None
         if node.type == 'GROUP':
             inner_tree = node.node_tree
             if inner_tree:
@@ -2474,8 +2478,9 @@ class _NodeVmCompiler:
         return None, None, None
 
     def _compile_principled_color(self, principled):
-        """Compile Base Color from a Principled BSDF, return register."""
-        bc_inp = principled.inputs.get('Base Color')
+        """Compile Base Color from a Principled/Diffuse/Glossy BSDF, return register."""
+        # Principled uses 'Base Color', Diffuse/Glossy use 'Color'
+        bc_inp = principled.inputs.get('Base Color') or principled.inputs.get('Color')
         if bc_inp and bc_inp.is_linked:
             return self._compile_node(bc_inp)
         val = bc_inp.default_value if bc_inp else (0.8, 0.8, 0.8, 1.0)
@@ -2598,7 +2603,7 @@ class _NodeVmCompiler:
             old = self._group_context
             if g: self._group_context = g
             uv_done = False
-            for iname in ('Base Color', 'Roughness', 'Metallic'):
+            for iname in ('Base Color', 'Color', 'Roughness', 'Metallic'):
                 inp = p.inputs.get(iname)
                 if inp and inp.is_linked:
                     tex = _find_image_texture_node(inp)
@@ -2630,16 +2635,21 @@ class _NodeVmCompiler:
         self._emit(_OP_MIX_REG, color_mix, srcA=color_a, srcB=color_b, imm_y=fac_reg & 0xF)
         self._emit(_OP_OUTPUT_COLOR, srcA=color_mix)
 
-        # Compile and blend Roughness
-        rough_a = self._compile_principled_scalar_ctx(p1, 'Roughness', 0.5, g1)
-        rough_b = self._compile_principled_scalar_ctx(p2, 'Roughness', 0.5, g2)
+        # Compile and blend Roughness (Diffuse BSDF defaults to 1.0 in PBR)
+        _rough_default_a = 1.0 if (p1 and p1.type == 'BSDF_DIFFUSE') else 0.5
+        _rough_default_b = 1.0 if (p2 and p2.type == 'BSDF_DIFFUSE') else 0.5
+        rough_a = self._compile_principled_scalar_ctx(p1, 'Roughness', _rough_default_a, g1)
+        rough_b = self._compile_principled_scalar_ctx(p2, 'Roughness', _rough_default_b, g2)
         rough_mix = self._alloc_reg()
         self._emit(_OP_MIX_REG, rough_mix, srcA=rough_a, srcB=rough_b, imm_y=fac_reg & 0xF)
         self._emit(_OP_OUTPUT_ROUGH, srcA=rough_mix)
 
         # Compile and blend Metallic
-        metal_a = self._compile_principled_scalar_ctx(p1, 'Metallic', 0.0, g1)
-        metal_b = self._compile_principled_scalar_ctx(p2, 'Metallic', 0.0, g2)
+        # Diffuse BSDF = metallic 0.0, Glossy BSDF = metallic 1.0
+        _metal_default_a = 1.0 if (p1 and p1.type == 'BSDF_GLOSSY') else 0.0
+        _metal_default_b = 1.0 if (p2 and p2.type == 'BSDF_GLOSSY') else 0.0
+        metal_a = self._compile_principled_scalar_ctx(p1, 'Metallic', _metal_default_a, g1)
+        metal_b = self._compile_principled_scalar_ctx(p2, 'Metallic', _metal_default_b, g2)
         metal_mix = self._alloc_reg()
         self._emit(_OP_MIX_REG, metal_mix, srcA=metal_a, srcB=metal_b, imm_y=fac_reg & 0xF)
         self._emit(_OP_OUTPUT_METAL, srcA=metal_mix)
