@@ -470,6 +470,17 @@ PBRHit evaluateBlenderMaterial(
             N = applyNormalMap(texN, T, N, B, strength);
         }
     }
+    // Procedural bump from VM (Noise Texture → Bump)
+    if (vmActive && vm.hasBump) {
+        vec3 T, B;
+        computeTBN(v0, v1, v2, uv0, uv1, uv2, N, T, B);
+        vec3 Tn = normalize(T);
+        vec3 Bn = normalize(B);
+        vec3 surfgrad = vm.bumpGradient.x * Tn + vm.bumpGradient.y * Bn;
+        vec3 bumpN = normalize(N - vm.bumpDistance * surfgrad);
+        N = normalize(vm.bumpStrength * bumpN + (1.0 - vm.bumpStrength) * N);
+    }
+
     hit.worldNormal = N;
 
     // Emission (with optional emission texture)

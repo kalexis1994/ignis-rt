@@ -1486,6 +1486,8 @@ _OP_COLOR_DODGE     = 0x2D
 _OP_COLOR_BURN      = 0x2E
 _OP_SOFT_LIGHT      = 0x2F
 _OP_LINEAR_LIGHT    = 0x90
+_OP_NOISE_BUMP      = 0x93
+_OP_OUTPUT_BUMP     = 0xF8
 
 
 def _make_instr(opcode, dst=0, srcA=0, srcB=0, imm_y=0, imm_z=0, imm_w=0):
@@ -2388,6 +2390,47 @@ class _NodeVmCompiler:
                                  f" image={getattr(from_n, 'image', None)}"
                                  f" reg={reg} instrs={_before}->{_after}\n")
                 except: pass
+
+        # ── 4. Compile procedural bump (Bump node with procedural height input) ──
+        norm_inp = principled_node.inputs.get('Normal')
+        if norm_inp and norm_inp.is_linked:
+            norm_node = norm_inp.links[0].from_node
+            if norm_node.type == 'BUMP':
+                height_inp = norm_node.inputs.get('Height')
+                if height_inp and height_inp.is_linked:
+                    height_node = height_inp.links[0].from_node
+                    # Check if height comes from a procedural texture (not Image Texture)
+                    if height_node.type == 'TEX_NOISE' and not _find_image_texture_node(height_inp):
+                        # Get noise parameters
+                        scale_inp = height_node.inputs.get('Scale')
+                        scale = float(scale_inp.default_value) if scale_inp and not scale_inp.is_linked else 5.0
+                        detail_inp = height_node.inputs.get('Detail')
+                        detail = float(detail_inp.default_value) if detail_inp and not detail_inp.is_linked else 2.0
+                        rough_inp = height_node.inputs.get('Roughness')
+                        roughness = float(rough_inp.default_value) if rough_inp and not rough_inp.is_linked else 0.5
+
+                        # Get bump parameters
+                        strength_inp = norm_node.inputs.get('Strength')
+                        bump_strength = float(strength_inp.default_value) if strength_inp else 1.0
+                        distance_inp = norm_node.inputs.get('Distance')
+                        bump_distance = float(distance_inp.default_value) if distance_inp else 1.0
+
+                        # Get position input (Vector or world pos)
+                        vec_inp = height_node.inputs.get('Vector')
+                        pos_reg = self._alloc_reg()
+                        if vec_inp and vec_inp.is_linked:
+                            pos_reg = self._compile_uv_chain(vec_inp)
+                            if pos_reg == 0:
+                                self._emit(_OP_LOAD_WORLD_POS, pos_reg)
+                        else:
+                            self._emit(_OP_LOAD_WORLD_POS, pos_reg)
+
+                        # Emit noise bump opcode
+                        grad_reg = self._alloc_reg()
+                        self._emit(_OP_NOISE_BUMP, grad_reg, srcA=pos_reg,
+                                   imm_y=_floatBits(scale), imm_z=_floatBits(detail), imm_w=_floatBits(roughness))
+                        self._emit(_OP_OUTPUT_BUMP, srcA=grad_reg,
+                                   imm_y=_floatBits(bump_strength), imm_z=_floatBits(bump_distance))
 
         return self.instructions if self.instructions else None
 

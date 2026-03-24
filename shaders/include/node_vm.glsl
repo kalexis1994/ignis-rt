@@ -93,6 +93,7 @@ const uint OP_BACKFACING     = 0x8Bu;  // R[dst].x = backfacing ? 1.0 : 0.0
 const uint OP_LINEAR_LIGHT   = 0x90u;  // R[dst] = A + 2*B - 1
 const uint OP_TEX_MAGIC      = 0x91u;  // R[dst] = magic(R[srcA].xyz, distortion)
 const uint OP_TEX_BRICK       = 0x92u;  // R[dst] = brick(R[srcA].xyz, scale, mortarSize)
+const uint OP_NOISE_BUMP      = 0x93u;  // R[dst] = noiseBump(R[srcA].xyz, scale, detail, roughness) → .xy=gradient, .z=height
 
 // Load immediate / special
 const uint OP_LOAD_CONST     = 0x60u;  // R[dst] = vec4(imm_y, imm_z, imm_w, 1)
@@ -112,6 +113,7 @@ const uint OP_OUTPUT_ALPHA   = 0xF4u;  // alpha = R[srcA].x
 const uint OP_OUTPUT_NORMAL  = 0xF5u;  // normalStrength = R[srcA].x
 const uint OP_OUTPUT_IOR     = 0xF6u;  // ior = R[srcA].x
 const uint OP_OUTPUT_TRANSMISSION = 0xF7u; // transmission = R[srcA].x
+const uint OP_OUTPUT_BUMP     = 0xF8u;  // bump gradient output: gradient=R[srcA].xy, strength=imm_y, distance=imm_z
 
 #include "noise.glsl"
 
@@ -165,6 +167,10 @@ struct NodeVmResult {
     bool  hasTransmission;
     bool  hasNormalStrength;
     bool  hasTransformedUV;
+    vec2  bumpGradient;
+    float bumpStrength;
+    float bumpDistance;
+    bool  hasBump;
 };
 
 // ── VM Execution ──
@@ -189,6 +195,10 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, ve
     result.hasNormalStrength = false;
     result.transformedUV = uv;
     result.hasTransformedUV = false;
+    result.bumpGradient = vec2(0.0);
+    result.bumpStrength = 0.0;
+    result.bumpDistance = 1.0;
+    result.hasBump = false;
 
     uint header = materialBuffer.materials[matIdx].nodeVmHeader;
     uint instrCount = header & 0xFFu;
@@ -534,6 +544,19 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, ve
             vec3 b = brickTexture(R[srcA].xyz, scale, mortarSize, col1, col2, mortarCol);
             R[dst] = vec4(b, 1.0);
         }
+        else if (opcode == OP_NOISE_BUMP) {
+            // Evaluate noise at 3 positions for finite-difference gradient
+            float scale = uintBitsToFloat(instr.y);
+            float detail = uintBitsToFloat(instr.z);
+            float roughness_n = uintBitsToFloat(instr.w);
+            vec3 p = R[srcA].xyz * scale;
+            float eps = 0.01;  // in noise space
+            float h_c = fbm3D(p, detail, roughness_n, 2.0);
+            float h_x = fbm3D(p + vec3(eps, 0.0, 0.0), detail, roughness_n, 2.0);
+            float h_y = fbm3D(p + vec3(0.0, eps, 0.0), detail, roughness_n, 2.0);
+            // Gradient: (dh/dx, dh/dy) in noise space, normalized by eps
+            R[dst] = vec4((h_x - h_c) / eps, (h_y - h_c) / eps, h_c, 1.0);
+        }
 
         // ── RGB Curves (baked LUT, Cycles-matching) ──
         else if (opcode == OP_RGB_CURVES) {
@@ -706,6 +729,12 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, ve
         else if (opcode == OP_OUTPUT_TRANSMISSION) {
             result.transmission = R[srcA].x;
             result.hasTransmission = true;
+        }
+        else if (opcode == OP_OUTPUT_BUMP) {
+            result.bumpGradient = R[srcA].xy;
+            result.bumpStrength = uintBitsToFloat(instr.y);
+            result.bumpDistance = uintBitsToFloat(instr.z);
+            result.hasBump = true;
         }
     }
 
