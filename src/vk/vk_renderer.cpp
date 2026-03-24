@@ -808,6 +808,28 @@ void Renderer::RenderFrameRT() {
 
     bool diagFlush = false;  // Set true to flush GPU between stages for crash isolation
 
+    // 0. Hybrid rasterization: fill visibility buffer before RT dispatch
+    {
+        PathTracerConfig* hybridCfg = VK_GetConfig();
+        if (hybridCfg && hybridCfg->hybridRasterEnabled) {
+            if (!gbufferPassReady_) {
+                InitGBufferPass();
+            }
+            if (gbufferPassReady_) {
+                RasterizeGBuffer(cmd);
+                // Barrier: rasterize output → RT shader read
+                VkMemoryBarrier memBarrier{};
+                memBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+                memBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                memBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                    0, 1, &memBarrier, 0, nullptr, 0, nullptr);
+            }
+        }
+    }
+
     // 1. Path tracing dispatch (wavefront or monolithic)
     interop_->TransitionForRTWrite(cmd);
     if (wavefrontPipeline_ && wavefrontPipeline_->IsReady()) {
@@ -2431,6 +2453,7 @@ void Renderer::ShutdownImGui() {
 }
 
 void Renderer::Shutdown() {
+    ShutdownGBufferPass();
     ShutdownImGui();
     if (context_ && context_->GetDevice() != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(context_->GetDevice());
