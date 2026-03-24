@@ -319,6 +319,37 @@ vec3 evaluateSky(vec3 dir) {
 }
 
 // ============================================================
+// Henyey-Greenstein Phase Function (for Volume Scatter)
+// ============================================================
+
+// Evaluate HG phase function value (for NEE in volumes)
+float henyeyGreensteinPhase(float cosTheta, float g) {
+    if (abs(g) < 1e-4) return 0.25 * INV_PI;  // isotropic
+    float g2 = g * g;
+    float denom = 1.0 + g2 - 2.0 * g * cosTheta;
+    return (1.0 - g2) / (4.0 * PI * denom * sqrt(denom));
+}
+
+// Importance-sample HG phase function, returns new direction
+vec3 sampleHenyeyGreenstein(vec3 inDir, float g) {
+    vec2 xi = rand2();
+    float cosTheta;
+    if (abs(g) < 1e-4) {
+        cosTheta = 1.0 - 2.0 * xi.x;
+    } else {
+        float k = (1.0 - g * g) / (1.0 - g + 2.0 * g * xi.x);
+        cosTheta = (1.0 + g * g - k * k) / (2.0 * g);
+    }
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    float phi = 2.0 * PI * xi.y;
+    // Build orthonormal basis around incoming direction
+    vec3 w = inDir;
+    vec3 u = abs(w.y) < 0.999 ? normalize(cross(w, vec3(0, 1, 0))) : normalize(cross(w, vec3(1, 0, 0)));
+    vec3 v = cross(w, u);
+    return normalize(u * (cos(phi) * sinTheta) + v * (sin(phi) * sinTheta) + w * cosTheta);
+}
+
+// ============================================================
 // PBR Material Evaluation for Blender Principled BSDF
 // ============================================================
 
@@ -837,6 +868,156 @@ void main() {
             hitVertexColor, uint(instanceId)
         );
 
+        // ---- Volume-only material: ray march with Beer-Lambert + in-scattering ----
+        bool isVolumeOnly = (mat.flags & 4u) != 0u && (mat.flags & 8u) != 0u;
+        if (isVolumeOnly) {
+            float volumeDensity = mat.sunSpecular;
+            float volumeAnisotropy = mat.sunSpecularEXP;
+            vec3 volumeColor = pbrHit.baseColor;
+            bool isHetero = (mat.flags & 16u) != 0u;
+
+            // Pass through ALL volume faces — both entering and exiting.
+            // On front face (entering): trace exit, ray march, apply transmittance + inscatter.
+            // On back face (exiting): just pass through (march already done on entry).
+            bool entering = dot(geoNormal, -rayDir) > 0.0;
+
+            if (!entering) {
+                rayOrigin = worldPos + rayDir * 0.002;
+                bounce--;
+                continue;
+            }
+
+            // Find exit distance: skip self-intersection hits (< 0.05)
+            vec3 entryPos = worldPos + rayDir * 0.001;
+            float marchDist = 0.0;
+            vec3 probeOrigin = entryPos;
+            for (int attempt = 0; attempt < 8; attempt++) {
+                rayQueryEXT exitRQ;
+                rayQueryInitializeEXT(exitRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
+                                      0xFF, probeOrigin, 0.0, rayDir, 100000.0);
+                while (rayQueryProceedEXT(exitRQ)) {}
+                if (rayQueryGetIntersectionTypeEXT(exitRQ, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+                    marchDist += 10.0;  // fallback
+                    break;
+                }
+                float t = rayQueryGetIntersectionTEXT(exitRQ, true);
+                marchDist += t + 0.01;
+                if (t > 0.05) break;  // real exit (not self-intersection)
+                probeOrigin += rayDir * (t + 0.01);  // skip this close hit, try next
+            }
+            marchDist = max(marchDist, 0.1);
+
+            // Noise parameters (from nodeVmPad + nodeVmCode[0..1])
+            float noiseScale = uintBitsToFloat(mat.nodeVmPad[0]);
+            float noiseDetail = uintBitsToFloat(mat.nodeVmPad[1]);
+            float noiseBrightness = uintBitsToFloat(mat.nodeVmPad[2]);
+            float noiseRoughness = uintBitsToFloat(mat.nodeVmCode[0].x);
+            float noiseLacunarity = uintBitsToFloat(mat.nodeVmCode[0].y);
+            float noiseContrast = uintBitsToFloat(mat.nodeVmCode[0].z);
+            vec3 mappingOffset = vec3(uintBitsToFloat(mat.nodeVmCode[1].x),
+                                      uintBitsToFloat(mat.nodeVmCode[1].y),
+                                      uintBitsToFloat(mat.nodeVmCode[1].z));
+            // Defaults for unpacked zeros
+            if (noiseRoughness <= 0.0) noiseRoughness = 0.5;
+            if (noiseLacunarity <= 0.0) noiseLacunarity = 2.0;
+
+            // Ray march
+            const int MAX_STEPS = 48;
+            float stepSize = marchDist / float(MAX_STEPS);
+            stepSize = max(stepSize, 0.01);  // minimum step size
+            int numSteps = min(int(marchDist / stepSize), MAX_STEPS);
+            float volTransmittance = 1.0;
+            vec3 inscatter = vec3(0.0);
+
+            // Sun for in-scattering
+            vec3 vSunDir = normalize(cam.sunLight.xyz);
+            float vSunInt = cam.sunLight.w;
+            vec3 vSunColor = cam.skyLight.rgb;
+
+            for (int step = 0; step < numSteps; step++) {
+                float t = (float(step) + 0.5) * stepSize;
+                vec3 samplePos = entryPos + rayDir * t;
+
+                // Evaluate volume coefficients (Cycles Principled Volume formula):
+                // sigma_s = Color * Density (scattering)
+                // sigma_a = max(1-Color, 0) * Density (absorption, when Absorption Color = black)
+                // sigma_t = sigma_s + sigma_a = Density (constant! only scatter/absorb ratio changes)
+                float localColor = 1.0;  // scatter albedo [0..1]
+                if (isHetero && noiseScale > 0.0) {
+                    vec3 noisePos = (samplePos + mappingOffset) * noiseScale;
+                    float n = fbm3D(noisePos, noiseDetail, noiseRoughness, noiseLacunarity);
+                    n = n + noiseBrightness;
+                    if (noiseContrast > 0.001) {
+                        n = (n - 0.5) * (1.0 + noiseContrast) + 0.5;
+                    }
+                    localColor = clamp(n, 0.0, 1.0);
+                }
+
+                // sigma_t = Density (total extinction is constant — matches Cycles)
+                float sigma_t_local = volumeDensity;
+                if (sigma_t_local < 0.0001) continue;
+
+                // sigma_s = Color * Density (scattering portion)
+                float sigma_s_local = localColor * volumeDensity;
+
+                // In-scattering from ALL light sources (Cycles-style)
+                // No shadow rays (volume self-occlusion)
+                vec3 L_in = vec3(0.0);
+
+                // 1. Sun (phase-weighted directional light)
+                if (vSunInt > 0.0) {
+                    float phase = henyeyGreensteinPhase(dot(rayDir, vSunDir), volumeAnisotropy);
+                    L_in += vSunColor * vSunInt * phase;
+                }
+
+                // 2. Point/spot/area lights — sample 1 random light, scale by count
+                uint vLightCount = min(cam.lightCount, 32u);
+                if (vLightCount > 0u) {
+                    uint li = uint(rand01() * float(vLightCount));
+                    li = min(li, vLightCount - 1u);
+                    vec4 lPosRange = cam.lights[li * 4u];
+                    vec4 lColInt   = cam.lights[li * 4u + 1u];
+                    vec3 lPos = lPosRange.xyz;
+                    float lRange = lPosRange.w;
+                    vec3 lColor = lColInt.rgb;
+                    float lIntensity = lColInt.w;
+                    vec3 toLight = lPos - samplePos;
+                    float dist2 = dot(toLight, toLight);
+                    float dist = sqrt(dist2);
+                    if (dist < lRange && dist > 0.01) {
+                        vec3 lDir = toLight / dist;
+                        float atten = 1.0 / dist2;
+                        // Windowed falloff (same as surface NEE)
+                        float falloff = clamp(1.0 - pow(dist / lRange, 4.0), 0.0, 1.0);
+                        falloff = falloff * falloff;
+                        float phase = henyeyGreensteinPhase(dot(rayDir, lDir), volumeAnisotropy);
+                        L_in += lColor * lIntensity * atten * falloff * phase * float(vLightCount);
+                    }
+                }
+
+                // 3. Ambient + sky (isotropic: phase = 1/4π)
+                L_in += cam.ambientLight.rgb * 0.25 * INV_PI;
+                L_in += evaluateSky(rayDir) * 0.25 * INV_PI;
+
+                // Accumulate: T(t) * sigma_s * L_in * dt
+                // sigma_s (not sigma_t!) — only scattered light contributes to inscatter
+                inscatter += volTransmittance * sigma_s_local * L_in * stepSize;
+
+                // Beer-Lambert with sigma_t (full extinction = scatter + absorption)
+                volTransmittance *= exp(-sigma_t_local * stepSize);
+                if (volTransmittance < 0.001) break;
+            }
+
+            // Apply: inscatter goes to diffuse, transmittance attenuates throughput
+            diffuseRadiance += inscatter * throughput;
+            throughput *= volTransmittance;
+
+            rayOrigin = entryPos + rayDir * marchDist;
+            if (bounce == 0) isDiffusePath = true;
+            bounce--;
+            continue;
+        }
+
         // Ensure normal faces the ray.
         // At grazing angles, the normal map can perturb N to face away from
         // the camera, causing black bands. Fix: if N·V < 0, project N onto
@@ -1036,7 +1217,7 @@ void main() {
                     }
 
                     // Transmission (Glass): let shadow ray pass through
-                    if ((sMat.flags & 2u) != 0u) {
+                    if ((sMat.flags & 2u) != 0u || (sMat.flags & 4u) != 0u) {
                         shadowOrigin = shadowOrigin + sunDir * (sHitT + 0.004);
                         continue;
                     }
@@ -1441,8 +1622,8 @@ void main() {
                     ptsMatIdx = ptsPM.m[ptsPrimId];
                 }
                 Material ptsMat = materialBuffer.materials[ptsMatIdx];
-                if ((ptsMat.flags & 2u) != 0u) {
-                    // Glass — skip and continue shadow ray
+                if ((ptsMat.flags & 2u) != 0u || (ptsMat.flags & 4u) != 0u) {
+                    // Glass or volume — skip and continue shadow ray
                     ptShadowOrigin = ptShadowOrigin + shadowDir * (ptsHitT + 0.004);
                     continue;
                 }
@@ -1512,7 +1693,7 @@ void main() {
                             eMatIdx = ePM.m[ePrimId];
                         }
                         Material eMat = materialBuffer.materials[eMatIdx];
-                        if ((eMat.flags & 2u) != 0u) {
+                        if ((eMat.flags & 2u) != 0u || (eMat.flags & 4u) != 0u) {
                             eShadowOrigin = eShadowOrigin + eDir * (eHitT + 0.004);
                             continue;
                         }
