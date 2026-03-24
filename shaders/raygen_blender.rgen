@@ -734,11 +734,21 @@ void main() {
                 totalRadiance += skyColor * throughput;
                 isSkyMiss = true;
             } else {
-                // Reconstruct hitT from depth (approximate)
-                hitT = length(rayDir) * 10.0; // TODO: reconstruct from depth buffer
-                // objToWorld from instance — need to get from TLAS (not available in visibility buffer)
-                // For now, use identity (positions already in world space if pre-transformed)
-                objToWorld = mat4x3(1.0);
+                // Reconstruct objToWorld from prevTransforms (3 vec4 rows per instance)
+                // prevTransforms stores current-frame transforms (swapped after render)
+                uint tbase = uint(instanceId) * 3u;
+                vec4 row0 = prevTransforms.data[tbase + 0u];
+                vec4 row1 = prevTransforms.data[tbase + 1u];
+                vec4 row2 = prevTransforms.data[tbase + 2u];
+                objToWorld = mat4x3(
+                    row0.x, row1.x, row2.x,  // column 0
+                    row0.y, row1.y, row2.y,  // column 1
+                    row0.z, row1.z, row2.z,  // column 2
+                    row0.w, row1.w, row2.w   // column 3 (translation)
+                );
+                // hitT: compute from world position and ray origin
+                // Will be refined after vertex fetch
+                hitT = 1.0; // placeholder, updated below
             }
         } else {
             // STANDARD: trace ray via ray query
@@ -796,6 +806,11 @@ void main() {
         // Interpolated local position
         vec3 localPos = p0 * bary.x + p1 * bary.y + p2 * bary.z;
         vec3 worldPos = (objToWorld * vec4(localPos, 1.0));
+
+        // Hybrid path: refine hitT from actual world position
+        if (bounce == 0 && hybridRasterMode) {
+            hitT = length(worldPos - rayOrigin);
+        }
 
         // World-space positions for TBN
         vec3 wp0 = (objToWorld * vec4(p0, 1.0));

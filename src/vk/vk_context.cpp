@@ -225,7 +225,9 @@ bool Context::CreateLogicalDevice() {
         deviceExtensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
         deviceExtensions.push_back(VK_NVX_BINARY_IMPORT_EXTENSION_NAME);
         deviceExtensions.push_back(VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME);
-        Log(L"[VK Context] RT + NGX extensions enabled\n");
+        // Hybrid rasterization: fragment shader barycentrics for visibility buffer
+        deviceExtensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+        Log(L"[VK Context] RT + NGX + barycentric extensions enabled\n");
     }
 
     // Chain features structs for Vulkan 1.2+ features
@@ -259,6 +261,12 @@ bool Context::CreateLogicalDevice() {
     atomicInt64Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES;
     atomicInt64Features.shaderBufferInt64Atomics = VK_TRUE;
     rtpFeatures.pNext = &atomicInt64Features;
+
+    // Fragment shader barycentrics (hybrid rasterization visibility buffer)
+    VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR baryFeatures{};
+    baryFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR;
+    baryFeatures.fragmentShaderBarycentric = VK_TRUE;
+    atomicInt64Features.pNext = &baryFeatures;
 
     // Device features
     VkPhysicalDeviceFeatures deviceFeatures{};
