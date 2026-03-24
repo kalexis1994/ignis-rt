@@ -91,6 +91,11 @@ public:
     // Pick result readback
     bool ReadPickResult(uint32_t& outCustomIndex, uint32_t& outPrimitiveId, uint32_t& outMaterialId);
 
+    // Hybrid rasterization: G-buffer rasterize pass
+    bool InitGBufferPass();     // Create render pass, pipeline, framebuffer
+    void RasterizeGBuffer(VkCommandBuffer cmd);  // Record draw calls
+    void ShutdownGBufferPass();
+
     // ImGui overlay
     bool InitImGui(HWND hwnd, bool forceRasterPath = false);
     void RenderImGuiOverlay(VkCommandBuffer cmd);
@@ -138,6 +143,14 @@ private:
 
     // Hybrid rasterization: stored TLAS instances for G-buffer rasterize pass
     std::vector<vk::TLASInstance> tlasInstances_;
+    VkRenderPass gbufferRenderPass_ = VK_NULL_HANDLE;
+    VkFramebuffer gbufferFramebuffer_ = VK_NULL_HANDLE;
+    VkPipelineLayout gbufferPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline gbufferPipeline_ = VK_NULL_HANDLE;
+    VkImage gbufferDepthImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory gbufferDepthMemory_ = VK_NULL_HANDLE;
+    VkImageView gbufferDepthView_ = VK_NULL_HANDLE;
+    bool gbufferPassReady_ = false;
 
     // Camera
     float cameraDistance_ = 5.0f;

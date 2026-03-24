@@ -209,6 +209,9 @@ public:
     VkImage GetBarycentricImage() const { return barycentricGBuffer_.image; }
     VkImageView GetBarycentricView() const { return barycentricGBuffer_.view; }
     bool HasGBuffers() const { return gbuffersCreated_; }
+    uint32_t GetRenderWidth() const { return gbufferWidth_; }
+    uint32_t GetRenderHeight() const { return gbufferHeight_; }
+    CameraUBO* GetCameraUBOPtr() { return &cachedCamera_; }
 
     // Shadow temporal accumulation — swap ping-pong buffers each frame
     void SwapShadowAccumBuffers();
@@ -248,6 +251,7 @@ private:
     // Camera UBO
     VkBuffer cameraBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory cameraMemory_ = VK_NULL_HANDLE;
+    CameraUBO cachedCamera_{};  // CPU-side copy for hybrid rasterization MVP computation
 
     // SBT
     VkBuffer sbtBuffer_ = VK_NULL_HANDLE;

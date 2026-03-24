@@ -1723,6 +1723,7 @@ void RTPipeline::UpdateCloudShadowDescriptor(VkImageView view, VkSampler sampler
 }
 
 void RTPipeline::UpdateCamera(const CameraUBO& camera) {
+    cachedCamera_ = camera;  // CPU-side copy for hybrid rasterization
     static int logCount = 0;
     if (logCount < 3) {
         Log(L"[VK RTPipeline] UpdateCamera: viewInv col3=(%.2f, %.2f, %.2f), projInv[0]=(%.4f), size=%zu\n",

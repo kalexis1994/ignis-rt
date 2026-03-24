@@ -2633,6 +2633,370 @@ bool Renderer::CreateSyncObjects() {
     return true;
 }
 
+// ============================================================================
+// Hybrid Rasterization: G-buffer pass
+// ============================================================================
+
+bool Renderer::InitGBufferPass() {
+    if (gbufferPassReady_) return true;
+    if (!context_ || !rtPipeline_ || !rtPipeline_->HasGBuffers()) return false;
+
+    VkDevice device = context_->GetDevice();
+    uint32_t w = rtPipeline_->GetRenderWidth();
+    uint32_t h = rtPipeline_->GetRenderHeight();
+
+    // ── 1. Depth image for z-test ──
+    {
+        VkImageCreateInfo imgInfo{};
+        imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imgInfo.imageType = VK_IMAGE_TYPE_2D;
+        imgInfo.format = VK_FORMAT_D32_SFLOAT;
+        imgInfo.extent = {w, h, 1};
+        imgInfo.mipLevels = 1;
+        imgInfo.arrayLayers = 1;
+        imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imgInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        if (vkCreateImage(device, &imgInfo, nullptr, &gbufferDepthImage_) != VK_SUCCESS) return false;
+
+        VkMemoryRequirements memReqs;
+        vkGetImageMemoryRequirements(device, gbufferDepthImage_, &memReqs);
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memReqs.size;
+        allocInfo.memoryTypeIndex = context_->FindMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        vkAllocateMemory(device, &allocInfo, nullptr, &gbufferDepthMemory_);
+        vkBindImageMemory(device, gbufferDepthImage_, gbufferDepthMemory_, 0);
+
+        VkImageViewCreateInfo viewInfo{};
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = gbufferDepthImage_;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = VK_FORMAT_D32_SFLOAT;
+        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        vkCreateImageView(device, &viewInfo, nullptr, &gbufferDepthView_);
+    }
+
+    // ── 2. Render pass (3 color attachments + depth) ──
+    {
+        VkAttachmentDescription attachments[4] = {};
+        // 0: visibility (RG32UI)
+        attachments[0].format = VK_FORMAT_R32G32_UINT;
+        attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+        attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        attachments[0].initialLayout = VK_IMAGE_LAYOUT_GENERAL;
+        attachments[0].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+        // 1: instanceId (R32UI)
+        attachments[1] = attachments[0];
+        attachments[1].format = VK_FORMAT_R32_UINT;
+        // 2: barycentric (RG16F)
+        attachments[2] = attachments[0];
+        attachments[2].format = VK_FORMAT_R16G16_SFLOAT;
+        // 3: depth
+        attachments[3].format = VK_FORMAT_D32_SFLOAT;
+        attachments[3].samples = VK_SAMPLE_COUNT_1_BIT;
+        attachments[3].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        attachments[3].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachments[3].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachments[3].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachments[3].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        attachments[3].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+        VkAttachmentReference colorRefs[3] = {
+            {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
+            {1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
+            {2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
+        };
+        VkAttachmentReference depthRef = {3, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 3;
+        subpass.pColorAttachments = colorRefs;
+        subpass.pDepthStencilAttachment = &depthRef;
+
+        VkRenderPassCreateInfo rpInfo{};
+        rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        rpInfo.attachmentCount = 4;
+        rpInfo.pAttachments = attachments;
+        rpInfo.subpassCount = 1;
+        rpInfo.pSubpasses = &subpass;
+        if (vkCreateRenderPass(device, &rpInfo, nullptr, &gbufferRenderPass_) != VK_SUCCESS) return false;
+    }
+
+    // ── 3. Framebuffer ──
+    {
+        VkImageView views[4] = {
+            rtPipeline_->GetVisibilityView(),
+            rtPipeline_->GetInstanceIdView(),
+            rtPipeline_->GetBarycentricView(),
+            gbufferDepthView_,
+        };
+        VkFramebufferCreateInfo fbInfo{};
+        fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fbInfo.renderPass = gbufferRenderPass_;
+        fbInfo.attachmentCount = 4;
+        fbInfo.pAttachments = views;
+        fbInfo.width = w;
+        fbInfo.height = h;
+        fbInfo.layers = 1;
+        if (vkCreateFramebuffer(device, &fbInfo, nullptr, &gbufferFramebuffer_) != VK_SUCCESS) return false;
+    }
+
+    // ── 4. Pipeline layout (push constants only — no descriptor set needed) ──
+    {
+        // Push constants: mat4 model (64 bytes) + uint customIndex (4) + uint instanceId (4) = 72 bytes
+        VkPushConstantRange pushRange{};
+        pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        pushRange.offset = 0;
+        pushRange.size = 72;
+
+        // Use RT pipeline's camera UBO descriptor set layout for binding 0
+        // Actually, for simplicity, we pass view/proj via push constants too
+        // Total push: mat4 model (64) + mat4 viewProj (64) + uint customIndex (4) + uint instanceId (4) = 136 bytes
+        // Vulkan guarantees min 128 bytes push constants. Let's use a UBO instead.
+        // Simplest approach: include camera matrices in push constants (fits in 128 if we combine VP)
+
+        // Use combined viewProj (mat4=64) + model (mat4=64) + 2 uints = 136 > 128
+        // Alternative: viewProj in push, model + IDs in push = 64+64+8 = 136 (too much)
+        // Solution: use the existing camera UBO binding from the Rasterizer class
+        // OR: push viewProj(64) + model comes from instance (64 is too much for push alone)
+
+        // Pragmatic: push mat4 MVP (64) + uint customIndex (4) + uint instanceId (4) = 72 bytes
+        // Compute MVP on CPU: mvp = proj * view * model (per instance)
+        pushRange.size = 72;
+
+        VkPipelineLayoutCreateInfo layoutInfo{};
+        layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &pushRange;
+        if (vkCreatePipelineLayout(device, &layoutInfo, nullptr, &gbufferPipelineLayout_) != VK_SUCCESS) return false;
+    }
+
+    // ── 5. Graphics pipeline ──
+    {
+        // Load shaders
+        std::vector<char> vertCode, fragCode;
+        if (!pipeline_->LoadShader("gbuffer.vert.spv", vertCode) ||
+            !pipeline_->LoadShader("gbuffer.frag.spv", fragCode)) {
+            Log(L"[VK Renderer] Failed to load G-buffer shaders\n");
+            return false;
+        }
+        VkShaderModule vertModule = pipeline_->CreateShaderModule(vertCode);
+        VkShaderModule fragModule = pipeline_->CreateShaderModule(fragCode);
+        if (!vertModule || !fragModule) return false;
+
+        VkPipelineShaderStageCreateInfo stages[2] = {};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = vertModule;
+        stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = fragModule;
+        stages[1].pName = "main";
+
+        // Vertex input: position only (3 floats, stride 12)
+        VkVertexInputBindingDescription binding{};
+        binding.binding = 0;
+        binding.stride = 12; // 3 × float32
+        binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+        VkVertexInputAttributeDescription attr{};
+        attr.binding = 0;
+        attr.location = 0;
+        attr.format = VK_FORMAT_R32G32B32_SFLOAT;
+        attr.offset = 0;
+
+        VkPipelineVertexInputStateCreateInfo vertexInput{};
+        vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        vertexInput.vertexBindingDescriptionCount = 1;
+        vertexInput.pVertexBindingDescriptions = &binding;
+        vertexInput.vertexAttributeDescriptionCount = 1;
+        vertexInput.pVertexAttributeDescriptions = &attr;
+
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+        inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkViewport viewport{0, 0, (float)w, (float)h, 0.0f, 1.0f};
+        VkRect2D scissor{{0, 0}, {w, h}};
+        VkPipelineViewportStateCreateInfo viewportState{};
+        viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewportState.viewportCount = 1;
+        viewportState.pViewports = &viewport;
+        viewportState.scissorCount = 1;
+        viewportState.pScissors = &scissor;
+
+        VkPipelineRasterizationStateCreateInfo rasterizer{};
+        rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterizer.cullMode = VK_CULL_MODE_NONE; // No culling for visibility buffer
+        rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rasterizer.lineWidth = 1.0f;
+
+        VkPipelineMultisampleStateCreateInfo multisampling{};
+        multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkPipelineDepthStencilStateCreateInfo depthStencil{};
+        depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depthStencil.depthTestEnable = VK_TRUE;
+        depthStencil.depthWriteEnable = VK_TRUE;
+        depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+
+        // 3 color blend attachments (no blending — write all)
+        VkPipelineColorBlendAttachmentState blendAttachments[3] = {};
+        for (int i = 0; i < 3; i++) {
+            blendAttachments[i].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                                  VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            blendAttachments[i].blendEnable = VK_FALSE;
+        }
+        VkPipelineColorBlendStateCreateInfo colorBlending{};
+        colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        colorBlending.attachmentCount = 3;
+        colorBlending.pAttachments = blendAttachments;
+
+        VkGraphicsPipelineCreateInfo pipelineInfo{};
+        pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipelineInfo.stageCount = 2;
+        pipelineInfo.pStages = stages;
+        pipelineInfo.pVertexInputState = &vertexInput;
+        pipelineInfo.pInputAssemblyState = &inputAssembly;
+        pipelineInfo.pViewportState = &viewportState;
+        pipelineInfo.pRasterizationState = &rasterizer;
+        pipelineInfo.pMultisampleState = &multisampling;
+        pipelineInfo.pDepthStencilState = &depthStencil;
+        pipelineInfo.pColorBlendState = &colorBlending;
+        pipelineInfo.layout = gbufferPipelineLayout_;
+        pipelineInfo.renderPass = gbufferRenderPass_;
+        pipelineInfo.subpass = 0;
+
+        if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &gbufferPipeline_) != VK_SUCCESS) {
+            Log(L"[VK Renderer] Failed to create G-buffer pipeline\n");
+            vkDestroyShaderModule(device, vertModule, nullptr);
+            vkDestroyShaderModule(device, fragModule, nullptr);
+            return false;
+        }
+
+        vkDestroyShaderModule(device, vertModule, nullptr);
+        vkDestroyShaderModule(device, fragModule, nullptr);
+    }
+
+    gbufferPassReady_ = true;
+    Log(L"[VK Renderer] G-buffer pass initialized (%ux%u)\n", w, h);
+    return true;
+}
+
+void Renderer::RasterizeGBuffer(VkCommandBuffer cmd) {
+    if (!gbufferPassReady_ || !accelBuilder_ || tlasInstances_.empty()) return;
+
+    // Transition visibility buffer images: GENERAL → COLOR_ATTACHMENT_OPTIMAL
+    // (They need to be in COLOR_ATTACHMENT layout for the render pass)
+    // The render pass handles this via initialLayout/finalLayout.
+
+    // Begin render pass
+    VkClearValue clearValues[4] = {};
+    clearValues[0].color.uint32[0] = 0xFFFFFFFF; clearValues[0].color.uint32[1] = 0xFFFFFFFF; // sky = no hit
+    clearValues[1].color.uint32[0] = 0xFFFFFFFF;
+    clearValues[2].color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    clearValues[3].depthStencil = {1.0f, 0};
+
+    uint32_t w = rtPipeline_->GetRenderWidth();
+    uint32_t h = rtPipeline_->GetRenderHeight();
+
+    VkRenderPassBeginInfo rpBegin{};
+    rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rpBegin.renderPass = gbufferRenderPass_;
+    rpBegin.framebuffer = gbufferFramebuffer_;
+    rpBegin.renderArea = {{0, 0}, {w, h}};
+    rpBegin.clearValueCount = 4;
+    rpBegin.pClearValues = clearValues;
+
+    vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, gbufferPipeline_);
+
+    // Get camera matrices for MVP computation
+    CameraUBO* cam = rtPipeline_->GetCameraUBOPtr();
+    float viewProj[16];
+    // Multiply proj * view on CPU (row-major)
+    // cam->view and cam->proj are column-major (GLSL convention)
+    // For push constants, we compute MVP = proj * view * model per instance
+
+    auto& blasList = accelBuilder_->GetBLASList();
+
+    for (size_t i = 0; i < tlasInstances_.size(); i++) {
+        const auto& inst = tlasInstances_[i];
+        if (inst.blasIndex < 0 || inst.blasIndex >= (int)blasList.size()) continue;
+        const auto& blas = blasList[inst.blasIndex];
+        if (!blas.built || !blas.vertexBuf.buffer || !blas.indexBuf.buffer) continue;
+
+        // Compute MVP: proj * view * model
+        // Transform is 3x4 row-major → expand to 4x4 column-major for GLSL
+        float model[16];
+        // Row-major 3x4 → column-major 4x4
+        model[0] = inst.transform[0]; model[4] = inst.transform[1]; model[8]  = inst.transform[2];  model[12] = inst.transform[3];
+        model[1] = inst.transform[4]; model[5] = inst.transform[5]; model[9]  = inst.transform[6];  model[13] = inst.transform[7];
+        model[2] = inst.transform[8]; model[6] = inst.transform[9]; model[10] = inst.transform[10]; model[14] = inst.transform[11];
+        model[3] = 0.0f;             model[7] = 0.0f;              model[11] = 0.0f;               model[15] = 1.0f;
+
+        // MVP = proj * view * model (all column-major, multiply in order)
+        float vm[16], mvp[16];
+        // view * model
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++) {
+                vm[r + c*4] = 0;
+                for (int k = 0; k < 4; k++)
+                    vm[r + c*4] += cam->view[r + k*4] * model[k + c*4];
+            }
+        // proj * (view*model)
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 4; c++) {
+                mvp[r + c*4] = 0;
+                for (int k = 0; k < 4; k++)
+                    mvp[r + c*4] += cam->proj[r + k*4] * vm[k + c*4];
+            }
+
+        // Push constants: mat4 mvp (64 bytes) + uint customIndex (4) + uint instanceId (4) = 72
+        struct {
+            float mvp[16];
+            uint32_t customIndex;
+            uint32_t instanceId;
+        } pushData;
+        memcpy(pushData.mvp, mvp, 64);
+        pushData.customIndex = inst.customIndex;
+        pushData.instanceId = (uint32_t)i;
+
+        vkCmdPushConstants(cmd, gbufferPipelineLayout_,
+                          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                          0, sizeof(pushData), &pushData);
+
+        // Bind vertex buffer (positions only, 3 floats/vertex)
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &blas.vertexBuf.buffer, &offset);
+        vkCmdBindIndexBuffer(cmd, blas.indexBuf.buffer, 0, VK_INDEX_TYPE_UINT32);
+
+        // Draw
+        vkCmdDrawIndexed(cmd, blas.indexCount, 1, 0, 0, 0);
+    }
+
+    vkCmdEndRenderPass(cmd);
+}
+
+void Renderer::ShutdownGBufferPass() {
+    if (!context_) return;
+    VkDevice device = context_->GetDevice();
+    if (gbufferPipeline_) { vkDestroyPipeline(device, gbufferPipeline_, nullptr); gbufferPipeline_ = VK_NULL_HANDLE; }
+    if (gbufferPipelineLayout_) { vkDestroyPipelineLayout(device, gbufferPipelineLayout_, nullptr); gbufferPipelineLayout_ = VK_NULL_HANDLE; }
+    if (gbufferFramebuffer_) { vkDestroyFramebuffer(device, gbufferFramebuffer_, nullptr); gbufferFramebuffer_ = VK_NULL_HANDLE; }
+    if (gbufferRenderPass_) { vkDestroyRenderPass(device, gbufferRenderPass_, nullptr); gbufferRenderPass_ = VK_NULL_HANDLE; }
+    if (gbufferDepthView_) { vkDestroyImageView(device, gbufferDepthView_, nullptr); gbufferDepthView_ = VK_NULL_HANDLE; }
+    if (gbufferDepthImage_) { vkDestroyImage(device, gbufferDepthImage_, nullptr); gbufferDepthImage_ = VK_NULL_HANDLE; }
+    if (gbufferDepthMemory_) { vkFreeMemory(device, gbufferDepthMemory_, nullptr); gbufferDepthMemory_ = VK_NULL_HANDLE; }
+    gbufferPassReady_ = false;
+}
+
 } // namespace vk
 } // namespace acpt
 
