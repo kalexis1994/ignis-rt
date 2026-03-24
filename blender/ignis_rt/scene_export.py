@@ -2329,16 +2329,173 @@ class _NodeVmCompiler:
                 return True
         return False
 
-    def compile(self, principled_node):
-        """Compile ALL Principled BSDF inputs into VM bytecode.
+    def compile(self, principled_node, surface_node=None):
+        """Compile shader tree into VM bytecode. VM is the SINGLE AUTHORITY.
 
-        The VM is the single authority for material evaluation. Every material
-        with a Principled BSDF gets VM code — even simple TEX_IMAGE → BSDF
-        chains. This eliminates the hybrid legacy/VM conflicts.
+        If surface_node is a Mix Shader, compiles BOTH branches and blends
+        per-pixel using OP_MIX_REG. Otherwise compiles the single Principled.
         """
-        if principled_node is None:
+        if principled_node is None and surface_node is None:
             return None
 
+        # Mix Shader: compile both branches and blend per-pixel
+        if surface_node and surface_node.type == 'MIX_SHADER':
+            return self._compile_mix_shader(surface_node)
+
+        if principled_node is None:
+            return None
+        return self._compile_principled(principled_node)
+
+    def _find_principled_in_shader(self, shader_inp):
+        """Find Principled BSDF from a Mix Shader's shader input socket."""
+        if not shader_inp or not shader_inp.is_linked:
+            return None
+        node = shader_inp.links[0].from_node
+        if node.type == 'BSDF_PRINCIPLED':
+            return node
+        if node.type == 'GROUP':
+            return _find_principled_in_group(node)
+        if node.type == 'MIX_SHADER':
+            # Nested Mix: find the dominant Principled inside
+            for si in (1, 2):
+                p = self._find_principled_in_shader(node.inputs[si] if len(node.inputs) > si else None)
+                if p: return p
+        return None
+
+    def _compile_principled_color(self, principled):
+        """Compile Base Color from a Principled BSDF, return register."""
+        bc_inp = principled.inputs.get('Base Color')
+        if bc_inp and bc_inp.is_linked:
+            return self._compile_node(bc_inp)
+        val = bc_inp.default_value if bc_inp else (0.8, 0.8, 0.8, 1.0)
+        r = self._alloc_reg()
+        self._emit(_OP_LOAD_CONST, r, imm_y=_floatBits(val[0]),
+                   imm_z=_floatBits(val[1]), imm_w=_floatBits(val[2]))
+        return r
+
+    def _compile_principled_scalar(self, principled, input_name, default=0.5):
+        """Compile scalar input (Roughness, Metallic, etc.), return register."""
+        inp = principled.inputs.get(input_name)
+        if inp and inp.is_linked:
+            return self._compile_node(inp)
+        val = float(inp.default_value) if inp else default
+        r = self._alloc_reg()
+        self._emit(_OP_LOAD_SCALAR, r, imm_y=_floatBits(val))
+        return r
+
+    def _compile_mix_shader(self, mix_node):
+        """Compile Mix Shader: both branches blended per-pixel."""
+        # Find Principled BSDF in each branch
+        s1_inp = mix_node.inputs[1] if len(mix_node.inputs) > 1 else None
+        s2_inp = mix_node.inputs[2] if len(mix_node.inputs) > 2 else None
+        p1 = self._find_principled_in_shader(s1_inp)
+        p2 = self._find_principled_in_shader(s2_inp)
+
+        # If one side is Transparent BSDF, use the other side directly
+        s1_node = s1_inp.links[0].from_node if (s1_inp and s1_inp.is_linked) else None
+        s2_node = s2_inp.links[0].from_node if (s2_inp and s2_inp.is_linked) else None
+        if s1_node and s1_node.type == 'BSDF_TRANSPARENT' and p2:
+            return self._compile_principled(p2)
+        if s2_node and s2_node.type == 'BSDF_TRANSPARENT' and p1:
+            return self._compile_principled(p1)
+
+        # If only one side has a Principled, use it directly
+        if p1 and not p2:
+            return self._compile_principled(p1)
+        if p2 and not p1:
+            return self._compile_principled(p2)
+        if not p1 and not p2:
+            return None
+
+        # ── Both sides have Principled BSDFs — compile and blend ──
+
+        # UV chain from first texture found in either shader
+        for p in (p1, p2):
+            uv_done = False
+            for iname in ('Base Color', 'Roughness', 'Metallic'):
+                inp = p.inputs.get(iname)
+                if inp and inp.is_linked:
+                    tex = _find_image_texture_node(inp)
+                    if tex:
+                        vi = tex.inputs.get('Vector')
+                        if vi and vi.is_linked:
+                            ur = self._compile_uv_chain(vi)
+                            if ur != 0:
+                                self._emit(_OP_OUTPUT_UV, srcA=ur)
+                                uv_done = True
+                                break
+            if uv_done:
+                break
+
+        # Compile factor
+        fac_inp = mix_node.inputs.get('Fac') or mix_node.inputs[0]
+        if fac_inp and fac_inp.is_linked:
+            fac_reg = self._compile_node(fac_inp)
+        else:
+            fac_val = float(fac_inp.default_value) if fac_inp else 0.5
+            fac_reg = self._alloc_reg()
+            self._emit(_OP_LOAD_SCALAR, fac_reg, imm_y=_floatBits(fac_val))
+
+        # Compile and blend Base Color
+        color_a = self._compile_principled_color(p1)
+        color_b = self._compile_principled_color(p2)
+        color_mix = self._alloc_reg()
+        self._emit(_OP_MIX_REG, color_mix, srcA=color_a, srcB=color_b, imm_y=fac_reg & 0xF)
+        self._emit(_OP_OUTPUT_COLOR, srcA=color_mix)
+
+        # Compile and blend Roughness
+        rough_a = self._compile_principled_scalar(p1, 'Roughness', 0.5)
+        rough_b = self._compile_principled_scalar(p2, 'Roughness', 0.5)
+        rough_mix = self._alloc_reg()
+        self._emit(_OP_MIX_REG, rough_mix, srcA=rough_a, srcB=rough_b, imm_y=fac_reg & 0xF)
+        self._emit(_OP_OUTPUT_ROUGH, srcA=rough_mix)
+
+        # Compile and blend Metallic
+        metal_a = self._compile_principled_scalar(p1, 'Metallic', 0.0)
+        metal_b = self._compile_principled_scalar(p2, 'Metallic', 0.0)
+        metal_mix = self._alloc_reg()
+        self._emit(_OP_MIX_REG, metal_mix, srcA=metal_a, srcB=metal_b, imm_y=fac_reg & 0xF)
+        self._emit(_OP_OUTPUT_METAL, srcA=metal_mix)
+
+        # Bump: use from whichever shader has it
+        for p in (p1, p2):
+            norm_inp = p.inputs.get('Normal')
+            if norm_inp and norm_inp.is_linked:
+                norm_node = norm_inp.links[0].from_node
+                if norm_node.type == 'BUMP':
+                    height_inp = norm_node.inputs.get('Height')
+                    if height_inp and height_inp.is_linked:
+                        h_node = height_inp.links[0].from_node
+                        if h_node.type == 'TEX_NOISE' and not _find_image_texture_node(height_inp):
+                            s_inp = h_node.inputs.get('Scale')
+                            scale = float(s_inp.default_value) if s_inp and not s_inp.is_linked else 5.0
+                            d_inp = h_node.inputs.get('Detail')
+                            detail = float(d_inp.default_value) if d_inp and not d_inp.is_linked else 2.0
+                            r_inp = h_node.inputs.get('Roughness')
+                            rough = float(r_inp.default_value) if r_inp and not r_inp.is_linked else 0.5
+                            str_inp = norm_node.inputs.get('Strength')
+                            bstr = float(str_inp.default_value) if str_inp else 1.0
+                            dist_inp = norm_node.inputs.get('Distance')
+                            bdist = float(dist_inp.default_value) if dist_inp else 1.0
+                            pos_reg = self._alloc_reg()
+                            v_inp = h_node.inputs.get('Vector')
+                            if v_inp and v_inp.is_linked:
+                                pos_reg = self._compile_uv_chain(v_inp)
+                                if pos_reg == 0:
+                                    self._emit(_OP_LOAD_WORLD_POS, pos_reg)
+                            else:
+                                self._emit(_OP_LOAD_WORLD_POS, pos_reg)
+                            grad_reg = self._alloc_reg()
+                            self._emit(_OP_NOISE_BUMP, grad_reg, srcA=pos_reg,
+                                       imm_y=_floatBits(scale), imm_z=_floatBits(detail), imm_w=_floatBits(rough))
+                            self._emit(_OP_OUTPUT_BUMP, srcA=grad_reg,
+                                       imm_y=_floatBits(bstr), imm_z=_floatBits(bdist))
+                            break
+
+        return self.instructions if self.instructions else None
+
+    def _compile_principled(self, principled_node):
+        """Compile a single Principled BSDF's inputs. VM is the SINGLE AUTHORITY."""
         # ── 1. Compile shared UV chain (from first texture with Mapping) ──
         _SCAN_INPUTS = ('Base Color', 'Roughness', 'Metallic', 'Emission Color')
         for input_name in _SCAN_INPUTS:
@@ -2354,42 +2511,20 @@ class _NodeVmCompiler:
                             break
 
         # ── 2. Compile Base Color ──
-        # Alpha is NOT extracted here — intermediate nodes (Mix, Hue/Sat, etc.)
-        # don't preserve .w from the texture sample. The shader reads alpha
-        # from the legacy diffuse texture instead (always correct).
-        bc_inp = principled_node.inputs.get('Base Color')
-        if bc_inp and bc_inp.is_linked:
-            reg = self._compile_node(bc_inp)
-            self._emit(_OP_OUTPUT_COLOR, srcA=reg)
-        elif bc_inp:
-            # Unlinked — emit constant base color
-            val = bc_inp.default_value
-            r = self._alloc_reg()
-            self._emit(_OP_LOAD_CONST, r, imm_y=_floatBits(val[0]),
-                       imm_z=_floatBits(val[1]), imm_w=_floatBits(val[2]))
-            self._emit(_OP_OUTPUT_COLOR, srcA=r)
+        color_reg = self._compile_principled_color(principled_node)
+        self._emit(_OP_OUTPUT_COLOR, srcA=color_reg)
 
-        # ── 3. Compile other linked inputs ──
-        _EXTRA_INPUTS = {
-            'Roughness': _OP_OUTPUT_ROUGH,
-            'Metallic': _OP_OUTPUT_METAL,
-            'Emission Color': _OP_OUTPUT_EMISSION,
-        }
-        for input_name, output_op in _EXTRA_INPUTS.items():
-            inp = principled_node.inputs.get(input_name)
-            if inp and inp.is_linked:
-                _before = len(self.instructions)
-                reg = self._compile_node(inp)
-                self._emit(output_op, srcA=reg)
-                _after = len(self.instructions)
-                import os
-                try:
-                    with open(os.path.join(os.path.expanduser("~"), "ignis-rt.log"), "a") as _f:
-                        from_n = inp.links[0].from_node
-                        _f.write(f"[ignis-vm-extra] {input_name}: linked to {from_n.type}:{from_n.name}"
-                                 f" image={getattr(from_n, 'image', None)}"
-                                 f" reg={reg} instrs={_before}->{_after}\n")
-                except: pass
+        # ── 3. Compile Roughness + Metallic ──
+        for input_name, output_op in [('Roughness', _OP_OUTPUT_ROUGH), ('Metallic', _OP_OUTPUT_METAL)]:
+            reg = self._compile_principled_scalar(principled_node, input_name,
+                                                   0.5 if input_name == 'Roughness' else 0.0)
+            self._emit(output_op, srcA=reg)
+
+        # ── 4. Emission (only if linked) ──
+        em_inp = principled_node.inputs.get('Emission Color')
+        if em_inp and em_inp.is_linked:
+            reg = self._compile_node(em_inp)
+            self._emit(_OP_OUTPUT_EMISSION, srcA=reg)
 
         # ── 4. Compile procedural bump (Bump node with procedural height input) ──
         norm_inp = principled_node.inputs.get('Normal')
@@ -2435,13 +2570,16 @@ class _NodeVmCompiler:
         return self.instructions if self.instructions else None
 
 
-def _compile_node_vm(principled_node, register_image_fn):
-    """Compile a Blender Principled BSDF node tree into VM bytecode.
+def _compile_node_vm(principled_node, register_image_fn, surface_node=None):
+    """Compile a shader tree into VM bytecode. VM is the SINGLE AUTHORITY.
+
+    If surface_node is a Mix Shader, compiles BOTH branches and blends per-pixel.
+    Otherwise compiles the single Principled BSDF.
 
     Returns a list of instruction tuples [(x,y,z,w), ...] or None if no VM needed.
     """
     compiler = _NodeVmCompiler(register_image_fn)
-    return compiler.compile(principled_node)
+    return compiler.compile(principled_node, surface_node=surface_node)
 
 
 # Now fix the ColorRamp data format issue.
@@ -3321,6 +3459,51 @@ def _extract_shader_props(node, register_image_fn):
         strength_inp = node.inputs.get('Strength')
         if strength_inp:
             props['emission_strength'] = float(strength_inp.default_value)
+    elif node.type == 'BSDF_PRINCIPLED':
+        # Extract Principled BSDF properties directly
+        color_inp = node.inputs.get('Base Color')
+        if color_inp:
+            c = color_inp.default_value
+            props['base_color'] = (c[0], c[1], c[2])
+            tex_node = _find_image_texture_node(color_inp)
+            if tex_node and tex_node.image:
+                props['diffuse_tex'] = register_image_fn(tex_node.image)
+        rough_inp = node.inputs.get('Roughness')
+        if rough_inp:
+            props['roughness'] = float(rough_inp.default_value)
+        metal_inp = node.inputs.get('Metallic')
+        if metal_inp:
+            props['metallic'] = float(metal_inp.default_value)
+        ior_inp = node.inputs.get('IOR')
+        if ior_inp:
+            props['ior'] = float(ior_inp.default_value)
+        trans_inp = node.inputs.get('Transmission Weight') or node.inputs.get('Transmission')
+        if trans_inp:
+            props['transmission'] = float(trans_inp.default_value)
+        ec_inp = node.inputs.get('Emission Color')
+        if ec_inp:
+            props['emission'] = (ec_inp.default_value[0], ec_inp.default_value[1], ec_inp.default_value[2])
+        es_inp = node.inputs.get('Emission Strength')
+        if es_inp:
+            props['emission_strength'] = float(es_inp.default_value)
+        spec_inp = node.inputs.get('Specular IOR Level') or node.inputs.get('Specular')
+        if spec_inp:
+            props['specular_level'] = float(spec_inp.default_value)
+    elif node.type == 'GROUP':
+        # Resolve Group node — find Principled BSDF inside
+        proxy = _find_principled_in_group(node)
+        if proxy:
+            props = _extract_shader_props(proxy, register_image_fn)
+        else:
+            # Try to follow Group's internal output
+            inner_tree = node.node_tree
+            if inner_tree:
+                for inode in inner_tree.nodes:
+                    if inode.type == 'GROUP_OUTPUT':
+                        inp = inode.inputs[0] if inode.inputs else None
+                        if inp and inp.is_linked:
+                            props = _extract_shader_props(inp.links[0].from_node, register_image_fn)
+                            break
     elif node.type == 'MIX_SHADER':
         # Nested Mix Shader — recurse
         props = _resolve_mix_shader(node, register_image_fn)
@@ -3719,95 +3902,149 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         alpha_ref = 0.5
 
         if mat.use_nodes and mat.node_tree:
-            # First try: find Principled BSDF directly (or inside a GROUP)
+            # ALWAYS resolve from Material Output first (correct shader chain)
             principled_node = None
-            for node in mat.node_tree.nodes:
-                if node.type == 'BSDF_PRINCIPLED':
-                    principled_node = node
+            _mix_shader_resolved = False  # When True, don't overwrite blended props
+            _original_surface_node = None  # Preserved for VM Mix Shader compilation
+            surface_node = _find_surface_shader(mat.node_tree)
+            if surface_node and surface_node.type == 'MIX_SHADER':
+                _original_surface_node = surface_node
+            # Debug: log what Material Output points to
+            import os as _os2
+            try:
+                with open(_os2.path.join(_os2.path.expanduser("~"), "ignis-rt.log"), "a") as _f:
+                    _stype = surface_node.type if surface_node else "None"
+                    _sname = surface_node.name if surface_node else "N/A"
+                    _f.write(f"[ignis-chain] '{mat.name}': MatOutput->Surface = {_stype} ({_sname})\n")
+            except: pass
+
+            # Follow chain from Material Output → Surface
+            _follow_depth = 0
+            while surface_node is not None and _follow_depth < 8:
+                if surface_node.type == 'BSDF_PRINCIPLED':
+                    principled_node = surface_node
                     break
-                if node.type == 'GROUP':
-                    proxy = _find_principled_in_group(node)
-                    if proxy:
-                        principled_node = proxy
-                        break
-
-            # Fallback: trace from Material Output to resolve any shader node
-            if principled_node is None:
-                surface_node = _find_surface_shader(mat.node_tree)
-                # Follow Group nodes and passthrough nodes to find the actual BSDF
-                _follow_depth = 0
-                while surface_node is not None and _follow_depth < 8:
-                    if surface_node.type in ('MIX_SHADER', 'BSDF_DIFFUSE', 'BSDF_GLOSSY',
-                                              'BSDF_GLASS', 'BSDF_TRANSPARENT', 'EMISSION',
-                                              'BSDF_PRINCIPLED'):
-                        break  # found a shader node
-                    elif surface_node.type == 'GROUP':
-                        # Try to resolve GROUP as Principled BSDF proxy
-                        proxy = _find_principled_in_group(surface_node)
-                        if proxy:
-                            principled_node = proxy
-                            break
-                        # Fallback: follow group's internal output
-                        inner_tree = surface_node.node_tree
-                        if inner_tree:
-                            for inode in inner_tree.nodes:
-                                if inode.type == 'GROUP_OUTPUT':
-                                    inp = inode.inputs.get('Surface') or (inode.inputs[0] if inode.inputs else None)
-                                    if inp and inp.is_linked:
-                                        surface_node = inp.links[0].from_node
-                                        break
-                            else:
-                                surface_node = None
-                        else:
-                            surface_node = None
-                    elif surface_node.type in ('ADD_SHADER',):
-                        # Add Shader — treat like mix at 0.5
-                        surface_node.type  # just use first input
-                        inp = surface_node.inputs[0] if surface_node.inputs else None
-                        if inp and inp.is_linked:
-                            surface_node = inp.links[0].from_node
-                        else:
-                            surface_node = None
-                    else:
-                        # Unknown node type between Output and BSDF — try first linked input
-                        found = False
-                        for inp in surface_node.inputs:
-                            if inp.is_linked:
-                                surface_node = inp.links[0].from_node
-                                found = True
-                                break
-                        if not found:
-                            surface_node = None
-                    _follow_depth += 1
-
-                if surface_node is not None and surface_node.type == 'BSDF_PRINCIPLED':
-                    principled_node = surface_node  # found it through chain!
-                elif surface_node is not None and surface_node.type in ('MIX_SHADER', 'BSDF_DIFFUSE', 'BSDF_GLOSSY', 'BSDF_GLASS', 'BSDF_TRANSPARENT', 'EMISSION'):
-                    if surface_node.type == 'MIX_SHADER':
-                        props = _resolve_mix_shader(surface_node, _register_image)
-                    else:
-                        props = _extract_shader_props(surface_node, _register_image)
+                elif surface_node.type == 'MIX_SHADER':
+                    # Resolve Mix Shader: blend properties from both inputs
+                    props = _resolve_mix_shader(surface_node, _register_image)
                     base_color = props['base_color']
                     roughness = props['roughness']
                     metallic = props['metallic']
                     emission = props['emission']
                     emission_strength = props['emission_strength']
                     diffuse_tex = props['diffuse_tex']
-                    emission_tex = props['emission_tex']
+                    emission_tex = props.get('emission_tex', _NO_TEX)
                     transmission = props['transmission']
                     ior = props['ior']
-                    if 'alpha' in props:
-                        alpha = props['alpha']
-                    if 'normal_tex' in props:
-                        normal_tex = props['normal_tex']
-                    if 'normal_strength' in props:
-                        normal_strength = props['normal_strength']
-                    if 'flags' in props:
-                        flags = props['flags']
-                    if 'transparent_prob' in props:
-                        transparent_prob = props['transparent_prob']
-                    if 'alpha_ref' in props:
-                        alpha_ref = props['alpha_ref']
+                    if 'alpha' in props: alpha = props['alpha']
+                    if 'normal_tex' in props: normal_tex = props['normal_tex']
+                    if 'normal_strength' in props: normal_strength = props['normal_strength']
+                    if 'flags' in props: flags = props['flags']
+                    if 'transparent_prob' in props: transparent_prob = props['transparent_prob']
+                    if 'alpha_ref' in props: alpha_ref = props['alpha_ref']
+                    _mix_shader_resolved = True
+                    import os
+                    try:
+                        with open(os.path.join(os.path.expanduser("~"), "ignis-rt.log"), "a") as _f:
+                            _f.write(f"[ignis-mix] '{mat.name}': Mix Shader resolved — "
+                                     f"color=({base_color[0]:.3f},{base_color[1]:.3f},{base_color[2]:.3f}) "
+                                     f"rough={roughness:.2f} metal={metallic:.2f} tp={transparent_prob:.2f}\n")
+                    except: pass
+                    # Find the BEST Principled BSDF for VM compilation.
+                    # Prefer the shader with linked inputs (textures/nodes) over
+                    # simple constants, since the VM adds value for per-pixel evaluation.
+                    _candidates = []
+                    for si in (1, 2):
+                        s_inp = surface_node.inputs[si] if len(surface_node.inputs) > si else None
+                        if s_inp and s_inp.is_linked:
+                            s_node = s_inp.links[0].from_node
+                            p_node = None
+                            if s_node.type == 'BSDF_PRINCIPLED':
+                                p_node = s_node
+                            elif s_node.type == 'GROUP':
+                                p_node = _find_principled_in_group(s_node)
+                            if p_node:
+                                # Count linked inputs as complexity score
+                                _complexity = sum(1 for inp in p_node.inputs if inp.is_linked)
+                                _candidates.append((p_node, _complexity))
+                    # Pick the most complex candidate (most linked inputs)
+                    if _candidates:
+                        _candidates.sort(key=lambda x: x[1], reverse=True)
+                        principled_node = _candidates[0][0]
+                    break
+                elif surface_node.type == 'ADD_SHADER':
+                    # Add Shader: find the Principled BSDF in either input
+                    for si in range(len(surface_node.inputs)):
+                        inp = surface_node.inputs[si]
+                        if inp.is_linked:
+                            s_node = inp.links[0].from_node
+                            if s_node.type == 'BSDF_PRINCIPLED':
+                                principled_node = s_node
+                                break
+                            elif s_node.type == 'EMISSION':
+                                # Extract emission from Add Shader
+                                e_props = _extract_shader_props(s_node, _register_image)
+                                emission = e_props['emission']
+                                emission_strength = e_props['emission_strength']
+                                if e_props['diffuse_tex'] != _NO_TEX:
+                                    emission_tex = e_props['diffuse_tex']
+                    if principled_node:
+                        break
+                    # Fallback: follow first linked input
+                    inp = surface_node.inputs[0] if surface_node.inputs else None
+                    surface_node = inp.links[0].from_node if (inp and inp.is_linked) else None
+                elif surface_node.type == 'GROUP':
+                    proxy = _find_principled_in_group(surface_node)
+                    if proxy:
+                        principled_node = proxy
+                        break
+                    inner_tree = surface_node.node_tree
+                    if inner_tree:
+                        for inode in inner_tree.nodes:
+                            if inode.type == 'GROUP_OUTPUT':
+                                inp = inode.inputs.get('Surface') or (inode.inputs[0] if inode.inputs else None)
+                                if inp and inp.is_linked:
+                                    surface_node = inp.links[0].from_node
+                                    break
+                        else:
+                            surface_node = None
+                    else:
+                        surface_node = None
+                elif surface_node.type in ('BSDF_DIFFUSE', 'BSDF_GLOSSY', 'BSDF_GLASS',
+                                           'BSDF_TRANSPARENT', 'EMISSION'):
+                    props = _extract_shader_props(surface_node, _register_image)
+                    base_color = props['base_color']
+                    roughness = props['roughness']
+                    metallic = props['metallic']
+                    emission = props['emission']
+                    emission_strength = props['emission_strength']
+                    diffuse_tex = props['diffuse_tex']
+                    transmission = props.get('transmission', 0.0)
+                    ior = props.get('ior', 1.5)
+                    break
+                else:
+                    # Unknown node — follow first linked input
+                    found = False
+                    for inp in surface_node.inputs:
+                        if inp.is_linked:
+                            surface_node = inp.links[0].from_node
+                            found = True
+                            break
+                    if not found:
+                        surface_node = None
+                _follow_depth += 1
+
+            # Fallback: direct scan if Material Output chain didn't find Principled
+            if principled_node is None:
+                for node in mat.node_tree.nodes:
+                    if node.type == 'BSDF_PRINCIPLED':
+                        principled_node = node
+                        break
+                    if node.type == 'GROUP':
+                        proxy = _find_principled_in_group(node)
+                        if proxy:
+                            principled_node = proxy
+                            break
                 else:
                     # No Mix Shader — scan individual nodes
                     for node in mat.node_tree.nodes:
@@ -3847,7 +4084,7 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                                     ior = float(ior_inp.default_value)
                             break
 
-            if principled_node is not None:
+            if principled_node is not None and not _mix_shader_resolved:
                 node = principled_node
                 # Base Color (resolve node chain if linked, otherwise use default)
                 bc_inp = node.inputs.get('Base Color')
@@ -3978,10 +4215,14 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         if transmission > 0.0:
             flags |= 2  # bit1 = transmission
 
-        # Compile Node VM bytecode for materials with non-trivial node chains
+        # Compile VM bytecode — VM is the SINGLE AUTHORITY for material evaluation.
+        # Legacy scalar path (ksAmbient, ksSpecularEXP, fresnelC) is DEPRECATED.
+        # For Mix Shader: pass surface_node so the VM compiles BOTH branches
+        # and blends per-pixel. No more scalar blending approximation.
         vm_code = None
-        if principled_node is not None:
-            vm_code = _compile_node_vm(principled_node, _register_image)
+        _vm_surface = _original_surface_node if _mix_shader_resolved else None
+        if principled_node is not None or _vm_surface is not None:
+            vm_code = _compile_node_vm(principled_node, _register_image, surface_node=_vm_surface)
             if vm_code:
                 mat_key_name = mat.name if mat else "?"
                 print(f"[ignis-vm] '{mat_key_name}': compiled {len(vm_code)} instructions")
