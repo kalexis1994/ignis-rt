@@ -177,6 +177,11 @@ layout(binding = 29, set = 0, r8) uniform image2D reactiveMaskImg;
 layout(binding = 30, set = 0, r8) uniform image2D diffConfidenceImg;
 layout(binding = 31, set = 0, r8) uniform image2D specConfidenceImg;
 
+// Hybrid rasterization: visibility buffer (written by rasterizer, read at bounce 0)
+layout(binding = 32, set = 0, rg32ui) uniform uimage2D visibilityBuffer;
+layout(binding = 33, set = 0, r32ui)  uniform uimage2D instanceIdBuffer;
+layout(binding = 34, set = 0, rg16f)  uniform image2D  barycentricBuffer;
+
 // Pick buffer
 layout(binding = 17, set = 0, scalar) buffer PickBuffer {
     uint pickCustomIndex;
@@ -591,6 +596,7 @@ void main() {
     int spp = clamp(int(cam.lightPad1), 1, 128);
     bool rrModeGlobal = (cam.parameters.w == 2u);
     bool backfaceCulling = (cam.lightPad2 & 1u) != 0u;  // bit 0 of lightPad2
+    bool hybridRasterMode = (cam.lightPad2 & 4u) != 0u; // bit 2 of lightPad2
 
     // Accumulators across SPP samples
     vec3 accumDiffuse = vec3(0.0);
@@ -704,41 +710,72 @@ void main() {
             }
         }
 
-        // Trace ray
-        rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT,
-                              0xFF, rayOrigin, MIN_HIT_DIST, rayDir, 10000.0);
+        // ── Primary ray: either trace or read from rasterized visibility buffer ──
+        uint customIndex;
+        int instanceId;
+        int primitiveId;
+        float hitT;
+        vec3 bary;
+        mat4x3 objToWorld;
+        bool isSkyMiss = false;
 
-        while (rayQueryProceedEXT(rq)) {}
+        if (bounce == 0 && hybridRasterMode && sampleIdx == 0) {
+            // HYBRID: read primary visibility from rasterized G-buffer
+            uvec2 vis = imageLoad(visibilityBuffer, pixel).rg;
+            customIndex = vis.x;
+            primitiveId = int(vis.y);
+            instanceId = int(imageLoad(instanceIdBuffer, pixel).r);
+            vec2 bary2 = imageLoad(barycentricBuffer, pixel).rg;
+            bary = vec3(1.0 - bary2.x - bary2.y, bary2.x, bary2.y);
 
-        if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
-            // Sky miss — notify SHARC for backpropagation
-            vec3 skyColor = evaluateSky(rayDir);
-            if (sharcEnabled && sharcUpdatePixel) {
-                SharcUpdateMiss(sharcGrid, sharcState, skyColor, sharcCapacity);
-            }
-            if (bounce == 0) {
+            if (customIndex == 0xFFFFFFFFu) {
+                // Sky pixel — no geometry hit from rasterizer
+                vec3 skyColor = evaluateSky(rayDir);
                 totalRadiance += skyColor * throughput;
+                isSkyMiss = true;
             } else {
-                // Indirect sky contribution
-                if (isDiffusePath) {
-                    diffuseRadiance += skyColor * throughput * giIntensity;
-                } else {
-                    specularRadiance += skyColor * throughput * giIntensity;
-                }
+                // Reconstruct hitT from depth (approximate)
+                hitT = length(rayDir) * 10.0; // TODO: reconstruct from depth buffer
+                // objToWorld from instance — need to get from TLAS (not available in visibility buffer)
+                // For now, use identity (positions already in world space if pre-transformed)
+                objToWorld = mat4x3(1.0);
             }
-            break;
+        } else {
+            // STANDARD: trace ray via ray query
+            rayQueryEXT rq;
+            rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT,
+                                  0xFF, rayOrigin, MIN_HIT_DIST, rayDir, 10000.0);
+
+            while (rayQueryProceedEXT(rq)) {}
+
+            if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+                // Sky miss
+                vec3 skyColor = evaluateSky(rayDir);
+                if (sharcEnabled && sharcUpdatePixel) {
+                    SharcUpdateMiss(sharcGrid, sharcState, skyColor, sharcCapacity);
+                }
+                if (bounce == 0) {
+                    totalRadiance += skyColor * throughput;
+                } else {
+                    if (isDiffusePath) {
+                        diffuseRadiance += skyColor * throughput * giIntensity;
+                    } else {
+                        specularRadiance += skyColor * throughput * giIntensity;
+                    }
+                }
+                isSkyMiss = true;
+            } else {
+                customIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+                instanceId = rayQueryGetIntersectionInstanceIdEXT(rq, true);
+                primitiveId = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+                hitT = rayQueryGetIntersectionTEXT(rq, true);
+                vec2 bary2 = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+                objToWorld = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+                bary = vec3(1.0 - bary2.x - bary2.y, bary2.x, bary2.y);
+            }
         }
 
-        // Get hit info
-        uint customIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);  // = BLAS index (geometry metadata)
-        int instanceId = rayQueryGetIntersectionInstanceIdEXT(rq, true);             // = instance index (prevTransforms)
-        int primitiveId = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-        float hitT = rayQueryGetIntersectionTEXT(rq, true);
-        vec2 bary2 = rayQueryGetIntersectionBarycentricsEXT(rq, true);
-        mat4x3 objToWorld = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
-
-        vec3 bary = vec3(1.0 - bary2.x - bary2.y, bary2.x, bary2.y);
+        if (isSkyMiss) break;
 
         // Fetch geometry data (customIndex maps to geometryMetadata array)
         GeometryMetadata geo = geometryMetadata.geometries[customIndex];
