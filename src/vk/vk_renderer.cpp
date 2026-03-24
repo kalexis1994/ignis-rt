@@ -701,6 +701,8 @@ void Renderer::UpdateTextureDescriptors(void* texManager) {
 bool Renderer::BuildTLASInstanced(const std::vector<vk::TLASInstance>& instances) {
     if (!accelBuilder_) return false;
     if (!accelBuilder_->BuildTLAS(instances)) return false;
+    // Store instances for hybrid rasterization G-buffer pass
+    tlasInstances_ = instances;
     if (rtPipeline_) {
         rtPipeline_->UpdateTLASDescriptor();
     }

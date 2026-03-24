@@ -136,6 +136,9 @@ private:
     std::vector<float> prevInstanceTransforms_;
     uint32_t instanceTransformCount_ = 0;
 
+    // Hybrid rasterization: stored TLAS instances for G-buffer rasterize pass
+    std::vector<vk::TLASInstance> tlasInstances_;
+
     // Camera
     float cameraDistance_ = 5.0f;
     float cameraAngle_ = 0.0f;
