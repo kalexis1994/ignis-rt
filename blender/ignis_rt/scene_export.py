@@ -2089,6 +2089,16 @@ class _NodeVmCompiler:
             self.node_reg_cache[node_id] = dst
             return dst
 
+        # ── Attribute / Vertex Color — TODO: implement per-vertex color buffer ──
+        # VM must compile this properly with vertex color data from mesh export.
+        # For now, return white (1,1,1) as default — vertex colors are typically
+        # surface colors and white is less wrong than black (0,0,0).
+        if from_node.type in ('ATTRIBUTE', 'VERTEX_COLOR'):
+            self._emit(_OP_LOAD_CONST, dst, imm_y=_floatBits(1.0),
+                       imm_z=_floatBits(1.0), imm_w=_floatBits(1.0))
+            self.node_reg_cache[node_id] = dst
+            return dst
+
         # ── Other procedural textures — compile as constant fallback ──
         if from_node.type in ('TEX_SKY', 'TEX_ENVIRONMENT'):
             self._emit(_OP_LOAD_CONST, dst, imm_y=_floatBits(0.5),
@@ -2984,6 +2994,10 @@ def _resolve_color_input(socket, default=(0.8, 0.8, 0.8), _depth=0):
             return (c[0], c[1], c[2])
         return default
     from_node = socket.links[0].from_node
+
+    # Attribute / Vertex Color — return white until vertex color pipeline is implemented
+    if from_node.type in ('ATTRIBUTE', 'VERTEX_COLOR'):
+        return (1.0, 1.0, 1.0)
 
     # Blackbody → RGB
     if from_node.type == 'BLACKBODY':
