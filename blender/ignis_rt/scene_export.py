@@ -3548,7 +3548,8 @@ def _extract_shader_props(node, register_image_fn):
     if node.type == 'BSDF_DIFFUSE':
         color_inp = node.inputs.get('Color')
         if color_inp:
-            c = color_inp.default_value
+            # Follow links to resolve actual color (noise chains, Mix nodes, etc.)
+            c = _resolve_color_input(color_inp, (0.8, 0.8, 0.8))
             props['base_color'] = (c[0], c[1], c[2])
             tex_node = _find_image_texture_node(color_inp)
             if tex_node and tex_node.image:
@@ -3560,7 +3561,7 @@ def _extract_shader_props(node, register_image_fn):
     elif node.type == 'BSDF_GLOSSY':
         color_inp = node.inputs.get('Color')
         if color_inp:
-            c = color_inp.default_value
+            c = _resolve_color_input(color_inp, (0.8, 0.8, 0.8))
             props['base_color'] = (c[0], c[1], c[2])
             tex_node = _find_image_texture_node(color_inp)
             if tex_node and tex_node.image:
@@ -4188,7 +4189,8 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                 _follow_depth += 1
 
             # Fallback: direct scan if Material Output chain didn't find Principled
-            if principled_node is None:
+            # Skip if Mix Shader already resolved properties correctly
+            if principled_node is None and not _mix_shader_resolved:
                 for node in mat.node_tree.nodes:
                     if node.type == 'BSDF_PRINCIPLED':
                         principled_node = node
