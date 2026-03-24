@@ -453,6 +453,7 @@ def export_meshes(depsgraph):
 
             # Vertex Colors
             vcols = np.ones((raw_vert_count, 4), dtype=np.float32)  # default white RGBA
+            _has_vcols = False
             if mesh.color_attributes and len(mesh.color_attributes) > 0:
                 try:
                     color_attr = mesh.color_attributes.active_color
@@ -472,8 +473,21 @@ def export_meshes(depsgraph):
                         loop_to_vert = np.empty(len(tri_verts), dtype=np.int32)
                         tri_verts.foreach_get("vertex_index", loop_to_vert)
                         vcols = all_colors[loop_to_vert[tri_loops]]
+                    _has_vcols = True
+                    import os as _os_vc2
+                    try:
+                        avg = vcols.mean(axis=0)
+                        with open(_os_vc2.path.join(_os_vc2.path.expanduser("~"), "ignis-rt.log"), "a") as _f:
+                            _f.write(f"[ignis-vcol] '{obj.name}' mesh '{mesh.name}': HAS vertex colors — avg=({avg[0]:.3f},{avg[1]:.3f},{avg[2]:.3f},{avg[3]:.3f})\n")
+                    except: pass
                 except Exception:
                     pass  # Keep default white
+            if not _has_vcols:
+                import os as _os_vc
+                try:
+                    with open(_os_vc.path.join(_os_vc.path.expanduser("~"), "ignis-rt.log"), "a") as _f:
+                        _f.write(f"[ignis-vcol] '{obj.name}' mesh '{mesh.name}': NO vertex colors — using white default\n")
+                except: pass
 
             # ---- Vertex deduplication ----
             # Skip dedup for large meshes (>50K tris) — np.unique is O(N log N)
@@ -1520,7 +1534,7 @@ _OP_OUTPUT_BUMP     = 0xF8
 
 def _make_instr(opcode, dst=0, srcA=0, srcB=0, imm_y=0, imm_z=0, imm_w=0):
     """Pack one VM instruction as a 4-tuple of uint32."""
-    x = (opcode & 0xFF) | ((dst & 0xF) << 8) | ((srcA & 0xF) << 16) | ((srcB & 0xF) << 24)
+    x = (opcode & 0xFF) | ((dst & 0x1F) << 8) | ((srcA & 0x1F) << 16) | ((srcB & 0x1F) << 24)
     return (x, imm_y, imm_z, imm_w)
 
 
@@ -1536,7 +1550,7 @@ class _NodeVmCompiler:
 
     def _alloc_reg(self):
         r = self.next_reg
-        self.next_reg = min(self.next_reg + 1, 15)
+        self.next_reg = min(self.next_reg + 1, 31)
         return r
 
     def _emit(self, opcode, dst=0, srcA=0, srcB=0, imm_y=0, imm_z=0, imm_w=0):
@@ -2117,8 +2131,15 @@ class _NodeVmCompiler:
             self.node_reg_cache[node_id] = dst
             return dst
 
-        # ── Attribute / Vertex Color — load per-vertex color from GPU buffer ──
+        # ── Attribute / Vertex Color — load per-vertex color or object color ──
         if from_node.type in ('ATTRIBUTE', 'VERTEX_COLOR'):
+            attr_name = getattr(from_node, 'attribute_name', '')
+            attr_type = getattr(from_node, 'attribute_type', 'GEOMETRY')
+            import os as _os_attr
+            try:
+                with open(_os_attr.path.join(_os_attr.path.expanduser("~"), "ignis-rt.log"), "a") as _f:
+                    _f.write(f"[ignis-attr] '{from_node.name}': type={attr_type} name='{attr_name}'\n")
+            except: pass
             self._emit(_OP_LOAD_VERTEX_COLOR, dst)
             self.node_reg_cache[node_id] = dst
             return dst

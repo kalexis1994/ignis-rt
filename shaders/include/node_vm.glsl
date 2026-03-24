@@ -206,16 +206,16 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, ve
 
     if (instrCount == 0u) return result;  // Fast path: no VM program
 
-    // Register file (16 vec4 registers)
-    vec4 R[16];
+    // Register file (32 vec4 registers — needed for Mix Shader with two full BSDFs)
+    vec4 R[32];
     R[0] = vec4(uv, 0.0, 1.0);  // R0 = UV input
 
     for (uint pc = 0u; pc < min(instrCount, 64u); pc++) {
         uvec4 instr = materialBuffer.materials[matIdx].nodeVmCode[pc];
         uint opcode = instr.x & 0xFFu;
-        uint dst    = (instr.x >> 8u)  & 0xFu;  // 4 bits = 0-15
-        uint srcA   = (instr.x >> 16u) & 0xFu;
-        uint srcB   = (instr.x >> 24u) & 0xFu;
+        uint dst    = (instr.x >> 8u)  & 0x1Fu;  // 5 bits = 0-31
+        uint srcA   = (instr.x >> 16u) & 0x1Fu;
+        uint srcB   = (instr.x >> 24u) & 0x1Fu;
 
         if (opcode == OP_NOP) continue;
 
