@@ -2483,11 +2483,12 @@ class _NodeVmCompiler:
                 return True
         return False
 
-    def compile(self, principled_node, surface_node=None):
+    def compile(self, principled_node, surface_node=None, emission_node=None):
         """Compile shader tree into VM bytecode. VM is the SINGLE AUTHORITY.
 
         If surface_node is a Mix Shader, compiles BOTH branches and blends
         per-pixel using OP_MIX_REG. Otherwise compiles the single Principled.
+        If emission_node is set (from Add Shader), compiles its Color as emission.
         """
         if principled_node is None and surface_node is None:
             return None
@@ -2498,7 +2499,38 @@ class _NodeVmCompiler:
 
         if principled_node is None:
             return None
-        return self._compile_principled(principled_node)
+        result = self._compile_principled(principled_node)
+
+        # Add Shader emission: compile the separate Emission node's Color
+        if emission_node and emission_node.type == 'EMISSION':
+            color_inp = emission_node.inputs.get('Color')
+            if color_inp and color_inp.is_linked:
+                reg = self._compile_node(color_inp)
+                str_inp = emission_node.inputs.get('Strength')
+                strength = float(str_inp.default_value) if str_inp else 1.0
+                # Scale emission color by strength and store in .a
+                if abs(strength - 1.0) > 0.001:
+                    str_reg = self._alloc_reg()
+                    self._emit(_OP_LOAD_CONST, str_reg,
+                               imm_y=_floatBits(strength), imm_z=_floatBits(strength), imm_w=_floatBits(strength))
+                    mul_reg = self._alloc_reg()
+                    self._emit(_OP_MULTIPLY, mul_reg, srcA=reg, srcB=str_reg)
+                    reg = mul_reg
+                self._emit(_OP_OUTPUT_EMISSION, srcA=reg)
+            else:
+                # Constant emission color
+                c = color_inp.default_value if color_inp else (1.0, 1.0, 1.0, 1.0)
+                str_inp = emission_node.inputs.get('Strength')
+                strength = float(str_inp.default_value) if str_inp else 1.0
+                reg = self._alloc_reg()
+                self._emit(_OP_LOAD_CONST, reg,
+                           imm_y=_floatBits(c[0] * strength),
+                           imm_z=_floatBits(c[1] * strength),
+                           imm_w=_floatBits(c[2] * strength))
+                self._emit(_OP_OUTPUT_EMISSION, srcA=reg)
+            result = self.instructions if self.instructions else None
+
+        return result
 
     def _find_principled_in_shader(self, shader_inp):
         """Find Principled BSDF (or internal Mix Shader) from a shader input.
@@ -2814,7 +2846,13 @@ class _NodeVmCompiler:
             reg = self._compile_node(em_inp)
             self._emit(_OP_OUTPUT_EMISSION, srcA=reg)
 
-        # ── 4. Compile procedural bump (Bump node with procedural height input) ──
+        # ── 5. Transmission Weight (only if linked — per-pixel transparency maps) ──
+        trans_inp = principled_node.inputs.get('Transmission Weight') or principled_node.inputs.get('Transmission')
+        if trans_inp and trans_inp.is_linked:
+            reg = self._compile_node(trans_inp)
+            self._emit(_OP_OUTPUT_TRANSMISSION, srcA=reg)
+
+        # ── 6. Compile procedural bump (Bump node with procedural height input) ──
         norm_inp = principled_node.inputs.get('Normal')
         if norm_inp and norm_inp.is_linked:
             norm_node = norm_inp.links[0].from_node
@@ -2858,16 +2896,17 @@ class _NodeVmCompiler:
         return self.instructions if self.instructions else None
 
 
-def _compile_node_vm(principled_node, register_image_fn, surface_node=None):
+def _compile_node_vm(principled_node, register_image_fn, surface_node=None, emission_node=None):
     """Compile a shader tree into VM bytecode. VM is the SINGLE AUTHORITY.
 
     If surface_node is a Mix Shader, compiles BOTH branches and blends per-pixel.
     Otherwise compiles the single Principled BSDF.
+    If emission_node is set (from Add Shader), compiles its Color as emission.
 
     Returns a list of instruction tuples [(x,y,z,w), ...] or None if no VM needed.
     """
     compiler = _NodeVmCompiler(register_image_fn)
-    return compiler.compile(principled_node, surface_node=surface_node)
+    return compiler.compile(principled_node, surface_node=surface_node, emission_node=emission_node)
 
 
 # Now fix the ColorRamp data format issue.
@@ -4205,6 +4244,7 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
             principled_node = None
             _mix_shader_resolved = False  # When True, don't overwrite blended props
             _original_surface_node = None  # Preserved for VM Mix Shader compilation
+            _add_shader_emission_node = None  # Emission node from Add Shader (for VM)
             surface_node = _find_surface_shader(mat.node_tree)
             if surface_node and surface_node.type == 'MIX_SHADER':
                 _original_surface_node = surface_node
@@ -4273,16 +4313,17 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                         principled_node = _candidates[0][0]
                     break
                 elif surface_node.type == 'ADD_SHADER':
-                    # Add Shader: find the Principled BSDF in either input
+                    # Add Shader: find the Principled BSDF and Emission in either input
+                    _add_shader_emission_node = None
                     for si in range(len(surface_node.inputs)):
                         inp = surface_node.inputs[si]
                         if inp.is_linked:
                             s_node = inp.links[0].from_node
                             if s_node.type == 'BSDF_PRINCIPLED':
                                 principled_node = s_node
-                                break
                             elif s_node.type == 'EMISSION':
-                                # Extract emission from Add Shader
+                                _add_shader_emission_node = s_node
+                                # Extract emission from Add Shader (legacy)
                                 e_props = _extract_shader_props(s_node, _register_image)
                                 emission = e_props['emission']
                                 emission_strength = e_props['emission_strength']
@@ -4522,8 +4563,9 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         # and blends per-pixel. No more scalar blending approximation.
         vm_code = None
         _vm_surface = _original_surface_node if _mix_shader_resolved else None
+        _vm_emission = _add_shader_emission_node
         if principled_node is not None or _vm_surface is not None:
-            vm_code = _compile_node_vm(principled_node, _register_image, surface_node=_vm_surface)
+            vm_code = _compile_node_vm(principled_node, _register_image, surface_node=_vm_surface, emission_node=_vm_emission)
             if vm_code:
                 mat_key_name = mat.name if mat else "?"
                 print(f"[ignis-vm] '{mat_key_name}': compiled {len(vm_code)} instructions")

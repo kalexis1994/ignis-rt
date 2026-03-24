@@ -490,18 +490,23 @@ PBRHit evaluateBlenderMaterial(
     // Emission (with optional emission texture)
     // Multiply by PI to compensate the BRDF's 1/PI diffuse term in indirect
     // bounces, so emission_strength=1 matches Cycles perceived brightness.
-    vec3 emissionColor = vec3(mat.emissiveR, mat.emissiveG, mat.emissiveB);
-    if (mat.detailTexIndex != 0xFFFFFFFFu) {
-        vec3 emTex = texture(textures[nonuniformEXT(mat.detailTexIndex)], uv).rgb;
-        // If scalar emission is black but texture exists, use texture directly
-        // (Blender Emission Color default is black when texture provides the color)
-        if (dot(emissionColor, emissionColor) < 0.001) {
-            emissionColor = emTex;
-        } else {
-            emissionColor *= emTex;
+    if (vmActive && vm.hasEmission) {
+        // VM compiled emission (includes texture sampling + strength)
+        hit.emission = vm.emission * PI;
+    } else {
+        vec3 emissionColor = vec3(mat.emissiveR, mat.emissiveG, mat.emissiveB);
+        if (mat.detailTexIndex != 0xFFFFFFFFu) {
+            vec3 emTex = texture(textures[nonuniformEXT(mat.detailTexIndex)], uv).rgb;
+            // If scalar emission is black but texture exists, use texture directly
+            // (Blender Emission Color default is black when texture provides the color)
+            if (dot(emissionColor, emissionColor) < 0.001) {
+                emissionColor = emTex;
+            } else {
+                emissionColor *= emTex;
+            }
         }
+        hit.emission = emissionColor * mat.fresnelMaxLevel * PI;
     }
-    hit.emission = emissionColor * mat.fresnelMaxLevel * PI;
 
     return hit;
 }
