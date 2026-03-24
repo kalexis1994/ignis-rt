@@ -217,6 +217,13 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
     )
 
     # -- Performance --
+    hybrid_raster: BoolProperty(
+        name="Hybrid Rasterization",
+        description="Rasterize primary ray (visibility buffer) instead of ray tracing. "
+                    "Faster for opaque scenes, slight fidelity loss on glass/refraction",
+        default=False,
+        update=_tag_redraw,
+    )
     vsync: BoolProperty(
         name="V-Sync",
         description="Limit FPS to monitor refresh rate to reduce screen tearing",
@@ -386,6 +393,7 @@ class IGNIS_PT_performance(bpy.types.Panel):
         props = context.scene.ignis_rt
         layout.use_property_split = True
         layout.use_property_decorate = False
+        layout.prop(props, "hybrid_raster")
         layout.prop(props, "vsync")
         layout.prop(props, "fps_limit")
         layout.prop(props, "show_fps")

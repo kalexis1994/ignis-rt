@@ -327,6 +327,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             _ignis_init_config = {
                 "dlss_quality": int(props.dlss_quality),
                 "use_wavefront": props.use_wavefront,
+                "hybrid_raster": props.hybrid_raster,
             }
         except Exception:
             _ignis_init_config = {}
@@ -1442,6 +1443,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         dll_wrapper.set_int("max_bounces", props.max_bounces)
         dll_wrapper.set_int("spp", props.samples_per_pixel)
         dll_wrapper.set_int("backface_culling", 1 if props.backface_culling else 0)
+        dll_wrapper.set_int("hybrid_raster", 1 if props.hybrid_raster else 0)
         dll_wrapper.set_int("restir_di", 1 if props.restir_di else 0)
         dll_wrapper.set_int("debug_view", props.debug_view)
         dll_wrapper.set_int("auto_sky_colors", 1 if props.auto_sky_colors else 0)

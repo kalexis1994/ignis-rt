@@ -124,6 +124,10 @@ struct PathTracerConfig {
     float worldBgR           = 0.05f;
     float worldBgG           = 0.05f;
     float worldBgB           = 0.05f;
+
+    // Hybrid rasterization: rasterize primary ray (visibility buffer), RT for bounces 1+
+    // Saves 4-9ms/frame on opaque geometry. Slight fidelity loss on glass/refraction.
+    bool  hybridRasterEnabled = false;
 };
 
 } // namespace acpt
