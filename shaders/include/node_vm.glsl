@@ -20,7 +20,7 @@ const uint OP_UV_VFLIP       = 0x13u;  // R[dst].y = 1.0 - R[srcA].y (Blender→
 
 // Color operations
 const uint OP_MIX            = 0x20u;  // R[dst] = mix(R[srcA], R[srcB], imm_y)
-const uint OP_MIX_REG        = 0x21u;  // R[dst] = mix(R[srcA], R[srcB], R[imm_y & 0xF].x)
+const uint OP_MIX_REG        = 0x21u;  // R[dst] = mix(R[srcA], R[srcB], R[imm_y & 0x1F].x)
 const uint OP_MULTIPLY       = 0x22u;  // R[dst] = R[srcA] * R[srcB]
 const uint OP_ADD            = 0x23u;  // R[dst] = R[srcA] + R[srcB]
 const uint OP_SUBTRACT       = 0x24u;  // R[dst] = R[srcA] - R[srcB]
@@ -95,6 +95,7 @@ const uint OP_TEX_MAGIC      = 0x91u;  // R[dst] = magic(R[srcA].xyz, distortion
 const uint OP_TEX_BRICK       = 0x92u;  // R[dst] = brick(R[srcA].xyz, scale, mortarSize)
 const uint OP_NOISE_BUMP      = 0x93u;  // R[dst] = noiseBump(R[srcA].xyz, scale, detail, roughness) → .xy=gradient, .z=height
 const uint OP_LOAD_VERTEX_COLOR = 0x94u;  // R[dst] = vertexColor (per-vertex color attribute)
+const uint OP_OBJECT_RANDOM    = 0x95u;  // R[dst].x = hash(instanceId) — per-instance random [0,1]
 
 // Load immediate / special
 const uint OP_LOAD_CONST     = 0x60u;  // R[dst] = vec4(imm_y, imm_z, imm_w, 1)
@@ -175,7 +176,7 @@ struct NodeVmResult {
 };
 
 // ── VM Execution ──
-NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 normal, vec4 vertexColor) {
+NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 normal, vec4 vertexColor, uint instanceId) {
     NodeVmResult result;
     result.baseColor = vec3(0.8);
     result.roughness = 0.5;
@@ -263,7 +264,7 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, ve
             R[dst] = mix(R[srcA], R[srcB], fac);
         }
         else if (opcode == OP_MIX_REG) {
-            uint facReg = instr.y & 0xFu;
+            uint facReg = instr.y & 0x1Fu;
             float fac = R[facReg].x;
             R[dst] = mix(R[srcA], R[srcB], fac);
         }
@@ -658,6 +659,15 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, ve
         }
         else if (opcode == OP_LOAD_VERTEX_COLOR) {
             R[dst] = vertexColor;
+        }
+        else if (opcode == OP_OBJECT_RANDOM) {
+            // Hash instanceId to produce per-instance random [0,1]
+            // Matches Cycles' hash_uint() from util/hash.h
+            uint h = uint(instanceId);
+            h = ((h >> 16u) ^ h) * 0x45d9f3bu;
+            h = ((h >> 16u) ^ h) * 0x45d9f3bu;
+            h = (h >> 16u) ^ h;
+            R[dst] = vec4(float(h) / 4294967295.0, 0.0, 0.0, 1.0);
         }
 
         // ── Load immediate ──

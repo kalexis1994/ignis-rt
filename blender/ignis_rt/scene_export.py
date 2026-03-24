@@ -1529,6 +1529,7 @@ _OP_SOFT_LIGHT      = 0x2F
 _OP_LINEAR_LIGHT    = 0x90
 _OP_NOISE_BUMP      = 0x93
 _OP_LOAD_VERTEX_COLOR = 0x94
+_OP_OBJECT_RANDOM   = 0x95
 _OP_OUTPUT_BUMP     = 0xF8
 
 
@@ -1604,7 +1605,15 @@ class _NodeVmCompiler:
                     # sRGB flag: color textures need gamma decoding, data textures don't
                     cs = getattr(from_node.image, 'colorspace_settings', None)
                     is_srgb = 1 if (cs and cs.name in ('sRGB', 'Filmic sRGB', 'Filmic Log')) else 0
-                    self._emit(_OP_SAMPLE_TEX, dst, srcA=uv_reg, imm_y=is_srgb, imm_z=tex_idx)
+                    # Sample full RGBA into a temp register
+                    tex_reg = dst
+                    self._emit(_OP_SAMPLE_TEX, tex_reg, srcA=uv_reg, imm_y=is_srgb, imm_z=tex_idx)
+                    # If the linked output is "Alpha", extract .a channel
+                    if from_socket.name == 'Alpha':
+                        alpha_reg = self._alloc_reg()
+                        self._emit(_OP_SEPARATE_RGB, alpha_reg, srcA=tex_reg, imm_y=3)  # ch=3 → .a
+                        self.node_reg_cache[node_id] = alpha_reg
+                        return alpha_reg
                     self.node_reg_cache[node_id] = dst
                     return dst
             # Fallback: gray
@@ -1679,6 +1688,29 @@ class _NodeVmCompiler:
         if from_node.type in ('MIX_RGB', 'MIX'):
             fac_inp = from_node.inputs.get('Fac') or from_node.inputs[0]
             if from_node.type == 'MIX':
+                # Blender 4.x MIX node supports FLOAT, VECTOR, RGBA data types
+                data_type = getattr(from_node, 'data_type', 'RGBA')
+                if data_type == 'FLOAT':
+                    # Float MIX: mix(A, B, factor) — scalar inputs
+                    float_inputs = [inp for inp in from_node.inputs if inp.type == 'VALUE']
+                    # float_inputs[0] = Factor, [1] = A, [2] = B
+                    a_inp = float_inputs[1] if len(float_inputs) > 1 else None
+                    b_inp = float_inputs[2] if len(float_inputs) > 2 else None
+                    a_reg = self._compile_node(a_inp, _depth + 1) if (a_inp and a_inp.is_linked) else self._alloc_reg()
+                    if a_inp and not a_inp.is_linked:
+                        self._emit(_OP_LOAD_SCALAR, a_reg, imm_y=_floatBits(float(a_inp.default_value)))
+                    b_reg = self._compile_node(b_inp, _depth + 1) if (b_inp and b_inp.is_linked) else self._alloc_reg()
+                    if b_inp and not b_inp.is_linked:
+                        self._emit(_OP_LOAD_SCALAR, b_reg, imm_y=_floatBits(float(b_inp.default_value)))
+                    fac_is_linked = fac_inp and fac_inp.is_linked
+                    if fac_is_linked:
+                        fac_reg = self._compile_node(fac_inp, _depth + 1)
+                        self._emit(_OP_MIX_REG, dst, srcA=a_reg, srcB=b_reg, imm_y=fac_reg)
+                    else:
+                        fac_val = float(fac_inp.default_value) if fac_inp else 0.5
+                        self._emit(_OP_MIX, dst, srcA=a_reg, srcB=b_reg, imm_y=_floatBits(fac_val))
+                    self.node_reg_cache[node_id] = dst
+                    return dst
                 rgba_inputs = [inp for inp in from_node.inputs if inp.type == 'RGBA']
                 c1_inp = rgba_inputs[0] if len(rgba_inputs) > 0 else None
                 c2_inp = rgba_inputs[1] if len(rgba_inputs) > 1 else None
@@ -2070,6 +2102,17 @@ class _NodeVmCompiler:
             out_name = socket.links[0].from_socket.name if socket.is_linked else 'Is Camera Ray'
             val = 1.0 if out_name == 'Is Camera Ray' else 0.0
             self._emit(_OP_LOAD_SCALAR, dst, imm_y=_floatBits(val))
+            self.node_reg_cache[node_id] = dst
+            return dst
+
+        # ── Object Info ──
+        if from_node.type == 'OBJECT_INFO':
+            out_name = socket.links[0].from_socket.name if socket.is_linked else 'Random'
+            if out_name == 'Random':
+                self._emit(_OP_OBJECT_RANDOM, dst)
+            else:
+                # Location, Object Index, etc. — not yet supported, return 0
+                self._emit(_OP_LOAD_SCALAR, dst, imm_y=_floatBits(0.0))
             self.node_reg_cache[node_id] = dst
             return dst
 
@@ -2585,7 +2628,10 @@ class _NodeVmCompiler:
                 self._group_context = old_ctx
                 return result
 
-        # If one side is Transparent BSDF, use the other side directly
+        # If one side is Transparent BSDF, use the other side + compile factor as alpha
+        # Mix Shader factor=0 → Shader 1, factor=1 → Shader 2
+        # So: Transparent on Shader 1 → alpha = factor (factor=1 means opaque)
+        #     Transparent on Shader 2 → alpha = 1-factor (factor=0 means opaque)
         s1_node = s1_inp.links[0].from_node if (s1_inp and s1_inp.is_linked) else None
         s2_node = s2_inp.links[0].from_node if (s2_inp and s2_inp.is_linked) else None
         if s1_node and s1_node.type == 'BSDF_TRANSPARENT' and p2:
@@ -2593,12 +2639,36 @@ class _NodeVmCompiler:
             if g2: self._group_context = g2
             r = self._compile_principled(p2)
             self._group_context = old
+            # Compile Mix Shader factor as alpha (factor=1 → fully Shader 2 → opaque)
+            fac_inp = mix_node.inputs.get('Fac') or mix_node.inputs[0]
+            if fac_inp and fac_inp.is_linked:
+                fac_reg = self._compile_node(fac_inp)
+                self._emit(_OP_OUTPUT_ALPHA, srcA=fac_reg)
+            else:
+                fac_val = float(fac_inp.default_value) if fac_inp else 0.5
+                fac_reg = self._alloc_reg()
+                self._emit(_OP_LOAD_SCALAR, fac_reg, imm_y=_floatBits(fac_val))
+                self._emit(_OP_OUTPUT_ALPHA, srcA=fac_reg)
             return r
         if s2_node and s2_node.type == 'BSDF_TRANSPARENT' and p1:
             old = self._group_context
             if g1: self._group_context = g1
             r = self._compile_principled(p1)
             self._group_context = old
+            # Compile Mix Shader factor as inverse alpha (factor=0 → fully Shader 1 → opaque)
+            fac_inp = mix_node.inputs.get('Fac') or mix_node.inputs[0]
+            if fac_inp and fac_inp.is_linked:
+                fac_reg = self._compile_node(fac_inp)
+                inv_reg = self._alloc_reg()
+                one_reg = self._alloc_reg()
+                self._emit(_OP_LOAD_SCALAR, one_reg, imm_y=_floatBits(1.0))
+                self._emit(_OP_SUBTRACT, inv_reg, srcA=one_reg, srcB=fac_reg)
+                self._emit(_OP_OUTPUT_ALPHA, srcA=inv_reg)
+            else:
+                fac_val = float(fac_inp.default_value) if fac_inp else 0.5
+                fac_reg = self._alloc_reg()
+                self._emit(_OP_LOAD_SCALAR, fac_reg, imm_y=_floatBits(1.0 - fac_val))
+                self._emit(_OP_OUTPUT_ALPHA, srcA=fac_reg)
             return r
 
         # If only one side has a Principled, use it with context
@@ -2653,7 +2723,7 @@ class _NodeVmCompiler:
         color_a = self._compile_principled_color_ctx(p1, g1)
         color_b = self._compile_principled_color_ctx(p2, g2)
         color_mix = self._alloc_reg()
-        self._emit(_OP_MIX_REG, color_mix, srcA=color_a, srcB=color_b, imm_y=fac_reg & 0xF)
+        self._emit(_OP_MIX_REG, color_mix, srcA=color_a, srcB=color_b, imm_y=fac_reg & 0x1F)
         self._emit(_OP_OUTPUT_COLOR, srcA=color_mix)
 
         # Compile and blend Roughness (Diffuse BSDF defaults to 1.0 in PBR)
@@ -2662,7 +2732,7 @@ class _NodeVmCompiler:
         rough_a = self._compile_principled_scalar_ctx(p1, 'Roughness', _rough_default_a, g1)
         rough_b = self._compile_principled_scalar_ctx(p2, 'Roughness', _rough_default_b, g2)
         rough_mix = self._alloc_reg()
-        self._emit(_OP_MIX_REG, rough_mix, srcA=rough_a, srcB=rough_b, imm_y=fac_reg & 0xF)
+        self._emit(_OP_MIX_REG, rough_mix, srcA=rough_a, srcB=rough_b, imm_y=fac_reg & 0x1F)
         self._emit(_OP_OUTPUT_ROUGH, srcA=rough_mix)
 
         # Compile and blend Metallic
@@ -2672,7 +2742,7 @@ class _NodeVmCompiler:
         metal_a = self._compile_principled_scalar_ctx(p1, 'Metallic', _metal_default_a, g1)
         metal_b = self._compile_principled_scalar_ctx(p2, 'Metallic', _metal_default_b, g2)
         metal_mix = self._alloc_reg()
-        self._emit(_OP_MIX_REG, metal_mix, srcA=metal_a, srcB=metal_b, imm_y=fac_reg & 0xF)
+        self._emit(_OP_MIX_REG, metal_mix, srcA=metal_a, srcB=metal_b, imm_y=fac_reg & 0x1F)
         self._emit(_OP_OUTPUT_METAL, srcA=metal_mix)
 
         # Bump: use from whichever shader has it
@@ -4462,17 +4532,20 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                 try:
                     _opnames = {0x01:'SAMPLE_TEX',0x10:'UV_TRANSFORM',0x11:'UV_ROTATE',
                         0x20:'MIX',0x21:'MIX_REG',0x22:'MULTIPLY',0x2B:'HUE_SAT',
-                        0x41:'MATH_ADD',0x42:'MATH_MUL',0x60:'LOAD_CONST',0x61:'LOAD_SCALAR',
+                        0x41:'MATH_ADD',0x42:'MATH_MUL',0x49:'MATH_SUB',
+                        0x60:'LOAD_CONST',0x61:'LOAD_SCALAR',
                         0x62:'LOAD_WORLD_POS',0x80:'TEX_NOISE',0x93:'NOISE_BUMP',
+                        0x95:'OBJECT_RANDOM',
                         0xEF:'OUTPUT_UV',0xF0:'OUTPUT_COLOR',0xF1:'OUTPUT_ROUGH',
-                        0xF2:'OUTPUT_METAL',0xF3:'OUTPUT_EMISSION',0xF8:'OUTPUT_BUMP'}
+                        0xF2:'OUTPUT_METAL',0xF3:'OUTPUT_EMISSION',0xF4:'OUTPUT_ALPHA',
+                        0xF8:'OUTPUT_BUMP'}
                     with open(_os3.path.join(_os3.path.expanduser("~"), "ignis-rt.log"), "a") as _f:
                         _f.write(f"[ignis-vm-dump] '{mat_key_name}' ({len(vm_code)} instrs):\n")
                         for _i, _instr in enumerate(vm_code):
                             _op = _instr[0] & 0xFF
                             _opn = _opnames.get(_op, f'0x{_op:02X}')
-                            _dst = (_instr[0] >> 8) & 0xF
-                            _srcA = (_instr[0] >> 16) & 0xF
+                            _dst = (_instr[0] >> 8) & 0x1F
+                            _srcA = (_instr[0] >> 16) & 0x1F
                             _f.write(f"  [{_i:2d}] {_opn} dst=R[{_dst}] srcA=R[{_srcA}]\n")
                         # Dump Group internal tree if Mix Shader
                         if _vm_surface and _vm_surface.type == 'MIX_SHADER':
@@ -4499,6 +4572,12 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                 if any((instr[0] & 0xFF) == 0xEF for instr in vm_code):
                     uv_scale_x = 1.0
                     uv_scale_y = 1.0
+                # When VM emits OP_OUTPUT_ALPHA (0xF4), it handles alpha per-pixel.
+                # Disable stochastic passthrough and enable alpha cutout instead.
+                if any((instr[0] & 0xFF) == 0xF4 for instr in vm_code):
+                    transparent_prob = 0.0
+                    flags |= 1  # enable alpha_test
+                    alpha = 1.0  # let VM alpha be sole factor
 
         # Log material to file — dump full node tree for the selected object's material
         import os
