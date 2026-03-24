@@ -440,6 +440,10 @@ void RTPipeline::Shutdown() {
         DestroyGBufferImage(reactiveMaskGBuffer_);
         DestroyGBufferImage(diffConfidenceGBuffer_);
         DestroyGBufferImage(specConfidenceGBuffer_);
+        // Hybrid rasterization: visibility buffer
+        DestroyGBufferImage(visibilityGBuffer_);
+        DestroyGBufferImage(instanceIdGBuffer_);
+        DestroyGBufferImage(barycentricGBuffer_);
         gbuffersCreated_ = false;
     }
 
@@ -557,6 +561,9 @@ bool RTPipeline::CreateGBuffers(uint32_t width, uint32_t height) {
         DestroyGBufferImage(reactiveMaskGBuffer_);
         DestroyGBufferImage(diffConfidenceGBuffer_);
         DestroyGBufferImage(specConfidenceGBuffer_);
+        DestroyGBufferImage(visibilityGBuffer_);
+        DestroyGBufferImage(instanceIdGBuffer_);
+        DestroyGBufferImage(barycentricGBuffer_);
     }
 
     if (!CreateGBufferImage(normalRoughnessGBuffer_, VK_FORMAT_R16G16B16A16_SFLOAT, width, height, "normalRoughness")) return false;
@@ -572,6 +579,11 @@ bool RTPipeline::CreateGBuffers(uint32_t width, uint32_t height) {
     if (!CreateGBufferImage(reactiveMaskGBuffer_, VK_FORMAT_R8_UNORM, width, height, "reactiveMask")) return false;
     if (!CreateGBufferImage(diffConfidenceGBuffer_, VK_FORMAT_R8_UNORM, width, height, "diffConfidence")) return false;
     if (!CreateGBufferImage(specConfidenceGBuffer_, VK_FORMAT_R8_UNORM, width, height, "specConfidence")) return false;
+
+    // Hybrid rasterization: visibility buffer images
+    if (!CreateGBufferImage(visibilityGBuffer_, VK_FORMAT_R32G32_UINT, width, height, "visibility")) return false;
+    if (!CreateGBufferImage(instanceIdGBuffer_, VK_FORMAT_R32_UINT, width, height, "instanceId")) return false;
+    if (!CreateGBufferImage(barycentricGBuffer_, VK_FORMAT_R16G16_SFLOAT, width, height, "barycentric")) return false;
 
     gbuffersCreated_ = true;
     gbufferWidth_ = width;
@@ -589,7 +601,7 @@ bool RTPipeline::CreateGBuffers(uint32_t width, uint32_t height) {
     // Update descriptor set with real G-buffer images
     VkDevice device = context_->GetDevice();
 
-    VkDescriptorImageInfo gbufferInfos[13];
+    VkDescriptorImageInfo gbufferInfos[16];
     gbufferInfos[0] = {VK_NULL_HANDLE, normalRoughnessGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
     gbufferInfos[1] = {VK_NULL_HANDLE, viewDepthGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
     gbufferInfos[2] = {VK_NULL_HANDLE, motionVectorsGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
@@ -603,10 +615,14 @@ bool RTPipeline::CreateGBuffers(uint32_t width, uint32_t height) {
     gbufferInfos[10] = {VK_NULL_HANDLE, reactiveMaskGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
     gbufferInfos[11] = {VK_NULL_HANDLE, diffConfidenceGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
     gbufferInfos[12] = {VK_NULL_HANDLE, specConfidenceGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
+    // Hybrid rasterization: visibility buffer
+    gbufferInfos[13] = {VK_NULL_HANDLE, visibilityGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
+    gbufferInfos[14] = {VK_NULL_HANDLE, instanceIdGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
+    gbufferInfos[15] = {VK_NULL_HANDLE, barycentricGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
 
-    int bindings[] = {6, 7, 8, 9, 10, 13, 15, 16, 18, 22, 29, 30, 31};
-    std::vector<VkWriteDescriptorSet> writes(13);
-    for (int i = 0; i < 13; i++) {
+    int bindings[] = {6, 7, 8, 9, 10, 13, 15, 16, 18, 22, 29, 30, 31, 32, 33, 34};
+    std::vector<VkWriteDescriptorSet> writes(16);
+    for (int i = 0; i < 16; i++) {
         writes[i] = {};
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = descriptorSet_;
@@ -791,8 +807,8 @@ bool RTPipeline::CreateDummyResources() {
 }
 
 bool RTPipeline::CreateDescriptorSetLayout() {
-    // Bindings matching raygen.rgen (0-31)
-    std::vector<VkDescriptorSetLayoutBinding> bindings(32);
+    // Bindings matching raygen.rgen (0-34, including hybrid rasterization visibility buffer)
+    std::vector<VkDescriptorSetLayoutBinding> bindings(35);
 
     // binding 0: TLAS
     bindings[0] = {};
@@ -991,10 +1007,29 @@ bool RTPipeline::CreateDescriptorSetLayout() {
     bindings[31].descriptorCount = 1;
     bindings[31].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
+    // binding 32: visibility buffer (RG32UI storage image) — hybrid rasterization
+    bindings[32] = {};
+    bindings[32].binding = 32;
+    bindings[32].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bindings[32].descriptorCount = 1;
+    bindings[32].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
+    // binding 33: instance ID buffer (R32UI storage image) — hybrid rasterization
+    bindings[33] = {};
+    bindings[33].binding = 33;
+    bindings[33].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bindings[33].descriptorCount = 1;
+    bindings[33].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
+    // binding 34: barycentric buffer (RG16F storage image) — hybrid rasterization
+    bindings[34] = {};
+    bindings[34].binding = 34;
+    bindings[34].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bindings[34].descriptorCount = 1;
+    bindings[34].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
     // Binding flags for partially bound descriptors
-    // Note: VARIABLE_DESCRIPTOR_COUNT can only be on the LAST binding (highest number).
-    // Since binding 5 is not the last, we just use PARTIALLY_BOUND with fixed count 1024.
-    std::vector<VkDescriptorBindingFlags> bindingFlags(32, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
+    std::vector<VkDescriptorBindingFlags> bindingFlags(35, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
 
     VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo{};
     flagsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;

@@ -201,6 +201,13 @@ public:
     VkDescriptorSetLayout GetDescriptorSetLayout() const { return descriptorSetLayout_; }
     VkDescriptorSet GetDescriptorSet() const { return descriptorSet_; }
     VkImage GetSpecConfidenceImage() const { return specConfidenceGBuffer_.image; }
+    // Hybrid rasterization: visibility buffer accessors
+    VkImage GetVisibilityImage() const { return visibilityGBuffer_.image; }
+    VkImageView GetVisibilityView() const { return visibilityGBuffer_.view; }
+    VkImage GetInstanceIdImage() const { return instanceIdGBuffer_.image; }
+    VkImageView GetInstanceIdView() const { return instanceIdGBuffer_.view; }
+    VkImage GetBarycentricImage() const { return barycentricGBuffer_.image; }
+    VkImageView GetBarycentricView() const { return barycentricGBuffer_.view; }
     bool HasGBuffers() const { return gbuffersCreated_; }
 
     // Shadow temporal accumulation — swap ping-pong buffers each frame
@@ -269,6 +276,12 @@ private:
     GBufferImage reactiveMaskGBuffer_;      // binding 29, R8_UNORM — DLSS reactive mask
     GBufferImage diffConfidenceGBuffer_;    // binding 30, R8_UNORM — NRD diffuse confidence
     GBufferImage specConfidenceGBuffer_;    // binding 31, R8_UNORM — NRD specular confidence
+
+    // Hybrid rasterization: visibility buffer (written by rasterizer, read by raygen)
+    GBufferImage visibilityGBuffer_;         // binding 32, RG32UI — customIndex + primitiveId
+    GBufferImage instanceIdGBuffer_;         // binding 33, R32UI — instance ID
+    GBufferImage barycentricGBuffer_;        // binding 34, RG16F — barycentric UV
+
     bool gbuffersCreated_ = false;
     uint32_t gbufferWidth_ = 0;
     uint32_t gbufferHeight_ = 0;
