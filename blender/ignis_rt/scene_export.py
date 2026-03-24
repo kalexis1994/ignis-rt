@@ -1503,7 +1503,8 @@ class _NodeVmCompiler:
         self.instructions = []
         self.register_image = register_image_fn
         self.next_reg = 1  # R0 = UV
-        self.node_reg_cache = {}  # id(node) → register
+        self.node_reg_cache = {}  # (type, name) → register
+        self._group_context = None  # Current Group node for cross-boundary compilation
 
     def _alloc_reg(self):
         r = self.next_reg
@@ -2091,6 +2092,29 @@ class _NodeVmCompiler:
             self.node_reg_cache[node_id] = dst
             return dst
 
+        # ── GROUP_INPUT — cross Group boundary to external input ──
+        if from_node.type == 'GROUP_INPUT' and self._group_context:
+            ext_name = socket.links[0].from_socket.name
+            ext_inp = self._group_context.inputs.get(ext_name)
+            if ext_inp and ext_inp.is_linked:
+                # Follow the external link (back in main tree)
+                old_ctx = self._group_context
+                self._group_context = None
+                result = self._compile_node(ext_inp, _depth + 1)
+                self._group_context = old_ctx
+                self.node_reg_cache[node_id] = result
+                return result
+            elif ext_inp:
+                # Constant from Group's external input
+                val = ext_inp.default_value
+                if hasattr(val, '__len__') and len(val) >= 3:
+                    self._emit(_OP_LOAD_CONST, dst, imm_y=_floatBits(val[0]),
+                               imm_z=_floatBits(val[1]), imm_w=_floatBits(val[2]))
+                else:
+                    self._emit(_OP_LOAD_SCALAR, dst, imm_y=_floatBits(float(val)))
+                self.node_reg_cache[node_id] = dst
+                return dst
+
         # ── Fallback: try to follow first linked color input ──
         for inp in from_node.inputs:
             if inp.is_linked and inp.type in ('RGBA', 'VALUE', 'VECTOR'):
@@ -2264,6 +2288,17 @@ class _NodeVmCompiler:
             inp = from_node.inputs[0] if from_node.inputs else None
             return self._compile_uv_chain(inp, _depth + 1) if inp else 0
 
+        # GROUP_INPUT — cross Group boundary
+        if from_node.type == 'GROUP_INPUT' and self._group_context:
+            ext_name = socket.links[0].from_socket.name
+            ext_inp = self._group_context.inputs.get(ext_name)
+            if ext_inp and ext_inp.is_linked:
+                old_ctx = self._group_context
+                self._group_context = None
+                result = self._compile_uv_chain(ext_inp, _depth + 1)
+                self._group_context = old_ctx
+                return result
+
         return 0
 
     def _compile_scalar_input(self, socket, default=0.5, _depth=0):
@@ -2347,20 +2382,34 @@ class _NodeVmCompiler:
         return self._compile_principled(principled_node)
 
     def _find_principled_in_shader(self, shader_inp):
-        """Find Principled BSDF from a Mix Shader's shader input socket."""
+        """Find Principled BSDF from a Mix Shader's shader input.
+
+        Returns (principled_node, group_node_or_None). For nodes inside a Group,
+        returns the ACTUAL internal node (not proxy) + the Group for context.
+        """
         if not shader_inp or not shader_inp.is_linked:
-            return None
+            return None, None
         node = shader_inp.links[0].from_node
         if node.type == 'BSDF_PRINCIPLED':
-            return node
+            return node, None
         if node.type == 'GROUP':
-            return _find_principled_in_group(node)
+            inner_tree = node.node_tree
+            if inner_tree:
+                for inode in inner_tree.nodes:
+                    if inode.type == 'BSDF_PRINCIPLED':
+                        return inode, node  # Return ACTUAL internal node + Group context
+                # Follow GROUP_OUTPUT
+                for inode in inner_tree.nodes:
+                    if inode.type == 'GROUP_OUTPUT':
+                        for inp in inode.inputs:
+                            if inp.is_linked and inp.links[0].from_node.type == 'BSDF_PRINCIPLED':
+                                return inp.links[0].from_node, node
+            return None, None
         if node.type == 'MIX_SHADER':
-            # Nested Mix: find the dominant Principled inside
             for si in (1, 2):
-                p = self._find_principled_in_shader(node.inputs[si] if len(node.inputs) > si else None)
-                if p: return p
-        return None
+                p, g = self._find_principled_in_shader(node.inputs[si] if len(node.inputs) > si else None)
+                if p: return p, g
+        return None, None
 
     def _compile_principled_color(self, principled):
         """Compile Base Color from a Principled BSDF, return register."""
@@ -2383,34 +2432,79 @@ class _NodeVmCompiler:
         self._emit(_OP_LOAD_SCALAR, r, imm_y=_floatBits(val))
         return r
 
+    def _compile_with_group_context(self, principled, group_ctx):
+        """Compile a Principled BSDF with optional Group context for cross-boundary."""
+        old_ctx = self._group_context
+        if group_ctx:
+            self._group_context = group_ctx
+        result = principled
+        self._group_context = old_ctx
+        return result
+
+    def _compile_principled_color_ctx(self, principled, group_ctx):
+        """Compile Base Color with Group context."""
+        old_ctx = self._group_context
+        if group_ctx: self._group_context = group_ctx
+        result = self._compile_principled_color(principled)
+        self._group_context = old_ctx
+        return result
+
+    def _compile_principled_scalar_ctx(self, principled, input_name, default, group_ctx):
+        """Compile scalar input with Group context."""
+        old_ctx = self._group_context
+        if group_ctx: self._group_context = group_ctx
+        result = self._compile_principled_scalar(principled, input_name, default)
+        self._group_context = old_ctx
+        return result
+
     def _compile_mix_shader(self, mix_node):
-        """Compile Mix Shader: both branches blended per-pixel."""
-        # Find Principled BSDF in each branch
+        """Compile Mix Shader: both branches blended per-pixel.
+        Supports Group nodes — crosses Group boundary for internal node compilation.
+        """
+        # Find Principled BSDF in each branch (+ Group context if inside a Group)
         s1_inp = mix_node.inputs[1] if len(mix_node.inputs) > 1 else None
         s2_inp = mix_node.inputs[2] if len(mix_node.inputs) > 2 else None
-        p1 = self._find_principled_in_shader(s1_inp)
-        p2 = self._find_principled_in_shader(s2_inp)
+        p1, g1 = self._find_principled_in_shader(s1_inp)
+        p2, g2 = self._find_principled_in_shader(s2_inp)
 
         # If one side is Transparent BSDF, use the other side directly
         s1_node = s1_inp.links[0].from_node if (s1_inp and s1_inp.is_linked) else None
         s2_node = s2_inp.links[0].from_node if (s2_inp and s2_inp.is_linked) else None
         if s1_node and s1_node.type == 'BSDF_TRANSPARENT' and p2:
-            return self._compile_principled(p2)
+            old = self._group_context
+            if g2: self._group_context = g2
+            r = self._compile_principled(p2)
+            self._group_context = old
+            return r
         if s2_node and s2_node.type == 'BSDF_TRANSPARENT' and p1:
-            return self._compile_principled(p1)
+            old = self._group_context
+            if g1: self._group_context = g1
+            r = self._compile_principled(p1)
+            self._group_context = old
+            return r
 
-        # If only one side has a Principled, use it directly
+        # If only one side has a Principled, use it with context
         if p1 and not p2:
-            return self._compile_principled(p1)
+            old = self._group_context
+            if g1: self._group_context = g1
+            r = self._compile_principled(p1)
+            self._group_context = old
+            return r
         if p2 and not p1:
-            return self._compile_principled(p2)
+            old = self._group_context
+            if g2: self._group_context = g2
+            r = self._compile_principled(p2)
+            self._group_context = old
+            return r
         if not p1 and not p2:
             return None
 
-        # ── Both sides have Principled BSDFs — compile and blend ──
+        # ── Both sides have Principled BSDFs — compile and blend per-pixel ──
 
         # UV chain from first texture found in either shader
-        for p in (p1, p2):
+        for p, g in ((p1, g1), (p2, g2)):
+            old = self._group_context
+            if g: self._group_context = g
             uv_done = False
             for iname in ('Base Color', 'Roughness', 'Metallic'):
                 inp = p.inputs.get(iname)
@@ -2424,6 +2518,7 @@ class _NodeVmCompiler:
                                 self._emit(_OP_OUTPUT_UV, srcA=ur)
                                 uv_done = True
                                 break
+            self._group_context = old
             if uv_done:
                 break
 
@@ -2436,23 +2531,23 @@ class _NodeVmCompiler:
             fac_reg = self._alloc_reg()
             self._emit(_OP_LOAD_SCALAR, fac_reg, imm_y=_floatBits(fac_val))
 
-        # Compile and blend Base Color
-        color_a = self._compile_principled_color(p1)
-        color_b = self._compile_principled_color(p2)
+        # Compile and blend Base Color (with Group context for each side)
+        color_a = self._compile_principled_color_ctx(p1, g1)
+        color_b = self._compile_principled_color_ctx(p2, g2)
         color_mix = self._alloc_reg()
         self._emit(_OP_MIX_REG, color_mix, srcA=color_a, srcB=color_b, imm_y=fac_reg & 0xF)
         self._emit(_OP_OUTPUT_COLOR, srcA=color_mix)
 
         # Compile and blend Roughness
-        rough_a = self._compile_principled_scalar(p1, 'Roughness', 0.5)
-        rough_b = self._compile_principled_scalar(p2, 'Roughness', 0.5)
+        rough_a = self._compile_principled_scalar_ctx(p1, 'Roughness', 0.5, g1)
+        rough_b = self._compile_principled_scalar_ctx(p2, 'Roughness', 0.5, g2)
         rough_mix = self._alloc_reg()
         self._emit(_OP_MIX_REG, rough_mix, srcA=rough_a, srcB=rough_b, imm_y=fac_reg & 0xF)
         self._emit(_OP_OUTPUT_ROUGH, srcA=rough_mix)
 
         # Compile and blend Metallic
-        metal_a = self._compile_principled_scalar(p1, 'Metallic', 0.0)
-        metal_b = self._compile_principled_scalar(p2, 'Metallic', 0.0)
+        metal_a = self._compile_principled_scalar_ctx(p1, 'Metallic', 0.0, g1)
+        metal_b = self._compile_principled_scalar_ctx(p2, 'Metallic', 0.0, g2)
         metal_mix = self._alloc_reg()
         self._emit(_OP_MIX_REG, metal_mix, srcA=metal_a, srcB=metal_b, imm_y=fac_reg & 0xF)
         self._emit(_OP_OUTPUT_METAL, srcA=metal_mix)
