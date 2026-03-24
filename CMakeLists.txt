@@ -164,6 +164,8 @@ if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
         cluster_culling.comp:cluster_culling.comp.spv
         hybrid.rgen:hybrid.rgen.spv
         raygen_blender.rgen:raygen_blender.rgen.spv
+        gbuffer.vert:gbuffer.vert.spv
+        gbuffer.frag:gbuffer.frag.spv
     )
 
     set(SPV_OUTPUTS "")
