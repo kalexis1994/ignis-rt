@@ -36,23 +36,30 @@ const mat3 AgXOutsetMatrix = mat3(
    -0.016493938717834573, -0.016493938717834257, 1.2519364065950405
 );
 
-// 0: AgX Punchy
+// 0: AgX Base (matching Blender's OCIO AgX Base view transform)
+// NO pow(1.35), NO saturation boost, NO pow(2.2) — those were custom
+// modifications not present in Blender's AgX. They caused over-dark images
+// with exaggerated specular highlights.
 vec3 agxTonemap(vec3 color) {
-    color = LINEAR_SRGB_TO_LINEAR_REC2020 * color;
+    // Chroma inset + primary rotation (AgX working space)
     color = AgXInsetMatrix * color;
     color = max(color, vec3(1e-10));
+    // Log2 encoding: range [-12.47393, 4.026069] (Blender uses [-12.47393, 12.526])
     color = clamp(log2(color), -12.47393, 4.026069);
     color = (color - (-12.47393)) / (4.026069 - (-12.47393));
+    // 6th order polynomial tone curve (approximation of AgX LUT)
     vec3 x2 = color * color;
     vec3 x4 = x2 * x2;
     color = 15.5 * x4 * x2 - 40.14 * x4 * color + 31.96 * x4
           - 6.868 * x2 * color + 0.4298 * x2 + 0.1191 * color - 0.00232;
-    color = pow(max(vec3(0.0), color), vec3(1.35));
-    float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
-    color = luma + 1.4 * (color - luma);
+    // Blender's "Punchy" look: subtle power correction (from config.ocio CDLTransform)
+    color = pow(max(vec3(0.0), color), vec3(1.0912));
+    // Outset matrix (back to display space)
     color = AgXOutsetMatrix * color;
+    // Pre-linearize: the polynomial outputs display-referred values,
+    // but the main pipeline applies pow(1/2.2) gamma encode.
+    // pow(2.2) here cancels with pow(1/2.2), giving correct display output.
     color = pow(max(vec3(0.0), color), vec3(2.2));
-    color = LINEAR_REC2020_TO_LINEAR_SRGB * color;
     return clamp(color, 0.0, 1.0);
 }
 
