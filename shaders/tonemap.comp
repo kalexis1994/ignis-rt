@@ -38,21 +38,16 @@ const mat3 AgXOutsetMatrix = mat3(
 );
 
 // 0: AgX — uses Blender's EXACT 3D LUT (AgX_Base_sRGB.cube, 57³)
-// No polynomial approximation — the LUT contains the precise tone curve.
+// Matches Blender's OCIO pipeline: InsetMatrix → Log2 → LUT → display-ready
 vec3 agxTonemap(vec3 color) {
-    // Step 1: Transform to AgX log encoding space (chroma inset)
+    // Chroma inset (AgX working space — matrix includes color space conversion)
     color = AgXInsetMatrix * color;
     color = max(color, vec3(1e-10));
-    // Step 2: Log2 encode + normalize to [0,1] (LUT input domain)
-    // LUT expects E-Gamut Log2 from -10 to +15 stops, but our range matches the polynomial
-    color = clamp(log2(color), -12.47393, 4.026069);
-    color = (color - (-12.47393)) / (4.026069 - (-12.47393));
-    // Step 3: Sample 3D LUT (replaces polynomial + outset matrix)
-    // LUT output is in display-referred space (power 2.4 encoded ≈ sRGB)
+    // Log2 encode with OCIO AllocationTransform range (from config.ocio)
+    color = clamp(log2(color), -12.47393, 12.52607);
+    color = (color - (-12.47393)) / (12.52607 - (-12.47393));
+    // Sample 3D LUT — output is display-ready (gamma encoded, no further transform needed)
     color = texture(agxLut, color).rgb;
-    // Step 4: LUT output is display-referred (gamma encoded).
-    // Main pipeline applies pow(1/2.2) — need pow(2.2) to compensate.
-    color = pow(max(vec3(0.0), color), vec3(2.2));
     return clamp(color, 0.0, 1.0);
 }
 
@@ -117,7 +112,11 @@ void main() {
     vec3 ldr = applyTonemap(hdr, push.tonemapMode);
     float luma = dot(ldr, vec3(0.2126, 0.7152, 0.0722));
     ldr = clamp(mix(vec3(luma), ldr, push.saturation), 0.0, 1.0);
-    ldr = pow(ldr, vec3(1.0 / 2.2));
+    // AgX LUT output is already display-ready (gamma encoded) — skip pow(1/2.2)
+    // Other tonemaps (ACES, Reinhard, etc.) output linear — need gamma encode
+    if (push.tonemapMode != 0u) {
+        ldr = pow(ldr, vec3(1.0 / 2.2));
+    }
 
     // Post-gamma contrast (matches raygen behavior)
     if (push.contrast > 0.01) {

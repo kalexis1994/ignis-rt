@@ -2054,11 +2054,12 @@ bool Renderer::LoadAgXLut() {
     std::vector<float> lutData;
     std::string line;
     while (std::getline(lutFile, line)) {
-        if (line.empty() || line[0] == '#' || line[0] == 'T' || line[0] == 'D') {
-            // Parse LUT_3D_SIZE
-            if (line.find("LUT_3D_SIZE") != std::string::npos) {
-                sscanf(line.c_str(), "LUT_3D_SIZE %d", &lutSize);
-            }
+        // Parse header lines
+        if (line.find("LUT_3D_SIZE") != std::string::npos) {
+            sscanf(line.c_str(), "LUT_3D_SIZE %d", &lutSize);
+            continue;
+        }
+        if (line.empty() || line[0] == '#' || line[0] == 'T' || line[0] == 'D' || line[0] == 'L') {
             continue;
         }
         float r, g, b;
