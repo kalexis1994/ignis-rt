@@ -4178,7 +4178,7 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                         with open(os.path.join(os.path.expanduser("~"), "ignis-rt.log"), "a") as _f:
                             _f.write(f"[ignis-mix] '{mat.name}': Mix Shader resolved — "
                                      f"color=({base_color[0]:.3f},{base_color[1]:.3f},{base_color[2]:.3f}) "
-                                     f"rough={roughness:.2f} metal={metallic:.2f} tp={transparent_prob:.2f}\n")
+                                     f"rough={roughness:.2f} metal={metallic:.2f} spec={specular_level:.4f} tp={transparent_prob:.2f}\n")
                     except: pass
                     # Find the BEST Principled BSDF for VM compilation.
                     # Prefer the shader with linked inputs (textures/nodes) over

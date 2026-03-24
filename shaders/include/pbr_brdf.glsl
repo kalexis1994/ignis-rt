@@ -6,21 +6,43 @@
 #ifndef PBR_BRDF_GLSL
 #define PBR_BRDF_GLSL
 
-// Fresnel — F82-Tint model (matches Cycles' Principled BSDF)
-// Adds a correction term that reduces reflectivity around ~82° incidence,
-// preventing dark metals from looking overly chrome at grazing angles.
-// Reference: "Novel aspects of the Adobe Standard Material" (Kutz et al.)
+// Real dielectric Fresnel (exact, NOT Schlick approximation)
+// Matches Cycles' fresnel_dielectric_cos() from bsdf_util.h
+float fresnel_dielectric(float cosi, float eta) {
+    float c = abs(cosi);
+    float g = eta * eta - 1.0 + c * c;
+    if (g > 0.0) {
+        g = sqrt(g);
+        float A = (g - c) / (g + c);
+        float B = (c * (g + c) - 1.0) / (c * (g - c) + 1.0);
+        return 0.5 * A * A * (1.0 + B * B);
+    }
+    return 1.0;  // Total internal reflection
+}
+
+// Fresnel — Real dielectric + F82-Tint (matches Cycles' Principled BSDF exactly)
+// Uses real Fresnel equations remapped to [F0, F90] range, NOT Schlick pow(5).
+// This produces smoother, less aggressive reflections at grazing angles.
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {
+    // Compute real dielectric Fresnel and remap to [F0_real, 1.0] range
+    // Cycles: s = inverse_lerp(F0_real, 1.0, F_real)
+    // Recover eta from F0: eta = (1+sqrt(F0))/(1-sqrt(F0))
+    float avgF0 = max((F0.r + F0.g + F0.b) / 3.0, 1e-6);
+    float sqrtF0 = sqrt(clamp(avgF0, 0.0, 0.999));
+    float eta = (1.0 + sqrtF0) / max(1.0 - sqrtF0, 1e-6);
+    float F0_real = ((eta - 1.0) / (eta + 1.0)) * ((eta - 1.0) / (eta + 1.0));
+    float F_real = fresnel_dielectric(cosTheta, eta);
+    float s = clamp((F_real - F0_real) / max(1.0 - F0_real, 1e-6), 0.0, 1.0);
+
+    // Interpolate between tinted F0 and white F90 using remapped real Fresnel
+    vec3 F = mix(F0, vec3(1.0), s);
+
+    // F82-Tint correction for metals (darkens reflections around ~82°)
+    vec3 B = (1.0 - F0) * (25.0 / 24.0);
     float t = 1.0 - cosTheta;
     float t2 = t * t;
-    vec3 schlick = F0 + (1.0 - F0) * (t2 * t2 * t);
-
-    // F82-Tint correction: B * cosTheta * (1 - cosTheta)^6
-    // B = (1 - F0) * 25.0 / 24.0 for white tint (default)
-    // This darkens reflections around 82° for low-F0 (dark) metals
-    vec3 B = (1.0 - F0) * (25.0 / 24.0);
-    float t6 = t2 * t2 * t2;  // (1-cos)^6
-    return max(schlick - B * cosTheta * t6, vec3(0.0));
+    float t6 = t2 * t2 * t2;
+    return max(F - B * cosTheta * t6, vec3(0.0));
 }
 
 // GGX Normal Distribution Function
