@@ -813,7 +813,9 @@ void Renderer::RenderFrameRT() {
         PathTracerConfig* hybridCfg = VK_GetConfig();
         if (hybridCfg && hybridCfg->hybridRasterEnabled) {
             if (!gbufferPassReady_) {
-                InitGBufferPass();
+                bool initOk = InitGBufferPass();
+                Log(L"[Hybrid] InitGBufferPass: %s (instances=%zu)\n",
+                    initOk ? L"OK" : L"FAILED", tlasInstances_.size());
             }
             if (gbufferPassReady_) {
                 RasterizeGBuffer(cmd);
@@ -2764,7 +2766,13 @@ bool Renderer::InitGBufferPass() {
         fbInfo.width = w;
         fbInfo.height = h;
         fbInfo.layers = 1;
-        if (vkCreateFramebuffer(device, &fbInfo, nullptr, &gbufferFramebuffer_) != VK_SUCCESS) return false;
+        VkResult fbResult = vkCreateFramebuffer(device, &fbInfo, nullptr, &gbufferFramebuffer_);
+        if (fbResult != VK_SUCCESS) {
+            Log(L"[Hybrid] FAILED to create framebuffer: %d (views: %p %p %p %p)\n",
+                fbResult, views[0], views[1], views[2], views[3]);
+            return false;
+        }
+        Log(L"[Hybrid] Framebuffer created OK (%ux%u)\n", w, h);
     }
 
     // ── 4. Pipeline layout (push constants only — no descriptor set needed) ──
@@ -2801,14 +2809,21 @@ bool Renderer::InitGBufferPass() {
     {
         // Load shaders
         std::vector<char> vertCode, fragCode;
-        if (!pipeline_->LoadShader("gbuffer.vert.spv", vertCode) ||
-            !pipeline_->LoadShader("gbuffer.frag.spv", fragCode)) {
-            Log(L"[VK Renderer] Failed to load G-buffer shaders\n");
+        if (!pipeline_->LoadShader("shaders/gbuffer.vert.spv", vertCode)) {
+            Log(L"[Hybrid] FAILED to load shaders/gbuffer.vert.spv\n");
             return false;
         }
+        if (!pipeline_->LoadShader("shaders/gbuffer.frag.spv", fragCode)) {
+            Log(L"[Hybrid] FAILED to load shaders/gbuffer.frag.spv\n");
+            return false;
+        }
+        Log(L"[Hybrid] Shaders loaded OK (vert=%zu, frag=%zu bytes)\n", vertCode.size(), fragCode.size());
         VkShaderModule vertModule = pipeline_->CreateShaderModule(vertCode);
         VkShaderModule fragModule = pipeline_->CreateShaderModule(fragCode);
-        if (!vertModule || !fragModule) return false;
+        if (!vertModule || !fragModule) {
+            Log(L"[Hybrid] FAILED to create shader modules\n");
+            return false;
+        }
 
         VkPipelineShaderStageCreateInfo stages[2] = {};
         stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -2843,7 +2858,8 @@ bool Renderer::InitGBufferPass() {
         inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
         inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
-        VkViewport viewport{0, 0, (float)w, (float)h, 0.0f, 1.0f};
+        // Negative height flips Y to match ray tracing coordinate system
+        VkViewport viewport{0, (float)h, (float)w, -(float)h, 0.0f, 1.0f};
         VkRect2D scissor{{0, 0}, {w, h}};
         VkPipelineViewportStateCreateInfo viewportState{};
         viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
@@ -2913,7 +2929,13 @@ bool Renderer::InitGBufferPass() {
 }
 
 void Renderer::RasterizeGBuffer(VkCommandBuffer cmd) {
-    if (!gbufferPassReady_ || !accelBuilder_ || tlasInstances_.empty()) return;
+    if (!gbufferPassReady_ || !accelBuilder_ || tlasInstances_.empty()) {
+        static int logOnce = 0;
+        if (logOnce++ < 3)
+            Log(L"[Hybrid] RasterizeGBuffer SKIP: ready=%d accel=%p instances=%zu\n",
+                (int)gbufferPassReady_, (void*)accelBuilder_, tlasInstances_.size());
+        return;
+    }
 
     // Transition visibility buffer images: GENERAL → COLOR_ATTACHMENT_OPTIMAL
     // (They need to be in COLOR_ATTACHMENT layout for the render pass)
@@ -2948,6 +2970,8 @@ void Renderer::RasterizeGBuffer(VkCommandBuffer cmd) {
     // For push constants, we compute MVP = proj * view * model per instance
 
     auto& blasList = accelBuilder_->GetBLASList();
+    static int drawLog = 0;
+    int drawCount = 0;
 
     for (size_t i = 0; i < tlasInstances_.size(); i++) {
         const auto& inst = tlasInstances_[i];
@@ -3002,9 +3026,12 @@ void Renderer::RasterizeGBuffer(VkCommandBuffer cmd) {
 
         // Draw
         vkCmdDrawIndexed(cmd, blas.indexCount, 1, 0, 0, 0);
+        drawCount++;
     }
 
     vkCmdEndRenderPass(cmd);
+    if (drawLog++ < 3)
+        Log(L"[Hybrid] RasterizeGBuffer: %d draw calls, %zu instances\n", drawCount, tlasInstances_.size());
 }
 
 void Renderer::ShutdownGBufferPass() {

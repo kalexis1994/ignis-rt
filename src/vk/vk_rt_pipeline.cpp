@@ -467,7 +467,8 @@ void RTPipeline::Shutdown() {
     Log(L"[VK RTPipeline] Shutdown\n");
 }
 
-bool RTPipeline::CreateGBufferImage(GBufferImage& gb, VkFormat format, uint32_t width, uint32_t height, const char* name) {
+bool RTPipeline::CreateGBufferImage(GBufferImage& gb, VkFormat format, uint32_t width, uint32_t height, const char* name,
+                                    VkImageUsageFlags extraUsage) {
     VkDevice device = context_->GetDevice();
 
     VkImageCreateInfo imgInfo{};
@@ -479,7 +480,7 @@ bool RTPipeline::CreateGBufferImage(GBufferImage& gb, VkFormat format, uint32_t 
     imgInfo.arrayLayers = 1;
     imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
     imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imgInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imgInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | extraUsage;
     imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -581,9 +582,12 @@ bool RTPipeline::CreateGBuffers(uint32_t width, uint32_t height) {
     if (!CreateGBufferImage(specConfidenceGBuffer_, VK_FORMAT_R8_UNORM, width, height, "specConfidence")) return false;
 
     // Hybrid rasterization: visibility buffer images
-    if (!CreateGBufferImage(visibilityGBuffer_, VK_FORMAT_R32G32_UINT, width, height, "visibility")) return false;
-    if (!CreateGBufferImage(instanceIdGBuffer_, VK_FORMAT_R32_UINT, width, height, "instanceId")) return false;
-    if (!CreateGBufferImage(barycentricGBuffer_, VK_FORMAT_R16G16_SFLOAT, width, height, "barycentric")) return false;
+    if (!CreateGBufferImage(visibilityGBuffer_, VK_FORMAT_R32G32_UINT, width, height, "visibility",
+                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) return false;
+    if (!CreateGBufferImage(instanceIdGBuffer_, VK_FORMAT_R32_UINT, width, height, "instanceId",
+                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) return false;
+    if (!CreateGBufferImage(barycentricGBuffer_, VK_FORMAT_R16G16_SFLOAT, width, height, "barycentric",
+                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) return false;
 
     gbuffersCreated_ = true;
     gbufferWidth_ = width;

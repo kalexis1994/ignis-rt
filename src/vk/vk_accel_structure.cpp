@@ -168,13 +168,15 @@ int AccelStructureBuilder::BuildBLAS(const float* vertices, uint32_t vertexCount
     AccelBuffer vertexBuf = CreateAccelBuffer(vertexSize,
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,  // Hybrid rasterization: G-buffer pass
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     VkDeviceSize indexSize = indexCount * sizeof(uint32_t);
     AccelBuffer indexBuf = CreateAccelBuffer(indexSize,
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT,  // Hybrid rasterization: G-buffer pass
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     if (!vertexBuf.buffer || !indexBuf.buffer) {
@@ -418,11 +420,13 @@ bool AccelStructureBuilder::RefitBLAS(int blasIndex, const float* vertices, uint
 
     AccelBuffer vertexBuf = CreateAccelBuffer(vertexSize,
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,  // Hybrid rasterization
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     AccelBuffer indexBuf = CreateAccelBuffer(indexSize,
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT,  // Hybrid rasterization
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     if (!vertexBuf.buffer || !indexBuf.buffer) {
@@ -640,8 +644,11 @@ int AccelStructureBuilder::UploadGeometryBuffers(const float* vertices, uint32_t
         return gpu;
     };
 
-    gb.vertexBuffer = uploadBuffer(vertices, vertexCount * 3 * sizeof(float), 0);
-    gb.indexBuffer = uploadBuffer(indices, indexCount * sizeof(uint32_t), 0);
+    // VERTEX_BUFFER_BIT + INDEX_BUFFER_BIT needed for hybrid rasterization G-buffer pass
+    gb.vertexBuffer = uploadBuffer(vertices, vertexCount * 3 * sizeof(float),
+                                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    gb.indexBuffer = uploadBuffer(indices, indexCount * sizeof(uint32_t),
+                                   VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
     gb.normalBuffer = uploadBuffer(normals, normals ? vertexCount * 3 * sizeof(float) : 0, 0);
     gb.uvBuffer = uploadBuffer(uvs, uvs ? vertexCount * 2 * sizeof(float) : 0, 0);
     gb.tangentBuffer = uploadBuffer(tangents, tangents ? vertexCount * 4 * sizeof(float) : 0, 0);

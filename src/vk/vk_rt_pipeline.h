@@ -290,7 +290,8 @@ private:
     uint32_t gbufferWidth_ = 0;
     uint32_t gbufferHeight_ = 0;
 
-    bool CreateGBufferImage(GBufferImage& gb, VkFormat format, uint32_t width, uint32_t height, const char* name);
+    bool CreateGBufferImage(GBufferImage& gb, VkFormat format, uint32_t width, uint32_t height, const char* name,
+                            VkImageUsageFlags extraUsage = 0);
     void DestroyGBufferImage(GBufferImage& gb);
 
     // GI Reservoir buffers for ReSTIR (bindings 24-25)
