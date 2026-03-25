@@ -126,8 +126,8 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         update=_tag_redraw,
     )
     samples_per_pixel: IntProperty(
-        name="Samples/Pixel", default=1, min=1, max=128,
-        description="Samples per pixel per frame (1-4=realtime, 8-16=quality, 32+=offline)",
+        name="Samples/Pixel", default=1, min=1, max=10,
+        description="Samples per pixel per frame (1-3=realtime, 4-6=quality, 8-10=offline)",
         update=_tag_redraw,
     )
     backface_culling: BoolProperty(
