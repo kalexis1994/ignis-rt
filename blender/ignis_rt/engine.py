@@ -1323,7 +1323,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                     continue
                 if not inst.show_self:
                     continue
-                if obj.name in _ignis_hidden_objects:
+                if obj.name in _ignis_hidden_objects and not inst.is_instance:
                     continue
                 if obj.hide_viewport:
                     continue

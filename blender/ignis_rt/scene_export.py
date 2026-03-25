@@ -368,8 +368,10 @@ def export_meshes(depsgraph):
         if obj.name in boolean_cutters:
             continue
 
-        # Skip objects in hidden/excluded collections
-        if obj.name in hidden_by_collection:
+        # Skip objects in hidden/excluded collections — but NOT instances.
+        # Collection instances (e.g., column.xxx) have their source collection
+        # excluded to hide the original; the instances themselves are visible.
+        if obj.name in hidden_by_collection and not instance.is_instance:
             continue
 
         # Skip objects hidden at object level
@@ -2262,9 +2264,17 @@ class _NodeVmCompiler:
                 self.node_reg_cache[node_id] = dst
                 return dst
 
+        # ── Reroute: transparent passthrough ──
+        if from_node.type == 'REROUTE':
+            inp = from_node.inputs[0] if from_node.inputs else None
+            if inp and inp.is_linked:
+                result = self._compile_node(inp, _depth + 1)
+                self.node_reg_cache[node_id] = result
+                return result
+
         # ── Fallback: try to follow first linked color input ──
         for inp in from_node.inputs:
-            if inp.is_linked and inp.type in ('RGBA', 'VALUE', 'VECTOR'):
+            if inp.is_linked and inp.type in ('RGBA', 'VALUE', 'VECTOR', 'CUSTOM'):
                 result = self._compile_node(inp, _depth + 1)
                 self.node_reg_cache[node_id] = result
                 return result
@@ -4192,7 +4202,9 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
             continue
         if not inst.show_self:
             continue
-        if obj.name in hidden_objects:
+        # Don't filter collection instances by hidden_objects — their source
+        # collection is excluded but the instances themselves are visible
+        if obj.name in hidden_objects and not inst.is_instance:
             continue
         if obj.hide_viewport:
             continue
@@ -4700,16 +4712,18 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                 if ec_node and ec_node.image:
                     emission_tex = _register_image(ec_node.image)
 
-                # Detect alpha testing
-                alpha_test = alpha < 1.0
+                # Detect alpha testing — only when Alpha is actually < 1 or linked
+                alpha_test = alpha < 0.999
                 alpha_inp = node.inputs.get('Alpha')
                 if alpha_inp and alpha_inp.is_linked:
                     alpha_test = True
-                try:
-                    if mat.blend_method in ('CLIP', 'HASHED', 'BLEND'):
-                        alpha_test = True
-                except AttributeError:
-                    pass
+                # blend_method only matters if Alpha is variable (linked or < 1)
+                if alpha_test:
+                    try:
+                        if mat.blend_method in ('CLIP', 'HASHED', 'BLEND'):
+                            alpha_ref = getattr(mat, 'alpha_threshold', 0.5)
+                    except AttributeError:
+                        pass
                 try:
                     alpha_ref = mat.alpha_threshold
                 except AttributeError:
