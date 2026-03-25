@@ -2927,7 +2927,7 @@ class _NodeVmCompiler:
     def _compile_principled(self, principled_node):
         """Compile a single Principled BSDF's inputs. VM is the SINGLE AUTHORITY."""
         # ── 1. Compile shared UV chain (from first texture with Mapping) ──
-        _SCAN_INPUTS = ('Base Color', 'Roughness', 'Metallic', 'Emission Color')
+        _SCAN_INPUTS = ('Base Color', 'Alpha', 'Roughness', 'Metallic', 'Emission Color')
         for input_name in _SCAN_INPUTS:
             inp = principled_node.inputs.get(input_name)
             if inp and inp.is_linked:
@@ -2962,7 +2962,13 @@ class _NodeVmCompiler:
             reg = self._compile_node(trans_inp)
             self._emit(_OP_OUTPUT_TRANSMISSION, srcA=reg)
 
-        # ── 6. Compile procedural bump (Bump node with procedural height input) ──
+        # ── 6. Alpha (only if linked — per-pixel alpha from texture) ──
+        alpha_inp = principled_node.inputs.get('Alpha')
+        if alpha_inp and alpha_inp.is_linked:
+            reg = self._compile_node(alpha_inp)
+            self._emit(_OP_OUTPUT_ALPHA, srcA=reg)
+
+        # ── 7. Compile procedural bump (Bump node with procedural height input) ──
         norm_inp = principled_node.inputs.get('Normal')
         if norm_inp and norm_inp.is_linked:
             norm_node = norm_inp.links[0].from_node
