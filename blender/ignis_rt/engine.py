@@ -1444,8 +1444,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         dll_wrapper.set_int("backface_culling", 1 if props.backface_culling else 0)
         dll_wrapper.set_int("restir_di", 1 if props.restir_di else 0)
         dll_wrapper.set_int("debug_view", props.debug_view)
-        dll_wrapper.set_int("auto_sky_colors", 1 if props.auto_sky_colors else 0)
-        if not props.auto_sky_colors:
+        # Force auto_sky_colors when sun comes from World Sky Texture
+        _force_auto_sky = sun.get("from_sky_texture", False)
+        dll_wrapper.set_int("auto_sky_colors", 1 if (props.auto_sky_colors or _force_auto_sky) else 0)
+        if not props.auto_sky_colors and not _force_auto_sky:
             dll_wrapper.set_float("ambient_intensity", props.ambient_intensity)
             dll_wrapper.set_float("ambient_color_r", props.ambient_color[0])
             dll_wrapper.set_float("ambient_color_g", props.ambient_color[1])

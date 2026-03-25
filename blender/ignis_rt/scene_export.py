@@ -879,18 +879,16 @@ def export_world_hdri(depsgraph):
 
 
 def export_sun(depsgraph):
-    """Find the first SUN light and extract direction/intensity.
+    """Extract sun direction/intensity from the scene.
 
-    Returns a dict with sun_elevation, sun_azimuth (degrees), sun_intensity.
-    Falls back to defaults if no sun light exists.
+    Priority:
+    1. Blender SUN light (explicit light object)
+    2. World Sky Texture (Nishita/Hosek) — uses Cycles' exact sun direction formula
+    3. Defaults (no sun)
+
+    Returns a dict with sun_elevation, sun_azimuth (degrees), sun_intensity, sun_color.
     """
-    defaults = {
-        "sun_elevation": 45.0,
-        "sun_azimuth": 180.0,
-        "sun_intensity": 0.0,
-        "sun_color": (1.0, 1.0, 1.0),
-    }
-
+    # --- 1. Try explicit SUN light ---
     for obj in depsgraph.objects:
         if obj.type != 'LIGHT':
             continue
@@ -898,31 +896,19 @@ def export_sun(depsgraph):
         if light.type != 'SUN':
             continue
 
-        # Sun position direction = +Z axis of the light's world matrix
-        # (light travels along -Z local; we want the direction TO the sun)
         mat = obj.matrix_world
         direction = mat.col[2].xyz.normalized()
 
         # Convert to Vulkan Y-up: Blender Z → Vulkan Y, Blender -Y → Vulkan Z
         dx = direction.x
-        dy = direction.z       # Blender Z → Vulkan Y
-        dz = -direction.y      # Blender -Y → Vulkan Z
+        dy = direction.z
+        dz = -direction.y
 
-        # Elevation = angle from horizon (XZ plane) toward Y
         elevation = math.degrees(math.asin(max(-1.0, min(1.0, dy))))
-        # Azimuth = angle around Y axis from +Z toward +X
         azimuth = math.degrees(math.atan2(dx, dz))
         if azimuth < 0:
             azimuth += 360.0
 
-        final_intensity = light.energy * math.pi
-
-        # Cycles sun: strength is irradiance (W/m²) applied as Li in the
-        # rendering equation.  Our Cook-Torrance diffuse = albedo/PI * Li * NdotL,
-        # so with Li=1 a white surface gives ~0.25.  Cycles produces the same
-        # math but its viewport "feels" brighter because Color Management exposure
-        # defaults differ.  Multiply by PI so energy=1 in Blender matches
-        # Cycles' perceived brightness (the PI cancels the BRDF's 1/PI).
         return {
             "sun_elevation": elevation,
             "sun_azimuth": azimuth,
@@ -930,7 +916,60 @@ def export_sun(depsgraph):
             "sun_color": (light.color[0], light.color[1], light.color[2]),
         }
 
-    return defaults
+    # --- 2. Try World Sky Texture (Nishita/Hosek) ---
+    scene = depsgraph.scene
+    world = scene.world
+    if world and world.use_nodes and world.node_tree:
+        sky_node = None
+        bg_strength = 1.0
+        for node in world.node_tree.nodes:
+            if node.type == 'TEX_SKY':
+                sky_node = node
+            elif node.type == 'BACKGROUND':
+                s_inp = node.inputs.get('Strength')
+                if s_inp:
+                    bg_strength = float(s_inp.default_value)
+
+        if sky_node:
+            # Cycles formula (from kernel/svm/sky.h + scene/shader_nodes.cpp):
+            # sun_dir = (-cos(e)*sin(r), cos(e)*cos(r), sin(e))  [Blender Z-up]
+            e = sky_node.sun_elevation  # radians
+            r = sky_node.sun_rotation   # radians
+
+            # Blender Z-up direction
+            bx = -math.cos(e) * math.sin(r)
+            by = math.cos(e) * math.cos(r)
+            bz = math.sin(e)
+
+            # Convert to Vulkan Y-up
+            dx = bx
+            dy = bz        # Blender Z → Vulkan Y
+            dz = -by       # Blender -Y → Vulkan Z
+
+            elevation = math.degrees(math.asin(max(-1.0, min(1.0, dy))))
+            azimuth = math.degrees(math.atan2(dx, dz))
+            if azimuth < 0:
+                azimuth += 360.0
+
+            # Sun intensity: Nishita produces physically-based radiance.
+            # Scale by background strength. PI factor for BRDF parity.
+            sun_intensity = 5.0 * bg_strength * math.pi
+
+            return {
+                "sun_elevation": elevation,
+                "sun_azimuth": azimuth,
+                "sun_intensity": sun_intensity,
+                "sun_color": (1.0, 0.98, 0.95),  # warm white for Nishita sun
+                "from_sky_texture": True,  # signal to force auto_sky_colors
+            }
+
+    # --- 3. Defaults (no sun) ---
+    return {
+        "sun_elevation": 45.0,
+        "sun_azimuth": 180.0,
+        "sun_intensity": 0.0,
+        "sun_color": (1.0, 1.0, 1.0),
+    }
 
 
 def _blackbody_to_rgb(temperature_k):
