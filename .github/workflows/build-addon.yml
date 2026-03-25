@@ -103,11 +103,15 @@ jobs:
           7z a -tzip ../ignis_rt_addon.zip ignis_rt/
 
       # ── Upload artifact (always — nightly or release) ──────────
+      # Upload staging/ so GitHub's artifact zip contains ignis_rt/ folder.
+      # Users download the artifact zip and install it directly in Blender
+      # (the zip already has the correct ignis_rt/ structure).
       - name: Upload addon zip
         uses: actions/upload-artifact@v4
         with:
           name: ignis-rt-blender-addon
-          path: ignis_rt_addon.zip
+          path: staging/
+          compression-level: 9
 
       # ── Attach zip to GitHub Release ───────────────────────────
       - name: Upload release asset
