@@ -158,6 +158,7 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
             ('3', "Balanced", "1.7x upscaling — balanced quality/performance"),
             ('4', "Quality", "1.5x upscaling — high quality (recommended)"),
             ('5', "Ultra Quality", "1.3x upscaling — may not be available on all GPUs"),
+            ('6', "DLAA", "Native resolution — no upscaling, AI anti-aliasing only"),
         ],
         default='4',
     )
