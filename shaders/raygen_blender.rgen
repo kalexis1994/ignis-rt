@@ -374,7 +374,8 @@ PBRHit evaluateBlenderMaterial(
     vec2 uv0, vec2 uv1, vec2 uv2,
     vec2 uv, vec3 rayDir,
     vec4 vertexColor,
-    uint instanceId
+    uint instanceId,
+    vec3 localPos
 ) {
     PBRHit hit;
     hit.worldPos = worldPos;
@@ -393,7 +394,7 @@ PBRHit evaluateBlenderMaterial(
     // When the VM has a program, it handles the ENTIRE material evaluation for
     // the properties it computes. The legacy pipeline only runs for properties
     // the VM doesn't override, preventing double-processing.
-    NodeVmResult vm = executeNodeVm(matIdx, uv, worldPos, rayDir, geoNormal, vertexColor, uint(instanceId));
+    NodeVmResult vm = executeNodeVm(matIdx, uv, worldPos, rayDir, geoNormal, vertexColor, uint(instanceId), localPos);
     bool vmActive = (mat.nodeVmHeader & 0xFFu) > 0u;
 
     // ── Material evaluation: VM is the single authority ──
@@ -741,12 +742,74 @@ void main() {
             }
         }
 
-        // Trace ray
+        // Trace ray — use non-opaque mode to handle alpha cutout INSIDE the
+        // proceed loop. This lets the ray pass through transparent decals and
+        // hit coplanar geometry behind them (no Z-fighting).
         rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT,
+        rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsNoneEXT,
                               0xFF, rayOrigin, MIN_HIT_DIST, rayDir, 10000.0);
 
-        while (rayQueryProceedEXT(rq)) {}
+        while (rayQueryProceedEXT(rq)) {
+            // For triangle candidates, check if this material needs alpha testing
+            if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                uint candCI = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false);
+                GeometryMetadata candGeo = geometryMetadata.geometries[candCI];
+                uint candMatIdx = 0u;
+                if (candGeo.primMaterialBufferAddress != 0u) {
+                    int candPrimId = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+                    PrimMaterials candPM = PrimMaterials(candGeo.primMaterialBufferAddress);
+                    candMatIdx = candPM.m[candPrimId];
+                }
+                Material candMat = materialBuffer.materials[candMatIdx];
+
+                // Check if this material has alpha testing enabled
+                if ((candMat.flags & 1u) != 0u) {
+                    // Sample texture alpha at hit point
+                    vec2 candBary2 = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+                    vec3 candBary = vec3(1.0 - candBary2.x - candBary2.y, candBary2.x, candBary2.y);
+                    // Read UVs
+                    UVs candUVData = UVs(candGeo.uvBufferAddress);
+                    Indices candIdx = Indices(candGeo.indexBufferAddress);
+                    int candPrimId2 = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+                    uint ci0 = candIdx.i[candPrimId2 * 3 + 0];
+                    uint ci1 = candIdx.i[candPrimId2 * 3 + 1];
+                    uint ci2 = candIdx.i[candPrimId2 * 3 + 2];
+                    vec2 cuv0 = vec2(candUVData.uv[ci0*2+0], 1.0 - candUVData.uv[ci0*2+1]);
+                    vec2 cuv1 = vec2(candUVData.uv[ci1*2+0], 1.0 - candUVData.uv[ci1*2+1]);
+                    vec2 cuv2 = vec2(candUVData.uv[ci2*2+0], 1.0 - candUVData.uv[ci2*2+1]);
+                    vec2 cuv = cuv0 * candBary.x + cuv1 * candBary.y + cuv2 * candBary.z;
+
+                    // Compute world + local position for VM noise evaluation
+                    float candT = rayQueryGetIntersectionTEXT(rq, false);
+                    vec3 candWP = rayOrigin + rayDir * candT;
+                    mat4x3 candObjToWorld = rayQueryGetIntersectionObjectToWorldEXT(rq, false);
+                    // Vertex positions for local pos interpolation
+                    Vertices candVerts = Vertices(candGeo.vertexBufferAddress);
+                    vec3 cp0 = vec3(candVerts.v[ci0*3+0], candVerts.v[ci0*3+1], candVerts.v[ci0*3+2]);
+                    vec3 cp1 = vec3(candVerts.v[ci1*3+0], candVerts.v[ci1*3+1], candVerts.v[ci1*3+2]);
+                    vec3 cp2 = vec3(candVerts.v[ci2*3+0], candVerts.v[ci2*3+1], candVerts.v[ci2*3+2]);
+                    vec3 candLocalPos = cp0 * candBary.x + cp1 * candBary.y + cp2 * candBary.z;
+
+                    // Alpha eval: run VM with correct positions
+                    float candAlpha = 1.0;
+                    uint candVmCount = candMat.nodeVmHeader & 0xFFu;
+                    if (candVmCount > 0u) {
+                        NodeVmResult candVm = executeNodeVm(candMatIdx, cuv, candWP, rayDir, vec3(0,1,0), vec4(0), 0u, candLocalPos);
+                        if (candVm.hasAlpha) candAlpha = candVm.alpha;
+                    } else if (candMat.diffuseTexIndex != 0xFFFFFFFFu) {
+                        // No VM — read texture alpha directly
+                        candAlpha = texture(textures[nonuniformEXT(candMat.diffuseTexIndex)], cuv).a;
+                    }
+                    // Stochastic alpha IN the proceed loop (Cycles-style).
+                    // Skip → traversal continues → finds coplanar wall behind.
+                    // No Z-fighting since we don't re-cast the ray.
+                    if (rand01() > candAlpha) continue;
+                }
+
+                // Opaque or alpha-passed: commit this intersection
+                rayQueryConfirmIntersectionEXT(rq);
+            }
+        }
 
         if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
             // Sky miss — notify SHARC for backpropagation
@@ -865,7 +928,7 @@ void main() {
         PBRHit pbrHit = evaluateBlenderMaterial(
             mat, matIdx, worldPos, worldN,
             wp0, wp1, wp2, uv0_, uv1_, uv2_, hitUV, rayDir,
-            hitVertexColor, uint(instanceId)
+            hitVertexColor, uint(instanceId), localPos
         );
 
         // ---- Volume-only material: ray march with Beer-Lambert + in-scattering ----
@@ -1045,15 +1108,8 @@ void main() {
             continue;
         }
 
-        // ---- Alpha cutout ----
-        if ((mat.flags & 1u) != 0u && pbrHit.alpha < mat.alphaRef) {
-            if (alphaSkips < MAX_ALPHA_SKIPS) {
-                alphaSkips++;
-                rayOrigin = worldPos + rayDir * 0.002;
-                bounce--;
-                continue;
-            }
-        }
+        // Alpha test is handled in the proceed loop (stochastic, coplanar-safe).
+        // If we reach here, the committed hit already passed the alpha test.
 
         // ---- Stochastic transparent passthrough (Cycles-style) ----
         // For materials with Transparent BSDF (tp > 0), use Fresnel to determine

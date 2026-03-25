@@ -102,6 +102,7 @@ const uint OP_LOAD_CONST     = 0x60u;  // R[dst] = vec4(imm_y, imm_z, imm_w, 1)
 const uint OP_LOAD_SCALAR    = 0x61u;  // R[dst].x = imm_y
 const uint OP_LOAD_WORLD_POS = 0x62u;  // R[dst] = vec4(worldPos, 1) — for position-based texturing
 const uint OP_LOAD_VIEW_DIR  = 0x63u;  // R[dst] = vec4(viewDir, 1) — camera-to-surface direction
+const uint OP_LOAD_LOCAL_POS = 0x66u;  // R[dst] = vec4(localPos, 1) — object-space position (TEX_COORD:Object)
 const uint OP_LAYER_WEIGHT   = 0x64u;  // R[dst].x = layer weight (Fresnel or Facing)
 const uint OP_FRESNEL        = 0x65u;  // R[dst].x = Fresnel(IOR, NdotV)
 
@@ -176,7 +177,7 @@ struct NodeVmResult {
 };
 
 // ── VM Execution ──
-NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 normal, vec4 vertexColor, uint instanceId) {
+NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 normal, vec4 vertexColor, uint instanceId, vec3 localPos) {
     NodeVmResult result;
     result.baseColor = vec3(0.8);
     result.roughness = 0.5;
@@ -679,6 +680,9 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, ve
         }
         else if (opcode == OP_LOAD_WORLD_POS) {
             R[dst] = vec4(worldPos, 1.0);
+        }
+        else if (opcode == OP_LOAD_LOCAL_POS) {
+            R[dst] = vec4(localPos, 1.0);
         }
         else if (opcode == OP_LOAD_VIEW_DIR) {
             R[dst] = vec4(viewDir, 1.0);

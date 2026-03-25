@@ -7,40 +7,39 @@
 #define NOISE_GLSL
 
 // ============================================================
-// Integer hash — murmurhash3-like mixing for 3D cell coordinates
+// Integer hash — Jenkins Lookup3 (exact Cycles match)
+// Source: intern/cycles/util/hash.h, hash_uint3()
+// License: Apache 2.0 (Blender Foundation)
 // ============================================================
 
 uint hash3(uvec3 k) {
-    k *= uvec3(0xcc9e2d51u, 0x1b873593u, 0x85ebca6bu);
-    k ^= k >> 16u;
-    k *= uvec3(0x85ebca6bu, 0xc2b2ae35u, 0xcc9e2d51u);
-    return k.x ^ k.y ^ k.z;
+    // Jenkins Lookup3 "final" mixing
+    uint a = 0xdeadbf0eu + k.x;  // 0xdeadbeef + (3 << 2) + 13
+    uint b = 0xdeadbf0eu + k.y;
+    uint c = 0xdeadbf0eu + k.z;
+
+    c ^= b; c -= (b << 14u) | (b >> 18u);
+    a ^= c; a -= (c << 11u) | (c >> 21u);
+    b ^= a; b -= (a << 25u) | (a >> 7u);
+    c ^= b; c -= (b << 16u) | (b >> 16u);
+    a ^= c; a -= (c << 4u)  | (c >> 28u);
+    b ^= a; b -= (a << 14u) | (a >> 18u);
+    c ^= b; c -= (b << 24u) | (b >> 8u);
+
+    return c;
 }
 
 // ============================================================
-// Gradient dot — 12 classic Perlin gradient directions
+// Gradient dot — Perlin improved noise (exact Cycles grad3)
+// Source: intern/cycles/kernel/svm/noise.h, grad3()
 // ============================================================
 
 float gradientDot3(uint hash, float x, float y, float z) {
-    switch (hash & 0xFu) {
-        case  0u: return  x + y;
-        case  1u: return -x + y;
-        case  2u: return  x - y;
-        case  3u: return -x - y;
-        case  4u: return  x + z;
-        case  5u: return -x + z;
-        case  6u: return  x - z;
-        case  7u: return -x - z;
-        case  8u: return  y + z;
-        case  9u: return -y + z;
-        case 10u: return  y - z;
-        case 11u: return -y - z;
-        // Repeat first four to fill 16-entry table (Perlin's trick)
-        case 12u: return  x + y;
-        case 13u: return -x + y;
-        case 14u: return  x - y;
-        default:  return -x - y;
-    }
+    uint h = hash & 15u;
+    float u = h < 8u ? x : y;
+    float vt = (h == 12u || h == 14u) ? x : z;
+    float v = h < 4u ? y : vt;
+    return ((h & 1u) != 0u ? -u : u) + ((h & 2u) != 0u ? -v : v);
 }
 
 // ============================================================

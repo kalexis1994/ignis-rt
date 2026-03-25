@@ -2012,10 +2012,10 @@ class _NodeVmCompiler:
             uv_reg = 0
             if vec_inp and vec_inp.is_linked:
                 uv_reg = self._compile_uv_chain(vec_inp, _depth + 1)
-            elif not vec_inp or not vec_inp.is_linked:
-                # Use world position for 3D noise if no vector input
+            else:
+                # Default: Generated coordinates (object-local position)
                 uv_reg = self._alloc_reg()
-                self._emit(_OP_LOAD_WORLD_POS, uv_reg)
+                self._emit(0x66, uv_reg)  # OP_LOAD_LOCAL_POS
 
             scale_inp = from_node.inputs.get('Scale')
             scale = float(scale_inp.default_value) if scale_inp and not scale_inp.is_linked else 5.0
@@ -2037,7 +2037,7 @@ class _NodeVmCompiler:
                 uv_reg = self._compile_uv_chain(vec_inp, _depth + 1)
             else:
                 uv_reg = self._alloc_reg()
-                self._emit(_OP_LOAD_WORLD_POS, uv_reg)
+                self._emit(0x66, uv_reg)  # OP_LOAD_LOCAL_POS (Generated coords)
 
             grad_type_map = {'LINEAR': 0, 'QUADRATIC': 1, 'EASING': 0, 'DIAGONAL': 0,
                              'RADIAL': 2, 'QUADRATIC_SPHERE': 3, 'SPHERICAL': 3}
@@ -2055,7 +2055,7 @@ class _NodeVmCompiler:
                 uv_reg = self._compile_uv_chain(vec_inp, _depth + 1)
             else:
                 uv_reg = self._alloc_reg()
-                self._emit(_OP_LOAD_WORLD_POS, uv_reg)
+                self._emit(0x66, uv_reg)  # OP_LOAD_LOCAL_POS (Generated coords)
 
             scale_inp = from_node.inputs.get('Scale')
             scale = float(scale_inp.default_value) if scale_inp and not scale_inp.is_linked else 5.0
@@ -2072,7 +2072,7 @@ class _NodeVmCompiler:
                 uv_reg = self._compile_uv_chain(vec_inp, _depth + 1)
             else:
                 uv_reg = self._alloc_reg()
-                self._emit(_OP_LOAD_WORLD_POS, uv_reg)
+                self._emit(0x66, uv_reg)  # OP_LOAD_LOCAL_POS (Generated coords)
 
             scale_inp = from_node.inputs.get('Scale')
             scale = float(scale_inp.default_value) if scale_inp and not scale_inp.is_linked else 5.0
@@ -2093,7 +2093,7 @@ class _NodeVmCompiler:
                 uv_reg = self._compile_uv_chain(vec_inp, _depth + 1)
             else:
                 uv_reg = self._alloc_reg()
-                self._emit(_OP_LOAD_WORLD_POS, uv_reg)
+                self._emit(0x66, uv_reg)  # OP_LOAD_LOCAL_POS (Generated coords)
             self._emit(_OP_TEX_WHITE_NOISE, dst, srcA=uv_reg)
             self.node_reg_cache[node_id] = dst
             return dst
@@ -2165,7 +2165,7 @@ class _NodeVmCompiler:
                 uv_reg = self._compile_uv_chain(vec_inp, _depth + 1)
             else:
                 uv_reg = self._alloc_reg()
-                self._emit(_OP_LOAD_WORLD_POS, uv_reg)
+                self._emit(0x66, uv_reg)  # OP_LOAD_LOCAL_POS (Generated coords)
 
             scale_inp = from_node.inputs.get('Scale')
             scale = float(scale_inp.default_value) if scale_inp and not scale_inp.is_linked else 5.0
@@ -2185,7 +2185,7 @@ class _NodeVmCompiler:
                 uv_reg = self._compile_uv_chain(vec_inp, _depth + 1)
             else:
                 uv_reg = self._alloc_reg()
-                self._emit(_OP_LOAD_WORLD_POS, uv_reg)
+                self._emit(0x66, uv_reg)  # OP_LOAD_LOCAL_POS (Generated coords)
 
             scale_inp = from_node.inputs.get('Scale')
             scale = float(scale_inp.default_value) if scale_inp and not scale_inp.is_linked else 5.0
@@ -2205,7 +2205,7 @@ class _NodeVmCompiler:
                 uv_reg = self._compile_uv_chain(vec_inp, _depth + 1)
             else:
                 uv_reg = self._alloc_reg()
-                self._emit(_OP_LOAD_WORLD_POS, uv_reg)
+                self._emit(0x66, uv_reg)  # OP_LOAD_LOCAL_POS (Generated coords)
             scale_inp = from_node.inputs.get('Scale')
             scale = float(scale_inp.default_value) if scale_inp and not scale_inp.is_linked else 5.0
             detail_inp = from_node.inputs.get('Detail')
@@ -2272,6 +2272,15 @@ class _NodeVmCompiler:
                 self.node_reg_cache[node_id] = result
                 return result
 
+        # ── UV/Vector nodes: delegate to _compile_uv_chain ──
+        # These nodes produce 3D positions, not colors. When encountered in
+        # _compile_node (e.g., Mapping→TEX_COORD used as color input via MIX),
+        # delegate to the UV chain compiler which handles them correctly.
+        if from_node.type in ('MAPPING', 'TEX_COORD'):
+            result = self._compile_uv_chain(socket, _depth)
+            self.node_reg_cache[node_id] = result
+            return result
+
         # ── Fallback: try to follow first linked color input ──
         for inp in from_node.inputs:
             if inp.is_linked and inp.type in ('RGBA', 'VALUE', 'VECTOR', 'CUSTOM'):
@@ -2305,21 +2314,64 @@ class _NodeVmCompiler:
             rot_v = rot.default_value if rot else (0, 0, 0)
             scale_v = scale.default_value if scale else (1, 1, 1)
 
-            # Cycles Mapping types:
-            # POINT:   result = Rotation * (UV * Scale) + Location
-            # TEXTURE: result = Rotation^T * (UV - Location) / Scale
-            # VECTOR:  result = Rotation * (UV * Scale)
-            # NORMAL:  result = normalize(Rotation * (UV / Scale))
+            # Check if Location is linked (e.g., Object Info:Location)
+            loc_linked = loc and loc.is_linked
+
+            # Detect 3D mapping (non-trivial Z scale/location, or 3D source like Object coords)
+            is_3d = (abs(scale_v[2] - 1.0) > 0.001 or abs(loc_v[2]) > 0.001
+                     or abs(scale_v[0] - scale_v[1]) < 0.001 and abs(scale_v[0] - scale_v[2]) < 0.001
+                     and abs(scale_v[0] - 1.0) > 0.001)
+
             mapping_type = getattr(from_node, 'vector_type', 'POINT')
+
+            if is_3d:
+                # 3D Mapping: result = pos * scale + location (full 3D vector math)
+                if mapping_type == 'TEXTURE':
+                    s = (1.0/scale_v[0] if abs(scale_v[0])>1e-6 else 1.0,
+                         1.0/scale_v[1] if abs(scale_v[1])>1e-6 else 1.0,
+                         1.0/scale_v[2] if abs(scale_v[2])>1e-6 else 1.0)
+                    l = (-loc_v[0], -loc_v[1], -loc_v[2])
+                else:
+                    s = (scale_v[0], scale_v[1], scale_v[2])
+                    l = (loc_v[0], loc_v[1], loc_v[2])
+
+                has_scale = abs(s[0]-1)>0.001 or abs(s[1]-1)>0.001 or abs(s[2]-1)>0.001
+                has_loc = abs(l[0])>0.001 or abs(l[1])>0.001 or abs(l[2])>0.001
+
+                if not has_scale and not has_loc and not loc_linked:
+                    return uv_reg
+
+                result_reg = uv_reg
+                if has_scale:
+                    scale_reg = self._alloc_reg()
+                    self._emit(_OP_LOAD_CONST, scale_reg,
+                               imm_y=_floatBits(s[0]), imm_z=_floatBits(s[1]), imm_w=_floatBits(s[2]))
+                    dst = self._alloc_reg()
+                    self._emit(_OP_MULTIPLY, dst, srcA=result_reg, srcB=scale_reg)
+                    result_reg = dst
+                if has_loc:
+                    loc_reg = self._alloc_reg()
+                    self._emit(_OP_LOAD_CONST, loc_reg,
+                               imm_y=_floatBits(l[0]), imm_z=_floatBits(l[1]), imm_w=_floatBits(l[2]))
+                    dst = self._alloc_reg()
+                    self._emit(_OP_ADD, dst, srcA=result_reg, srcB=loc_reg)
+                    result_reg = dst
+                if loc_linked:
+                    # Location linked to Object Info:Location or similar
+                    loc_reg = self._compile_node(loc, _depth + 1)
+                    dst = self._alloc_reg()
+                    self._emit(_OP_ADD, dst, srcA=result_reg, srcB=loc_reg)
+                    result_reg = dst
+                return result_reg
+
+            # 2D UV Mapping (standard UV transforms)
             if mapping_type == 'TEXTURE':
-                # TEXTURE mode: divide by scale, subtract location, inverse rotation
                 eff_scale_x = 1.0 / scale_v[0] if abs(scale_v[0]) > 1e-6 else 1.0
                 eff_scale_y = 1.0 / scale_v[1] if abs(scale_v[1]) > 1e-6 else 1.0
                 eff_loc_x = -loc_v[0]
                 eff_loc_y = -loc_v[1]
-                eff_rot = -rot_v[2]  # inverse rotation
+                eff_rot = -rot_v[2]
             else:
-                # POINT mode: result = Rotation * (UV * Scale) + Location
                 eff_scale_x = scale_v[0]
                 eff_scale_y = scale_v[1]
                 eff_loc_x = loc_v[0]
@@ -2329,14 +2381,13 @@ class _NodeVmCompiler:
             has_scale = abs(eff_scale_x - 1.0) > 0.001 or abs(eff_scale_y - 1.0) > 0.001
             has_loc = abs(eff_loc_x) > 0.001 or abs(eff_loc_y) > 0.001
             has_rot = abs(eff_rot) > 0.001
-            has_any = has_scale or has_loc or has_rot
+            has_any = has_scale or has_loc or has_rot or loc_linked
 
             if not has_any:
                 return uv_reg
 
             dst = self._alloc_reg()
 
-            # Step 1: UV_TRANSFORM — undo V-flip, apply scale+offset → Blender space
             if has_scale or has_loc or has_rot:
                 self._emit(_OP_UV_TRANSFORM, dst, srcA=uv_reg,
                            imm_y=_floatBits(eff_scale_x),
@@ -2344,19 +2395,28 @@ class _NodeVmCompiler:
                            imm_w=_floatBits(eff_loc_x))
                 uv_reg = dst
 
-            # Step 2: UV_ROTATE
             if has_rot:
                 rot_dst = self._alloc_reg()
                 self._emit(_OP_UV_ROTATE, rot_dst, srcA=uv_reg,
                            imm_y=_floatBits(eff_rot))
-                return rot_dst
+                uv_reg = rot_dst
+
+            if loc_linked:
+                loc_reg = self._compile_node(loc, _depth + 1)
+                add_dst = self._alloc_reg()
+                self._emit(_OP_ADD, add_dst, srcA=uv_reg, srcB=loc_reg)
+                return add_dst
 
             return uv_reg
 
         if from_node.type == 'TEX_COORD':
             # Check which output is connected (UV, Object, Generated, etc.)
             out_name = socket.links[0].from_socket.name if socket.is_linked else 'UV'
-            if out_name in ('Object', 'Generated', 'Camera', 'Window'):
+            if out_name == 'Object':
+                dst = self._alloc_reg()
+                self._emit(0x66, dst)  # OP_LOAD_LOCAL_POS — object-space position
+                return dst
+            if out_name in ('Generated', 'Camera', 'Window'):
                 dst = self._alloc_reg()
                 self._emit(_OP_LOAD_WORLD_POS, dst)
                 return dst
@@ -2467,7 +2527,8 @@ class _NodeVmCompiler:
                 self._group_context = old_ctx
                 return result
 
-        return 0
+        # Fallback: compile as a regular node (handles MIX, Noise, etc. used as Vector)
+        return self._compile_node(socket, _depth)
 
     def _compile_scalar_input(self, socket, default=0.5, _depth=0):
         """Compile a scalar socket (Roughness, Metallic, etc.)."""
