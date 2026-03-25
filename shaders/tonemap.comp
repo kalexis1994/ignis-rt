@@ -8,7 +8,7 @@ layout(binding = 1, set = 0) writeonly uniform image2D ldrOutput; // Interop (RG
 layout(binding = 2, set = 0) uniform sampler3D agxLut;           // AgX 3D LUT (57³, from Blender OCIO)
 
 layout(push_constant) uniform TonemapParams {
-    uint tonemapMode;   // 0=AgX, 1=ACES, 2=Reinhard, 3=Hable, 4=Neutral
+    uint tonemapMode;   // 0=AgX, 1=ACES, 2=Reinhard, 3=Hable, 4=Neutral, 5=Filmic LUT
     float exposure;
     float saturation;
     float contrast;
@@ -47,6 +47,18 @@ vec3 agxTonemap(vec3 color) {
     color = clamp(log2(color), -12.47393, 12.52607);
     color = (color - (-12.47393)) / (12.52607 - (-12.47393));
     // Sample 3D LUT — output is display-ready (gamma encoded, no further transform needed)
+    color = texture(agxLut, color).rgb;
+    return clamp(color, 0.0, 1.0);
+}
+
+// 5: Filmic — uses Blender's EXACT Filmic LUT (baked from OCIO pipeline)
+// NO AgXInsetMatrix — Filmic has its own log encoding baked into the LUT
+vec3 filmicLutTonemap(vec3 color) {
+    color = max(color, vec3(1e-10));
+    // Log2 encode with same OCIO AllocationTransform range as Filmic uses
+    color = clamp(log2(color), -12.47393, 12.52607);
+    color = (color - (-12.47393)) / (12.52607 - (-12.47393));
+    // Sample 3D LUT — output is display-ready (gamma encoded)
     color = texture(agxLut, color).rgb;
     return clamp(color, 0.0, 1.0);
 }
@@ -96,6 +108,7 @@ vec3 applyTonemap(vec3 hdr, uint mode) {
     if (mode == 2u) return reinhardTonemap(hdr);
     if (mode == 3u) return hableTonemap(hdr);
     if (mode == 4u) return neutralTonemap(hdr);
+    if (mode == 5u) return filmicLutTonemap(hdr);
     return agxTonemap(hdr);
 }
 
@@ -112,9 +125,9 @@ void main() {
     vec3 ldr = applyTonemap(hdr, push.tonemapMode);
     float luma = dot(ldr, vec3(0.2126, 0.7152, 0.0722));
     ldr = clamp(mix(vec3(luma), ldr, push.saturation), 0.0, 1.0);
-    // AgX LUT output is already display-ready (gamma encoded) — skip pow(1/2.2)
+    // LUT-based tonemaps (AgX=0, Filmic=5) output display-ready (gamma encoded)
     // Other tonemaps (ACES, Reinhard, etc.) output linear — need gamma encode
-    if (push.tonemapMode != 0u) {
+    if (push.tonemapMode != 0u && push.tonemapMode != 5u) {
         ldr = pow(ldr, vec3(1.0 / 2.2));
     }
 

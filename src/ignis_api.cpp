@@ -607,6 +607,7 @@ IGNIS_API void ignis_set_int(const char* key, int value) {
     if (!key) return;
 
     if      (strcmp(key, "tonemap_mode") == 0)     cfg->ptTonemapMode = value;
+    else if (strcmp(key, "tonemap_lut") == 0)       cfg->tonemapLutId = value;
     else if (strcmp(key, "debug_view") == 0)        cfg->debugView = value;
     else if (strcmp(key, "auto_exposure") == 0)     cfg->ptAutoExposure = (value != 0);
     else if (strcmp(key, "auto_sky_colors") == 0)   cfg->autoSkyColors = (value != 0);

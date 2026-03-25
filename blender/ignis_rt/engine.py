@@ -428,6 +428,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 dll_wrapper.set_int("shader_mode", 1)
                 dll_wrapper.set_int("dlss_enabled", 1)
                 dll_wrapper.set_int("dlss_rr_enabled", 1)
+                # Set tonemap LUT before renderer init (LUT loads during create())
+                _vt = bpy.context.scene.view_settings.view_transform
+                _lut_map = {'AgX': 0, 'Filmic': 1}
+                dll_wrapper.set_int("tonemap_lut", _lut_map.get(_vt, 0))
                 try:
                     props = bpy.context.scene.ignis_rt
                     dll_wrapper.set_int("dlss_quality", int(props.dlss_quality))
@@ -1463,10 +1467,33 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         except Exception:
             pass
 
-        dll_wrapper.set_float("exposure", props.exposure)
-        dll_wrapper.set_int("tonemap_mode", props.tonemap_mode)
+        # Read exposure and tonemap from Blender's Color Management settings
+        import math as _math
+        _vs = context.scene.view_settings
+        _blender_exposure = 2.0 ** _vs.exposure  # Blender uses EV stops → multiplier
+        # Map Blender view_transform to our tonemap modes
+        _vt = _vs.view_transform
+        # AgX uses mode 0 (with AgXInsetMatrix), Filmic uses mode 5 (no inset matrix).
+        # Both sample the 3D LUT at binding 2 — the correct LUT was loaded at init.
+        _tonemap_map = {
+            'AgX': 0, 'Filmic': 5, 'Standard': 4, 'Raw': 4,
+            'Khronos PBR Neutral': 4, 'False Color': 0,
+        }
+        _tonemap_mode = _tonemap_map.get(_vt, 0)
+        # Read "look" for contrast
+        _look = _vs.look
+        _look_contrast = 0.0
+        if 'High Contrast' in _look: _look_contrast = 0.4
+        elif 'Medium High' in _look: _look_contrast = 0.3
+        elif 'Medium Contrast' in _look: _look_contrast = 0.2
+        elif 'Medium Low' in _look: _look_contrast = 0.1
+        elif 'Low Contrast' in _look: _look_contrast = 0.0
+        elif 'Very High' in _look: _look_contrast = 0.5
+
+        dll_wrapper.set_float("exposure", _blender_exposure)
+        dll_wrapper.set_int("tonemap_mode", _tonemap_mode)
         dll_wrapper.set_float("saturation", props.saturation)
-        dll_wrapper.set_float("contrast", props.contrast)
+        dll_wrapper.set_float("contrast", _look_contrast)
 
         # Camera
         try:

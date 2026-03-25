@@ -8,7 +8,8 @@ namespace acpt {
 struct PathTracerConfig {
     // Exposure & tonemap
     float ptExposure         = 0.55f;
-    int   ptTonemapMode      = 0;       // 0=ACES, 1=Reinhard, 2=Filmic, etc.
+    int   ptTonemapMode      = 0;       // 0=AgX, 1=ACES, 2=Reinhard, 3=Hable, 4=Neutral
+    int   tonemapLutId       = 0;       // 0=AgX LUT, 1=Filmic LUT
     float ptSaturation       = 1.0f;
     float ptContrast         = 1.0f;
 

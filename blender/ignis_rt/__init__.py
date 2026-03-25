@@ -193,22 +193,10 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         update=_tag_redraw,
     )
 
-    # -- Tonemap --
-    exposure: FloatProperty(
-        name="Exposure", default=1.0, min=0.01, max=20.0, step=10,
-        update=_tag_redraw,
-    )
-    tonemap_mode: IntProperty(
-        name="Tonemap", default=0, min=0, max=4,
-        description="0=AgX, 1=ACES, 2=Reinhard, 3=Hable, 4=Neutral",
-        update=_tag_redraw,
-    )
+    # -- Color --
+    # (Exposure, tonemap, contrast now come from Blender Color Management)
     saturation: FloatProperty(
         name="Saturation", default=1.0, min=0.0, max=3.0, step=10,
-        update=_tag_redraw,
-    )
-    contrast: FloatProperty(
-        name="Contrast", default=1.0, min=0.0, max=3.0, step=10,
         update=_tag_redraw,
     )
 
@@ -293,10 +281,7 @@ class IGNIS_PT_color(bpy.types.Panel):
         props = context.scene.ignis_rt
         layout.use_property_split = True
         layout.use_property_decorate = False
-        layout.prop(props, "exposure")
-        layout.prop(props, "tonemap_mode")
         layout.prop(props, "saturation")
-        layout.prop(props, "contrast")
 
 
 class IGNIS_PT_performance(bpy.types.Panel):
@@ -400,13 +385,27 @@ def register():
     for panel in _get_compatible_panels():
         panel.COMPAT_ENGINES.add('IGNIS_RT')
 
-    # Clean up: remove IGNIS_RT from any render-context panel that isn't ours
+    # Explicitly add IGNIS_RT to Color Management panels (render context)
+    # so users can control exposure, view transform, and look from Blender's UI
+    for panel in bpy.types.Panel.__subclasses__():
+        if panel.__name__.startswith('RENDER_PT_color_management'):
+            compat = getattr(panel, 'COMPAT_ENGINES', None)
+            if compat is not None:
+                compat.add('IGNIS_RT')
+
+    # Clean up: remove IGNIS_RT from render-context panels that aren't ours,
+    # EXCEPT Blender's Color Management panel (we read exposure/tonemap from it)
     _own_panels = {
         'IGNIS_PT_sampling', 'IGNIS_PT_dlss', 'IGNIS_PT_color',
         'IGNIS_PT_performance', 'IGNIS_PT_advanced',
     }
+    _keep_panels = {
+        'RENDER_PT_color_management', 'RENDER_PT_color_management_curves',
+    }
     for panel in bpy.types.Panel.__subclasses__():
         if getattr(panel, 'bl_context', '') == 'render' and panel.__name__ not in _own_panels:
+            if panel.__name__ in _keep_panels:
+                continue  # keep Color Management visible
             compat = getattr(panel, 'COMPAT_ENGINES', None)
             if compat and 'IGNIS_RT' in compat:
                 compat.discard('IGNIS_RT')

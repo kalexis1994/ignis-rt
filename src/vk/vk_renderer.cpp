@@ -34,6 +34,8 @@ void ImGui_Render(VkCommandBuffer cmd);
 void ImGui_Shutdown();
 bool ImGui_WantCaptureMouse();
 
+namespace acpt { extern PathTracerConfig g_config; }
+
 namespace acpt {
 namespace vk {
 
@@ -2042,8 +2044,16 @@ void Renderer::ShutdownExposureResolve() {
 }
 
 bool Renderer::LoadAgXLut() {
-    // Parse AgX_Base_sRGB.cube and upload as 3D texture
-    std::string lutPath = IgnisResolvePath("shaders/AgX_Base_sRGB.cube");
+    // Load tonemap 3D LUT (.cube) based on Blender's view_transform.
+    // The LUT is set via ignis_set_int("tonemap_lut", id) before create():
+    //   0 = AgX (default), 1 = Filmic
+    const char* lutFiles[] = {
+        "shaders/AgX_Base_sRGB.cube",
+        "shaders/Filmic_Base_sRGB.cube",
+    };
+    int lutId = acpt::g_config.tonemapLutId;
+    if (lutId < 0 || lutId > 1) lutId = 0;
+    std::string lutPath = IgnisResolvePath(lutFiles[lutId]);
     std::ifstream lutFile(lutPath);
     if (!lutFile.is_open()) {
         Log(L"[VK Renderer] WARNING: AgX LUT not found at %S\n", lutPath.c_str());
