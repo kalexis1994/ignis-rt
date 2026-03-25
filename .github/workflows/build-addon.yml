@@ -27,10 +27,10 @@ jobs:
           echo "C:\VulkanSDK\$ver\Bin" >> $env:GITHUB_PATH
 
       # ── DLSS SDK (headers + lib + runtime DLLs) ────────────────
-      - name: Clone DLSS SDK
+      - name: Clone DLSS SDK (v310.5.3 — DLSS 4 Super Resolution + Ray Reconstruction)
         shell: bash
         run: |
-          git clone --depth 1 https://github.com/NVIDIA/DLSS.git vendor/DLSS
+          git clone --depth 1 --branch v310.5.3 https://github.com/NVIDIA/DLSS.git vendor/DLSS
           ls vendor/DLSS/include/
           ls vendor/DLSS/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib
           ls -lh vendor/DLSS/lib/Windows_x86_64/rel/
