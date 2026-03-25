@@ -117,43 +117,7 @@ def _tag_redraw(self, context):
 class IgnisRTSceneProperties(bpy.types.PropertyGroup):
     """Scene-level settings shown in Render properties."""
 
-    # -- Sky / Lighting --
-    auto_sky_colors: BoolProperty(
-        name="Auto Sky Colors",
-        description="Compute sun/ambient colors automatically from sun elevation",
-        default=False, update=_tag_redraw,
-    )
-    sun_intensity: FloatProperty(
-        name="Sun Intensity", default=1.29, min=0.0, max=20.0, step=10,
-        update=_tag_redraw,
-    )
-    sun_color: FloatVectorProperty(
-        name="Sun Color", subtype='COLOR', size=3, min=0.0, max=1.0,
-        default=(1.0, 0.95, 0.9), update=_tag_redraw,
-    )
-    ambient_intensity: FloatProperty(
-        name="Ambient Intensity", default=0.5, min=0.0, max=5.0, step=10,
-        update=_tag_redraw,
-    )
-    ambient_color: FloatVectorProperty(
-        name="Ambient Color", subtype='COLOR', size=3, min=0.0, max=1.0,
-        default=(0.5, 0.6, 0.8), update=_tag_redraw,
-    )
-    sky_refl_intensity: FloatProperty(
-        name="Sky Reflection", default=0.5, min=0.0, max=5.0, step=10,
-        description="Intensity of sky reflections on surfaces",
-        update=_tag_redraw,
-    )
-    sky_bounce_intensity: FloatProperty(
-        name="Sky Bounce", default=0.25, min=0.0, max=2.0, step=10,
-        description="Intensity of sky indirect lighting on bounce hits",
-        update=_tag_redraw,
-    )
-    cloud_visibility: FloatProperty(
-        name="Visibility (km)", default=50.0, min=0.1, max=200.0, step=100,
-        description="Atmospheric visibility / fog distance (Koschmieder)",
-        update=_tag_redraw,
-    )
+    # (Sky & Lighting removed — sun/ambient/sky now come from Blender World settings)
 
     # -- Quality --
     max_bounces: IntProperty(
@@ -312,39 +276,6 @@ class IGNIS_PT_dlss(bpy.types.Panel):
         layout.prop(props, "dlss_quality")
 
 
-class IGNIS_PT_sky(bpy.types.Panel):
-    bl_label = "Sky & Lighting"
-    bl_idname = "IGNIS_PT_sky"
-    bl_space_type = 'PROPERTIES'
-    bl_region_type = 'WINDOW'
-    bl_context = "render"
-    COMPAT_ENGINES = {'IGNIS_RT'}
-
-    @classmethod
-    def poll(cls, context):
-        return context.engine in cls.COMPAT_ENGINES
-
-    def draw(self, context):
-        layout = self.layout
-        props = context.scene.ignis_rt
-        layout.use_property_split = True
-        layout.use_property_decorate = False
-
-        layout.prop(props, "auto_sky_colors")
-
-        col = layout.column()
-        col.active = not props.auto_sky_colors
-        col.prop(props, "sun_color")
-        col.prop(props, "sun_intensity")
-        col.prop(props, "ambient_color")
-        col.prop(props, "ambient_intensity")
-
-        layout.separator()
-        layout.prop(props, "sky_refl_intensity")
-        layout.prop(props, "sky_bounce_intensity")
-        layout.prop(props, "cloud_visibility")
-
-
 class IGNIS_PT_color(bpy.types.Panel):
     bl_label = "Color"
     bl_idname = "IGNIS_PT_color"
@@ -459,7 +390,6 @@ def register():
     bpy.utils.register_class(IGNIS_OT_reload_scene)
     bpy.utils.register_class(IGNIS_PT_sampling)
     bpy.utils.register_class(IGNIS_PT_dlss)
-    bpy.utils.register_class(IGNIS_PT_sky)
     bpy.utils.register_class(IGNIS_PT_color)
     bpy.utils.register_class(IGNIS_PT_performance)
     bpy.utils.register_class(IGNIS_PT_advanced)
@@ -472,7 +402,7 @@ def register():
 
     # Clean up: remove IGNIS_RT from any render-context panel that isn't ours
     _own_panels = {
-        'IGNIS_PT_sampling', 'IGNIS_PT_dlss', 'IGNIS_PT_sky', 'IGNIS_PT_color',
+        'IGNIS_PT_sampling', 'IGNIS_PT_dlss', 'IGNIS_PT_color',
         'IGNIS_PT_performance', 'IGNIS_PT_advanced',
     }
     for panel in bpy.types.Panel.__subclasses__():
@@ -495,7 +425,6 @@ def unregister():
     bpy.utils.unregister_class(IGNIS_PT_advanced)
     bpy.utils.unregister_class(IGNIS_PT_performance)
     bpy.utils.unregister_class(IGNIS_PT_color)
-    bpy.utils.unregister_class(IGNIS_PT_sky)
     bpy.utils.unregister_class(IGNIS_PT_dlss)
     bpy.utils.unregister_class(IGNIS_PT_sampling)
     bpy.utils.unregister_class(IGNIS_OT_reload_scene)

@@ -1444,14 +1444,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         dll_wrapper.set_int("backface_culling", 1 if props.backface_culling else 0)
         dll_wrapper.set_int("restir_di", 1 if props.restir_di else 0)
         dll_wrapper.set_int("debug_view", props.debug_view)
-        # Force auto_sky_colors when sun comes from World Sky Texture
-        _force_auto_sky = sun.get("from_sky_texture", False)
-        dll_wrapper.set_int("auto_sky_colors", 1 if (props.auto_sky_colors or _force_auto_sky) else 0)
-        if not props.auto_sky_colors and not _force_auto_sky:
-            dll_wrapper.set_float("ambient_intensity", props.ambient_intensity)
-            dll_wrapper.set_float("ambient_color_r", props.ambient_color[0])
-            dll_wrapper.set_float("ambient_color_g", props.ambient_color[1])
-            dll_wrapper.set_float("ambient_color_b", props.ambient_color[2])
+        # Auto sky colors always on — sun/ambient come from World settings
+        dll_wrapper.set_int("auto_sky_colors", 1)
         # Sync World background color (from Surface → Background node)
         try:
             world = context.scene.world
@@ -1469,9 +1463,6 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         except Exception:
             pass
 
-        dll_wrapper.set_float("sky_refl_intensity", props.sky_refl_intensity)
-        dll_wrapper.set_float("sky_bounce_intensity", props.sky_bounce_intensity)
-        dll_wrapper.set_float("cloud_visibility", props.cloud_visibility)
         dll_wrapper.set_float("exposure", props.exposure)
         dll_wrapper.set_int("tonemap_mode", props.tonemap_mode)
         dll_wrapper.set_float("saturation", props.saturation)
