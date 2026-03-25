@@ -70,6 +70,64 @@ def _log_close():
         _log_file = None
 
 
+def _bake_view_transform_lut(view_transform_name):
+    """Bake ANY Blender view transform into a .cube LUT file using OCIO.
+
+    Reads the active display device (sRGB, Display P3, etc.) and view transform
+    (AgX, Filmic, Standard, etc.) from Blender's Color Management, and bakes
+    the full OCIO pipeline into a 33³ 3D LUT at a known path.
+    """
+    import PyOpenColorIO as ocio
+    import os
+    config = ocio.GetCurrentConfig()
+
+    display = bpy.context.scene.display_settings.display_device
+    _log(f"Baking LUT: view='{view_transform_name}' display='{display}'")
+
+    try:
+        transform = ocio.DisplayViewTransform()
+        transform.setSrc(ocio.ROLE_SCENE_LINEAR)
+        transform.setDisplay(display)
+        transform.setView(view_transform_name)
+        processor = config.getProcessor(transform)
+        cpu = processor.getDefaultCPUProcessor()
+    except Exception as e:
+        _log(f"OCIO processor failed: {e}")
+        raise
+
+    LUT_SIZE = 33
+    LOG_MIN = -12.47393
+    LOG_MAX = 12.52607
+    LOG_RANGE = LOG_MAX - LOG_MIN
+
+    # Write to a known path that the C++ renderer will load
+    from . import get_base_path
+    lut_path = os.path.join(get_base_path(), "shaders", "Runtime_LUT.cube")
+
+    with open(lut_path, 'w') as f:
+        f.write(f'TITLE "{view_transform_name}_{display}"\n')
+        f.write(f'LUT_3D_SIZE {LUT_SIZE}\n')
+        f.write(f'DOMAIN_MIN 0.0 0.0 0.0\n')
+        f.write(f'DOMAIN_MAX 1.0 1.0 1.0\n\n')
+        for b in range(LUT_SIZE):
+            for g in range(LUT_SIZE):
+                for r in range(LUT_SIZE):
+                    rn = r / (LUT_SIZE - 1)
+                    gn = g / (LUT_SIZE - 1)
+                    bn = b / (LUT_SIZE - 1)
+                    r_lin = 2.0 ** (rn * LOG_RANGE + LOG_MIN)
+                    g_lin = 2.0 ** (gn * LOG_RANGE + LOG_MIN)
+                    b_lin = 2.0 ** (bn * LOG_RANGE + LOG_MIN)
+                    try:
+                        result = cpu.applyRGB([r_lin, g_lin, b_lin])
+                    except:
+                        result = [0.0, 0.0, 0.0]
+                    result = [max(0.0, min(1.0, v)) for v in result]
+                    f.write(f"{result[0]:.6f} {result[1]:.6f} {result[2]:.6f}\n")
+
+    _log(f"LUT baked: {lut_path} ({LUT_SIZE}³)")
+
+
 def _draw_texture_flipped(texture, w, h):
     """Draw texture fullscreen with V flipped (Vulkan top-down -> OpenGL bottom-up)."""
     gpu.state.blend_set('NONE')
@@ -428,10 +486,12 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 dll_wrapper.set_int("shader_mode", 1)
                 dll_wrapper.set_int("dlss_enabled", 1)
                 dll_wrapper.set_int("dlss_rr_enabled", 1)
-                # Set tonemap LUT before renderer init (LUT loads during create())
+                # Bake active view transform LUT using OCIO (supports ALL transforms + displays)
                 _vt = bpy.context.scene.view_settings.view_transform
-                _lut_map = {'AgX': 0, 'Filmic': 1}
-                dll_wrapper.set_int("tonemap_lut", _lut_map.get(_vt, 0))
+                try:
+                    _bake_view_transform_lut(_vt)
+                except Exception as _e:
+                    _log(f"LUT bake failed for '{_vt}': {_e}")
                 try:
                     props = bpy.context.scene.ignis_rt
                     dll_wrapper.set_int("dlss_quality", int(props.dlss_quality))
@@ -1473,13 +1533,9 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         _blender_exposure = 2.0 ** _vs.exposure  # Blender uses EV stops → multiplier
         # Map Blender view_transform to our tonemap modes
         _vt = _vs.view_transform
-        # AgX uses mode 0 (with AgXInsetMatrix), Filmic uses mode 5 (no inset matrix).
-        # Both sample the 3D LUT at binding 2 — the correct LUT was loaded at init.
-        _tonemap_map = {
-            'AgX': 0, 'Filmic': 5, 'Standard': 4, 'Raw': 4,
-            'Khronos PBR Neutral': 4, 'False Color': 0,
-        }
-        _tonemap_mode = _tonemap_map.get(_vt, 0)
+        # ALL view transforms use the runtime-baked OCIO LUT (mode 5).
+        # Raw uses mode 6 (just clamp + gamma, no tone curve).
+        _tonemap_mode = 6 if _vt == 'Raw' else 5
         # Read "look" for contrast
         _look = _vs.look
         _look_contrast = 0.0

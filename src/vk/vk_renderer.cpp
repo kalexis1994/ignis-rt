@@ -2047,12 +2047,12 @@ bool Renderer::LoadAgXLut() {
     // Load tonemap 3D LUT (.cube) based on Blender's view_transform.
     // The LUT is set via ignis_set_int("tonemap_lut", id) before create():
     //   0 = AgX (default), 1 = Filmic
+    // Try runtime-baked LUT first (from Blender OCIO), fallback to AgX
     const char* lutFiles[] = {
-        "shaders/AgX_Base_sRGB.cube",
-        "shaders/Filmic_Base_sRGB.cube",
+        "shaders/Runtime_LUT.cube",         // 0: runtime-baked from OCIO (any view transform)
+        "shaders/AgX_Base_sRGB.cube",       // 1: fallback AgX
     };
-    int lutId = acpt::g_config.tonemapLutId;
-    if (lutId < 0 || lutId > 1) lutId = 0;
+    int lutId = 0;  // always try runtime first
     std::string lutPath = IgnisResolvePath(lutFiles[lutId]);
     std::ifstream lutFile(lutPath);
     if (!lutFile.is_open()) {

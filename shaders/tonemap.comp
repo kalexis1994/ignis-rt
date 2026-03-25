@@ -103,12 +103,18 @@ vec3 neutralTonemap(vec3 color) {
     return mix(color, vec3(newPeak), g);
 }
 
+// 6: Standard — just clamp, no tone curve (gamma applied separately)
+vec3 standardTonemap(vec3 color) {
+    return clamp(color, 0.0, 1.0);
+}
+
 vec3 applyTonemap(vec3 hdr, uint mode) {
     if (mode == 1u) return acesTonemap(hdr);
     if (mode == 2u) return reinhardTonemap(hdr);
     if (mode == 3u) return hableTonemap(hdr);
     if (mode == 4u) return neutralTonemap(hdr);
     if (mode == 5u) return filmicLutTonemap(hdr);
+    if (mode == 6u) return standardTonemap(hdr);
     return agxTonemap(hdr);
 }
 
