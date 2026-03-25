@@ -104,7 +104,7 @@ jobs:
 
           # Python addon files + manifest + assets
           cp blender/ignis_rt/*.py   staging/ignis_rt/
-          cp blender/ignis_rt/blender_manifest.toml staging/ignis_rt/ 2>/dev/null || true
+          cp blender/ignis_rt/blender_manifest.toml staging/ignis_rt/
           cp -r blender/ignis_rt/icons staging/ignis_rt/ 2>/dev/null || true
 
           # DLL (built with DLSS + NRD support)
@@ -118,8 +118,9 @@ jobs:
           find vendor/NRD -name "NRD.dll" -type f -exec cp {} staging/ignis_rt/lib/ \; 2>/dev/null
           ls -lh staging/ignis_rt/lib/NRD.dll 2>/dev/null || echo "WARNING: NRD.dll not found"
 
-          # Compiled shaders
+          # Compiled shaders + LUT files
           cp shaders/*.spv staging/ignis_rt/shaders/
+          cp shaders/*.cube staging/ignis_rt/shaders/ 2>/dev/null || true
           mkdir -p staging/ignis_rt/shaders/wavefront
           cp shaders/wavefront/*.spv staging/ignis_rt/shaders/wavefront/ 2>/dev/null || true
 

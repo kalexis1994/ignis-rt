@@ -2048,15 +2048,22 @@ bool Renderer::LoadAgXLut() {
     // The LUT is set via ignis_set_int("tonemap_lut", id) before create():
     //   0 = AgX (default), 1 = Filmic
     // Try runtime-baked LUT first (from Blender OCIO), fallback to AgX
-    const char* lutFiles[] = {
-        "shaders/Runtime_LUT.cube",         // 0: runtime-baked from OCIO (any view transform)
-        "shaders/AgX_Base_sRGB.cube",       // 1: fallback AgX
+    const char* lutCandidates[] = {
+        "shaders/Runtime_LUT.cube",
+        "shaders/AgX_Base_sRGB.cube",
     };
-    int lutId = 0;  // always try runtime first
-    std::string lutPath = IgnisResolvePath(lutFiles[lutId]);
-    std::ifstream lutFile(lutPath);
+    std::string lutPath;
+    std::ifstream lutFile;
+    for (const char* candidate : lutCandidates) {
+        lutPath = IgnisResolvePath(candidate);
+        lutFile.open(lutPath);
+        if (lutFile.is_open()) {
+            Log(L"[VK Renderer] Loaded tonemap LUT: %S\n", lutPath.c_str());
+            break;
+        }
+    }
     if (!lutFile.is_open()) {
-        Log(L"[VK Renderer] WARNING: AgX LUT not found at %S\n", lutPath.c_str());
+        Log(L"[VK Renderer] WARNING: No tonemap LUT found\n");
         return false;
     }
 
