@@ -238,12 +238,14 @@ vec3 EnvBRDFApprox(vec3 F0, float roughness, float NdotV) {
 // ============================================================
 
 // Core sky evaluation: returns HDR sky radiance for any direction.
-vec3 proceduralSky(vec3 dir, vec3 sunDirL, vec3 ambColor, vec3 sunTint) {
+vec3 proceduralSky(vec3 dir, vec3 sunDirL, vec3 ambColor, vec3 sunTint,
+                   float airDensity, float dustDensity, float sunSize) {
     float sunAlt = sunDirL.y;  // sun elevation [-1, 1]
     float cosTheta = max(dir.y, 0.001);     // view elevation
     float cosGamma = dot(dir, sunDirL);     // angle to sun
 
     // Rayleigh scattering: blue overhead, warmer at horizon
+    // airDensity modulates scattering strength (default 1.0)
     float rayleighPhase = 0.75 * (1.0 + cosGamma * cosGamma);
     vec3 rayleighColor = vec3(0.30, 0.42, 0.68);
 
@@ -255,26 +257,33 @@ vec3 proceduralSky(vec3 dir, vec3 sunDirL, vec3 ambColor, vec3 sunTint) {
     float opticalDepth = 1.0 / (cosTheta + 0.15 * pow(93.885 - degrees(acos(cosTheta)), -1.253));
     opticalDepth = min(opticalDepth, 40.0);
 
-    vec3 rayleigh = rayleighColor * rayleighPhase * exp(-opticalDepth * 0.1);
+    vec3 rayleigh = rayleighColor * rayleighPhase * exp(-opticalDepth * 0.1 * airDensity);
 
     // Mie forward scattering (Henyey-Greenstein, g=0.76)
+    // dustDensity modulates haze/glow intensity (default 1.0)
     float g = 0.76;
     float miePhase = 1.5 * ((1.0 - g*g) / (2.0 + g*g))
                    * (1.0 + cosGamma*cosGamma) / pow(1.0 + g*g - 2.0*g*cosGamma, 1.5);
-    vec3 mie = sunTint * miePhase * 0.02;
+    vec3 mie = sunTint * miePhase * 0.02 * dustDensity;
 
     float sunInt = clamp(sunAlt * 3.0 + 0.3, 0.05, 1.0);
     vec3 clearSky = (rayleigh + mie) * sunInt * ambColor * 2.0;
 
-    // Sun disk (sharp highlight + softer glow)
-    clearSky += sunTint * pow(max(cosGamma, 0.0), 512.0) * 5.0;
-    clearSky += sunTint * pow(max(cosGamma, 0.0), 16.0) * 0.4;
+    // Sun disk: angular radius from Blender's sun_size (default 0.009512 rad ≈ 0.545°)
+    // cosAngle threshold for the disk edge
+    float cosHalfAngle = cos(sunSize * 0.5);
+    // Sharp disk + softer glow using sun_size-derived exponents
+    float diskSharpness = 1.0 / max(1.0 - cosHalfAngle, 1e-5);
+    float diskFactor = clamp((cosGamma - cosHalfAngle) * diskSharpness, 0.0, 1.0);
+    clearSky += sunTint * diskFactor * diskFactor * 5.0;
+    // Wider glow (corona), scales with dust density
+    clearSky += sunTint * pow(max(cosGamma, 0.0), 16.0) * 0.4 * dustDensity;
 
     // Horizon haze — continuous with scene fog
     vec3 fogColor = ambColor * 0.6 + sunTint * 0.3 + vec3(0.1);
     fogColor = mix(fogColor, vec3(dot(fogColor, vec3(0.33))), 0.3);
     float hazeT = 1.0 - smoothstep(0.0, 0.25, dir.y);
-    clearSky = mix(clearSky, fogColor * sunInt, hazeT * 0.8);
+    clearSky = mix(clearSky, fogColor * sunInt, hazeT * 0.8 * dustDensity);
 
     return max(clearSky, vec3(0.0));
 }
@@ -315,12 +324,20 @@ vec3 evaluateSky(vec3 dir) {
     vec3 ambColor = cam.ambientLight.rgb;
     vec3 sunTint = cam.skyLight.rgb;
 
+    // Sky Texture atmosphere properties (from jitterPattern[2..3])
+    float skyAirDensity = intBitsToFloat(cam.jitterPattern[2].z);
+    float skyDustDensity = intBitsToFloat(cam.jitterPattern[2].w);
+    float skySunSize = intBitsToFloat(cam.jitterPattern[2].x);
+    if (skyAirDensity <= 0.0) skyAirDensity = 1.0;
+    if (skyDustDensity <= 0.0) skyDustDensity = 1.0;
+    if (skySunSize <= 0.0) skySunSize = 0.009512;
+
     // Fallback for zero-initialized colors
     if (dot(ambColor, ambColor) < 0.001) ambColor = vec3(0.5, 0.6, 0.8);
     if (dot(sunTint, sunTint) < 0.001) sunTint = vec3(1.0, 0.92, 0.85);
 
     if (dir.y > 0.0) {
-        return proceduralSky(dir, sunDir, ambColor, sunTint);
+        return proceduralSky(dir, sunDir, ambColor, sunTint, skyAirDensity, skyDustDensity, skySunSize);
     } else {
         // Below horizon: dark ground fading to horizon fog
         vec3 fogColor = ambColor * 0.6 + sunTint * 0.3 + vec3(0.1);
@@ -1267,7 +1284,9 @@ void main() {
                 // Blue noise + Halton temporal sequence for stable penumbra convergence
                 vec3 shadowDir = sunDir;
                 {
-                    float sunRadius = 0.01;  // ~0.57° angular radius (close to real sun)
+                    float sunRadius = intBitsToFloat(cam.jitterPattern[2].x);  // from Blender sun_size
+                    if (sunRadius <= 0.0) sunRadius = 0.009512;  // Nishita default
+                    sunRadius *= 0.5;  // sun_size is diameter, we need radius
                     // Use blue noise for spatial coherence + frame index for temporal variation
                     ivec2 bnCoord = ivec2((pixel.x + frameIndex * 7) & 63, (pixel.y + frameIndex * 11) & 63);
                     vec2 diskSample = vec2(

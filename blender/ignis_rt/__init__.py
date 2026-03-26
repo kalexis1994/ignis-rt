@@ -394,6 +394,10 @@ def register():
             if compat is not None:
                 compat.add('IGNIS_RT')
 
+    # Undo/redo handlers: force full transform sync after undo/redo
+    bpy.app.handlers.undo_post.append(engine._on_undo_redo)
+    bpy.app.handlers.redo_post.append(engine._on_undo_redo)
+
     # Clean up: remove IGNIS_RT from render-context panels that aren't ours,
     # EXCEPT Blender's Color Management panel (we read exposure/tonemap from it)
     _own_panels = {
@@ -415,6 +419,11 @@ def register():
 
 def unregister():
     global _icon_previews
+    # Remove undo/redo handlers
+    if engine._on_undo_redo in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.remove(engine._on_undo_redo)
+    if engine._on_undo_redo in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.remove(engine._on_undo_redo)
     try:
         engine._ignis_shutdown()
     except Exception:

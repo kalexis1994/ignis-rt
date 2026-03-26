@@ -36,6 +36,14 @@ struct PathTracerConfig {
     float sunColorB          = 0.92f;
     bool  autoSkyColors      = false;
 
+    // Sky Texture atmosphere (from Blender's Sky Texture node)
+    float sunSize            = 0.009512f; // sun angular diameter (radians)
+    float sunDiscIntensity   = 1.0f;      // sun disc brightness multiplier
+    float airDensity         = 1.0f;      // Rayleigh scattering density
+    float dustDensity        = 1.0f;      // Mie scattering density
+    float ozoneDensity       = 1.0f;      // ozone absorption
+    float altitude           = 0.0f;      // camera altitude (meters);
+
     // Ambient / sky
     float ambientColorR      = 0.5f;
     float ambientColorG      = 0.6f;

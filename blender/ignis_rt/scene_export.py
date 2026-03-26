@@ -911,11 +911,19 @@ def export_sun(depsgraph):
         if azimuth < 0:
             azimuth += 360.0
 
+        # SUN light: use Blender's angle property as sun_size
+        sun_angle = getattr(light, 'angle', 0.009512)  # SUN light angular diameter
         return {
             "sun_elevation": elevation,
             "sun_azimuth": azimuth,
             "sun_intensity": light.energy * math.pi,
             "sun_color": (light.color[0], light.color[1], light.color[2]),
+            "sun_size": sun_angle,
+            "sun_disc_intensity": 1.0,
+            "air_density": 1.0,
+            "dust_density": 1.0,
+            "ozone_density": 1.0,
+            "altitude": 0.0,
         }
 
     # --- 2. Try World Sky Texture (Nishita/Hosek) ---
@@ -953,16 +961,29 @@ def export_sun(depsgraph):
             if azimuth < 0:
                 azimuth += 360.0
 
-            # Sun intensity: Nishita produces physically-based radiance.
-            # Scale by background strength. PI factor for BRDF parity.
-            sun_intensity = 5.0 * bg_strength * math.pi
+            # Read all Sky Texture node properties
+            sky_sun_size = getattr(sky_node, 'sun_size', 0.009512)       # angular diameter (rad)
+            sky_sun_intensity = getattr(sky_node, 'sun_intensity', 1.0)  # disc brightness multiplier
+            sky_air_density = getattr(sky_node, 'air_density', 1.0)
+            sky_dust_density = getattr(sky_node, 'dust_density', 1.0)
+            sky_ozone_density = getattr(sky_node, 'ozone_density', 1.0)
+            sky_altitude = getattr(sky_node, 'altitude', 0.0)           # meters
+
+            # Sun radiance: base × node intensity × background strength × PI (BRDF parity)
+            sun_intensity = 5.0 * sky_sun_intensity * bg_strength * math.pi
 
             return {
                 "sun_elevation": elevation,
                 "sun_azimuth": azimuth,
                 "sun_intensity": sun_intensity,
                 "sun_color": (1.0, 0.98, 0.95),  # warm white for Nishita sun
-                "from_sky_texture": True,  # signal to force auto_sky_colors
+                "from_sky_texture": True,
+                "sun_size": sky_sun_size,
+                "sun_disc_intensity": sky_sun_intensity,
+                "air_density": sky_air_density,
+                "dust_density": sky_dust_density,
+                "ozone_density": sky_ozone_density,
+                "altitude": sky_altitude,
             }
 
     # --- 3. Defaults (no sun) ---
@@ -971,6 +992,12 @@ def export_sun(depsgraph):
         "sun_azimuth": 180.0,
         "sun_intensity": 0.0,
         "sun_color": (1.0, 1.0, 1.0),
+        "sun_size": 0.009512,
+        "sun_disc_intensity": 1.0,
+        "air_density": 1.0,
+        "dust_density": 1.0,
+        "ozone_density": 1.0,
+        "altitude": 0.0,
     }
 
 

@@ -167,6 +167,10 @@ _fps_display = 0.0
 _ignis_full_dirty = True       # need full scene upload (meshes + materials + TLAS)
 _ignis_materials_dirty = False  # need materials-only re-upload (property tweak)
 _ignis_tlas_dirty = False      # need TLAS rebuild only (move/hide/show/delete)
+_ignis_objects_dirty = False   # need FULL transform sync (Scene change, add/remove)
+_ignis_changed_objects = set() # names of individual objects whose transforms changed
+_ignis_cached_tlas = []        # [(mesh_key, obj_key, transform), ...] from last full sync
+_ignis_objkey_to_tlas = {}     # obj_key → [indices into _ignis_cached_tlas]
 _ignis_last_full_upload = 0.0  # perf_counter timestamp (cooldown for init burst)
 _ignis_instance_count = 0      # mesh instance count after last sync
 _ignis_last_tex_names = None   # texture name tuple from last upload (skip re-upload if same)
@@ -246,11 +250,19 @@ def _draw_fps_overlay(w, h):
 from . import loading_screen
 
 
+@bpy.app.handlers.persistent
+def _on_undo_redo(scene, depsgraph=None):
+    """Force full transform sync after undo/redo."""
+    global _ignis_objects_dirty
+    _ignis_objects_dirty = True
+
+
 def _ignis_shutdown():
     global _ignis_initialized, _ignis_width, _ignis_height
     global _ignis_blas_handles, _ignis_float_buffer, _ignis_byte_buffer
     global _ignis_gpu_texture, _ignis_tex_manager
-    global _ignis_frame_index, _ignis_full_dirty, _ignis_materials_dirty, _ignis_tlas_dirty
+    global _ignis_frame_index, _ignis_full_dirty, _ignis_materials_dirty, _ignis_tlas_dirty, _ignis_objects_dirty
+    global _ignis_changed_objects, _ignis_cached_tlas, _ignis_objkey_to_tlas
     global _ignis_last_full_upload, _ignis_instance_count
     global _fps_times, _fps_display
     global _load_stage, _ignis_last_draw_time
@@ -271,6 +283,10 @@ def _ignis_shutdown():
         _ignis_full_dirty = True
         _ignis_materials_dirty = False
         _ignis_tlas_dirty = False
+        _ignis_objects_dirty = False
+        _ignis_changed_objects = set()
+        _ignis_cached_tlas = []
+        _ignis_objkey_to_tlas = {}
         _ignis_last_full_upload = 0.0
         _ignis_instance_count = 0
         _fps_times = []
@@ -295,7 +311,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         """Initialize or resize the renderer if needed. Returns True if ready."""
         global _ignis_initialized, _ignis_width, _ignis_height
         global _ignis_float_buffer, _ignis_byte_buffer, _ignis_gpu_texture
-        global _ignis_frame_index, _ignis_blas_handles, _ignis_full_dirty, _ignis_materials_dirty, _ignis_tlas_dirty
+        global _ignis_frame_index, _ignis_blas_handles, _ignis_full_dirty, _ignis_materials_dirty, _ignis_tlas_dirty, _ignis_objects_dirty
+        global _ignis_changed_objects, _ignis_cached_tlas, _ignis_objkey_to_tlas
 
         if not dll_wrapper.load():
             _log("ERROR: DLL failed to load")
@@ -397,6 +414,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         _ignis_full_dirty = True
         _ignis_materials_dirty = False
         _ignis_tlas_dirty = False
+        _ignis_objects_dirty = False
+        _ignis_changed_objects = set()
+        _ignis_cached_tlas = []
+        _ignis_objkey_to_tlas = {}
         _ignis_float_buffer = (ctypes.c_float * (width * height * 4))()
         _ignis_byte_buffer = (ctypes.c_uint8 * (width * height * 4))()
 
@@ -441,6 +462,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
     def _tick_staged_load(self, depsgraph):
         """Process one stage of loading. Returns True when complete."""
+        import math
         global _load_stage, _load_status, _load_progress
         global _load_unique_meshes, _load_scene_instances, _load_mesh_keys, _load_mesh_idx
         global _load_materials_data, _load_mat_name_to_index, _load_textures_list, _load_obj_to_mesh_key, _load_hidden
@@ -448,7 +470,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         global _ignis_initialized, _ignis_width, _ignis_height
         global _ignis_float_buffer, _ignis_byte_buffer
         global _ignis_blas_handles, _ignis_frame_index
-        global _ignis_full_dirty, _ignis_materials_dirty, _ignis_tlas_dirty
+        global _ignis_full_dirty, _ignis_materials_dirty, _ignis_tlas_dirty, _ignis_objects_dirty
+        global _ignis_changed_objects, _ignis_cached_tlas, _ignis_objkey_to_tlas
         global _ignis_last_full_upload, _ignis_instance_count, _ignis_tex_manager
         global _ignis_last_tex_names
 
@@ -544,6 +567,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             _ignis_full_dirty = True
             _ignis_materials_dirty = False
             _ignis_tlas_dirty = False
+            _ignis_objects_dirty = False
+            _ignis_changed_objects = set()
+            _ignis_cached_tlas = []
+            _ignis_objkey_to_tlas = {}
             _ignis_float_buffer = (ctypes.c_float * (w * h * 4))()
             _ignis_byte_buffer = (ctypes.c_uint8 * (w * h * 4))()
             _log("Init complete (background thread)")
@@ -862,56 +889,69 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
             # Use HDRI-extracted sun if no Blender SUN light exists
             global _ignis_hdri_sun
-            if sun["sun_intensity"] <= 0.0 and hdri_sun:
-                sun = hdri_sun
-                hdri_str = hdri["strength"] if hdri else 1.0
-                # Scale by PI to compensate for hemisphere sampling deficit
-                # (Cycles importance-samples the sun disc efficiently; we use NEE)
-                sun["sun_intensity"] = sun["sun_intensity"] * hdri_str * math.pi
-                _log(f"Stage FINALIZE: Sun from HDRI — elev={sun['sun_elevation']:.1f}° "
-                     f"azim={sun['sun_azimuth']:.1f}° intensity={sun['sun_intensity']:.1f} "
-                     f"color=({sun['sun_color'][0]:.3f},{sun['sun_color'][1]:.3f},{sun['sun_color'][2]:.3f})")
-                # Cache for per-frame sync (export_sun returns 0 when no SUN light)
-                _ignis_hdri_sun = dict(sun)
+            try:
+                if sun["sun_intensity"] <= 0.0 and hdri_sun:
+                    sun = hdri_sun
+                    hdri_str = hdri["strength"] if hdri else 1.0
+                    # Scale by PI to compensate for hemisphere sampling deficit
+                    # (Cycles importance-samples the sun disc efficiently; we use NEE)
+                    sun["sun_intensity"] = sun["sun_intensity"] * hdri_str * math.pi
+                    _log(f"Stage FINALIZE: Sun from HDRI — elev={sun['sun_elevation']:.1f}° "
+                         f"azim={sun['sun_azimuth']:.1f}° intensity={sun['sun_intensity']:.1f} "
+                         f"color=({sun['sun_color'][0]:.3f},{sun['sun_color'][1]:.3f},{sun['sun_color'][2]:.3f})")
+                    # Cache for per-frame sync (export_sun returns 0 when no SUN light)
+                    _ignis_hdri_sun = dict(sun)
 
-            dll_wrapper.set_float("sun_elevation", sun["sun_elevation"])
-            dll_wrapper.set_float("sun_azimuth", sun["sun_azimuth"])
-            dll_wrapper.set_float("sun_intensity", sun["sun_intensity"])
-            sun_color = sun.get("sun_color", (1.0, 1.0, 1.0))
-            dll_wrapper.set_float("sun_color_r", sun_color[0])
-            dll_wrapper.set_float("sun_color_g", sun_color[1])
-            dll_wrapper.set_float("sun_color_b", sun_color[2])
+                dll_wrapper.set_float("sun_elevation", sun["sun_elevation"])
+                dll_wrapper.set_float("sun_azimuth", sun["sun_azimuth"])
+                dll_wrapper.set_float("sun_intensity", sun["sun_intensity"])
+                sun_color = sun.get("sun_color", (1.0, 1.0, 1.0))
+                dll_wrapper.set_float("sun_color_r", sun_color[0])
+                dll_wrapper.set_float("sun_color_g", sun_color[1])
+                dll_wrapper.set_float("sun_color_b", sun_color[2])
+                # Sky Texture atmosphere properties
+                dll_wrapper.set_float("sun_size", sun.get("sun_size", 0.009512))
+                dll_wrapper.set_float("sun_disc_intensity", sun.get("sun_disc_intensity", 1.0))
+                dll_wrapper.set_float("air_density", sun.get("air_density", 1.0))
+                dll_wrapper.set_float("dust_density", sun.get("dust_density", 1.0))
+                dll_wrapper.set_float("ozone_density", sun.get("ozone_density", 1.0))
+                dll_wrapper.set_float("altitude", sun.get("altitude", 0.0))
+            except Exception:
+                _log_exception("FINALIZE sun")
 
             # Point/spot/area lights
-            light_data = scene_export.export_lights(depsgraph)
-            n_lights = len(light_data) // 16
-            dll_wrapper.upload_lights(light_data, n_lights)
-            _log(f"Stage FINALIZE: {n_lights} lights uploaded")
+            try:
+                light_data = scene_export.export_lights(depsgraph)
+                n_lights = len(light_data) // 16
+                dll_wrapper.upload_lights(light_data, n_lights)
+                _log(f"Stage FINALIZE: {n_lights} lights uploaded")
+            except Exception:
+                _log_exception("FINALIZE lights")
 
             # Compute scene AABB for early sky-ray rejection
-            if _load_scene_instances:
-                import math
-                aabb_min = [math.inf, math.inf, math.inf]
-                aabb_max = [-math.inf, -math.inf, -math.inf]
-                for inst in _load_scene_instances:
-                    t = inst["transform_3x4"]
-                    # Position is in t[3], t[7], t[11] (last column of 3x4)
-                    px, py, pz = t[3], t[7], t[11]
+            try:
+                if _load_scene_instances:
+                    aabb_min = [math.inf, math.inf, math.inf]
+                    aabb_max = [-math.inf, -math.inf, -math.inf]
+                    for inst in _load_scene_instances:
+                        t = inst["transform_3x4"]
+                        px, py, pz = t[3], t[7], t[11]
+                        for i in range(3):
+                            aabb_min[i] = min(aabb_min[i], [px, py, pz][i])
+                            aabb_max[i] = max(aabb_max[i], [px, py, pz][i])
+                    pad = 20.0
                     for i in range(3):
-                        aabb_min[i] = min(aabb_min[i], [px, py, pz][i])
-                        aabb_max[i] = max(aabb_max[i], [px, py, pz][i])
-                # Expand by estimated object radius (conservative)
-                pad = 20.0
-                for i in range(3):
-                    aabb_min[i] -= pad
-                    aabb_max[i] += pad
-                dll_wrapper.set_float("scene_aabb_min_x", aabb_min[0])
-                dll_wrapper.set_float("scene_aabb_min_y", aabb_min[1])
-                dll_wrapper.set_float("scene_aabb_min_z", aabb_min[2])
-                dll_wrapper.set_float("scene_aabb_max_x", aabb_max[0])
-                dll_wrapper.set_float("scene_aabb_max_y", aabb_max[1])
-                dll_wrapper.set_float("scene_aabb_max_z", aabb_max[2])
-                _log(f"Stage FINALIZE: scene AABB [{aabb_min[0]:.1f},{aabb_min[1]:.1f},{aabb_min[2]:.1f}] → [{aabb_max[0]:.1f},{aabb_max[1]:.1f},{aabb_max[2]:.1f}]")
+                        aabb_min[i] -= pad
+                        aabb_max[i] += pad
+                    dll_wrapper.set_float("scene_aabb_min_x", aabb_min[0])
+                    dll_wrapper.set_float("scene_aabb_min_y", aabb_min[1])
+                    dll_wrapper.set_float("scene_aabb_min_z", aabb_min[2])
+                    dll_wrapper.set_float("scene_aabb_max_x", aabb_max[0])
+                    dll_wrapper.set_float("scene_aabb_max_y", aabb_max[1])
+                    dll_wrapper.set_float("scene_aabb_max_z", aabb_max[2])
+                    _log(f"Stage FINALIZE: scene AABB [{aabb_min[0]:.1f},{aabb_min[1]:.1f},{aabb_min[2]:.1f}] -> [{aabb_max[0]:.1f},{aabb_max[1]:.1f},{aabb_max[2]:.1f}]")
+            except Exception:
+                _log_exception("FINALIZE AABB")
 
             # Emissive triangles for MIS — use already-exported mesh data to avoid
             # re-evaluating meshes (which hangs on 7M+ tri scenes)
@@ -946,8 +986,11 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             _ignis_full_dirty = False
             _ignis_materials_dirty = False
             _ignis_tlas_dirty = False
+            _ignis_objects_dirty = False
+            _ignis_changed_objects = set()
+            _ignis_cached_tlas = []
+            _ignis_objkey_to_tlas = {}
             _ignis_last_full_upload = time.perf_counter()
-            _ignis_instance_count = _ignis_instance_count  # already set
             _ignis_frame_index = 0
 
             dt = time.perf_counter() - _load_start_time
@@ -969,7 +1012,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         - Geometry MODIFIED on existing object → full reload (BLAS rebuild)
         - Material/NodeTree changed → fast material re-upload
         """
-        global _ignis_full_dirty, _ignis_materials_dirty
+        global _ignis_full_dirty, _ignis_materials_dirty, _ignis_objects_dirty, _ignis_changed_objects
 
         if _load_stage != LOAD_IDLE:
             return
@@ -987,11 +1030,12 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
         for update in depsgraph.updates:
             uid = update.id
-            if isinstance(uid, bpy.types.Material):
+            if isinstance(uid, bpy.types.Object):
+                # Track specific object names for fast-path transform patch
+                _ignis_changed_objects.add(uid.name)
+            elif isinstance(uid, bpy.types.Material):
                 has_material_change = True
             elif isinstance(uid, bpy.types.NodeTree):
-                # Only trigger material re-export if the NodeTree belongs to a material,
-                # NOT the World (sky texture changes are handled per-frame via export_sun)
                 is_world_tree = False
                 try:
                     world = depsgraph.scene.world
@@ -1005,6 +1049,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 if update.is_updated_geometry:
                     has_geometry_change = True
                     geometry_mesh_name = uid.name
+            elif isinstance(uid, bpy.types.Scene):
+                _ignis_objects_dirty = True  # scene change → full rebuild
 
         # Material changes → fast re-upload (no full reload)
         if has_material_change:
@@ -1218,7 +1264,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
     # ------------------------------------------------------------------
 
     def _rebuild_tlas(self, depsgraph):
-        global _ignis_tlas_dirty, _ignis_instance_count, _ignis_frame_index
+        global _ignis_tlas_dirty, _ignis_objects_dirty, _ignis_instance_count, _ignis_frame_index
+        global _ignis_changed_objects, _ignis_cached_tlas, _ignis_objkey_to_tlas
 
         t0 = time.perf_counter()
         instances = []
@@ -1255,6 +1302,12 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         dll_wrapper.set_float("sun_color_r", sun_color[0])
         dll_wrapper.set_float("sun_color_g", sun_color[1])
         dll_wrapper.set_float("sun_color_b", sun_color[2])
+        dll_wrapper.set_float("sun_size", sun.get("sun_size", 0.009512))
+        dll_wrapper.set_float("sun_disc_intensity", sun.get("sun_disc_intensity", 1.0))
+        dll_wrapper.set_float("air_density", sun.get("air_density", 1.0))
+        dll_wrapper.set_float("dust_density", sun.get("dust_density", 1.0))
+        dll_wrapper.set_float("ozone_density", sun.get("ozone_density", 1.0))
+        dll_wrapper.set_float("altitude", sun.get("altitude", 0.0))
 
         # Re-sync point/spot/area lights (in case a light was moved/added)
         light_data = scene_export.export_lights(depsgraph)
@@ -1262,6 +1315,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         dll_wrapper.upload_lights(light_data, n_lights)
 
         _ignis_tlas_dirty = False
+        _ignis_objects_dirty = False
+        _ignis_changed_objects = set()
+        _ignis_cached_tlas = []  # invalidate — full sync will rebuild
+        _ignis_objkey_to_tlas = {}
         _ignis_instance_count = len(instances)
         _ignis_frame_index = 0
 
@@ -1332,6 +1389,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             except Exception:
                 _log_exception("view_draw -> _tick_staged_load")
                 _load_stage = LOAD_IDLE
+                _ignis_full_dirty = False  # prevent infinite reload loop
                 done = True
             self.tag_redraw()
             return
@@ -1399,6 +1457,12 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         dll_wrapper.set_float("sun_color_r", sun_color[0])
         dll_wrapper.set_float("sun_color_g", sun_color[1])
         dll_wrapper.set_float("sun_color_b", sun_color[2])
+        dll_wrapper.set_float("sun_size", sun.get("sun_size", 0.009512))
+        dll_wrapper.set_float("sun_disc_intensity", sun.get("sun_disc_intensity", 1.0))
+        dll_wrapper.set_float("air_density", sun.get("air_density", 1.0))
+        dll_wrapper.set_float("dust_density", sun.get("dust_density", 1.0))
+        dll_wrapper.set_float("ozone_density", sun.get("ozone_density", 1.0))
+        dll_wrapper.set_float("altitude", sun.get("altitude", 0.0))
 
         light_data = scene_export.export_lights(depsgraph)
         n_lights = len(light_data) // 16
@@ -1408,114 +1472,208 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         global _ignis_last_light_count
         _ignis_last_light_count = n_lights
 
-        # ── Transform sync (detect moved/added/removed objects per frame) ──
-        # Uses obj→mesh mapping for BLAS lookup. Handles:
-        # - Moved objects (transform changed)
-        # - New objects (obj.name not in mapping → upload BLAS incrementally)
-        # - Removed objects (not in depsgraph → excluded from TLAS)
-        global _ignis_last_transforms, _ignis_obj_to_mesh
-        if _ignis_blas_handles is not None:
-            cur_instances = []
-            new_objects = {}  # obj_name → (obj, inst) for incremental upload
-            _sync_obj_count = 0
-            for inst in depsgraph.object_instances:
-                obj = inst.object
-                if obj.type != 'MESH':
-                    continue
-                if not inst.show_self:
-                    continue
-                if obj.name in _ignis_hidden_objects and not inst.is_instance:
-                    continue
-                if obj.hide_viewport:
-                    continue
-                try:
-                    if obj.hide_get():
-                        continue
-                except RuntimeError:
-                    pass
-                if hasattr(obj, 'visible_camera') and not obj.visible_camera:
-                    continue
-                _sync_obj_count += 1
-                # Use library-qualified name (same as export_meshes)
-                if obj.library:
-                    obj_key = f"{obj.library.filepath}:{obj.name}"
-                else:
-                    obj_key = obj.name
-                # Resolve obj_key → mesh_key → BLAS handle
-                mesh_key = _ignis_obj_to_mesh.get(obj_key)
-                if mesh_key is None:
-                    mesh_key = obj_key  # try direct
-                if mesh_key and mesh_key in _ignis_blas_handles:
-                    xform = scene_export._matrix_to_3x4_row_major(inst.matrix_world)
-                    cur_instances.append((mesh_key, xform))
-                else:
-                    # Unknown object — only upload if genuinely NEW (not a pre-existing
-                    # collection instance or hidden object from initial load)
-                    if obj_key not in _ignis_known_objects and obj_key not in new_objects:
-                        new_objects[obj_key] = (obj, inst)
+        # ── Transform sync ──
+        # Three paths (fastest first):
+        #   1. Instant — all changed objects are direct (1 TLAS entry each)
+        #               → patch cache via id_eval_get, no depsgraph iteration
+        #   2. Partial — some changed objects are instanced (>1 TLAS entry)
+        #               → iterate depsgraph but skip matrix extraction for unchanged
+        #   3. Full    — Scene change / add / remove / unknown
+        #               → iterate depsgraph with full visibility checks
+        global _ignis_last_transforms, _ignis_obj_to_mesh, _ignis_objects_dirty
+        global _ignis_changed_objects, _ignis_cached_tlas, _ignis_objkey_to_tlas
+        global _ignis_instance_count
 
-            # Incremental BLAS upload for new objects
-            if new_objects:
-                try:
-                    self._upload_new_objects(depsgraph, new_objects)
-                except Exception:
-                    _log_exception("incremental mesh upload")
-                    # Mark as known so we don't retry every frame
-                    for obj_name in new_objects:
-                        _ignis_known_objects.add(obj_name)
-                # Re-scan to include newly uploaded objects
+        _need_full_sync = _ignis_objects_dirty
+        _changed = _ignis_changed_objects
+        _ignis_objects_dirty = False
+        _ignis_changed_objects = set()
+
+        if _ignis_blas_handles is not None and (_need_full_sync or _changed):
+
+            # Helper: build TLAS ctypes array from cached instance list
+            def _build_tlas_from_cache():
+                count = len(_ignis_cached_tlas)
+                if count <= 0:
+                    return
+                InstanceArray = TLASInstance * count
+                tlas_arr = InstanceArray()
+                for i, (mesh_key, _, xform) in enumerate(_ignis_cached_tlas):
+                    blas_idx = _ignis_blas_handles.get(mesh_key, 0)
+                    tlas_arr[i].blasIndex = blas_idx
+                    for j in range(12):
+                        tlas_arr[i].transform[j] = xform[j]
+                    tlas_arr[i].customIndex = blas_idx
+                    tlas_arr[i].mask = 0xFF
+                dll_wrapper.build_tlas(tlas_arr, count)
+                _ignis_frame_index  # just to keep linter happy
+
+            # ── Path 1 or 2: use cached TLAS when possible ──
+            if not _need_full_sync and _ignis_cached_tlas and _changed:
+                # Classify changed objects
+                all_direct = True   # every changed obj has exactly 1 TLAS entry
+                has_unknown = False # some changed obj is not a mesh in our cache
+                mesh_changed = set()  # mesh names that changed (for partial filter)
+                for obj_name in _changed:
+                    indices = _ignis_objkey_to_tlas.get(obj_name)
+                    if indices is None:
+                        has_unknown = True  # Empty, Light, or new object
+                    else:
+                        mesh_changed.add(obj_name)
+                        if len(indices) != 1:
+                            all_direct = False
+
+                if not has_unknown and all_direct:
+                    # ── Path 1: Instant — all changed are direct objects ──
+                    try:
+                        for obj_name in _changed:
+                            obj_ref = bpy.data.objects.get(obj_name)
+                            if obj_ref is None:
+                                _need_full_sync = True
+                                break
+                            obj_eval = depsgraph.id_eval_get(obj_ref)
+                            new_xform = scene_export._matrix_to_3x4_row_major(obj_eval.matrix_world)
+                            idx = _ignis_objkey_to_tlas[obj_name][0]
+                            mk, ok, _ = _ignis_cached_tlas[idx]
+                            _ignis_cached_tlas[idx] = (mk, ok, new_xform)
+                    except Exception:
+                        _need_full_sync = True
+
+                    if not _need_full_sync:
+                        _build_tlas_from_cache()
+                        _ignis_frame_index = 0
+                else:
+                    # ── Path 2: Partial — iterate depsgraph, update transforms ──
+                    # When has_unknown=True (e.g., Empty moved), we don't know which
+                    # children changed, so extract ALL transforms from depsgraph.
+                    # When has_unknown=False, only extract for changed mesh names.
+                    extract_all = has_unknown
+                    try:
+                        cache_idx = 0
+                        cache_len = len(_ignis_cached_tlas)
+                        for inst in depsgraph.object_instances:
+                            obj = inst.object
+                            if obj.type != 'MESH':
+                                continue
+                            if not inst.show_self:
+                                continue
+                            if cache_idx >= cache_len:
+                                _need_full_sync = True
+                                break
+                            if extract_all or obj.name in mesh_changed:
+                                xform = scene_export._matrix_to_3x4_row_major(inst.matrix_world)
+                                mk, ok, _ = _ignis_cached_tlas[cache_idx]
+                                _ignis_cached_tlas[cache_idx] = (mk, ok, xform)
+                            cache_idx += 1
+
+                        if not _need_full_sync and cache_idx == cache_len:
+                            _build_tlas_from_cache()
+                            _ignis_frame_index = 0
+                        elif not _need_full_sync:
+                            _need_full_sync = True
+                    except Exception:
+                        _need_full_sync = True
+
+            # ── Path 3: Full sync ──
+            if _need_full_sync:
                 cur_instances = []
+                new_objects = {}
+                _sync_obj_count = 0
                 for inst in depsgraph.object_instances:
                     obj = inst.object
                     if obj.type != 'MESH':
                         continue
-                    mesh_key = _ignis_obj_to_mesh.get(obj.name)
+                    if not inst.show_self:
+                        continue
+                    if obj.name in _ignis_hidden_objects and not inst.is_instance:
+                        continue
+                    if obj.hide_viewport:
+                        continue
+                    try:
+                        if obj.hide_get():
+                            continue
+                    except RuntimeError:
+                        pass
+                    if hasattr(obj, 'visible_camera') and not obj.visible_camera:
+                        continue
+                    _sync_obj_count += 1
+                    if obj.library:
+                        obj_key = f"{obj.library.filepath}:{obj.name}"
+                    else:
+                        obj_key = obj.name
+                    mesh_key = _ignis_obj_to_mesh.get(obj_key)
+                    if mesh_key is None:
+                        mesh_key = obj_key
                     if mesh_key and mesh_key in _ignis_blas_handles:
                         xform = scene_export._matrix_to_3x4_row_major(inst.matrix_world)
-                        cur_instances.append((mesh_key, xform))
+                        cur_instances.append((mesh_key, obj_key, xform))
+                    else:
+                        if obj_key not in _ignis_known_objects and obj_key not in new_objects:
+                            new_objects[obj_key] = (obj, inst)
 
-            # Add hair instances (not in depsgraph — use parent object transform)
-            for hair_key, blas_idx in _ignis_blas_handles.items():
-                if '__hair_' in hair_key:
-                    # Find parent object transform from existing instances
-                    parent_name = hair_key.split('__hair_')[0]
-                    for mk, xf in cur_instances:
-                        if mk == parent_name:
-                            cur_instances.append((hair_key, xf))
+                # Incremental BLAS upload for new objects
+                if new_objects:
+                    try:
+                        self._upload_new_objects(depsgraph, new_objects)
+                    except Exception:
+                        _log_exception("incremental mesh upload")
+                        for obj_name in new_objects:
+                            _ignis_known_objects.add(obj_name)
+                    cur_instances = []
+                    for inst in depsgraph.object_instances:
+                        obj = inst.object
+                        if obj.type != 'MESH':
+                            continue
+                        mesh_key = _ignis_obj_to_mesh.get(obj.name)
+                        if mesh_key and mesh_key in _ignis_blas_handles:
+                            xform = scene_export._matrix_to_3x4_row_major(inst.matrix_world)
+                            cur_instances.append((mesh_key, obj.name, xform))
+
+                # Add hair instances
+                for hair_key, blas_idx in _ignis_blas_handles.items():
+                    if '__hair_' in hair_key:
+                        parent_name = hair_key.split('__hair_')[0]
+                        for mk, ok, xf in cur_instances:
+                            if mk == parent_name:
+                                cur_instances.append((hair_key, ok, xf))
+                                break
+
+                # Rebuild cache for next frame
+                _ignis_cached_tlas = list(cur_instances)
+                _ignis_objkey_to_tlas = {}
+                for i, (_, ok, _) in enumerate(_ignis_cached_tlas):
+                    _ignis_objkey_to_tlas.setdefault(ok, []).append(i)
+
+                # Detect actual changes
+                xform_floats = tuple(f for _, _, xf in cur_instances for f in xf)
+                transforms_changed = len(cur_instances) != _ignis_instance_count
+                if not transforms_changed and _ignis_last_transforms is not None:
+                    for a, b in zip(xform_floats, _ignis_last_transforms):
+                        if abs(a - b) > 1e-5:
+                            transforms_changed = True
                             break
 
-            # Compare with tolerance to avoid float jitter causing constant resets
-            xform_floats = tuple(f for _, xf in cur_instances for f in xf)
-            transforms_changed = len(cur_instances) != _ignis_instance_count
-            if not transforms_changed and _ignis_last_transforms is not None:
-                for a, b in zip(xform_floats, _ignis_last_transforms):
-                    if abs(a - b) > 1e-5:
-                        transforms_changed = True
-                        break
+                if _ignis_frame_index < 2:
+                    _log(f"  sync: {_sync_obj_count} mesh objects, {len(cur_instances)} known, {len(new_objects)} new, changed={transforms_changed}")
 
-            if _ignis_frame_index < 2:
-                _log(f"  sync: {_sync_obj_count} mesh objects, {len(cur_instances)} known, {len(new_objects)} new, changed={transforms_changed}")
-
-            if transforms_changed or new_objects:
-                _ignis_last_transforms = xform_floats
-                count = len(cur_instances)
-                if count > 0:
-                    InstanceArray = TLASInstance * count
-                    tlas_arr = InstanceArray()
-                    for i, (mesh_key, xform) in enumerate(cur_instances):
-                        blas_idx = _ignis_blas_handles[mesh_key]
-                        tlas_arr[i].blasIndex = blas_idx
-                        for j in range(12):
-                            tlas_arr[i].transform[j] = xform[j]
-                        tlas_arr[i].customIndex = blas_idx
-                        tlas_arr[i].mask = 0xFF
-                    dll_wrapper.build_tlas(tlas_arr, count)
-                    # Reset denoiser only when objects added/removed (count changed),
-                    # NOT on transform-only changes (NRD anti-lag handles those naturally)
-                    if count != _ignis_instance_count or new_objects:
-                        _ignis_frame_index = 0
-                        dll_wrapper.set_int("reset_history", 1)
-                    _ignis_instance_count = count
+                if transforms_changed or new_objects:
+                    _ignis_last_transforms = xform_floats
+                    count = len(cur_instances)
+                    if count > 0:
+                        InstanceArray = TLASInstance * count
+                        tlas_arr = InstanceArray()
+                        for i, (mesh_key, _, xform) in enumerate(cur_instances):
+                            blas_idx = _ignis_blas_handles[mesh_key]
+                            tlas_arr[i].blasIndex = blas_idx
+                            for j in range(12):
+                                tlas_arr[i].transform[j] = xform[j]
+                            tlas_arr[i].customIndex = blas_idx
+                            tlas_arr[i].mask = 0xFF
+                        dll_wrapper.build_tlas(tlas_arr, count)
+                        if count != _ignis_instance_count or new_objects:
+                            _ignis_frame_index = 0
+                            dll_wrapper.set_int("reset_history", 1)
+                        _ignis_instance_count = count
 
         # FPS limiter / V-Sync
         props = context.scene.ignis_rt

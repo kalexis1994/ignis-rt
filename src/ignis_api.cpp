@@ -469,9 +469,21 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
     }
 
     // Scene AABB for early sky-ray rejection (packed into jitterPattern[0..7])
-    // jitterPattern[0].xyz = sceneMin (as float bits in int32), jitterPattern[1].xyz = sceneMax
+    // jitterPattern[0].xyz = sceneMin, jitterPattern[1].xyz = sceneMax (as float bits in int32)
     memcpy(&cam.jitterPattern[0], cfg->sceneAABBMin, 3 * sizeof(float));
     memcpy(&cam.jitterPattern[4], cfg->sceneAABBMax, 3 * sizeof(float));
+
+    // Sky Texture atmosphere properties (packed into jitterPattern[8..13] as float bits)
+    // Shader reads via intBitsToFloat(cam.jitterPattern[2])
+    float skyAtmo[6] = {
+        cfg->sunSize,           // [2].x — sun angular diameter (radians)
+        cfg->sunDiscIntensity,  // [2].y — sun disc brightness multiplier
+        cfg->airDensity,        // [2].z — Rayleigh scattering
+        cfg->dustDensity,       // [2].w — Mie scattering
+        cfg->ozoneDensity,      // [3].x — ozone absorption
+        cfg->altitude           // [3].y — camera altitude (meters)
+    };
+    memcpy(&cam.jitterPattern[8], skyAtmo, 6 * sizeof(float));
 
     g_renderer->UpdateCamera(cam);
 
@@ -587,6 +599,12 @@ IGNIS_API void ignis_set_float(const char* key, float value) {
     else if (strcmp(key, "world_bg_r") == 0)          cfg->worldBgR = value;
     else if (strcmp(key, "world_bg_g") == 0)          cfg->worldBgG = value;
     else if (strcmp(key, "world_bg_b") == 0)          cfg->worldBgB = value;
+    else if (strcmp(key, "sun_size") == 0)            cfg->sunSize = value;
+    else if (strcmp(key, "sun_disc_intensity") == 0)  cfg->sunDiscIntensity = value;
+    else if (strcmp(key, "air_density") == 0)         cfg->airDensity = value;
+    else if (strcmp(key, "dust_density") == 0)        cfg->dustDensity = value;
+    else if (strcmp(key, "ozone_density") == 0)       cfg->ozoneDensity = value;
+    else if (strcmp(key, "altitude") == 0)            cfg->altitude = value;
     else if (strcmp(key, "scene_aabb_min_x") == 0)   cfg->sceneAABBMin[0] = value;
     else if (strcmp(key, "scene_aabb_min_y") == 0)   cfg->sceneAABBMin[1] = value;
     else if (strcmp(key, "scene_aabb_min_z") == 0)   cfg->sceneAABBMin[2] = value;
