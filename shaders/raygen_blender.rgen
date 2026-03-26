@@ -672,6 +672,7 @@ void main() {
     vec3 primaryAlbedo = vec3(0.0);
     vec3 primaryWorldPos = vec3(0.0);
     float primaryHitDist = 0.0;
+    float secondaryHitDist = 0.0;  // bounce 1 hit distance (for denoiser)
     bool primaryHit = false;
     vec3 primaryLocalPos = vec3(0.0);
     uint primaryCustomIndex = 0u;
@@ -1163,6 +1164,11 @@ void main() {
             // View-space Z (negative in RH convention)
             vec4 viewPos = cam.view * vec4(pbrHit.worldPos, 1.0);
             primaryViewZ = viewPos.z;
+        }
+
+        // ---- Capture secondary hit distance (bounce 1, for denoiser) ----
+        if (bounce == 1 && sampleIdx == 0) {
+            secondaryHitDist = hitT;
         }
 
         // ---- Capture specular motion vector (bounce 1 hit of reflected object) ----
@@ -2155,10 +2161,11 @@ void main() {
         float mvZ = prevViewZ - currViewZ;
         imageStore(motionVectorsImg, pixel, vec4(motionVector, mvZ, 0));
 
-        // hitDist = actual primary hit distance for both lobes.
-        // NRD uses it internally for spatial edge-stopping; 0.0 would disable
-        // distance-based edge preservation and degrade temporal reprojection.
-        float diffHitDist = primaryHitDist;
+        // Hit distances for denoiser (DLSS RR / NRD).
+        // Diffuse: use secondary bounce distance (geometry-stable, not noise-dependent).
+        // Specular: use primary hit distance (reflection at surface).
+        // Both are stable across frames (depend on geometry, not stochastic sampling).
+        float diffHitDist = secondaryHitDist > 0.0 ? secondaryHitDist : primaryHitDist;
         float specHitDist = primaryHitDist;
 
         // Demodulate diffuse for DLSS RR (separate albedo buffer is also passed).
