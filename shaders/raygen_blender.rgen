@@ -157,6 +157,7 @@ layout(binding = 21, set = 0, std430) buffer SHARCData        { uint data[];    
 #define _sharcResolved _sharcAccum  // resolved region starts at capacity*4
 
 #include "include/sharc_setup.glsl"
+#include "include/surfel_gi.glsl"
 
 // GI Reservoir buffers for ReSTIR temporal reuse (3 vec4s per pixel)
 layout(binding = 24, set = 0, std430) buffer GIReservoirCurrBuf { vec4 data[]; } giReservoirCurr;
@@ -742,9 +743,30 @@ void main() {
     uint sharcCapacity = cam.sharcCapacity;
     vec3 prevBounceNormal = vec3(0, 1, 0);
 
+    // Surfel GI cache (Phase 1: reads from SHARC buffers, finer grid)
+    bool surfelEnabled = sharcEnabled;  // TODO: independent toggle
+    SurfelGridParams surfelGrid;
+    surfelGrid.cameraPosition = sharcGrid.cameraPosition;
+    surfelGrid.sceneScale = cam.sharcSceneScale * SURFEL_GRID_SCALE_MULT;
+
     for (int bounce = 0; bounce < maxBounces; bounce++) {
 
-        // ── SHARC cache query (bounce 1+): early path termination ──
+        // ── Surfel GI query (bounce 1+): surface-based irradiance cache ──
+        if (surfelEnabled && bounce >= 1) {
+            vec3 surfelIrradiance;
+            if (surfelGetCachedIrradiance(rayOrigin, prevBounceNormal,
+                                          surfelGrid, sharcCapacity, surfelIrradiance)) {
+                surfelIrradiance *= giIntensity;
+                if (isDiffusePath) {
+                    diffuseRadiance += surfelIrradiance * throughput;
+                } else {
+                    specularRadiance += surfelIrradiance * throughput;
+                }
+                break;
+            }
+        }
+
+        // ── SHARC cache query (bounce 1+): fallback if surfel miss ──
         if (sharcEnabled && bounce >= 1) {
             vec3 cachedRadiance;
             if (SharcGetCachedRadiance(sharcGrid, rayOrigin, prevBounceNormal,
