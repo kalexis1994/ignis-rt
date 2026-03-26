@@ -53,3 +53,5 @@ nul
 # --- Claude Code local config ---
 .claude/
 external/SHARC/
+/site
+site/
