@@ -395,8 +395,14 @@ def register():
                 compat.add('IGNIS_RT')
 
     # Undo/redo handlers: force full transform sync after undo/redo
-    bpy.app.handlers.undo_post.append(engine._on_undo_redo)
-    bpy.app.handlers.redo_post.append(engine._on_undo_redo)
+    # Guard against duplicate registration (re-enable without restart)
+    if engine._on_undo_redo not in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.append(engine._on_undo_redo)
+    if engine._on_undo_redo not in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.append(engine._on_undo_redo)
+    # Also hook load_post to catch file loads
+    if engine._on_undo_redo not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(engine._on_undo_redo)
 
     # Clean up: remove IGNIS_RT from render-context panels that aren't ours,
     # EXCEPT Blender's Color Management panel (we read exposure/tonemap from it)
@@ -419,11 +425,10 @@ def register():
 
 def unregister():
     global _icon_previews
-    # Remove undo/redo handlers
-    if engine._on_undo_redo in bpy.app.handlers.undo_post:
-        bpy.app.handlers.undo_post.remove(engine._on_undo_redo)
-    if engine._on_undo_redo in bpy.app.handlers.redo_post:
-        bpy.app.handlers.redo_post.remove(engine._on_undo_redo)
+    # Remove undo/redo/load handlers
+    for handler_list in (bpy.app.handlers.undo_post, bpy.app.handlers.redo_post, bpy.app.handlers.load_post):
+        if engine._on_undo_redo in handler_list:
+            handler_list.remove(engine._on_undo_redo)
     try:
         engine._ignis_shutdown()
     except Exception:

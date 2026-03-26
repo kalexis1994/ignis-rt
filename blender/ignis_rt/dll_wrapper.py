@@ -123,6 +123,12 @@ def load():
     # ------------------------------------------------------------------
     _lib.ignis_build_tlas.argtypes = [c_void_p, c_uint32]
     _lib.ignis_build_tlas.restype = c_bool
+    _lib.ignis_update_instance_transforms.argtypes = [
+        ctypes.POINTER(c_uint32),  # indices
+        ctypes.POINTER(c_float),   # transforms (12 floats per instance)
+        c_uint32,                  # count
+    ]
+    _lib.ignis_update_instance_transforms.restype = c_bool
 
     # ------------------------------------------------------------------
     # Camera
@@ -261,6 +267,20 @@ def upload_mesh_attributes(blas_handle: int, normals, uvs, vertex_count: int, co
 def build_tlas(instances_array, count: int) -> bool:
     """instances_array must be a ctypes Array of TLASInstance."""
     return _lib.ignis_build_tlas(ctypes.cast(instances_array, c_void_p), c_uint32(count))
+
+
+def update_instance_transforms(indices_np, transforms_np, count: int) -> bool:
+    """Patch specific TLAS instance transforms in-place (GPU refit, no full rebuild).
+    indices_np: np.array of uint32 TLAS indices
+    transforms_np: np.array of float32, 12 floats per instance (3x4 row-major)
+    """
+    import numpy as np
+    idx = np.ascontiguousarray(indices_np, dtype=np.uint32)
+    xfm = np.ascontiguousarray(transforms_np, dtype=np.float32)
+    return _lib.ignis_update_instance_transforms(
+        idx.ctypes.data_as(ctypes.POINTER(c_uint32)),
+        xfm.ctypes.data_as(ctypes.POINTER(c_float)),
+        c_uint32(count))
 
 
 def set_camera(view_inv, proj_inv, view, proj, frame_index: int):

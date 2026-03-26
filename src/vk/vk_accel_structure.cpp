@@ -1120,7 +1120,8 @@ bool AccelStructureBuilder::BuildTLAS(const std::vector<TLASInstance>& instances
     VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
     buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
     buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
-    buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+    buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR |
+                      VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
     buildInfo.geometryCount = 1;
     buildInfo.pGeometries = &tlasGeometry;
 
@@ -1166,6 +1167,91 @@ bool AccelStructureBuilder::BuildTLAS(const std::vector<TLASInstance>& instances
     buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
     buildInfo.dstAccelerationStructure = tlas_;
     buildInfo.scratchData.deviceAddress = tlasScratchBuffer_.deviceAddress;
+
+    VkAccelerationStructureBuildRangeInfoKHR rangeInfo{};
+    rangeInfo.primitiveCount = instanceCount;
+    const VkAccelerationStructureBuildRangeInfoKHR* pRangeInfo = &rangeInfo;
+
+    cmd = context_->BeginSingleTimeCommands();
+    vkCmdBuildAccelerationStructuresKHR_(cmd, 1, &buildInfo, &pRangeInfo);
+    context_->EndSingleTimeCommands(cmd);
+
+    return true;
+}
+
+bool AccelStructureBuilder::UpdateTLAS(const std::vector<TLASInstance>& instances) {
+    // Require existing TLAS with same instance count for in-place update
+    if (tlas_ == VK_NULL_HANDLE || (uint32_t)instances.size() != tlasInstanceCount_) {
+        return BuildTLAS(instances);  // fall back to full build
+    }
+
+    VkDevice device = context_->GetDevice();
+    uint32_t instanceCount = (uint32_t)instances.size();
+
+    // Build VkAccelerationStructureInstanceKHR array (same as BuildTLAS)
+    std::vector<VkAccelerationStructureInstanceKHR> vkInstances(instanceCount);
+    for (uint32_t i = 0; i < instanceCount; i++) {
+        const auto& src = instances[i];
+        auto& dst = vkInstances[i];
+        memset(&dst, 0, sizeof(dst));
+        memcpy(&dst.transform, src.transform, sizeof(float) * 12);
+        dst.instanceCustomIndex = src.customIndex;
+        dst.mask = src.mask;
+        dst.instanceShaderBindingTableRecordOffset = 0;
+        dst.flags = 0;
+        if (src.blasIndex >= 0 && src.blasIndex < (int)blasList_.size()) {
+            dst.accelerationStructureReference = blasList_[src.blasIndex].deviceAddress;
+        }
+    }
+
+    VkDeviceSize instanceSize = instanceCount * sizeof(VkAccelerationStructureInstanceKHR);
+
+    // Upload instance data via staging
+    AccelBuffer instanceStaging = CreateAccelBuffer(instanceSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    void* mapped;
+    vkMapMemory(device, instanceStaging.memory, 0, instanceSize, 0, &mapped);
+    memcpy(mapped, vkInstances.data(), instanceSize);
+    vkUnmapMemory(device, instanceStaging.memory);
+
+    VkCommandBuffer cmd = context_->BeginSingleTimeCommands();
+    VkBufferCopy copy{};
+    copy.size = instanceSize;
+    vkCmdCopyBuffer(cmd, instanceStaging.buffer, instanceBuffer_.buffer, 1, &copy);
+
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0,
+        1, &barrier, 0, nullptr, 0, nullptr);
+    context_->EndSingleTimeCommands(cmd);
+    DestroyAccelBuffer(instanceStaging);
+
+    // TLAS UPDATE (refit) — reuse existing TLAS, just refit the BVH
+    VkAccelerationStructureGeometryInstancesDataKHR instancesData{};
+    instancesData.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    instancesData.data.deviceAddress = instanceBuffer_.deviceAddress;
+
+    VkAccelerationStructureGeometryKHR tlasGeometry{};
+    tlasGeometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    tlasGeometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    tlasGeometry.geometry.instances = instancesData;
+
+    VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
+    buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR |
+                      VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+    buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;  // REFIT, not rebuild
+    buildInfo.srcAccelerationStructure = tlas_;  // update in-place
+    buildInfo.dstAccelerationStructure = tlas_;
+    buildInfo.scratchData.deviceAddress = tlasScratchBuffer_.deviceAddress;
+    buildInfo.geometryCount = 1;
+    buildInfo.pGeometries = &tlasGeometry;
 
     VkAccelerationStructureBuildRangeInfoKHR rangeInfo{};
     rangeInfo.primitiveCount = instanceCount;

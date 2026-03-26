@@ -77,6 +77,11 @@ public:
     // Build TLAS with custom per-instance transforms (for static/dynamic split)
     bool BuildTLAS(const std::vector<TLASInstance>& instances);
 
+    // Update TLAS in-place (refit) — much faster than full rebuild.
+    // Only updates instance transforms; same count and BLAS refs required.
+    // Falls back to full build if TLAS doesn't exist or count changed.
+    bool UpdateTLAS(const std::vector<TLASInstance>& instances);
+
     // Upload normal/UV/color attribute buffers directly into a BLAS entry
     bool UploadBLASAttributes(int blasIndex, const float* normals, const float* uvs, uint32_t vertexCount, const float* colors = nullptr);
 

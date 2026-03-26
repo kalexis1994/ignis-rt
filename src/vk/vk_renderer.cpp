@@ -707,21 +707,44 @@ bool Renderer::BuildTLASInstanced(const std::vector<vk::TLASInstance>& instances
         rtPipeline_->UpdateTLASDescriptor();
     }
 
+    // Cache for partial updates
+    cachedTLASInstances_ = instances;
+
     // Capture per-instance transforms for motion vectors.
-    // prev is managed by RenderFrameRT (swapped after each render), so we
-    // only update curr here.  On first build or instance-count change we
-    // initialise prev = curr so the shader sees zero motion.
     currInstanceTransforms_.resize(instances.size() * 12);
     for (size_t i = 0; i < instances.size(); i++) {
         memcpy(&currInstanceTransforms_[i * 12], instances[i].transform, 12 * sizeof(float));
     }
     if (instances.size() != instanceTransformCount_ || prevInstanceTransforms_.empty()) {
-        // No valid history — initialise prev = curr (zero motion vectors)
         prevInstanceTransforms_ = currInstanceTransforms_;
     }
     instanceTransformCount_ = (uint32_t)instances.size();
 
     rtReady_ = true;
+    return true;
+}
+
+bool Renderer::UpdateInstanceTransforms(const uint32_t* indices, const float* transforms, uint32_t count) {
+    if (!accelBuilder_ || cachedTLASInstances_.empty()) return false;
+
+    // Patch cached instances at specified indices
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t idx = indices[i];
+        if (idx >= cachedTLASInstances_.size()) continue;
+        memcpy(cachedTLASInstances_[idx].transform, &transforms[i * 12], 12 * sizeof(float));
+    }
+
+    // TLAS refit (UPDATE mode — faster than full rebuild)
+    if (!accelBuilder_->UpdateTLAS(cachedTLASInstances_)) return false;
+
+    // Update motion vector transforms
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t idx = indices[i];
+        if (idx < instanceTransformCount_) {
+            memcpy(&currInstanceTransforms_[idx * 12], &transforms[i * 12], 12 * sizeof(float));
+        }
+    }
+
     return true;
 }
 

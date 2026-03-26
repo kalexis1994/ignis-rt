@@ -537,6 +537,12 @@ def export_meshes(depsgraph):
             eval_obj.to_mesh_clear()
 
         xform = _matrix_to_3x4_row_major(instance.matrix_world)
+        # Detect collection instance parent for hierarchy caching
+        parent_name = None
+        parent_matrix_bl = None
+        if instance.is_instance and instance.parent:
+            parent_name = instance.parent.name
+            parent_matrix_bl = np.array(instance.parent.matrix_world, dtype=np.float32)
         instances.append({
             "mesh_key": mesh_key,
             "transform_3x4": xform,
@@ -546,6 +552,9 @@ def export_meshes(depsgraph):
             "hide_render": obj.hide_render,
             "hide_viewport": obj.hide_viewport,
             "visible_camera": getattr(obj, 'visible_camera', '?'),
+            "parent_name": parent_name,
+            "parent_matrix_bl": parent_matrix_bl,
+            "child_matrix_bl": np.array(instance.matrix_world, dtype=np.float32) if parent_name else None,
         })
 
     # Export particle hair as ribbon meshes

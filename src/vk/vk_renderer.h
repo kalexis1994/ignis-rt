@@ -54,6 +54,8 @@ public:
     void UploadLightTree(const void* nodes, uint32_t nodeCount,
                          const void* emitters, uint32_t emitterCount);
     bool BuildTLASInstanced(const std::vector<vk::TLASInstance>& instances);
+    // Update specific instance transforms in-place (TLAS refit, no full rebuild)
+    bool UpdateInstanceTransforms(const uint32_t* indices, const float* transforms, uint32_t count);
     void UpdateCamera(const CameraUBO& camera);
     void RenderFrameRT();
 
@@ -135,6 +137,7 @@ private:
     std::vector<float> currInstanceTransforms_;  // 12 floats per instance (3x4 row-major)
     std::vector<float> prevInstanceTransforms_;
     uint32_t instanceTransformCount_ = 0;
+    std::vector<vk::TLASInstance> cachedTLASInstances_; // full instance cache for partial updates
 
     // Camera
     float cameraDistance_ = 5.0f;

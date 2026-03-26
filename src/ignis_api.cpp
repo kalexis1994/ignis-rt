@@ -310,6 +310,13 @@ IGNIS_API bool ignis_build_tlas(const void* instances, uint32_t count) {
     return g_renderer->BuildTLASInstanced(vkInstances);
 }
 
+IGNIS_API bool ignis_update_instance_transforms(const uint32_t* indices,
+                                                 const float* transforms,
+                                                 uint32_t count) {
+    if (!g_renderer || !indices || !transforms || count == 0) return false;
+    return g_renderer->UpdateInstanceTransforms(indices, transforms, count);
+}
+
 // Previous frame camera matrices for motion vectors
 static float s_viewPrev[16] = {0};
 static float s_projPrev[16] = {0};

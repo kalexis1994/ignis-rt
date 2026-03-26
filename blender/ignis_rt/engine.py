@@ -171,8 +171,12 @@ _ignis_objects_dirty = False   # need FULL transform sync (Scene change, add/rem
 _ignis_changed_objects = set() # names of individual objects whose transforms changed
 _ignis_cached_tlas = []        # [(mesh_key, obj_key, transform), ...] from last full sync
 _ignis_objkey_to_tlas = {}     # obj_key → [indices into _ignis_cached_tlas]
+# Hierarchy cache: parent Empty → child instances (avoids depsgraph iteration)
+_ignis_parent_groups = {}      # parent_name → {"indices": np.array(uint32), "relative": np.array(N,4,4)}
+_ignis_direct_objects = {}     # obj_name → tlas_idx (single direct objects)
 _ignis_last_full_upload = 0.0  # perf_counter timestamp (cooldown for init burst)
 _ignis_instance_count = 0      # mesh instance count after last sync
+_ignis_frames_since_sync = 0   # frames without any transform sync (for periodic validation)
 _ignis_last_tex_names = None   # texture name tuple from last upload (skip re-upload if same)
 _ignis_last_transforms = None  # cached instance transforms hash for change detection
 _ignis_last_light_count = -1   # track light count for emissive re-export
@@ -812,9 +816,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             return False
 
         elif _load_stage == LOAD_TLAS:
-            # ── Stage 5: Build TLAS ──
+            # ── Stage 5: Build TLAS + hierarchy cache ──
             _load_status = "Building acceleration structure..."
             _load_progress = 0.85
+            global _ignis_parent_groups, _ignis_direct_objects
             try:
                 if _load_scene_instances:
                     count = len(_load_scene_instances)
@@ -829,10 +834,47 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         tlas_arr[i].blasIndex = blas_idx
                         for j in range(12):
                             tlas_arr[i].transform[j] = inst["transform_3x4"][j]
-                        tlas_arr[i].customIndex = blas_idx  # indexes geometryMetadata[], NOT instance
+                        tlas_arr[i].customIndex = blas_idx
                         tlas_arr[i].mask = 0xFF
                     dll_wrapper.build_tlas(tlas_arr, count)
-                    _log(f"Stage TLAS: {count} instances OK")
+
+                    # ── Build hierarchy cache for O(1) transform updates ──
+                    _ignis_parent_groups = {}
+                    _ignis_direct_objects = {}
+                    _parent_children = {}  # temp: parent_name → [(tlas_idx, relative_4x4)]
+                    for i, inst in enumerate(_load_scene_instances):
+                        parent_name = inst.get("parent_name")
+                        if parent_name and inst.get("parent_matrix_bl") is not None:
+                            # Collection instance: compute relative transform in VULKAN space
+                            # Convert both to Vulkan coords first, then compute relative
+                            parent_vk = scene_export.COORD_CONV @ inst["parent_matrix_bl"]
+                            child_vk = scene_export.COORD_CONV @ inst["child_matrix_bl"]
+                            relative_vk = np.linalg.inv(parent_vk) @ child_vk
+                            _parent_children.setdefault(parent_name, []).append((i, relative_vk))
+                        else:
+                            obj_key = inst["mesh_key"]
+                            if obj_key not in _ignis_direct_objects:
+                                _ignis_direct_objects[obj_key] = i
+                            # If same obj_key seen again, it becomes multi-instance → remove from direct
+                            elif _ignis_direct_objects.get(obj_key) is not None:
+                                _ignis_direct_objects[obj_key] = None
+
+                    # Convert to numpy arrays for fast batch multiplication
+                    for parent_name, children in _parent_children.items():
+                        indices = np.array([c[0] for c in children], dtype=np.uint32)
+                        relatives = np.array([c[1] for c in children], dtype=np.float32)
+                        _ignis_parent_groups[parent_name] = {
+                            "indices": indices,
+                            "relative": relatives,  # shape (N, 4, 4)
+                        }
+                    # Clean up direct objects with None (multi-instance without parent)
+                    _ignis_direct_objects = {k: v for k, v in _ignis_direct_objects.items() if v is not None}
+
+                    n_parents = len(_ignis_parent_groups)
+                    n_children = sum(len(g["indices"]) for g in _ignis_parent_groups.values())
+                    n_direct = len(_ignis_direct_objects)
+                    _log(f"Stage TLAS: {count} instances OK "
+                         f"({n_parents} parent groups, {n_children} instanced, {n_direct} direct)")
             except Exception:
                 _log_exception("LOAD_TLAS")
                 _load_stage = LOAD_IDLE
@@ -1473,112 +1515,78 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         _ignis_last_light_count = n_lights
 
         # ── Transform sync ──
-        # Three paths (fastest first):
-        #   1. Instant — all changed objects are direct (1 TLAS entry each)
-        #               → patch cache via id_eval_get, no depsgraph iteration
-        #   2. Partial — some changed objects are instanced (>1 TLAS entry)
-        #               → iterate depsgraph but skip matrix extraction for unchanged
-        #   3. Full    — Scene change / add / remove / unknown
-        #               → iterate depsgraph with full visibility checks
+        # Hierarchy-based: O(K) where K = affected instances, no depsgraph iteration.
+        # Falls back to full sync only on add/remove/undo.
         global _ignis_last_transforms, _ignis_obj_to_mesh, _ignis_objects_dirty
         global _ignis_changed_objects, _ignis_cached_tlas, _ignis_objkey_to_tlas
-        global _ignis_instance_count
+        global _ignis_instance_count, _ignis_parent_groups, _ignis_direct_objects
 
         _need_full_sync = _ignis_objects_dirty
         _changed = _ignis_changed_objects
         _ignis_objects_dirty = False
         _ignis_changed_objects = set()
+        global _ignis_frames_since_sync
+
+        # Periodic validation: if no sync for 60 frames, force full sync
+        # Catches missed undo/redo, duplications, or any edge case
+        if not _need_full_sync and not _changed:
+            _ignis_frames_since_sync += 1
+            if _ignis_frames_since_sync >= 60:
+                _need_full_sync = True
+                _ignis_frames_since_sync = 0
 
         if _ignis_blas_handles is not None and (_need_full_sync or _changed):
+            _ignis_frames_since_sync = 0
 
-            # Helper: build TLAS ctypes array from cached instance list
-            def _build_tlas_from_cache():
-                count = len(_ignis_cached_tlas)
-                if count <= 0:
-                    return
-                InstanceArray = TLASInstance * count
-                tlas_arr = InstanceArray()
-                for i, (mesh_key, _, xform) in enumerate(_ignis_cached_tlas):
-                    blas_idx = _ignis_blas_handles.get(mesh_key, 0)
-                    tlas_arr[i].blasIndex = blas_idx
-                    for j in range(12):
-                        tlas_arr[i].transform[j] = xform[j]
-                    tlas_arr[i].customIndex = blas_idx
-                    tlas_arr[i].mask = 0xFF
-                dll_wrapper.build_tlas(tlas_arr, count)
-                _ignis_frame_index  # just to keep linter happy
-
-            # ── Path 1 or 2: use cached TLAS when possible ──
-            if not _need_full_sync and _ignis_cached_tlas and _changed:
-                # Classify changed objects
-                all_direct = True   # every changed obj has exactly 1 TLAS entry
-                has_unknown = False # some changed obj is not a mesh in our cache
-                mesh_changed = set()  # mesh names that changed (for partial filter)
-                for obj_name in _changed:
-                    indices = _ignis_objkey_to_tlas.get(obj_name)
-                    if indices is None:
-                        has_unknown = True  # Empty, Light, or new object
-                    else:
-                        mesh_changed.add(obj_name)
-                        if len(indices) != 1:
-                            all_direct = False
-
-                if not has_unknown and all_direct:
-                    # ── Path 1: Instant — all changed are direct objects ──
-                    try:
-                        for obj_name in _changed:
+            # ── Fast path: hierarchy-based transform update (no depsgraph iteration) ──
+            if not _need_full_sync and _changed and (_ignis_parent_groups or _ignis_direct_objects):
+                all_indices = []
+                all_transforms = []
+                try:
+                    for obj_name in _changed:
+                        if obj_name in _ignis_parent_groups:
+                            group = _ignis_parent_groups[obj_name]
                             obj_ref = bpy.data.objects.get(obj_name)
                             if obj_ref is None:
                                 _need_full_sync = True
                                 break
                             obj_eval = depsgraph.id_eval_get(obj_ref)
-                            new_xform = scene_export._matrix_to_3x4_row_major(obj_eval.matrix_world)
-                            idx = _ignis_objkey_to_tlas[obj_name][0]
-                            mk, ok, _ = _ignis_cached_tlas[idx]
-                            _ignis_cached_tlas[idx] = (mk, ok, new_xform)
-                    except Exception:
-                        _need_full_sync = True
-
-                    if not _need_full_sync:
-                        _build_tlas_from_cache()
-                        _ignis_frame_index = 0
-                else:
-                    # ── Path 2: Partial — iterate depsgraph, update transforms ──
-                    # When has_unknown=True (e.g., Empty moved), we don't know which
-                    # children changed, so extract ALL transforms from depsgraph.
-                    # When has_unknown=False, only extract for changed mesh names.
-                    extract_all = has_unknown
-                    try:
-                        cache_idx = 0
-                        cache_len = len(_ignis_cached_tlas)
-                        for inst in depsgraph.object_instances:
-                            obj = inst.object
-                            if obj.type != 'MESH':
-                                continue
-                            if not inst.show_self:
-                                continue
-                            if cache_idx >= cache_len:
+                            parent_vk = scene_export.COORD_CONV @ np.array(obj_eval.matrix_world, dtype=np.float32)
+                            children_vk = parent_vk @ group["relative"]
+                            children_3x4 = children_vk[:, :3, :].reshape(-1, 12)
+                            all_indices.extend(group["indices"].tolist())
+                            all_transforms.append(children_3x4)
+                        elif obj_name in _ignis_direct_objects:
+                            idx = _ignis_direct_objects[obj_name]
+                            obj_ref = bpy.data.objects.get(obj_name)
+                            if obj_ref is None:
                                 _need_full_sync = True
                                 break
-                            if extract_all or obj.name in mesh_changed:
-                                xform = scene_export._matrix_to_3x4_row_major(inst.matrix_world)
-                                mk, ok, _ = _ignis_cached_tlas[cache_idx]
-                                _ignis_cached_tlas[cache_idx] = (mk, ok, xform)
-                            cache_idx += 1
-
-                        if not _need_full_sync and cache_idx == cache_len:
-                            _build_tlas_from_cache()
-                            _ignis_frame_index = 0
-                        elif not _need_full_sync:
+                            obj_eval = depsgraph.id_eval_get(obj_ref)
+                            xform = scene_export._matrix_to_3x4_row_major(obj_eval.matrix_world)
+                            all_indices.append(idx)
+                            all_transforms.append(np.array([xform], dtype=np.float32))
+                        else:
+                            # Unknown object (new duplicate, pasted, etc.) → full sync
                             _need_full_sync = True
-                    except Exception:
-                        _need_full_sync = True
+                            break
 
-            # ── Path 3: Full sync ──
+                    if not _need_full_sync and all_indices:
+                        idx_arr = np.array(all_indices, dtype=np.uint32)
+                        xfm_arr = np.concatenate(all_transforms, axis=0).flatten().astype(np.float32)
+                        dll_wrapper.update_instance_transforms(idx_arr, xfm_arr, len(all_indices))
+                        _ignis_frame_index = 0
+                except Exception:
+                    _log_exception("hierarchy transform sync")
+                    _need_full_sync = True
+
+            # ── Full sync: iterate depsgraph (undo, add/remove, fallback) ──
             if _need_full_sync:
                 cur_instances = []
                 new_objects = {}
                 _sync_obj_count = 0
+                # Collect parent hierarchy info during iteration
+                _parent_children_sync = {}  # parent_name → [(tlas_idx, parent_vk_4x4, child_vk_4x4)]
                 for inst in depsgraph.object_instances:
                     obj = inst.object
                     if obj.type != 'MESH':
@@ -1606,12 +1614,18 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         mesh_key = obj_key
                     if mesh_key and mesh_key in _ignis_blas_handles:
                         xform = scene_export._matrix_to_3x4_row_major(inst.matrix_world)
+                        tlas_idx = len(cur_instances)
                         cur_instances.append((mesh_key, obj_key, xform))
+                        # Detect collection instance hierarchy for fast path
+                        if inst.is_instance and inst.parent:
+                            pname = inst.parent.name
+                            parent_vk = scene_export.COORD_CONV @ np.array(inst.parent.matrix_world, dtype=np.float32)
+                            child_vk = scene_export.COORD_CONV @ np.array(inst.matrix_world, dtype=np.float32)
+                            _parent_children_sync.setdefault(pname, []).append((tlas_idx, parent_vk, child_vk))
                     else:
                         if obj_key not in _ignis_known_objects and obj_key not in new_objects:
                             new_objects[obj_key] = (obj, inst)
 
-                # Incremental BLAS upload for new objects
                 if new_objects:
                     try:
                         self._upload_new_objects(depsgraph, new_objects)
@@ -1620,6 +1634,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         for obj_name in new_objects:
                             _ignis_known_objects.add(obj_name)
                     cur_instances = []
+                    _parent_children_sync = {}
                     for inst in depsgraph.object_instances:
                         obj = inst.object
                         if obj.type != 'MESH':
@@ -1627,9 +1642,14 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         mesh_key = _ignis_obj_to_mesh.get(obj.name)
                         if mesh_key and mesh_key in _ignis_blas_handles:
                             xform = scene_export._matrix_to_3x4_row_major(inst.matrix_world)
+                            tlas_idx = len(cur_instances)
                             cur_instances.append((mesh_key, obj.name, xform))
+                            if inst.is_instance and inst.parent:
+                                pname = inst.parent.name
+                                parent_vk = scene_export.COORD_CONV @ np.array(inst.parent.matrix_world, dtype=np.float32)
+                                child_vk = scene_export.COORD_CONV @ np.array(inst.matrix_world, dtype=np.float32)
+                                _parent_children_sync.setdefault(pname, []).append((tlas_idx, parent_vk, child_vk))
 
-                # Add hair instances
                 for hair_key, blas_idx in _ignis_blas_handles.items():
                     if '__hair_' in hair_key:
                         parent_name = hair_key.split('__hair_')[0]
@@ -1638,42 +1658,45 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                                 cur_instances.append((hair_key, ok, xf))
                                 break
 
-                # Rebuild cache for next frame
                 _ignis_cached_tlas = list(cur_instances)
                 _ignis_objkey_to_tlas = {}
                 for i, (_, ok, _) in enumerate(_ignis_cached_tlas):
                     _ignis_objkey_to_tlas.setdefault(ok, []).append(i)
 
-                # Detect actual changes
-                xform_floats = tuple(f for _, _, xf in cur_instances for f in xf)
-                transforms_changed = len(cur_instances) != _ignis_instance_count
-                if not transforms_changed and _ignis_last_transforms is not None:
-                    for a, b in zip(xform_floats, _ignis_last_transforms):
-                        if abs(a - b) > 1e-5:
-                            transforms_changed = True
-                            break
+                # Rebuild hierarchy caches from depsgraph data
+                _ignis_parent_groups = {}
+                for pname, children in _parent_children_sync.items():
+                    indices = np.array([c[0] for c in children], dtype=np.uint32)
+                    # Compute relative in Vulkan space: inv(parent_vk) @ child_vk
+                    parent_vk = children[0][1]  # all share same parent
+                    parent_inv = np.linalg.inv(parent_vk)
+                    relatives = np.array([parent_inv @ c[2] for c in children], dtype=np.float32)
+                    _ignis_parent_groups[pname] = {"indices": indices, "relative": relatives}
+
+                _ignis_direct_objects = {}
+                for ok, indices in _ignis_objkey_to_tlas.items():
+                    if len(indices) == 1 and ok not in _ignis_parent_groups:
+                        _ignis_direct_objects[ok] = indices[0]
+
+                count = len(cur_instances)
+                if count > 0:
+                    InstanceArray = TLASInstance * count
+                    tlas_arr = InstanceArray()
+                    for i, (mesh_key, _, xform) in enumerate(cur_instances):
+                        blas_idx = _ignis_blas_handles[mesh_key]
+                        tlas_arr[i].blasIndex = blas_idx
+                        for j in range(12):
+                            tlas_arr[i].transform[j] = xform[j]
+                        tlas_arr[i].customIndex = blas_idx
+                        tlas_arr[i].mask = 0xFF
+                    dll_wrapper.build_tlas(tlas_arr, count)
+                    if count != _ignis_instance_count or new_objects:
+                        _ignis_frame_index = 0
+                        dll_wrapper.set_int("reset_history", 1)
+                    _ignis_instance_count = count
 
                 if _ignis_frame_index < 2:
-                    _log(f"  sync: {_sync_obj_count} mesh objects, {len(cur_instances)} known, {len(new_objects)} new, changed={transforms_changed}")
-
-                if transforms_changed or new_objects:
-                    _ignis_last_transforms = xform_floats
-                    count = len(cur_instances)
-                    if count > 0:
-                        InstanceArray = TLASInstance * count
-                        tlas_arr = InstanceArray()
-                        for i, (mesh_key, _, xform) in enumerate(cur_instances):
-                            blas_idx = _ignis_blas_handles[mesh_key]
-                            tlas_arr[i].blasIndex = blas_idx
-                            for j in range(12):
-                                tlas_arr[i].transform[j] = xform[j]
-                            tlas_arr[i].customIndex = blas_idx
-                            tlas_arr[i].mask = 0xFF
-                        dll_wrapper.build_tlas(tlas_arr, count)
-                        if count != _ignis_instance_count or new_objects:
-                            _ignis_frame_index = 0
-                            dll_wrapper.set_int("reset_history", 1)
-                        _ignis_instance_count = count
+                    _log(f"  sync: {_sync_obj_count} mesh objects, {len(cur_instances)} known, {len(new_objects)} new")
 
         # FPS limiter / V-Sync
         props = context.scene.ignis_rt
