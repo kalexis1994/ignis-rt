@@ -868,7 +868,33 @@ void Renderer::RenderFrameRT() {
         vkCmdDispatch(cmd, groups, 1, 1);
     }
 
-    // (SHARC diag flush removed — SHARC is disabled)
+    // Surfel GI resolve: merge surfel accumulation → resolved
+    if (surfelResolveReady_ && rtPipeline_->HasSurfelBuffers()) {
+        VkMemoryBarrier rtToSurfel{};
+        rtToSurfel.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        rtToSurfel.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        rtToSurfel.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,  // after SHARC resolve
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &rtToSurfel, 0, nullptr, 0, nullptr);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, surfelResolvePipeline_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            surfelResolvePipelineLayout_, 0, 1, &surfelResolveDescSet_, 0, nullptr);
+
+        struct { uint32_t capacity; uint32_t frameIndex; uint32_t accFrameMax; uint32_t staleMax; float radScale; } surfelPC;
+        surfelPC.capacity = RTPipeline::SURFEL_CAPACITY;
+        surfelPC.frameIndex = frameIndex_;
+        surfelPC.accFrameMax = 64;   // faster convergence than SHARC
+        surfelPC.staleMax = 128;
+        surfelPC.radScale = 1000.0f;
+        vkCmdPushConstants(cmd, surfelResolvePipelineLayout_,
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(surfelPC), &surfelPC);
+
+        uint32_t groups = (RTPipeline::SURFEL_CAPACITY + 255) / 256;
+        vkCmdDispatch(cmd, groups, 1, 1);
+    }
 
     // Wavefront path: skip NRD denoise + composite — K5 wrote G-buffers + output
     // But DLSS SR + tonemap still need to run if DLSS is active
@@ -1602,6 +1628,11 @@ bool Renderer::InitNRD() {
     // Create SHARC resolve pipeline
     if (!CreateSHARCResolvePipeline()) {
         Log(L"[VK Renderer] WARNING: SHARC resolve pipeline creation failed (non-fatal)\n");
+    }
+
+    // Create Surfel GI resolve pipeline
+    if (!CreateSurfelResolvePipeline()) {
+        Log(L"[VK Renderer] WARNING: Surfel resolve pipeline creation failed (non-fatal)\n");
     }
 
     return true;
@@ -2539,6 +2570,126 @@ void Renderer::ShutdownSHARCResolve() {
     if (sharcResolveDescriptorPool_) { vkDestroyDescriptorPool(device, sharcResolveDescriptorPool_, nullptr); sharcResolveDescriptorPool_ = VK_NULL_HANDLE; }
     if (sharcResolveDescriptorSetLayout_) { vkDestroyDescriptorSetLayout(device, sharcResolveDescriptorSetLayout_, nullptr); sharcResolveDescriptorSetLayout_ = VK_NULL_HANDLE; }
     sharcResolveReady_ = false;
+}
+
+bool Renderer::CreateSurfelResolvePipeline() {
+    VkDevice device = context_->GetDevice();
+
+    // Descriptor set layout: 2 SSBOs (hash entries + data)
+    VkDescriptorSetLayoutBinding bindings[2] = {};
+    for (int i = 0; i < 2; i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = 2;
+    layoutInfo.pBindings = bindings;
+    if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &surfelResolveDescSetLayout_) != VK_SUCCESS)
+        return false;
+
+    // Pipeline layout with push constants
+    VkPushConstantRange pushRange{};
+    pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushRange.offset = 0;
+    pushRange.size = 20;  // 4 uints + 1 float
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+    pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &surfelResolveDescSetLayout_;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+    if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &surfelResolvePipelineLayout_) != VK_SUCCESS)
+        return false;
+
+    // Load compute shader
+    std::ifstream file(IgnisResolvePath("shaders/surfel_resolve.comp.spv"), std::ios::ate | std::ios::binary);
+    if (!file.is_open()) {
+        Log(L"[VK Renderer] WARNING: surfel_resolve.comp.spv not found\n");
+        return false;
+    }
+    size_t fileSize = (size_t)file.tellg();
+    std::vector<char> code(fileSize);
+    file.seekg(0);
+    file.read(code.data(), fileSize);
+    file.close();
+
+    VkShaderModuleCreateInfo moduleInfo{};
+    moduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    moduleInfo.codeSize = code.size();
+    moduleInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
+    VkShaderModule shaderModule;
+    if (vkCreateShaderModule(device, &moduleInfo, nullptr, &shaderModule) != VK_SUCCESS)
+        return false;
+
+    VkComputePipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipelineInfo.stage.module = shaderModule;
+    pipelineInfo.stage.pName = "main";
+    pipelineInfo.layout = surfelResolvePipelineLayout_;
+
+    VkResult result = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &surfelResolvePipeline_);
+    vkDestroyShaderModule(device, shaderModule, nullptr);
+    if (result != VK_SUCCESS) return false;
+
+    // Descriptor pool + set
+    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
+    VkDescriptorPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.maxSets = 1;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &surfelResolveDescPool_) != VK_SUCCESS)
+        return false;
+
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = surfelResolveDescPool_;
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &surfelResolveDescSetLayout_;
+    if (vkAllocateDescriptorSets(device, &allocInfo, &surfelResolveDescSet_) != VK_SUCCESS)
+        return false;
+
+    UpdateSurfelResolveDescriptors();
+    surfelResolveReady_ = true;
+    Log(L"[VK Renderer] Surfel GI resolve pipeline created\n");
+    return true;
+}
+
+void Renderer::UpdateSurfelResolveDescriptors() {
+    if (!rtPipeline_ || !rtPipeline_->HasSurfelBuffers()) return;
+    VkDevice device = context_->GetDevice();
+
+    VkDescriptorBufferInfo hashInfo{};
+    hashInfo.buffer = rtPipeline_->GetSurfelBuffer(0);
+    hashInfo.offset = 0;
+    hashInfo.range = RTPipeline::SURFEL_CAPACITY * 8;
+
+    VkDescriptorBufferInfo dataInfo{};
+    dataInfo.buffer = rtPipeline_->GetSurfelBuffer(1);
+    dataInfo.offset = 0;
+    dataInfo.range = RTPipeline::SURFEL_CAPACITY * 32;
+
+    VkWriteDescriptorSet writes[2] = {};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = surfelResolveDescSet_;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[0].pBufferInfo = &hashInfo;
+
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = surfelResolveDescSet_;
+    writes[1].dstBinding = 1;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[1].pBufferInfo = &dataInfo;
+
+    vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
 }
 
 void Renderer::ShutdownDLSS() {

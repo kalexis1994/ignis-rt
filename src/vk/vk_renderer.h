@@ -233,6 +233,16 @@ private:
     void UpdateSHARCResolveDescriptors();
     void ShutdownSHARCResolve();
 
+    // Surfel GI resolve compute pipeline
+    VkPipeline surfelResolvePipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout surfelResolvePipelineLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout surfelResolveDescSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorPool surfelResolveDescPool_ = VK_NULL_HANDLE;
+    VkDescriptorSet surfelResolveDescSet_ = VK_NULL_HANDLE;
+    bool surfelResolveReady_ = false;
+    bool CreateSurfelResolvePipeline();
+    void UpdateSurfelResolveDescriptors();
+
     // ImGui overlay
     VkRenderPass imguiRenderPass_ = VK_NULL_HANDLE;
     VkFramebuffer imguiFramebuffer_[2] = {};

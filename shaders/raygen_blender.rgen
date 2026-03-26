@@ -754,8 +754,9 @@ void main() {
     uint sharcCapacity = cam.sharcCapacity;
     vec3 prevBounceNormal = vec3(0, 1, 0);
 
-    // Surfel GI cache (Phase 1: reads from SHARC buffers, finer grid)
+    // Surfel GI cache (independent buffers at bindings 32-33)
     bool surfelEnabled = sharcEnabled;  // TODO: independent toggle
+    uint surfelCapacity = 1u << 20u;    // 1M entries
     SurfelGridParams surfelGrid;
     surfelGrid.cameraPosition = sharcGrid.cameraPosition;
     surfelGrid.sceneScale = cam.sharcSceneScale * SURFEL_GRID_SCALE_MULT;
@@ -1152,6 +1153,12 @@ void main() {
             primaryLocalPos = localPos;
             primaryCustomIndex = customIndex;   // BLAS index
             primaryInstanceId = instanceId;     // instance index
+
+            // Insert surfel at primary hit position
+            if (surfelEnabled) {
+                uint64_t surfelKey = surfelHashKey(pbrHit.worldPos, N, surfelGrid);
+                surfelInsert(surfelKey, surfelCapacity);
+            }
 
             // View-space Z (negative in RH convention)
             vec4 viewPos = cam.view * vec4(pbrHit.worldPos, 1.0);
@@ -1842,6 +1849,23 @@ void main() {
             if (!continueTracing) break;
 
             SharcSetThroughput(sharcState, throughput);
+        }
+
+        // ---- Surfel update: accumulate direct lighting at primary hit ----
+        if (surfelEnabled && bounce == 0 && surfelIsUpdatePixel(pixel, frameIndex)) {
+            uint64_t sKey = surfelHashKey(pbrHit.worldPos, N, surfelGrid);
+            uint sSlot = surfelFind(sKey, surfelCapacity);
+            if (sSlot != 0xFFFFFFFFu) {
+                // Accumulate the direct lighting at this primary hit
+                vec3 directContrib = pbrHit.emission;
+                // Add NEE sun contribution (already computed above)
+                // Use a simplified estimate: baseColor * sun_NdotL * sunIntensity
+                float sunNdotL = max(dot(N, normalize(cam.sunLight.xyz)), 0.0);
+                vec3 sunContrib = pbrHit.baseColor * sunNdotL * cam.sunLight.w * cam.skyLight.rgb;
+                // Add ambient
+                vec3 ambContrib = pbrHit.baseColor * cam.ambientLight.rgb * 0.3;
+                surfelAccumulate(sSlot, sunContrib + ambContrib + directContrib, surfelCapacity);
+            }
         }
 
         // ---- Early termination: throughput too low to contribute visibly ----
