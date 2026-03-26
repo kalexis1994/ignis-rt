@@ -754,8 +754,8 @@ void main() {
     uint sharcCapacity = cam.sharcCapacity;
     vec3 prevBounceNormal = vec3(0, 1, 0);
 
-    // Surfel GI cache (independent buffers at bindings 32-33)
-    bool surfelEnabled = sharcEnabled;  // TODO: independent toggle
+    // Surfel GI cache (disabled until surfel quality justifies the cost)
+    bool surfelEnabled = false;
     uint surfelCapacity = 1u << 20u;    // 1M entries
     SurfelGridParams surfelGrid;
     surfelGrid.cameraPosition = sharcGrid.cameraPosition;
@@ -1332,8 +1332,8 @@ void main() {
                 if (bounce == 0) {
                     // Always apply shadow directly (works for both RR and NRD modes)
                     float shadow = inShadow ? 0.0 : 1.0;
-                    diffuseRadiance += diffContrib * sunRadiance * throughput * shadow;
-                    specularRadiance += specContrib * sunRadiance * throughput * shadow;
+                    diffuseRadiance += clampRadiance(diffContrib * sunRadiance * throughput * shadow);
+                    specularRadiance += clampRadiance(specContrib * sunRadiance * throughput * shadow);
 
                     // Store penumbra for SIGMA (NRD fallback)
                     primaryNdotLSample = NdotL;
@@ -1346,7 +1346,7 @@ void main() {
                 } else {
                     // Indirect bounces: apply shadow directly (SIGMA only handles primary)
                     float shadow = inShadow ? 0.0 : 1.0;
-                    vec3 directLight = (diffContrib + specContrib) * sunRadiance * shadow;
+                    vec3 directLight = clampRadiance((diffContrib + specContrib) * sunRadiance * shadow);
                     if (isDiffusePath) {
                         diffuseRadiance += directLight * throughput * giIntensity;
                     } else {
@@ -1548,9 +1548,9 @@ void main() {
                     evaluateCookTorrance(N, V, fL, pbrHit.baseColor, pbrHit.roughness,
                         pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior, fDiffC, fSpecC);
 
-                    vec3 contribution = (fDiffC + fSpecC) * fRadiance * W;
-                    diffuseRadiance += fDiffC * fRadiance * W * throughput;
-                    specularRadiance += fSpecC * fRadiance * W * throughput;
+                    vec3 contribution = clampRadiance((fDiffC + fSpecC) * fRadiance * W);
+                    diffuseRadiance += clampRadiance(fDiffC * fRadiance * W * throughput);
+                    specularRadiance += clampRadiance(fSpecC * fRadiance * W * throughput);
                 }
             }
 
@@ -1715,10 +1715,10 @@ void main() {
 
             if (bounce == 0) {
                 // Point lights: apply shadow directly (SIGMA only handles sun)
-                diffuseRadiance += diffC * lightRadiance * shadow * throughput * neeScale;
-                specularRadiance += specC * lightRadiance * shadow * throughput * neeScale;
+                diffuseRadiance += clampRadiance(diffC * lightRadiance * shadow * throughput * neeScale);
+                specularRadiance += clampRadiance(specC * lightRadiance * shadow * throughput * neeScale);
             } else {
-                vec3 directLight = (diffC + specC) * lightRadiance * shadow * neeScale;
+                vec3 directLight = clampRadiance((diffC + specC) * lightRadiance * shadow * neeScale);
                 if (isDiffusePath) {
                     diffuseRadiance += directLight * throughput * giIntensity;
                 } else {
@@ -1788,14 +1788,14 @@ void main() {
                         float lightPdf = eSample.pdf * eDist * eDist / eCosTheta;
                         float misWeight = (lightPdf * lightPdf) / (lightPdf * lightPdf + bsdfPdf * bsdfPdf + 1e-8);
 
-                        vec3 eDiffContrib = eDiffC * eRadiance * misWeight / eSample.pdf;
-                        vec3 eSpecContrib = eSpecC * eRadiance * misWeight / eSample.pdf;
+                        vec3 eDiffContrib = clampRadiance(eDiffC * eRadiance * misWeight / max(eSample.pdf, 1e-6));
+                        vec3 eSpecContrib = clampRadiance(eSpecC * eRadiance * misWeight / max(eSample.pdf, 1e-6));
 
                         if (bounce == 0) {
-                            diffuseRadiance += eDiffContrib * throughput;
-                            specularRadiance += eSpecContrib * throughput;
+                            diffuseRadiance += clampRadiance(eDiffContrib * throughput);
+                            specularRadiance += clampRadiance(eSpecContrib * throughput);
                         } else {
-                            vec3 directLight = eDiffContrib + eSpecContrib;
+                            vec3 directLight = clampRadiance(eDiffContrib + eSpecContrib);
                             if (isDiffusePath) {
                                 diffuseRadiance += directLight * throughput * giIntensity;
                             } else {
@@ -1919,9 +1919,9 @@ void main() {
         float tpMax = max(throughput.r, max(throughput.g, throughput.b));
         if (tpMax < 0.01) break;
 
-        // ---- Russian roulette (start at bounce 1 instead of 2 for faster termination) ----
+        // ---- Russian roulette (NRD guidance: min survival prob 0.05 → max 20x boost) ----
         if (bounce >= 1) {
-            float p = min(sqrt(tpMax), 1.0);
+            float p = clamp(sqrt(tpMax), 0.05, 1.0);
             if (rand01() > p) break;
             throughput /= p;
             throughput = min(throughput, vec3(MAX_RADIANCE));

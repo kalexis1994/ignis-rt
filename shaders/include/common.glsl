@@ -48,9 +48,16 @@ vec2 stratifiedSample(uint sampleIdx, vec2 randomOffset) {
     return fract(r2Sample(sampleIdx) + randomOffset);
 }
 
-// Clamp contribution to prevent fireflies
+// Clamp contribution to prevent fireflies (luminance-based, preserves hue).
+// MAX_RADIANCE = 30.0 chosen to match Cycles/RenderMan indirect clamp range.
+// Luminance-based clamping scales the entire color proportionally instead of
+// clipping individual channels, which would shift hue toward white.
 vec3 clampRadiance(vec3 r) {
-    return min(r, vec3(MAX_RADIANCE));
+    float lum = dot(r, vec3(0.2126, 0.7152, 0.0722));
+    if (lum > MAX_RADIANCE) {
+        r *= MAX_RADIANCE / lum;
+    }
+    return r;
 }
 
 // Shadow terminator fix (Appleseed/Cycles):
