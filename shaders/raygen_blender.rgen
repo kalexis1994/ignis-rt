@@ -1851,20 +1851,67 @@ void main() {
             SharcSetThroughput(sharcState, throughput);
         }
 
-        // ---- Surfel update: accumulate direct lighting at primary hit ----
+        // ---- Surfel update: trace 4 hemisphere rays for indirect irradiance ----
         if (surfelEnabled && bounce == 0 && surfelIsUpdatePixel(pixel, frameIndex)) {
             uint64_t sKey = surfelHashKey(pbrHit.worldPos, N, surfelGrid);
             uint sSlot = surfelFind(sKey, surfelCapacity);
             if (sSlot != 0xFFFFFFFFu) {
-                // Accumulate the direct lighting at this primary hit
-                vec3 directContrib = pbrHit.emission;
-                // Add NEE sun contribution (already computed above)
-                // Use a simplified estimate: baseColor * sun_NdotL * sunIntensity
-                float sunNdotL = max(dot(N, normalize(cam.sunLight.xyz)), 0.0);
-                vec3 sunContrib = pbrHit.baseColor * sunNdotL * cam.sunLight.w * cam.skyLight.rgb;
-                // Add ambient
-                vec3 ambContrib = pbrHit.baseColor * cam.ambientLight.rgb * 0.3;
-                surfelAccumulate(sSlot, sunContrib + ambContrib + directContrib, surfelCapacity);
+                vec3 surfelRadiance = vec3(0.0);
+                vec3 surfelOrigin = pbrHit.worldPos + N * 0.002;
+
+                for (int sr = 0; sr < 4; sr++) {
+                    vec3 sDir = sampleCosineHemisphere(rand2(), N);
+
+                    rayQueryEXT srq;
+                    rayQueryInitializeEXT(srq, topLevelAS, gl_RayFlagsOpaqueEXT,
+                                          0xFF, surfelOrigin, MIN_HIT_DIST, sDir, 10000.0);
+                    while (rayQueryProceedEXT(srq)) {}
+
+                    if (rayQueryGetIntersectionTypeEXT(srq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+                        // Sky contribution
+                        surfelRadiance += evaluateSky(sDir);
+                    } else {
+                        // Hit surface — compute direct lighting at hit point
+                        uint sCI = rayQueryGetIntersectionInstanceCustomIndexEXT(srq, true);
+                        int sPrimId = rayQueryGetIntersectionPrimitiveIndexEXT(srq, true);
+                        GeometryMetadata sGeo = geometryMetadata.geometries[sCI];
+
+                        // Material albedo (from legacy struct, no VM)
+                        uint sMatIdx = 0u;
+                        if (sGeo.primMaterialBufferAddress != 0u) {
+                            PrimMaterials sPM = PrimMaterials(sGeo.primMaterialBufferAddress);
+                            sMatIdx = sPM.m[sPrimId];
+                        }
+                        Material sMat = materialBuffer.materials[sMatIdx];
+                        vec3 albedo = vec3(sMat.ksAmbient, sMat.ksDiffuse, sMat.ksSpecular);
+
+                        // Geometric normal at hit
+                        Indices sIdx = Indices(sGeo.indexBufferAddress);
+                        Vertices sVerts = Vertices(sGeo.vertexBufferAddress);
+                        uint si0 = sIdx.i[sPrimId * 3 + 0];
+                        uint si1 = sIdx.i[sPrimId * 3 + 1];
+                        uint si2 = sIdx.i[sPrimId * 3 + 2];
+                        vec3 sv0 = vec3(sVerts.v[si0*3], sVerts.v[si0*3+1], sVerts.v[si0*3+2]);
+                        vec3 sv1 = vec3(sVerts.v[si1*3], sVerts.v[si1*3+1], sVerts.v[si1*3+2]);
+                        vec3 sv2 = vec3(sVerts.v[si2*3], sVerts.v[si2*3+1], sVerts.v[si2*3+2]);
+                        mat4x3 sOTW = rayQueryGetIntersectionObjectToWorldEXT(srq, true);
+                        vec3 sN = normalize(cross(
+                            (sOTW * vec4(sv1, 1.0)) - (sOTW * vec4(sv0, 1.0)),
+                            (sOTW * vec4(sv2, 1.0)) - (sOTW * vec4(sv0, 1.0))));
+
+                        // Sun direct (unshadowed for speed)
+                        vec3 sunDir = normalize(cam.sunLight.xyz);
+                        float sNdotL = max(dot(sN, sunDir), 0.0);
+                        surfelRadiance += albedo * sNdotL * cam.sunLight.w * cam.skyLight.rgb * INV_PI;
+
+                        // Ambient hemisphere
+                        surfelRadiance += albedo * cam.ambientLight.rgb * 0.25 * INV_PI;
+
+                        // Emission
+                        surfelRadiance += vec3(sMat.emissiveR, sMat.emissiveG, sMat.emissiveB) * sMat.fresnelMaxLevel;
+                    }
+                }
+                surfelAccumulate(sSlot, surfelRadiance * 0.25, surfelCapacity);
             }
         }
 
