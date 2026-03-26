@@ -53,7 +53,42 @@ flowchart TB
 | 5. TLAS | Build top-level acceleration structure (instances) | <0.1s |
 | 6. Finalize | Sun extraction, emissive triangles, HDRI | <0.5s |
 
-### Per-Frame Sync
+### Per-Frame Transform Sync
+
+Three-tier system avoids expensive depsgraph iteration for most object movements:
+
+```mermaid
+flowchart TD
+    VU[view_update] -->|Object changed| CO[_ignis_changed_objects]
+    VU -->|Scene changed| OD[_ignis_objects_dirty]
+    UNDO[undo_post / redo_post] --> OD
+
+    CO --> CHECK{Object type?}
+    CHECK -->|"Parent Empty<br>(in _ignis_parent_groups)"| HIER["Hierarchy path<br>1 API call + numpy batch multiply<br>O(K children)"]
+    CHECK -->|"Direct mesh<br>(in _ignis_direct_objects)"| INST["Instant path<br>1 API call per object<br>O(1)"]
+    CHECK -->|Unknown / new| FULL
+
+    OD --> FULL["Full sync<br>iterate depsgraph<br>rebuild all caches"]
+
+    HIER --> UPDATE[update_instance_transforms]
+    INST --> UPDATE
+    FULL --> BUILD[build_tlas]
+
+    UPDATE -->|"TLAS refit<br>(VK_..._MODE_UPDATE)"| GPU[GPU]
+    BUILD -->|"TLAS rebuild<br>(VK_..._MODE_BUILD)"| GPU
+
+    IDLE["60 frames idle"] -->|safety net| FULL
+
+    style HIER fill:#2E7D32,color:white
+    style INST fill:#2E7D32,color:white
+    style FULL fill:#C62828,color:white
+```
+
+**Hierarchy cache**: During initial load, collection instance parent-child relationships are detected via `inst.parent`. Each parent Empty stores its children's relative transforms (in Vulkan space). When the parent moves, child transforms are computed via numpy batch matrix multiply -- zero depsgraph iteration.
+
+**TLAS refit**: When only transforms change (same instance count), the TLAS is updated in-place using `VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR` instead of a full rebuild. The C++ renderer caches the full instance array and patches only the changed entries.
+
+**Safety net**: After 60 frames without any sync, a full sync is forced to catch any missed updates from undo, duplication, or other edge cases.
 
 ```mermaid
 sequenceDiagram
@@ -65,7 +100,15 @@ sequenceDiagram
     B->>P: view_draw()
     P->>C: set_camera(matrices)
     P->>C: set_float(exposure, sun, etc.)
-    P->>C: build_tlas(transforms)
+    alt Object moved (fast path)
+        P->>P: numpy: parent_vk @ child_relative
+        P->>C: update_instance_transforms(indices, xforms)
+        C->>G: TLAS refit (UPDATE mode)
+    else Scene changed (full sync)
+        P->>P: iterate depsgraph
+        P->>C: build_tlas(all instances)
+        C->>G: TLAS rebuild (BUILD mode)
+    end
     C->>G: dispatch raygen shader
     G->>G: path trace + denoise
     G->>C: output texture
@@ -99,10 +142,12 @@ All rays use `gl_RayFlagsOpaqueEXT` for maximum hardware BVH performance. Alpha-
 
 ### Performance Optimizations
 
-| Optimization | Impact | GPU |
+| Optimization | Impact | Where |
 |---|---|---|
-| **Shader Execution Reordering (SER)** | Reduces thread divergence by grouping threads with same material | RTX 40+ hardware, 30 software |
-| **VM skip for empty programs** | Avoids function call + 20-field struct init when instrCount=0 | All |
-| **Output opcode fast-path** | Opcodes >= 0xE0 branch directly to output handlers, skipping 50+ intermediate checks | All |
-| **Opaque ray queries** | Hardware BVH finds closest hit natively, no per-candidate processing | All |
-| **Runtime OCIO LUT bake** | Single 3D texture lookup for any view transform, no per-pixel OCIO evaluation | All |
+| **Hierarchy transform sync** | O(1) API calls + numpy batch multiply instead of O(N) depsgraph iteration per frame | CPU |
+| **TLAS refit (UPDATE mode)** | In-place BVH refit instead of full TLAS rebuild when only transforms change | GPU |
+| **Shader Execution Reordering (SER)** | Reduces thread divergence by grouping threads with same material | RTX 40+ HW, 30 SW |
+| **VM skip for empty programs** | Avoids function call + 20-field struct init when instrCount=0 | GPU |
+| **Output opcode fast-path** | Opcodes >= 0xE0 branch directly to output handlers, skipping 50+ intermediate checks | GPU |
+| **Opaque ray queries** | Hardware BVH finds closest hit natively, no per-candidate processing | GPU |
+| **Runtime OCIO LUT bake** | Single 3D texture lookup for any view transform, no per-pixel OCIO evaluation | GPU |

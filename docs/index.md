@@ -16,6 +16,8 @@ Ignis RT is a viewport render engine for Blender that uses hardware-accelerated 
 - **Volumetric rendering** — ray marching with Beer-Lambert + Henyey-Greenstein
 - **Blender Color Management** — runtime OCIO LUT bake for any view transform
 - **Procedural textures** — Cycles-exact Perlin noise (Jenkins Lookup3 hash)
+- **Sky Texture atmosphere** — sun size, air/dust density from Blender's Nishita sky
+- **Hierarchy transform sync** — O(1) collection instance updates via TLAS refit, zero depsgraph iteration
 
 ## Architecture at a Glance
 
