@@ -80,9 +80,7 @@ uint surfelGetSlot(uint64_t key, uint capacity) {
 }
 
 // ============================================================
-// Hash Map Operations
-// Uses SSBOs at bindings 20-21 (same as SHARC for Phase 1)
-// Phase 2 will switch to independent bindings 32-33
+// Hash Map Operations — uses independent surfel buffers (bindings 32-33)
 // ============================================================
 
 // Insert a hash key, return slot index (or 0xFFFFFFFF if failed)
@@ -91,7 +89,7 @@ uint surfelInsert(uint64_t key, uint capacity) {
     for (uint i = 0u; i < SURFEL_BUCKET_SIZE; i++) {
         uint slot = (baseSlot + i) % capacity;
         uint64_t existing = atomicCompSwap(
-            _sharcHashEntries.keys[slot], uint64_t(0u), key);
+            _surfelHashEntries.keys[slot], uint64_t(0u), key);
         if (existing == uint64_t(0u) || existing == key) {
             return slot;
         }
@@ -104,7 +102,7 @@ uint surfelFind(uint64_t key, uint capacity) {
     uint baseSlot = surfelGetSlot(key, capacity);
     for (uint i = 0u; i < SURFEL_BUCKET_SIZE; i++) {
         uint slot = (baseSlot + i) % capacity;
-        uint64_t stored = _sharcHashEntries.keys[slot];
+        uint64_t stored = _surfelHashEntries.keys[slot];
         if (stored == key) return slot;
         if (stored == uint64_t(0u)) return 0xFFFFFFFFu;
     }
@@ -116,14 +114,14 @@ uint surfelResolvedOffset(uint slot, uint capacity) {
     return capacity * 4u + slot * 4u;
 }
 
-// Add radiance to accumulation buffer
+// Add radiance to accumulation buffer (region 0 of surfel data)
 void surfelAccumulate(uint slot, vec3 radiance, uint capacity) {
     vec3 scaled = radiance * float(SURFEL_RADIANCE_SCALE);
     uvec3 uScaled = uvec3(max(scaled, vec3(0.0)));
-    if (uScaled.x > 0u) atomicAdd(_sharcAccum.data[slot * 4u + 0u], uScaled.x);
-    if (uScaled.y > 0u) atomicAdd(_sharcAccum.data[slot * 4u + 1u], uScaled.y);
-    if (uScaled.z > 0u) atomicAdd(_sharcAccum.data[slot * 4u + 2u], uScaled.z);
-    atomicAdd(_sharcAccum.data[slot * 4u + 3u], 1u);
+    if (uScaled.x > 0u) atomicAdd(_surfelData.data[slot * 4u + 0u], uScaled.x);
+    if (uScaled.y > 0u) atomicAdd(_surfelData.data[slot * 4u + 1u], uScaled.y);
+    if (uScaled.z > 0u) atomicAdd(_surfelData.data[slot * 4u + 2u], uScaled.z);
+    atomicAdd(_surfelData.data[slot * 4u + 3u], 1u);
 }
 
 // ============================================================
@@ -140,12 +138,12 @@ bool surfelGetCachedIrradiance(vec3 worldPos, vec3 normal,
     uint slot = surfelFind(key, capacity);
     if (slot == 0xFFFFFFFFu) return false;
 
-    // Read resolved irradiance
+    // Read resolved irradiance (region 1 of surfel data)
     uint rOff = surfelResolvedOffset(slot, capacity);
-    float r = uintBitsToFloat(_sharcAccum.data[rOff + 0u]);
-    float g = uintBitsToFloat(_sharcAccum.data[rOff + 1u]);
-    float b = uintBitsToFloat(_sharcAccum.data[rOff + 2u]);
-    uint meta = _sharcAccum.data[rOff + 3u];
+    float r = uintBitsToFloat(_surfelData.data[rOff + 0u]);
+    float g = uintBitsToFloat(_surfelData.data[rOff + 1u]);
+    float b = uintBitsToFloat(_surfelData.data[rOff + 2u]);
+    uint meta = _surfelData.data[rOff + 3u];
 
     // Check sample count (low 16 bits of meta)
     uint sampleCount = meta & 0xFFFFu;

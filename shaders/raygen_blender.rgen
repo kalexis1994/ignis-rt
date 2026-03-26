@@ -157,7 +157,7 @@ layout(binding = 21, set = 0, std430) buffer SHARCData        { uint data[];    
 #define _sharcResolved _sharcAccum  // resolved region starts at capacity*4
 
 #include "include/sharc_setup.glsl"
-#include "include/surfel_gi.glsl"
+// surfel_gi.glsl included AFTER buffer declarations (needs _surfelHashEntries, _surfelData)
 
 // GI Reservoir buffers for ReSTIR temporal reuse (3 vec4s per pixel)
 layout(binding = 24, set = 0, std430) buffer GIReservoirCurrBuf { vec4 data[]; } giReservoirCurr;
@@ -168,6 +168,17 @@ layout(binding = 25, set = 0, std430) buffer GIReservoirPrevBuf { vec4 data[]; }
 layout(binding = 26, set = 0, std430) buffer EmissiveTriBuf {
     vec4 data[];  // 4 vec4s per triangle
 } emissiveTris;
+
+// Surfel GI cache (experimental)
+layout(binding = 32, set = 0, std430) buffer SurfelHashBuf {
+    uint64_t keys[];
+} _surfelHashEntries;
+
+layout(binding = 33, set = 0, std430) buffer SurfelDataBuf {
+    uint data[];
+} _surfelData;
+
+#include "include/surfel_gi.glsl"
 
 // Per-instance previous-frame transforms (3 vec4s per instance: row0, row1, row2 of 3x4 row-major)
 layout(binding = 28, set = 0, std430) buffer PrevTransformBuf {

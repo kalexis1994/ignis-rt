@@ -199,6 +199,86 @@ void RTPipeline::DestroySHARCBuffers() {
     sharcCreated_ = false;
 }
 
+bool RTPipeline::CreateSurfelBuffers() {
+    if (surfelCreated_) return true;
+
+    VkDevice device = context_->GetDevice();
+
+    // Surfel uses 2 buffers on bindings 32-33:
+    // [0] Hash Entries: uint64 per entry = 8 bytes
+    // [1] Combined: accum (uint×4) + resolved (uint×4) = 32 bytes/entry
+    const VkDeviceSize sizes[2] = {
+        SURFEL_CAPACITY * 8,   // hash entries (uint64)
+        SURFEL_CAPACITY * 32,  // combined accum+resolved (8 uints per entry)
+    };
+
+    auto vkGetBufferDeviceAddressKHR_ = (PFN_vkGetBufferDeviceAddressKHR)
+        vkGetDeviceProcAddr(device, "vkGetBufferDeviceAddressKHR");
+
+    for (int i = 0; i < 2; i++) {
+        VkBufferCreateInfo bufInfo{};
+        bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufInfo.size = sizes[i];
+        bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                        VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        if (vkCreateBuffer(device, &bufInfo, nullptr, &surfelBuffer_[i]) != VK_SUCCESS) {
+            Log(L"[VK RTPipeline] ERROR: Failed to create surfel buffer %d\n", i);
+            return false;
+        }
+
+        VkMemoryRequirements memReqs;
+        vkGetBufferMemoryRequirements(device, surfelBuffer_[i], &memReqs);
+
+        VkMemoryAllocateFlagsInfo allocFlags{};
+        allocFlags.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+        allocFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.pNext = &allocFlags;
+        allocInfo.allocationSize = memReqs.size;
+        allocInfo.memoryTypeIndex = context_->FindMemoryType(memReqs.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &surfelMemory_[i]) != VK_SUCCESS) {
+            Log(L"[VK RTPipeline] ERROR: Failed to allocate surfel memory %d\n", i);
+            return false;
+        }
+        vkBindBufferMemory(device, surfelBuffer_[i], surfelMemory_[i], 0);
+
+        // Zero-fill
+        VkCommandBuffer cmd = context_->BeginSingleTimeCommands();
+        vkCmdFillBuffer(cmd, surfelBuffer_[i], 0, sizes[i], 0);
+        context_->EndSingleTimeCommands(cmd);
+    }
+
+    surfelCreated_ = true;
+
+    // Update descriptor set bindings 32-33
+    VkDescriptorBufferInfo bufInfos[2] = {};
+    bufInfos[0].buffer = surfelBuffer_[0]; bufInfos[0].offset = 0; bufInfos[0].range = sizes[0];
+    bufInfos[1].buffer = surfelBuffer_[1]; bufInfos[1].offset = 0; bufInfos[1].range = sizes[1];
+
+    VkWriteDescriptorSet writes[2] = {};
+    for (int i = 0; i < 2; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = descriptorSet_;
+        writes[i].dstBinding = 32 + i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+    vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+
+    VkDeviceSize totalMB = (sizes[0] + sizes[1]) / (1024 * 1024);
+    Log(L"[VK RTPipeline] Surfel GI buffers created: %u MiB (%u entries)\n",
+        (uint32_t)totalMB, SURFEL_CAPACITY);
+    return true;
+}
+
 bool RTPipeline::CreateGIReservoirBuffers(uint32_t width, uint32_t height) {
     if (giReservoirCreated_) return true;
 
@@ -582,6 +662,9 @@ bool RTPipeline::CreateGBuffers(uint32_t width, uint32_t height) {
 
     // Create SHARC radiance cache buffers (resolution-independent)
     CreateSHARCBuffers();
+
+    // Create Surfel GI cache buffers (experimental)
+    CreateSurfelBuffers();
 
     // Create GI reservoir buffers for ReSTIR (resolution-dependent)
     CreateGIReservoirBuffers(width, height);
@@ -991,10 +1074,18 @@ bool RTPipeline::CreateDescriptorSetLayout() {
     bindings[31].descriptorCount = 1;
     bindings[31].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
+    // bindings 32-33: Surfel GI cache (SSBOs)
+    bindings.resize(34);
+    for (int i = 32; i <= 33; i++) {
+        bindings[i] = {};
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+
     // Binding flags for partially bound descriptors
-    // Note: VARIABLE_DESCRIPTOR_COUNT can only be on the LAST binding (highest number).
-    // Since binding 5 is not the last, we just use PARTIALLY_BOUND with fixed count 1024.
-    std::vector<VkDescriptorBindingFlags> bindingFlags(32, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
+    std::vector<VkDescriptorBindingFlags> bindingFlags(34, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
 
     VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo{};
     flagsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
@@ -1193,7 +1284,7 @@ bool RTPipeline::CreateDescriptorPool() {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 21},   // 13 base + 1 reserved(27) + 3 masks(29-31) + padding
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9},   // 3 base + 2 SHARC + 1 prevTransforms(28) + 2 GI reservoir(24-25) + 1 emissive(26)
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 11},  // 3 base + 2 SHARC + 1 prevTransforms(28) + 2 GI reservoir(24-25) + 1 emissive(26) + 2 surfel(32-33)
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1034},  // 1024 textures + 10 other samplers
     };
 
@@ -1527,6 +1618,18 @@ bool RTPipeline::CreateDescriptorSet() {
         wr.descriptorCount = 1;
         wr.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         wr.pImageInfo = &dummyImageR8Info;
+        writes.push_back(wr);
+    }
+
+    // bindings 32-33: Surfel GI cache (dummy SSBOs, replaced by CreateSurfelBuffers)
+    for (int i = 32; i <= 33; i++) {
+        VkWriteDescriptorSet wr{};
+        wr.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr.dstSet = descriptorSet_;
+        wr.dstBinding = i;
+        wr.descriptorCount = 1;
+        wr.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        wr.pBufferInfo = &geomInfo;  // reuse dummy buffer
         writes.push_back(wr);
     }
 

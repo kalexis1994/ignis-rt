@@ -219,6 +219,12 @@ public:
     VkDeviceAddress GetSHARCResolvedAddr() const { return sharcDeviceAddr_[2]; }
     static constexpr uint32_t SHARC_CAPACITY = 1u << 22;
 
+    // Surfel GI cache accessors
+    bool HasSurfelBuffers() const { return surfelCreated_; }
+    VkBuffer GetSurfelBuffer(int idx) const { return surfelBuffer_[idx]; }
+    static constexpr uint32_t SURFEL_CAPACITY = 1u << 20;  // 1M entries
+    bool CreateSurfelBuffers();
+
 private:
     bool CreateDescriptorSetLayout();
     bool CreatePipeline();
@@ -291,6 +297,11 @@ private:
     VkDeviceMemory sharcMemory_[3] = {};
     VkDeviceAddress sharcDeviceAddr_[3] = {};  // buffer device addresses for shader access
     bool sharcCreated_ = false;
+
+    // Surfel GI cache buffers (bindings 32-33)
+    VkBuffer surfelBuffer_[2] = {};      // [0]=hashEntries (uint64), [1]=data (accum+resolved)
+    VkDeviceMemory surfelMemory_[2] = {};
+    bool surfelCreated_ = false;
     bool CreateSHARCBuffers();
     void DestroySHARCBuffers();
 

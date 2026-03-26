@@ -161,6 +161,7 @@ if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
         exposure_resolve.comp:exposure_resolve.comp.spv
         tonemap.comp:tonemap.comp.spv
         sharc_resolve.comp:sharc_resolve.comp.spv
+        surfel_resolve.comp:surfel_resolve.comp.spv
         cluster_culling.comp:cluster_culling.comp.spv
         hybrid.rgen:hybrid.rgen.spv
         raygen_blender.rgen:raygen_blender.rgen.spv

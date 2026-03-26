@@ -1,0 +1,79 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_atomic_int64 : require
+
+// Surfel GI Resolve Compute Shader
+// Merges per-frame surfel accumulation into resolved (temporal) buffer.
+// Same algorithm as SHARC resolve but for surfel-specific buffers.
+
+layout(binding = 0, set = 0, std430) buffer HashEntries { uint64_t keys[]; } hashEntries;
+layout(binding = 1, set = 0, std430) buffer DataBuffer  { uint data[];     } dataBuffer;
+
+layout(push_constant) uniform PushConstants {
+    uint capacity;
+    uint frameIndex;
+    uint accumulationFrameMax;  // temporal window (64 for faster convergence)
+    uint staleFrameMax;         // eviction timeout (128)
+    float radianceScale;
+} pc;
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.capacity) return;
+
+    uint64_t hashKey = hashEntries.keys[idx];
+    if (hashKey == 0u) return;
+
+    // Accumulation region: [0..capacity*4-1]
+    uint aBase = idx * 4u;
+    uint accumR = dataBuffer.data[aBase + 0u];
+    uint accumG = dataBuffer.data[aBase + 1u];
+    uint accumB = dataBuffer.data[aBase + 2u];
+    uint sampleCount = dataBuffer.data[aBase + 3u];
+
+    // Resolved region: [capacity*4..capacity*8-1]
+    uint rBase = pc.capacity * 4u + idx * 4u;
+    float resolvedR = uintBitsToFloat(dataBuffer.data[rBase + 0u]);
+    float resolvedG = uintBitsToFloat(dataBuffer.data[rBase + 1u]);
+    float resolvedB = uintBitsToFloat(dataBuffer.data[rBase + 2u]);
+
+    uint resolvedMeta = dataBuffer.data[rBase + 3u];
+    uint staleFrames = (resolvedMeta >> 16u) & 0xFFFFu;
+    float prevSampleNum = float(resolvedMeta & 0xFFFFu);
+
+    if (sampleCount > 0u) {
+        float invScale = 1.0 / pc.radianceScale;
+        vec3 newRadiance = vec3(float(accumR), float(accumG), float(accumB)) * invScale / float(sampleCount);
+
+        float prevWeight = prevSampleNum / max(prevSampleNum + float(sampleCount), 1.0);
+        float newWeight = float(sampleCount) / max(prevSampleNum + float(sampleCount), 1.0);
+
+        vec3 blended = vec3(resolvedR, resolvedG, resolvedB) * prevWeight + newRadiance * newWeight;
+        float totalSamples = min(prevSampleNum + float(sampleCount), 65535.0);
+
+        dataBuffer.data[rBase + 0u] = floatBitsToUint(blended.r);
+        dataBuffer.data[rBase + 1u] = floatBitsToUint(blended.g);
+        dataBuffer.data[rBase + 2u] = floatBitsToUint(blended.b);
+        dataBuffer.data[rBase + 3u] = uint(totalSamples) & 0xFFFFu;
+
+        // Clear accumulation
+        dataBuffer.data[aBase + 0u] = 0u;
+        dataBuffer.data[aBase + 1u] = 0u;
+        dataBuffer.data[aBase + 2u] = 0u;
+        dataBuffer.data[aBase + 3u] = 0u;
+    } else {
+        staleFrames++;
+        if (staleFrames > pc.staleFrameMax) {
+            hashEntries.keys[idx] = uint64_t(0u);
+            dataBuffer.data[rBase + 0u] = 0u;
+            dataBuffer.data[rBase + 1u] = 0u;
+            dataBuffer.data[rBase + 2u] = 0u;
+            dataBuffer.data[rBase + 3u] = 0u;
+        } else {
+            uint meta = (staleFrames << 16u) | (uint(prevSampleNum) & 0xFFFFu);
+            dataBuffer.data[rBase + 3u] = meta;
+        }
+    }
+}
