@@ -1,0 +1,72 @@
+/* ============================================================
+   Ignis RT Brand Palette (from icons/palette.json)
+   sky:     #8FA7C4
+   darkness: #2E2E30
+   sunset:  #E06030
+   accents: sand #C4A68F, golden #D4B87A, aqua #8FC4B5, rose #C48F9F
+   ============================================================ */
+
+/* Dark theme (slate) */
+[data-md-color-scheme="slate"] {
+    --md-primary-fg-color: #2E2E30;
+    --md-primary-bg-color: #DCE4ED;
+    --md-accent-fg-color: #E06030;
+    --md-default-bg-color: #1C1C1E;
+    --md-default-fg-color: #DCE4ED;
+    --md-typeset-a-color: #EB9462;
+    --md-code-bg-color: #0E0E10;
+}
+
+/* Light theme */
+[data-md-color-scheme="default"] {
+    --md-primary-fg-color: #4A6380;
+    --md-primary-bg-color: #ffffff;
+    --md-accent-fg-color: #E06030;
+    --md-typeset-a-color: #B34A24;
+}
+
+/* Header bar */
+.md-header {
+    background-color: #2E2E30 !important;
+}
+
+/* Nav tabs */
+.md-tabs {
+    background-color: #1C1C1E !important;
+}
+
+/* Admonition accent */
+.md-typeset .admonition.info,
+.md-typeset details.info {
+    border-color: #8FA7C4 !important;
+}
+
+.md-typeset .admonition.warning,
+.md-typeset details.warning {
+    border-color: #E06030 !important;
+}
+
+/* ============================================================
+   Mermaid theme override via CSS variables
+   These control ALL colors inside Mermaid SVGs.
+   ============================================================ */
+
+/* Dark mode: light text on dark nodes */
+[data-md-color-scheme="slate"] {
+    --md-mermaid-node-bg-color: #2E2E30;
+    --md-mermaid-node-fg-color: #636366;
+    --md-mermaid-label-fg-color: #DCE4ED;
+    --md-mermaid-label-bg-color: #1C1C1E;
+    --md-mermaid-edge-color: #8FA7C4;
+    --md-mermaid-font-family: inherit;
+}
+
+/* Light mode: dark text on light nodes */
+[data-md-color-scheme="default"] {
+    --md-mermaid-node-bg-color: #DCE4ED;
+    --md-mermaid-node-fg-color: #4A6380;
+    --md-mermaid-label-fg-color: #1C1C1E;
+    --md-mermaid-label-bg-color: #f5f5f5;
+    --md-mermaid-edge-color: #4A6380;
+    --md-mermaid-font-family: inherit;
+}
