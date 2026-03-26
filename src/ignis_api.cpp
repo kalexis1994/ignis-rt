@@ -276,6 +276,16 @@ IGNIS_API bool ignis_refit_blas(int blasHandle, const float* vertices, uint32_t 
     return g_renderer->RefitBLAS(blasHandle, vertices, vertexCount, indices, indexCount);
 }
 
+IGNIS_API void* ignis_map_blas_deform_staging(int blasIndex, uint32_t vertexCount) {
+    if (!g_renderer) return nullptr;
+    return g_renderer->GetAccelBuilder()->MapBLASDeformStaging(blasIndex, vertexCount);
+}
+
+IGNIS_API bool ignis_commit_blas_deform(int blasIndex) {
+    if (!g_renderer) return false;
+    return g_renderer->GetAccelBuilder()->CommitBLASDeform(blasIndex);
+}
+
 IGNIS_API bool ignis_upload_mesh_attributes(int blasHandle,
                                             const float* normals, const float* uvs,
                                             uint32_t vertexCount,

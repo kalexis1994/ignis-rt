@@ -107,6 +107,11 @@ def load():
     ]
     _lib.ignis_refit_blas.restype = c_bool
 
+    _lib.ignis_map_blas_deform_staging.argtypes = [c_int, c_uint32]
+    _lib.ignis_map_blas_deform_staging.restype = c_void_p
+    _lib.ignis_commit_blas_deform.argtypes = [c_int]
+    _lib.ignis_commit_blas_deform.restype = c_bool
+
     _lib.ignis_upload_mesh_attributes.argtypes = [
         c_int, POINTER(c_float), POINTER(c_float), c_uint32, POINTER(c_float),
     ]
@@ -267,6 +272,18 @@ def upload_mesh_attributes(blas_handle: int, normals, uvs, vertex_count: int, co
         u.ctypes.data_as(POINTER(c_float)),
         c_uint32(vertex_count),
         c_ptr)
+
+
+def map_blas_deform_staging(blas_index: int, vertex_count: int):
+    """Map persistent staging buffer for zero-copy deformation writes.
+    Layout: [positions N*3*f32] [normals N*3*f32] [UVs N*2*f32]
+    Returns raw pointer (int) or 0/None on failure."""
+    return _lib.ignis_map_blas_deform_staging(c_int(blas_index), c_uint32(vertex_count))
+
+
+def commit_blas_deform(blas_index: int) -> bool:
+    """DMA staging → GPU buffers + BLAS rebuild. No memcpy — data already in staging."""
+    return _lib.ignis_commit_blas_deform(c_int(blas_index))
 
 
 def refit_blas(blas_handle: int, vertices, vertex_count: int, indices, index_count: int) -> bool:

@@ -2,6 +2,7 @@
 
 #include <vulkan/vulkan.h>
 #include <vector>
+#include <unordered_map>
 #include <cstdint>
 
 namespace acpt {
@@ -82,6 +83,14 @@ public:
     // Falls back to full build if TLAS doesn't exist or count changed.
     bool UpdateTLAS(const std::vector<TLASInstance>& instances);
 
+    // Zero-copy deformation: map a persistent staging buffer for positions + normals + UVs.
+    // Layout: [pos: N*3*float] [norm: N*3*float] [uv: N*2*float]
+    // Returns mapped pointer. Call CommitBLASDeform() after writing.
+    void* MapBLASDeformStaging(int blasIndex, uint32_t vertexCount);
+
+    // DMA staging → GPU buffers + BLAS rebuild. No memcpy — data is already in staging.
+    bool CommitBLASDeform(int blasIndex);
+
     // Upload normal/UV/color attribute buffers directly into a BLAS entry
     bool UploadBLASAttributes(int blasIndex, const float* normals, const float* uvs, uint32_t vertexCount, const float* colors = nullptr);
 
@@ -151,6 +160,18 @@ private:
     // Persistent scratch buffer for GPU-buffer BLAS builds (avoids reallocation)
     AccelBuffer gpuBlasScratchBuffer_;
     VkDeviceSize gpuBlasScratchSize_ = 0;
+
+    // Zero-copy deformation staging (persistently mapped, per BLAS)
+    struct DeformStaging {
+        AccelBuffer buffer;
+        void* mapped = nullptr;
+        uint32_t vertexCount = 0;
+        VkDeviceSize posSize = 0;
+        VkDeviceSize normSize = 0;
+        VkDeviceSize uvSize = 0;
+        VkDeviceSize totalSize = 0;
+    };
+    std::unordered_map<int, DeformStaging> deformStagings_;
 };
 
 } // namespace vk

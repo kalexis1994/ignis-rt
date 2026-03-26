@@ -1610,38 +1610,55 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                     n_unrolled = tri_count * 3
                     tri_verts = np.empty(n_unrolled, dtype=np.int32)
                     mesh.loop_triangles.foreach_get('vertices', tri_verts)
-                    all_pos = positions.reshape(-1, 3)
-                    unrolled_pos = all_pos[tri_verts].flatten().astype(np.float32)
-                    unrolled_idx = np.arange(n_unrolled, dtype=np.uint32)
-
-                    # Extract per-corner (loop) normals — same as initial export
                     tri_loops = np.empty(n_unrolled, dtype=np.int32)
                     mesh.loop_triangles.foreach_get('loops', tri_loops)
 
-                    all_loop_normals = np.empty(len(mesh.loops) * 3, dtype=np.float32)
-                    try:
-                        mesh.corner_normals.foreach_get("vector", all_loop_normals)
-                    except (AttributeError, RuntimeError):
-                        mesh.calc_normals_split()
-                        mesh.loops.foreach_get("normal", all_loop_normals)
-                    all_loop_normals = all_loop_normals.reshape(-1, 3)
-                    unrolled_normals = all_loop_normals[tri_loops].flatten().astype(np.float32)
+                    # Map persistent staging buffer (zero-copy: Python writes directly)
+                    import ctypes as _ct
+                    ptr = dll_wrapper.map_blas_deform_staging(blas_idx, n_unrolled)
+                    if ptr:
+                        # Layout: [pos: N*3*f32] [norm: N*3*f32] [uv: N*2*f32]
+                        pos_n = n_unrolled * 3
+                        norm_n = n_unrolled * 3
+                        uv_n = n_unrolled * 2
+                        staging = np.ctypeslib.as_array(
+                            (_ct.c_float * (pos_n + norm_n + uv_n)).from_address(ptr))
+                        pos_view = staging[:pos_n].reshape(-1, 3)
+                        norm_view = staging[pos_n:pos_n + norm_n].reshape(-1, 3)
+                        uv_view = staging[pos_n + norm_n:].reshape(-1, 2)
 
-                    # Extract UVs per-triangle-loop
-                    uv_layer = mesh.uv_layers.active
-                    if uv_layer:
-                        all_uvs = np.empty(len(mesh.loops) * 2, dtype=np.float32)
-                        uv_layer.data.foreach_get('uv', all_uvs)
-                        all_uvs = all_uvs.reshape(-1, 2)
-                        unrolled_uvs = all_uvs[tri_loops].flatten().astype(np.float32)
+                        # Write positions directly to staging (no intermediate array)
+                        all_pos = positions.reshape(-1, 3)
+                        pos_view[:] = all_pos[tri_verts]
+
+                        # Write per-corner normals directly to staging
+                        all_loop_normals = np.empty(len(mesh.loops) * 3, dtype=np.float32)
+                        try:
+                            mesh.corner_normals.foreach_get("vector", all_loop_normals)
+                        except (AttributeError, RuntimeError):
+                            mesh.calc_normals_split()
+                            mesh.loops.foreach_get("normal", all_loop_normals)
+                        norm_view[:] = all_loop_normals.reshape(-1, 3)[tri_loops]
+
+                        # Write UVs directly to staging
+                        uv_layer = mesh.uv_layers.active
+                        if uv_layer:
+                            all_uvs = np.empty(len(mesh.loops) * 2, dtype=np.float32)
+                            uv_layer.data.foreach_get('uv', all_uvs)
+                            uv_view[:] = all_uvs.reshape(-1, 2)[tri_loops]
+                        else:
+                            uv_view[:] = 0.0
+
+                        # DMA staging → GPU + BLAS rebuild (no memcpy in C++)
+                        dll_wrapper.commit_blas_deform(blas_idx)
                     else:
-                        unrolled_uvs = np.zeros(n_unrolled * 2, dtype=np.float32)
+                        # Fallback: non-zero-copy path
+                        all_pos = positions.reshape(-1, 3)
+                        unrolled_pos = all_pos[tri_verts].flatten().astype(np.float32)
+                        unrolled_idx = np.arange(n_unrolled, dtype=np.uint32)
+                        dll_wrapper.refit_blas(blas_idx, unrolled_pos, n_unrolled,
+                                              unrolled_idx, n_unrolled)
 
-                    # Full BLAS rebuild + attributes
-                    dll_wrapper.refit_blas(blas_idx, unrolled_pos, n_unrolled,
-                                          unrolled_idx, n_unrolled)
-                    dll_wrapper.upload_mesh_attributes(blas_idx, unrolled_normals,
-                                                       unrolled_uvs, n_unrolled)
                     eval_obj.to_mesh_clear()
                     # Rebuild TLAS to update geometry metadata pointers
                     _ignis_objects_dirty = True

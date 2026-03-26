@@ -1266,5 +1266,196 @@ bool AccelStructureBuilder::UpdateTLAS(const std::vector<TLASInstance>& instance
     return true;
 }
 
+void* AccelStructureBuilder::MapBLASDeformStaging(int blasIndex, uint32_t vertexCount) {
+    if (blasIndex < 0 || blasIndex >= (int)blasList_.size()) return nullptr;
+
+    VkDevice device = context_->GetDevice();
+    VkDeviceSize posSize  = vertexCount * 3 * sizeof(float);
+    VkDeviceSize normSize = vertexCount * 3 * sizeof(float);
+    VkDeviceSize uvSize   = vertexCount * 2 * sizeof(float);
+    VkDeviceSize totalSize = posSize + normSize + uvSize;
+
+    auto it = deformStagings_.find(blasIndex);
+    if (it != deformStagings_.end() && it->second.vertexCount == vertexCount && it->second.mapped) {
+        return it->second.mapped;  // reuse existing
+    }
+
+    // Destroy old if size changed
+    if (it != deformStagings_.end()) {
+        if (it->second.mapped) vkUnmapMemory(device, it->second.buffer.memory);
+        DestroyAccelBuffer(it->second.buffer);
+        deformStagings_.erase(it);
+    }
+
+    DeformStaging ds;
+    ds.buffer = CreateAccelBuffer(totalSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (!ds.buffer.buffer) return nullptr;
+
+    vkMapMemory(device, ds.buffer.memory, 0, totalSize, 0, &ds.mapped);
+    ds.vertexCount = vertexCount;
+    ds.posSize = posSize;
+    ds.normSize = normSize;
+    ds.uvSize = uvSize;
+    ds.totalSize = totalSize;
+    deformStagings_[blasIndex] = ds;
+    return ds.mapped;
+}
+
+bool AccelStructureBuilder::CommitBLASDeform(int blasIndex) {
+    auto it = deformStagings_.find(blasIndex);
+    if (it == deformStagings_.end() || !it->second.mapped) return false;
+    if (blasIndex < 0 || blasIndex >= (int)blasList_.size()) return false;
+
+    auto& ds = it->second;
+    auto& blas = blasList_[blasIndex];
+    VkDevice device = context_->GetDevice();
+
+    vkDeviceWaitIdle(device);
+
+    uint32_t vertexCount = ds.vertexCount;
+    uint32_t indexCount = vertexCount;  // identity indices for unrolled layout
+
+    // === Rebuild vertex + index buffers ===
+    if (blas.handle != VK_NULL_HANDLE && vkDestroyAccelerationStructureKHR_) {
+        vkDestroyAccelerationStructureKHR_(device, blas.handle, nullptr);
+    }
+    DestroyAccelBuffer(blas.buffer);
+    DestroyAccelBuffer(blas.vertexBuf);
+    DestroyAccelBuffer(blas.indexBuf);
+    DestroyAccelBuffer(blas.normalBuf);
+    DestroyAccelBuffer(blas.uvBuf);
+
+    // Create GPU buffers
+    blas.vertexBuf = CreateAccelBuffer(ds.posSize,
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    blas.normalBuf = CreateAccelBuffer(ds.normSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    blas.uvBuf = CreateAccelBuffer(ds.uvSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    // Identity index buffer
+    VkDeviceSize indexSize = indexCount * sizeof(uint32_t);
+    blas.indexBuf = CreateAccelBuffer(indexSize,
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    // Create index staging with identity indices
+    AccelBuffer idxStaging = CreateAccelBuffer(indexSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    void* idxMapped;
+    vkMapMemory(device, idxStaging.memory, 0, indexSize, 0, &idxMapped);
+    auto* idxPtr = reinterpret_cast<uint32_t*>(idxMapped);
+    for (uint32_t i = 0; i < indexCount; i++) idxPtr[i] = i;
+    vkUnmapMemory(device, idxStaging.memory);
+
+    // DMA: staging → GPU buffers (positions, normals, UVs, indices)
+    // NO memcpy for pos/norm/uv — data is already in ds.buffer from Python writes
+    VkCommandBuffer cmd = context_->BeginSingleTimeCommands();
+    VkBufferCopy copy{};
+
+    copy.srcOffset = 0;           copy.size = ds.posSize;
+    vkCmdCopyBuffer(cmd, ds.buffer.buffer, blas.vertexBuf.buffer, 1, &copy);
+    copy.srcOffset = ds.posSize;  copy.size = ds.normSize;
+    vkCmdCopyBuffer(cmd, ds.buffer.buffer, blas.normalBuf.buffer, 1, &copy);
+    copy.srcOffset = ds.posSize + ds.normSize; copy.size = ds.uvSize;
+    vkCmdCopyBuffer(cmd, ds.buffer.buffer, blas.uvBuf.buffer, 1, &copy);
+    copy.srcOffset = 0;           copy.size = indexSize;
+    vkCmdCopyBuffer(cmd, idxStaging.buffer, blas.indexBuf.buffer, 1, &copy);
+
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0,
+        1, &barrier, 0, nullptr, 0, nullptr);
+
+    // Build BLAS
+    VkAccelerationStructureGeometryTrianglesDataKHR triangles{};
+    triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+    triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    triangles.vertexData.deviceAddress = blas.vertexBuf.deviceAddress;
+    triangles.vertexStride = 3 * sizeof(float);
+    triangles.maxVertex = vertexCount - 1;
+    triangles.indexType = VK_INDEX_TYPE_UINT32;
+    triangles.indexData.deviceAddress = blas.indexBuf.deviceAddress;
+
+    VkAccelerationStructureGeometryKHR geometry{};
+    geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    geometry.flags = 0;
+    geometry.geometry.triangles = triangles;
+
+    uint32_t primitiveCount = indexCount / 3;
+
+    VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
+    buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+    buildInfo.geometryCount = 1;
+    buildInfo.pGeometries = &geometry;
+
+    VkAccelerationStructureBuildSizesInfoKHR sizeInfo{};
+    sizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+    vkGetAccelerationStructureBuildSizesKHR_(device,
+        VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+        &buildInfo, &primitiveCount, &sizeInfo);
+
+    blas.buffer = CreateAccelBuffer(sizeInfo.accelerationStructureSize,
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    VkAccelerationStructureCreateInfoKHR asCreateInfo{};
+    asCreateInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+    asCreateInfo.buffer = blas.buffer.buffer;
+    asCreateInfo.size = sizeInfo.accelerationStructureSize;
+    asCreateInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+
+    if (vkCreateAccelerationStructureKHR_(device, &asCreateInfo, nullptr, &blas.handle) != VK_SUCCESS) {
+        context_->EndSingleTimeCommands(cmd);
+        DestroyAccelBuffer(idxStaging);
+        return false;
+    }
+
+    AccelBuffer scratchBuf = CreateAccelBuffer(sizeInfo.buildScratchSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    buildInfo.dstAccelerationStructure = blas.handle;
+    buildInfo.scratchData.deviceAddress = scratchBuf.deviceAddress;
+
+    VkAccelerationStructureBuildRangeInfoKHR rangeInfo{};
+    rangeInfo.primitiveCount = primitiveCount;
+    const VkAccelerationStructureBuildRangeInfoKHR* pRangeInfo = &rangeInfo;
+    vkCmdBuildAccelerationStructuresKHR_(cmd, 1, &buildInfo, &pRangeInfo);
+    context_->EndSingleTimeCommands(cmd);
+
+    DestroyAccelBuffer(scratchBuf);
+    DestroyAccelBuffer(idxStaging);
+
+    VkAccelerationStructureDeviceAddressInfoKHR addressInfo{};
+    addressInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
+    addressInfo.accelerationStructure = blas.handle;
+    blas.deviceAddress = vkGetAccelerationStructureDeviceAddressKHR_(device, &addressInfo);
+    blas.vertexCount = vertexCount;
+    blas.indexCount = indexCount;
+    blas.built = true;
+
+    return true;
+}
+
 } // namespace vk
 } // namespace acpt
