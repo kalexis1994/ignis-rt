@@ -83,3 +83,4 @@ flowchart LR
     - Windows 10/11
     - Blender 4.0+
     - Latest NVIDIA drivers (560+)
+
