@@ -593,12 +593,12 @@ def draw(w, h, status="", progress=0.0):
         gpu.state.blend_set('ALPHA')
         fire_sh.bind()
         fire_sh.uniform_float("mvp", gpu.matrix.get_projection_matrix() @ gpu.matrix.get_model_view_matrix())
-        fire_sh.uniform_float("time", time.perf_counter())
+        fire_sh.uniform_float("time", now - _start_time)
         fire_sh.uniform_float("alpha", fade)
         fire_sh.uniform_float("fillCol", COL_SUNSET)
         fire_batch.draw(fire_sh)
     else:
-        _draw_spinner(shader, cx, spinner_y, time.perf_counter())
+        _draw_spinner(shader, cx, spinner_y, now - _start_time)
 
     # Status text
     if status:

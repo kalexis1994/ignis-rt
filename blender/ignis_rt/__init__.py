@@ -1,13 +1,7 @@
-"""Ignis RT — Vulkan ray tracing render engine for Blender."""
+"""Ignis RT — Vulkan ray tracing render engine for Blender.
 
-bl_info = {
-    "name": "Ignis RT",
-    "author": "Alexis",
-    "version": (0, 0, 1),
-    "blender": (4, 0, 0),
-    "category": "Render",
-    "description": "Vulkan ray tracing render engine (viewport preview)",
-}
+Metadata is in blender_manifest.toml (Blender Extension System).
+"""
 
 import os
 import bpy

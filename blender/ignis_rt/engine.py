@@ -1575,7 +1575,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         idx_arr = np.array(all_indices, dtype=np.uint32)
                         xfm_arr = np.concatenate(all_transforms, axis=0).flatten().astype(np.float32)
                         dll_wrapper.update_instance_transforms(idx_arr, xfm_arr, len(all_indices))
-                        _ignis_frame_index = 0
+                        # No frame_index reset — DLSS RR handles motion via motion vectors
                 except Exception:
                     _log_exception("hierarchy transform sync")
                     _need_full_sync = True

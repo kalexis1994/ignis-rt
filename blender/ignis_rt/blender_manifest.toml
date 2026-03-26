@@ -16,3 +16,11 @@ platforms = ["windows-x64"]
 
 [permissions]
 files = "Read/write log files and load shaders from disk"
+
+# Wheels/paths to exclude when building extension package
+[build]
+paths_exclude_pattern = [
+    "__pycache__/",
+    "_deploy_root.txt",
+    "*.pyc",
+]
