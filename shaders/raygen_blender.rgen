@@ -7,6 +7,7 @@
 #extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_shader_atomic_int64 : require
 #extension GL_GOOGLE_include_directive : require
+#extension GL_NV_ray_tracing_invocation_reorder : enable
 
 // ============================================================
 // Descriptor bindings — IDENTICAL layout to raygen.rgen (0-23)
@@ -867,6 +868,14 @@ void main() {
             PrimMaterials primMats = PrimMaterials(geo.primMaterialBufferAddress);
             matIdx = primMats.m[primitiveId];
         }
+
+        // Shader Execution Reordering (SER): reorder threads by material ID
+        // so threads evaluating the same material run together → less divergence
+        // in Node VM execution. Hardware-accelerated on RTX 40+, software on 30.
+#ifdef GL_NV_ray_tracing_invocation_reorder
+        reorderThreadNV(matIdx, 16);  // 16 bits = up to 65536 materials
+#endif
+
         Material mat = materialBuffer.materials[matIdx];
 
         // Apply UV scale from Mapping node (stored in multA, magicMult)
