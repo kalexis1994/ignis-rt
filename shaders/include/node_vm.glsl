@@ -710,50 +710,49 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, ve
             R[dst].x = f0 + (1.0 - f0) * pow(1.0 - NdotV, 5.0);
         }
 
-        // ── Output targets ──
-        else if (opcode == OP_OUTPUT_UV) {
-            result.transformedUV = R[srcA].xy;
-            result.hasTransformedUV = true;
+        // ── Output targets (fast-path: opcodes >= 0xE0) ──
+        // These are always at the end of the program. Early branch avoids
+        // falling through all intermediate opcode checks.
+        else if (opcode >= 0xE0u) {
+            if (opcode == OP_OUTPUT_COLOR) {
+                result.baseColor = R[srcA].rgb;
+                result.hasBaseColor = true;
+            } else if (opcode == OP_OUTPUT_ROUGH) {
+                result.roughness = R[srcA].x;
+                result.hasRoughness = true;
+            } else if (opcode == OP_OUTPUT_METAL) {
+                result.metallic = R[srcA].x;
+                result.hasMetallic = true;
+            } else if (opcode == OP_OUTPUT_ALPHA) {
+                result.alpha = R[srcA].x;
+                result.hasAlpha = true;
+            } else if (opcode == OP_OUTPUT_UV) {
+                result.transformedUV = R[srcA].xy;
+                result.hasTransformedUV = true;
+            } else if (opcode == OP_OUTPUT_EMISSION) {
+                result.emission = R[srcA].rgb;
+                result.emissionStrength = R[srcA].a;
+                result.hasEmission = true;
+            } else if (opcode == OP_OUTPUT_IOR) {
+                result.ior = R[srcA].x;
+                result.hasIor = true;
+            } else if (opcode == OP_OUTPUT_TRANSMISSION) {
+                result.transmission = R[srcA].x;
+                result.hasTransmission = true;
+            } else if (opcode == OP_OUTPUT_NORMAL) {
+                result.normalStrength = R[srcA].x;
+                result.hasNormalStrength = true;
+            } else if (opcode == OP_OUTPUT_BUMP) {
+                result.bumpGradient = R[srcA].xy;
+                result.bumpStrength = uintBitsToFloat(instr.y);
+                result.bumpDistance = uintBitsToFloat(instr.z);
+                result.hasBump = true;
+            }
         }
-        else if (opcode == OP_OUTPUT_COLOR) {
-            result.baseColor = R[srcA].rgb;
-            result.hasBaseColor = true;
-        }
-        else if (opcode == OP_OUTPUT_ROUGH) {
-            result.roughness = R[srcA].x;
-            result.hasRoughness = true;
-        }
-        else if (opcode == OP_OUTPUT_METAL) {
-            result.metallic = R[srcA].x;
-            result.hasMetallic = true;
-        }
-        else if (opcode == OP_OUTPUT_EMISSION) {
-            result.emission = R[srcA].rgb;
-            result.emissionStrength = R[srcA].a;
-            result.hasEmission = true;
-        }
-        else if (opcode == OP_OUTPUT_ALPHA) {
-            result.alpha = R[srcA].x;
-            result.hasAlpha = true;
-        }
-        else if (opcode == OP_OUTPUT_NORMAL) {
-            result.normalStrength = R[srcA].x;
-            result.hasNormalStrength = true;
-        }
-        else if (opcode == OP_OUTPUT_IOR) {
-            result.ior = R[srcA].x;
-            result.hasIor = true;
-        }
-        else if (opcode == OP_OUTPUT_TRANSMISSION) {
-            result.transmission = R[srcA].x;
-            result.hasTransmission = true;
-        }
-        else if (opcode == OP_OUTPUT_BUMP) {
-            result.bumpGradient = R[srcA].xy;
-            result.bumpStrength = uintBitsToFloat(instr.y);
-            result.bumpDistance = uintBitsToFloat(instr.z);
-            result.hasBump = true;
-        }
+
+        // (removed duplicate output handlers — now inside the >= 0xE0 branch above)
+
+        // (output opcodes handled in >= 0xE0 fast-path above)
     }
 
     return result;

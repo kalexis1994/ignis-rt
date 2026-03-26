@@ -228,6 +228,25 @@ bool Context::CreateLogicalDevice() {
         Log(L"[VK Context] RT + NGX extensions enabled\n");
     }
 
+    // Shader Execution Reordering (SER) — reduces thread divergence
+    // when rays hit different materials. RTX 40+ hardware, software fallback on 30.
+    bool serEnabled = false;
+    if (rayQuerySupported_ && CheckRTExtensionSupport(physicalDevice_)) {
+        // Re-check for the specific extension
+        uint32_t extCount = 0;
+        vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &extCount, nullptr);
+        std::vector<VkExtensionProperties> exts(extCount);
+        vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &extCount, exts.data());
+        for (const auto& ext : exts) {
+            if (strcmp(ext.extensionName, "VK_NV_ray_tracing_invocation_reorder") == 0) {
+                deviceExtensions.push_back("VK_NV_ray_tracing_invocation_reorder");
+                serEnabled = true;
+                Log(L"[VK Context] SER (Shader Execution Reordering) enabled\n");
+                break;
+            }
+        }
+    }
+
     // Chain features structs for Vulkan 1.2+ features
     VkPhysicalDeviceBufferDeviceAddressFeatures bdaFeatures{};
     bdaFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
@@ -259,6 +278,14 @@ bool Context::CreateLogicalDevice() {
     atomicInt64Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES;
     atomicInt64Features.shaderBufferInt64Atomics = VK_TRUE;
     rtpFeatures.pNext = &atomicInt64Features;
+
+    // SER feature struct (must be in chain before device creation)
+    VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV serFeatures{};
+    serFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_NV;
+    serFeatures.rayTracingInvocationReorder = VK_TRUE;
+    if (serEnabled) {
+        atomicInt64Features.pNext = &serFeatures;
+    }
 
     // Device features
     VkPhysicalDeviceFeatures deviceFeatures{};
@@ -467,12 +494,17 @@ bool Context::CheckRTExtensionSupport(VkPhysicalDevice device) const {
     vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount, extensions.data());
 
     bool hasAccelStruct = false, hasRayQuery = false, hasBDA = false, hasDeferredOps = false, hasRTPipeline = false;
+    bool hasInvocationReorder = false;
     for (const auto& ext : extensions) {
         if (strcmp(ext.extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) == 0) hasAccelStruct = true;
         if (strcmp(ext.extensionName, VK_KHR_RAY_QUERY_EXTENSION_NAME) == 0) hasRayQuery = true;
         if (strcmp(ext.extensionName, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) == 0) hasRTPipeline = true;
         if (strcmp(ext.extensionName, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) == 0) hasBDA = true;
         if (strcmp(ext.extensionName, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) == 0) hasDeferredOps = true;
+        if (strcmp(ext.extensionName, "VK_NV_ray_tracing_invocation_reorder") == 0) hasInvocationReorder = true;
+    }
+    if (hasInvocationReorder) {
+        Log(L"[VK Context] VK_NV_ray_tracing_invocation_reorder available (SER)\n");
     }
 
     bool supported = hasAccelStruct && hasRayQuery && hasRTPipeline && hasBDA && hasDeferredOps;
