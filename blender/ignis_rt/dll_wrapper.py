@@ -102,6 +102,11 @@ def load():
     ]
     _lib.ignis_upload_mesh.restype = c_int
 
+    _lib.ignis_refit_blas.argtypes = [
+        c_int, POINTER(c_float), c_uint32, POINTER(c_uint32), c_uint32,
+    ]
+    _lib.ignis_refit_blas.restype = c_bool
+
     _lib.ignis_upload_mesh_attributes.argtypes = [
         c_int, POINTER(c_float), POINTER(c_float), c_uint32, POINTER(c_float),
     ]
@@ -262,6 +267,16 @@ def upload_mesh_attributes(blas_handle: int, normals, uvs, vertex_count: int, co
         u.ctypes.data_as(POINTER(c_float)),
         c_uint32(vertex_count),
         c_ptr)
+
+
+def refit_blas(blas_handle: int, vertices, vertex_count: int, indices, index_count: int) -> bool:
+    """Rebuild BLAS with new vertex positions (same topology required)."""
+    v = _np_f32(vertices)
+    i = _np_u32(indices)
+    return _lib.ignis_refit_blas(
+        c_int(blas_handle),
+        v.ctypes.data_as(POINTER(c_float)), c_uint32(vertex_count),
+        i.ctypes.data_as(POINTER(c_uint32)), c_uint32(index_count))
 
 
 def build_tlas(instances_array, count: int) -> bool:

@@ -399,18 +399,23 @@ int AccelStructureBuilder::BuildBLAS(const float* vertices, uint32_t vertexCount
 bool AccelStructureBuilder::RefitBLAS(int blasIndex, const float* vertices, uint32_t vertexCount,
                                        const uint32_t* indices, uint32_t indexCount) {
     if (blasIndex < 0 || blasIndex >= (int)blasList_.size()) return false;
+    auto& blas = blasList_[blasIndex];
+    if (!blas.built) return false;
+
     VkDevice device = context_->GetDevice();
 
+    // Wait for GPU to finish before destroying resources
+    vkDeviceWaitIdle(device);
+
     // Destroy old BLAS resources
-    auto& oldBlas = blasList_[blasIndex];
-    if (oldBlas.handle != VK_NULL_HANDLE && vkDestroyAccelerationStructureKHR_) {
-        vkDestroyAccelerationStructureKHR_(device, oldBlas.handle, nullptr);
+    if (blas.handle != VK_NULL_HANDLE && vkDestroyAccelerationStructureKHR_) {
+        vkDestroyAccelerationStructureKHR_(device, blas.handle, nullptr);
     }
-    DestroyAccelBuffer(oldBlas.buffer);
-    DestroyAccelBuffer(oldBlas.vertexBuf);
-    DestroyAccelBuffer(oldBlas.indexBuf);
-    oldBlas.handle = VK_NULL_HANDLE;
-    oldBlas.built = false;
+    DestroyAccelBuffer(blas.buffer);
+    DestroyAccelBuffer(blas.vertexBuf);
+    DestroyAccelBuffer(blas.indexBuf);
+    blas.handle = VK_NULL_HANDLE;
+    blas.built = false;
 
     // Upload new vertex/index data
     VkDeviceSize vertexSize = vertexCount * 3 * sizeof(float);
@@ -418,7 +423,8 @@ bool AccelStructureBuilder::RefitBLAS(int blasIndex, const float* vertices, uint
 
     AccelBuffer vertexBuf = CreateAccelBuffer(vertexSize,
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     AccelBuffer indexBuf = CreateAccelBuffer(indexSize,
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
@@ -465,7 +471,6 @@ bool AccelStructureBuilder::RefitBLAS(int blasIndex, const float* vertices, uint
     DestroyAccelBuffer(vertexStaging);
     DestroyAccelBuffer(indexStaging);
 
-    // Build geometry info
     VkAccelerationStructureGeometryTrianglesDataKHR triangles{};
     triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
     triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
@@ -478,7 +483,7 @@ bool AccelStructureBuilder::RefitBLAS(int blasIndex, const float* vertices, uint
     VkAccelerationStructureGeometryKHR geometry{};
     geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
     geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-    geometry.flags = 0;  // Non-opaque: enables alpha test via candidate intersection
+    geometry.flags = 0;
     geometry.geometry.triangles = triangles;
 
     uint32_t primitiveCount = indexCount / 3;
@@ -507,8 +512,8 @@ bool AccelStructureBuilder::RefitBLAS(int blasIndex, const float* vertices, uint
     asCreateInfo.size = sizeInfo.accelerationStructureSize;
     asCreateInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
 
-    VkAccelerationStructureKHR blas;
-    if (vkCreateAccelerationStructureKHR_(device, &asCreateInfo, nullptr, &blas) != VK_SUCCESS) {
+    VkAccelerationStructureKHR newBlas;
+    if (vkCreateAccelerationStructureKHR_(device, &asCreateInfo, nullptr, &newBlas) != VK_SUCCESS) {
         DestroyAccelBuffer(asBuf);
         DestroyAccelBuffer(vertexBuf);
         DestroyAccelBuffer(indexBuf);
@@ -520,7 +525,7 @@ bool AccelStructureBuilder::RefitBLAS(int blasIndex, const float* vertices, uint
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-    buildInfo.dstAccelerationStructure = blas;
+    buildInfo.dstAccelerationStructure = newBlas;
     buildInfo.scratchData.deviceAddress = scratchBuf.deviceAddress;
 
     VkAccelerationStructureBuildRangeInfoKHR rangeInfo{};
@@ -530,23 +535,20 @@ bool AccelStructureBuilder::RefitBLAS(int blasIndex, const float* vertices, uint
     cmd = context_->BeginSingleTimeCommands();
     vkCmdBuildAccelerationStructuresKHR_(cmd, 1, &buildInfo, &pRangeInfo);
     context_->EndSingleTimeCommands(cmd);
-
     DestroyAccelBuffer(scratchBuf);
 
     VkAccelerationStructureDeviceAddressInfoKHR addressInfo{};
     addressInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
-    addressInfo.accelerationStructure = blas;
-    VkDeviceAddress blasAddr = vkGetAccelerationStructureDeviceAddressKHR_(device, &addressInfo);
+    addressInfo.accelerationStructure = newBlas;
 
-    // Replace in-place (no vector shift)
-    oldBlas.handle = blas;
-    oldBlas.buffer = asBuf;
-    oldBlas.deviceAddress = blasAddr;
-    oldBlas.vertexCount = vertexCount;
-    oldBlas.indexCount = indexCount;
-    oldBlas.built = true;
-    oldBlas.vertexBuf = vertexBuf;
-    oldBlas.indexBuf = indexBuf;
+    blas.handle = newBlas;
+    blas.buffer = asBuf;
+    blas.deviceAddress = vkGetAccelerationStructureDeviceAddressKHR_(device, &addressInfo);
+    blas.vertexCount = vertexCount;
+    blas.indexCount = indexCount;
+    blas.built = true;
+    blas.vertexBuf = vertexBuf;
+    blas.indexBuf = indexBuf;
 
     return true;
 }

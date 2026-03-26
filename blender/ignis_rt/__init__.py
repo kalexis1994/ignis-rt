@@ -397,6 +397,9 @@ def register():
     # Also hook load_post to catch file loads
     if engine._on_undo_redo not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(engine._on_undo_redo)
+    # Depsgraph handler: catches modifier/deformation changes that view_update misses
+    if engine._on_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(engine._on_depsgraph_update)
 
     # Clean up: remove IGNIS_RT from render-context panels that aren't ours,
     # EXCEPT Blender's Color Management panel (we read exposure/tonemap from it)
@@ -423,6 +426,8 @@ def unregister():
     for handler_list in (bpy.app.handlers.undo_post, bpy.app.handlers.redo_post, bpy.app.handlers.load_post):
         if engine._on_undo_redo in handler_list:
             handler_list.remove(engine._on_undo_redo)
+    if engine._on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(engine._on_depsgraph_update)
     try:
         engine._ignis_shutdown()
     except Exception:

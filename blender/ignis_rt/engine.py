@@ -174,6 +174,9 @@ _ignis_objkey_to_tlas = {}     # obj_key → [indices into _ignis_cached_tlas]
 # Hierarchy cache: parent Empty → child instances (avoids depsgraph iteration)
 _ignis_parent_groups = {}      # parent_name → {"indices": np.array(uint32), "relative": np.array(N,4,4)}
 _ignis_direct_objects = {}     # obj_name → tlas_idx (single direct objects)
+_ignis_deformed_meshes = set() # obj_keys whose mesh geometry changed (for BLAS refit)
+_ignis_mesh_to_objkeys = {}    # mesh.data.name → [obj_keys] for deformation lookup
+_ignis_vert_hashes = {}        # obj_key → hash of vertex positions (detect actual deformation)
 _ignis_last_full_upload = 0.0  # perf_counter timestamp (cooldown for init burst)
 _ignis_instance_count = 0      # mesh instance count after last sync
 _ignis_frames_since_sync = 0   # frames without any transform sync (for periodic validation)
@@ -259,6 +262,39 @@ def _on_undo_redo(scene, depsgraph=None):
     """Force full transform sync after undo/redo."""
     global _ignis_objects_dirty
     _ignis_objects_dirty = True
+
+
+@bpy.app.handlers.persistent
+def _on_depsgraph_update(scene, depsgraph=None):
+    """Catch ALL depsgraph changes including modifier property edits.
+    Blender doesn't always call RenderEngine.view_update for these."""
+    global _ignis_deformed_meshes, _ignis_changed_objects
+    if _load_stage != LOAD_IDLE or not _ignis_blas_handles:
+        return
+    if not depsgraph:
+        return
+    _needs_redraw = False
+    for update in depsgraph.updates:
+        uid = update.id
+        if isinstance(uid, bpy.types.Object):
+            _ignis_changed_objects.add(uid.name)
+            if uid.name in _ignis_blas_handles:
+                _ignis_deformed_meshes.add(uid.name)
+                _needs_redraw = True
+                _log(f"[dg_handler] Object '{uid.name}' → deform candidate")
+        elif isinstance(uid, bpy.types.Mesh):
+            obj_keys = _ignis_mesh_to_objkeys.get(uid.name)
+            if obj_keys:
+                for ok in obj_keys:
+                    if ok in _ignis_blas_handles:
+                        _ignis_deformed_meshes.add(ok)
+                        _needs_redraw = True
+    # Force viewport redraw so view_draw processes the deformation
+    if _needs_redraw:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
 
 
 def _ignis_shutdown():
@@ -870,11 +906,23 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                     # Clean up direct objects with None (multi-instance without parent)
                     _ignis_direct_objects = {k: v for k, v in _ignis_direct_objects.items() if v is not None}
 
+                    # Build mesh.data.name → obj_keys mapping for deformation detection
+                    global _ignis_mesh_to_objkeys
+                    _ignis_mesh_to_objkeys = {}
+                    for obj_key in _ignis_blas_handles:
+                        try:
+                            obj_ref = bpy.data.objects.get(obj_key)
+                            if obj_ref and obj_ref.data:
+                                _ignis_mesh_to_objkeys.setdefault(obj_ref.data.name, []).append(obj_key)
+                        except Exception:
+                            pass
+
                     n_parents = len(_ignis_parent_groups)
                     n_children = sum(len(g["indices"]) for g in _ignis_parent_groups.values())
                     n_direct = len(_ignis_direct_objects)
                     _log(f"Stage TLAS: {count} instances OK "
-                         f"({n_parents} parent groups, {n_children} instanced, {n_direct} direct)")
+                         f"({n_parents} parent groups, {n_children} instanced, {n_direct} direct, "
+                         f"{len(_ignis_mesh_to_objkeys)} mesh→obj)")
             except Exception:
                 _log_exception("LOAD_TLAS")
                 _load_stage = LOAD_IDLE
@@ -1055,6 +1103,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         - Material/NodeTree changed → fast material re-upload
         """
         global _ignis_full_dirty, _ignis_materials_dirty, _ignis_objects_dirty, _ignis_changed_objects
+        global _ignis_deformed_meshes
 
         if _load_stage != LOAD_IDLE:
             return
@@ -1067,14 +1116,15 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             return
 
         has_material_change = False
-        has_geometry_change = False
-        geometry_mesh_name = None
+        deformed_mesh_names = set()
 
         for update in depsgraph.updates:
             uid = update.id
             if isinstance(uid, bpy.types.Object):
-                # Track specific object names for fast-path transform patch
                 _ignis_changed_objects.add(uid.name)
+                if update.is_updated_geometry and uid.name in _ignis_blas_handles:
+                    if uid.data:
+                        deformed_mesh_names.add(uid.data.name)
             elif isinstance(uid, bpy.types.Material):
                 has_material_change = True
             elif isinstance(uid, bpy.types.NodeTree):
@@ -1089,24 +1139,28 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                     has_material_change = True
             elif isinstance(uid, bpy.types.Mesh):
                 if update.is_updated_geometry:
-                    has_geometry_change = True
-                    geometry_mesh_name = uid.name
+                    deformed_mesh_names.add(uid.name)
             elif isinstance(uid, bpy.types.Scene):
-                _ignis_objects_dirty = True  # scene change → full rebuild
+                _ignis_objects_dirty = True
 
-        # Material changes → fast re-upload (no full reload)
         if has_material_change:
             _ignis_materials_dirty = True
 
-        # Geometry changes on known objects → full reload (BLAS needs rebuild)
-        # Skip if accompanied by material change only (Blender reports mesh
-        # update when material slot changes, but topology didn't change)
-        if has_geometry_change and not has_material_change:
-            if geometry_mesh_name and (
-                geometry_mesh_name in _ignis_known_objects or
-                geometry_mesh_name in _ignis_blas_handles
-            ):
-                _ignis_full_dirty = True
+        # Geometry deformation → BLAS refit (fast) or full reload (topology change)
+        if deformed_mesh_names and not has_material_change:
+            for mesh_name in deformed_mesh_names:
+                # Use pre-built mapping from LOAD_TLAS
+                obj_keys = _ignis_mesh_to_objkeys.get(mesh_name)
+                if obj_keys:
+                    for ok in obj_keys:
+                        if ok in _ignis_blas_handles:
+                            _ignis_deformed_meshes.add(ok)
+                else:
+                    # Also try direct match (obj_name == mesh_name)
+                    if mesh_name in _ignis_blas_handles:
+                        _ignis_deformed_meshes.add(mesh_name)
+                    elif mesh_name in _ignis_known_objects:
+                        _ignis_full_dirty = True
 
     # ------------------------------------------------------------------
     # Materials-only re-upload (fast)
@@ -1514,13 +1568,87 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         global _ignis_last_light_count
         _ignis_last_light_count = n_lights
 
-        # ── Transform sync ──
-        # Hierarchy-based: O(K) where K = affected instances, no depsgraph iteration.
-        # Falls back to full sync only on add/remove/undo.
+        # ── Deformation + Transform sync globals ──
+        global _ignis_deformed_meshes, _ignis_vert_hashes
         global _ignis_last_transforms, _ignis_obj_to_mesh, _ignis_objects_dirty
         global _ignis_changed_objects, _ignis_cached_tlas, _ignis_objkey_to_tlas
         global _ignis_instance_count, _ignis_parent_groups, _ignis_direct_objects
 
+        # ── Deformation sync (BLAS rebuild for deformed meshes) ──
+        # _ignis_deformed_meshes is populated by _on_depsgraph_update handler.
+        # We compare vertex hashes to avoid unnecessary rebuilds for transform-only changes.
+        if _ignis_deformed_meshes and _ignis_blas_handles:
+            deformed = _ignis_deformed_meshes
+            _ignis_deformed_meshes = set()
+            for obj_key in deformed:
+                blas_idx = _ignis_blas_handles.get(obj_key)
+                if blas_idx is None:
+                    continue
+                try:
+                    obj_ref = bpy.data.objects.get(obj_key)
+                    if obj_ref is None:
+                        continue
+                    eval_obj = depsgraph.id_eval_get(obj_ref)
+                    mesh = eval_obj.to_mesh()
+                    if mesh is None:
+                        continue
+                    # Extract vertex positions
+                    vert_count = len(mesh.vertices)
+                    positions = np.empty(vert_count * 3, dtype=np.float32)
+                    mesh.vertices.foreach_get('co', positions)
+                    # Compare hash to detect actual geometry change (not just transform)
+                    vhash = hash(positions.tobytes())
+                    old_hash = _ignis_vert_hashes.get(obj_key)
+                    if vhash == old_hash:
+                        eval_obj.to_mesh_clear()
+                        continue
+                    _ignis_vert_hashes[obj_key] = vhash
+                    # Unroll vertices per-triangle (same layout as initial export)
+                    if len(mesh.loop_triangles) == 0:
+                        mesh.calc_loop_triangles()
+                    tri_count = len(mesh.loop_triangles)
+                    n_unrolled = tri_count * 3
+                    tri_verts = np.empty(n_unrolled, dtype=np.int32)
+                    mesh.loop_triangles.foreach_get('vertices', tri_verts)
+                    all_pos = positions.reshape(-1, 3)
+                    unrolled_pos = all_pos[tri_verts].flatten().astype(np.float32)
+                    unrolled_idx = np.arange(n_unrolled, dtype=np.uint32)
+
+                    # Extract per-corner (loop) normals — same as initial export
+                    tri_loops = np.empty(n_unrolled, dtype=np.int32)
+                    mesh.loop_triangles.foreach_get('loops', tri_loops)
+
+                    all_loop_normals = np.empty(len(mesh.loops) * 3, dtype=np.float32)
+                    try:
+                        mesh.corner_normals.foreach_get("vector", all_loop_normals)
+                    except (AttributeError, RuntimeError):
+                        mesh.calc_normals_split()
+                        mesh.loops.foreach_get("normal", all_loop_normals)
+                    all_loop_normals = all_loop_normals.reshape(-1, 3)
+                    unrolled_normals = all_loop_normals[tri_loops].flatten().astype(np.float32)
+
+                    # Extract UVs per-triangle-loop
+                    uv_layer = mesh.uv_layers.active
+                    if uv_layer:
+                        all_uvs = np.empty(len(mesh.loops) * 2, dtype=np.float32)
+                        uv_layer.data.foreach_get('uv', all_uvs)
+                        all_uvs = all_uvs.reshape(-1, 2)
+                        unrolled_uvs = all_uvs[tri_loops].flatten().astype(np.float32)
+                    else:
+                        unrolled_uvs = np.zeros(n_unrolled * 2, dtype=np.float32)
+
+                    # Full BLAS rebuild + attributes
+                    dll_wrapper.refit_blas(blas_idx, unrolled_pos, n_unrolled,
+                                          unrolled_idx, n_unrolled)
+                    dll_wrapper.upload_mesh_attributes(blas_idx, unrolled_normals,
+                                                       unrolled_uvs, n_unrolled)
+                    eval_obj.to_mesh_clear()
+                    # Rebuild TLAS to update geometry metadata pointers
+                    _ignis_objects_dirty = True
+                except Exception:
+                    _log_exception(f"deformation refit '{obj_key}'")
+
+        # ── Transform sync ──
         _need_full_sync = _ignis_objects_dirty
         _changed = _ignis_changed_objects
         _ignis_objects_dirty = False
