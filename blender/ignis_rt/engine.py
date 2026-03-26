@@ -888,6 +888,31 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             dll_wrapper.upload_lights(light_data, n_lights)
             _log(f"Stage FINALIZE: {n_lights} lights uploaded")
 
+            # Compute scene AABB for early sky-ray rejection
+            if _load_scene_instances:
+                import math
+                aabb_min = [math.inf, math.inf, math.inf]
+                aabb_max = [-math.inf, -math.inf, -math.inf]
+                for inst in _load_scene_instances:
+                    t = inst["transform_3x4"]
+                    # Position is in t[3], t[7], t[11] (last column of 3x4)
+                    px, py, pz = t[3], t[7], t[11]
+                    for i in range(3):
+                        aabb_min[i] = min(aabb_min[i], [px, py, pz][i])
+                        aabb_max[i] = max(aabb_max[i], [px, py, pz][i])
+                # Expand by estimated object radius (conservative)
+                pad = 20.0
+                for i in range(3):
+                    aabb_min[i] -= pad
+                    aabb_max[i] += pad
+                dll_wrapper.set_float("scene_aabb_min_x", aabb_min[0])
+                dll_wrapper.set_float("scene_aabb_min_y", aabb_min[1])
+                dll_wrapper.set_float("scene_aabb_min_z", aabb_min[2])
+                dll_wrapper.set_float("scene_aabb_max_x", aabb_max[0])
+                dll_wrapper.set_float("scene_aabb_max_y", aabb_max[1])
+                dll_wrapper.set_float("scene_aabb_max_z", aabb_max[2])
+                _log(f"Stage FINALIZE: scene AABB [{aabb_min[0]:.1f},{aabb_min[1]:.1f},{aabb_min[2]:.1f}] → [{aabb_max[0]:.1f},{aabb_max[1]:.1f},{aabb_max[2]:.1f}]")
+
             # Emissive triangles for MIS — use already-exported mesh data to avoid
             # re-evaluating meshes (which hangs on 7M+ tri scenes)
             try:
@@ -962,8 +987,20 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
         for update in depsgraph.updates:
             uid = update.id
-            if isinstance(uid, (bpy.types.Material, bpy.types.NodeTree)):
+            if isinstance(uid, bpy.types.Material):
                 has_material_change = True
+            elif isinstance(uid, bpy.types.NodeTree):
+                # Only trigger material re-export if the NodeTree belongs to a material,
+                # NOT the World (sky texture changes are handled per-frame via export_sun)
+                is_world_tree = False
+                try:
+                    world = depsgraph.scene.world
+                    if world and world.node_tree and uid.name == world.node_tree.name:
+                        is_world_tree = True
+                except Exception:
+                    pass
+                if not is_world_tree:
+                    has_material_change = True
             elif isinstance(uid, bpy.types.Mesh):
                 if update.is_updated_geometry:
                     has_geometry_change = True

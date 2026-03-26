@@ -794,13 +794,35 @@ void main() {
             }
         }
 
-        // Trace ray — opaque mode for hardware BVH performance.
-        rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT,
-                              0xFF, rayOrigin, MIN_HIT_DIST, rayDir, 10000.0);
-        while (rayQueryProceedEXT(rq)) {}
+        // Scene AABB early-out: if ray can't intersect scene bounds, skip
+        // expensive TLAS traversal and go directly to sky evaluation.
+        // AABB stored in jitterPattern[0..1] as (minX,minY,minZ,_), (maxX,maxY,maxZ,_)
+        vec3 sceneMin = intBitsToFloat(cam.jitterPattern[0].xyz);
+        vec3 sceneMax = intBitsToFloat(cam.jitterPattern[1].xyz);
+        bool hasSceneAABB = (sceneMin.x < sceneMax.x);  // valid if min < max
 
-        if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+        bool skipTrace = false;
+        if (hasSceneAABB) {
+            // Slab-based ray-AABB intersection (6 comparisons)
+            vec3 invDir = 1.0 / rayDir;
+            vec3 t1 = (sceneMin - rayOrigin) * invDir;
+            vec3 t2 = (sceneMax - rayOrigin) * invDir;
+            vec3 tNear = min(t1, t2);
+            vec3 tFar = max(t1, t2);
+            float tEntry = max(max(tNear.x, tNear.y), tNear.z);
+            float tExit = min(min(tFar.x, tFar.y), tFar.z);
+            skipTrace = (tEntry > tExit || tExit < MIN_HIT_DIST);
+        }
+
+        rayQueryEXT rq;
+        if (!skipTrace) {
+            // Trace ray — opaque mode for hardware BVH performance.
+            rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT,
+                                  0xFF, rayOrigin, MIN_HIT_DIST, rayDir, 10000.0);
+            while (rayQueryProceedEXT(rq)) {}
+        }
+
+        if (skipTrace || rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
             // Sky miss — notify SHARC for backpropagation
             vec3 skyColor = evaluateSky(rayDir);
             if (sharcEnabled && sharcUpdatePixel) {

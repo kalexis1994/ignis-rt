@@ -125,6 +125,10 @@ struct PathTracerConfig {
     float worldBgR           = 0.05f;
     float worldBgG           = 0.05f;
     float worldBgB           = 0.05f;
+
+    // Scene AABB for early sky-ray rejection (computed from TLAS instances)
+    float sceneAABBMin[3]    = {0, 0, 0};
+    float sceneAABBMax[3]    = {0, 0, 0};  // min == max means invalid (not set)
 };
 
 } // namespace acpt

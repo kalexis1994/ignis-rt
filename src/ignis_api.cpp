@@ -468,6 +468,11 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
         cam.sharcRadianceScale = 1e3f;   // quantization for uint accumulation
     }
 
+    // Scene AABB for early sky-ray rejection (packed into jitterPattern[0..7])
+    // jitterPattern[0].xyz = sceneMin (as float bits in int32), jitterPattern[1].xyz = sceneMax
+    memcpy(&cam.jitterPattern[0], cfg->sceneAABBMin, 3 * sizeof(float));
+    memcpy(&cam.jitterPattern[4], cfg->sceneAABBMax, 3 * sizeof(float));
+
     g_renderer->UpdateCamera(cam);
 
     // Store current frame as prev for next frame
@@ -582,6 +587,12 @@ IGNIS_API void ignis_set_float(const char* key, float value) {
     else if (strcmp(key, "world_bg_r") == 0)          cfg->worldBgR = value;
     else if (strcmp(key, "world_bg_g") == 0)          cfg->worldBgG = value;
     else if (strcmp(key, "world_bg_b") == 0)          cfg->worldBgB = value;
+    else if (strcmp(key, "scene_aabb_min_x") == 0)   cfg->sceneAABBMin[0] = value;
+    else if (strcmp(key, "scene_aabb_min_y") == 0)   cfg->sceneAABBMin[1] = value;
+    else if (strcmp(key, "scene_aabb_min_z") == 0)   cfg->sceneAABBMin[2] = value;
+    else if (strcmp(key, "scene_aabb_max_x") == 0)   cfg->sceneAABBMax[0] = value;
+    else if (strcmp(key, "scene_aabb_max_y") == 0)   cfg->sceneAABBMax[1] = value;
+    else if (strcmp(key, "scene_aabb_max_z") == 0)   cfg->sceneAABBMax[2] = value;
     else if (strcmp(key, "sky_refl_intensity") == 0) cfg->ptSkyReflIntensity = value;
     else if (strcmp(key, "sky_bounce_intensity") == 0) cfg->ptSkyBounceIntensity = value;
     else if (strcmp(key, "auto_exposure_key") == 0)  cfg->ptAutoExposureKey = value;
