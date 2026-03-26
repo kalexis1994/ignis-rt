@@ -1811,13 +1811,15 @@ void main() {
             SharcSetThroughput(sharcState, throughput);
         }
 
-        // ---- Russian roulette (Cycles-style: sqrt perceptual, min bounce guard) ----
-        if (bounce >= 2) {
-            float maxC = max(throughput.r, max(throughput.g, throughput.b));
-            float p = min(sqrt(maxC), 1.0);
+        // ---- Early termination: throughput too low to contribute visibly ----
+        float tpMax = max(throughput.r, max(throughput.g, throughput.b));
+        if (tpMax < 0.01) break;
+
+        // ---- Russian roulette (start at bounce 1 instead of 2 for faster termination) ----
+        if (bounce >= 1) {
+            float p = min(sqrt(tpMax), 1.0);
             if (rand01() > p) break;
             throughput /= p;
-            // Clamp throughput to prevent firefly explosion from RR compensation
             throughput = min(throughput, vec3(MAX_RADIANCE));
         }
 
