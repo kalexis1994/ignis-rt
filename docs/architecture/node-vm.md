@@ -109,6 +109,12 @@ flowchart TD
     BUMP --> BYTECODE[VM Bytecode - up to 64 instrs]
 ```
 
+## Runtime Optimizations
+
+- **Skip empty programs**: `executeNodeVm()` is not called when `instrCount == 0` — avoids function call overhead and 20-field struct initialization for materials without VM bytecode
+- **Output fast-path**: opcodes `>= 0xE0` (OUTPUT_COLOR, OUTPUT_ROUGH, etc.) branch directly to output handlers, skipping 50+ intermediate opcode checks for texture, math, and color operations
+- **SER (Shader Execution Reordering)**: `reorderThreadNV(matIdx)` groups GPU threads by material ID before VM execution — threads evaluating the same material run together with better cache coherence (hardware on RTX 40+, software on RTX 30)
+
 ## Limitations
 
 | Aspect | Limit | Notes |

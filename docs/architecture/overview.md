@@ -93,6 +93,16 @@ Ray Reconstruction replaces the traditional NRD denoiser with an AI model that u
 - Handles noisy path-traced input better (transformer architecture)
 - Single DLL, no NRD build dependency
 
-### Opaque + Hybrid Alpha Ray Queries
+### Alpha Transparency
 
-Main rays use `gl_RayFlagsOpaqueEXT` for maximum hardware BVH performance. Only alpha pass-through rays use `gl_RayFlagsNoneEXT` with a short backward-stepped origin to find coplanar geometry behind transparent decals.
+All rays use `gl_RayFlagsOpaqueEXT` for maximum hardware BVH performance. Alpha-tested materials (Mix Shader with Transparent BSDF) use stochastic pass-through in the bounce loop — `rand() > alpha` decides whether the ray continues through or shades the surface. Back faces of alpha-tested meshes are not culled, allowing visibility through 3D wireframe/foliage meshes.
+
+### Performance Optimizations
+
+| Optimization | Impact | GPU |
+|---|---|---|
+| **Shader Execution Reordering (SER)** | Reduces thread divergence by grouping threads with same material | RTX 40+ hardware, 30 software |
+| **VM skip for empty programs** | Avoids function call + 20-field struct init when instrCount=0 | All |
+| **Output opcode fast-path** | Opcodes >= 0xE0 branch directly to output handlers, skipping 50+ intermediate checks | All |
+| **Opaque ray queries** | Hardware BVH finds closest hit natively, no per-candidate processing | All |
+| **Runtime OCIO LUT bake** | Single 3D texture lookup for any view transform, no per-pixel OCIO evaluation | All |
