@@ -8,14 +8,14 @@ theme:
   name: material
   palette:
     - scheme: slate
-      primary: deep orange
-      accent: orange
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-4
         name: Switch to light mode
     - scheme: default
-      primary: deep orange
-      accent: orange
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
@@ -26,8 +26,21 @@ theme:
     - navigation.top
     - search.highlight
     - content.code.copy
+  favicon: assets/favicon.png
+  logo: assets/logo.png
   icon:
     repo: fontawesome/brands/github
+  custom_dir: docs/overrides
+
+extra_css:
+  - stylesheets/extra.css
+
+extra_javascript:
+  - javascripts/mermaid-config.js
+  - javascripts/contrast.js
+
+plugins:
+  - search
 
 markdown_extensions:
   - pymdownx.highlight:

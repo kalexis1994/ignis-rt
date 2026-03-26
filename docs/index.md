@@ -1,3 +1,7 @@
+<div style="text-align: center; margin-bottom: 1em;">
+  <img src="assets/ignis_512.png" alt="Ignis RT" style="width: 128px; height: 128px;">
+</div>
+
 # Ignis RT
 
 **Real-time Vulkan ray tracing path tracer for Blender**
@@ -16,48 +20,36 @@ Ignis RT is a viewport render engine for Blender that uses hardware-accelerated 
 ## Architecture at a Glance
 
 ```mermaid
-mindmap
-  root((Ignis RT))
-    Blender Addon
-      Scene Export
-        Meshes → BLAS
-        Materials → Node VM
-        Lights → NEE
-        World → Sky/HDRI
-      Engine Sync
-        Camera
-        Transforms → TLAS
-        Color Management
-    Vulkan Renderer
-      Ray Tracing
-        Opaque Ray Queries
-        Hybrid Alpha Queries
-        BVH Traversal
-      Path Tracing
-        NEE Sun/Lights
-        BRDF Sampling
-        Russian Roulette
-      DLSS 4
-        Ray Reconstruction
-        Super Resolution
-        DLAA
-      Post-Processing
-        OCIO Tonemap LUT
-        Exposure
-        Saturation
-    Shader System
-      Node VM
-        86 Opcodes
-        32 Registers
-        64 Instructions max
-      Procedural Textures
-        Perlin/FBM
-        Voronoi
-        Gradient
-      PBR BRDF
-        GGX Specular
-        Dielectric Fresnel
-        F82-Tint Metals
+flowchart TB
+    RT((Ignis RT))
+
+    RT --- ADDON & VULKAN & SHADERS
+
+    subgraph ADDON[Blender Addon]
+        direction LR
+        SE[Scene Export<br/>Meshes · Materials · Lights]
+        SYNC[Engine Sync<br/>Camera · Transforms · OCIO]
+    end
+
+    subgraph VULKAN[Vulkan Renderer]
+        direction LR
+        RAYS[Ray Tracing<br/>Opaque BVH · Hybrid Alpha]
+        PT[Path Tracing<br/>NEE · BRDF · Russian Roulette]
+        DL[DLSS 4<br/>Ray Reconstruction · SR · DLAA]
+    end
+
+    subgraph SHADERS[Shader System]
+        direction LR
+        VM[Node VM<br/>86 opcodes · 32 regs · 64 instrs]
+        TEX[Procedural Textures<br/>Perlin · Voronoi · Gradient]
+        BRDF[PBR BRDF<br/>GGX · Fresnel · F82-Tint]
+        VOL[Volumetrics<br/>Ray March · Beer-Lambert · HG]
+    end
+
+    style RT fill:#E06030,color:#fff,stroke:#B34A24
+    style ADDON fill:#4A6380,color:#fff,stroke:#4A6380
+    style VULKAN fill:#2E2E30,color:#fff,stroke:#636366
+    style SHADERS fill:#2E2E30,color:#fff,stroke:#636366
 ```
 
 ## Render Pipeline
@@ -72,10 +64,10 @@ flowchart LR
     F --> G[Tonemap LUT]
     G --> H[Display]
 
-    style D fill:#e65100,color:white
-    style E fill:#1565c0,color:white
-    style F fill:#1565c0,color:white
-    style G fill:#2e7d32,color:white
+    style D fill:#E06030,color:white
+    style E fill:#4A6380,color:white
+    style F fill:#4A6380,color:white
+    style G fill:#00695C,color:white
 ```
 
 ## Quick Start

@@ -5,22 +5,36 @@ Ignis RT uses NVIDIA DLSS 4 (SDK v310.5.3) for denoising, upscaling, and anti-al
 ## Features
 
 ```mermaid
-mindmap
-  root((DLSS 4))
-    Ray Reconstruction
-      Replaces NRD denoiser
-      Transformer model
-      Handles noisy PT input
-      Temporal stability
-    Super Resolution
-      AI upscaling
-      5 quality modes
-      Transformer 2nd-gen
-    DLAA
-      Native resolution
-      AI anti-aliasing
-      No upscaling
-      Highest quality
+flowchart LR
+    DLSS((DLSS 4))
+
+    DLSS --- RR
+    DLSS --- SR
+    DLSS --- DLAA_N
+
+    subgraph RR[Ray Reconstruction]
+        RR1[Replaces NRD denoiser]
+        RR2[Transformer model]
+        RR3[Handles noisy PT input]
+        RR4[Temporal stability]
+    end
+
+    subgraph SR[Super Resolution]
+        SR1[AI upscaling]
+        SR2[6 quality modes]
+        SR3[Transformer 2nd-gen]
+    end
+
+    subgraph DLAA_N[DLAA]
+        DLAA1[Native resolution]
+        DLAA2[AI anti-aliasing]
+        DLAA3[Highest quality]
+    end
+
+    style DLSS fill:#E06030,color:white
+    style RR fill:#4A6380,color:white
+    style SR fill:#37474F,color:white
+    style DLAA_N fill:#2E2E30,color:white
 ```
 
 ## Quality Modes

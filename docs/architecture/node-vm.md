@@ -5,94 +5,63 @@ The Node VM is a bytecode interpreter that runs inside the raygen shader, evalua
 ## Architecture
 
 ```mermaid
-mindmap
-  root((Node VM))
-    Compilation
-      Python _NodeVmCompiler
-      Walks node tree
-      Emits bytecode
-      64 instruction limit
-      32 registers
-    Execution
-      GLSL executeNodeVm
-      Per-pixel evaluation
-      All material properties
-      Texture sampling
-    Opcodes - 86 total
-      Texture Sampling
-        SAMPLE_TEX
-        TEX_NOISE
-        TEX_VORONOI
-        TEX_GRADIENT
-        TEX_CHECKER
-        TEX_WAVE
-        TEX_MAGIC
-        TEX_BRICK
-        TEX_WHITE_NOISE
-        NOISE_BUMP
-      Color Blend - 13 modes
-        MIX / MIX_REG
-        MULTIPLY
-        ADD / SUBTRACT
-        SCREEN / OVERLAY
-        DARKEN / LIGHTEN
-        COLOR_DODGE / COLOR_BURN
-        SOFT_LIGHT / LINEAR_LIGHT
-      Color Adjust
-        HUE_SAT_VAL
-        COLORRAMP + RAMP_DATA
-        INVERT
-        GAMMA
-        BRIGHT_CONTRAST
-        LUMINANCE
-      Math - 21 operations
-        ADD MUL DIV POWER
-        MIN MAX SUB ABS
-        SQRT MOD FLOOR CEIL
-        FRACT SIN COS TAN
-        LESS GREATER ROUND
-        SIGN SMOOTH_MIN
-      Vector Math - 18 operations
-        ADD SUB MUL DIV
-        CROSS DOT LENGTH DIST
-        NORMALIZE SCALE REFLECT
-        ABS MIN MAX FLOOR
-        FRACT MOD SIGN
-      Channel
-        SEPARATE_RGB
-        COMBINE_RGB
-      Input
-        LOAD_WORLD_POS
-        LOAD_LOCAL_POS
-        LOAD_VIEW_DIR
-        LOAD_NORMAL
-        LOAD_INCOMING
-        LOAD_VERTEX_COLOR
-        OBJECT_RANDOM
-        BACKFACING
-        LAYER_WEIGHT
-        FRESNEL
-      UV
-        UV_TRANSFORM
-        UV_ROTATE
-        UV_VFLIP
-      Output
-        OUTPUT_COLOR
-        OUTPUT_ROUGH
-        OUTPUT_METAL
-        OUTPUT_ALPHA
-        OUTPUT_EMISSION
-        OUTPUT_TRANSMISSION
-        OUTPUT_IOR
-        OUTPUT_NORMAL
-        OUTPUT_UV
-        OUTPUT_BUMP
-      Constants
-        LOAD_CONST
-        LOAD_SCALAR
-        MATH_CLAMP
-        MAP_RANGE_FULL
-        VEC_MATH
+flowchart TB
+    VM((Node VM<br/>86 Opcodes<br/>32 Registers<br/>64 Instructions))
+
+    VM --- COMP[Compilation<br/>Python _NodeVmCompiler]
+    VM --- EXEC[Execution<br/>GLSL executeNodeVm]
+
+    VM --- TEX & COL & MATH & INPUT & OUT
+
+    subgraph TEX[Texture - 10 ops]
+        direction LR
+        T1[SAMPLE_TEX]
+        T2[TEX_NOISE]
+        T3[TEX_VORONOI]
+        T4[TEX_GRADIENT]
+        T5[TEX_CHECKER / WAVE]
+        T6[TEX_MAGIC / BRICK]
+    end
+
+    subgraph COL[Color - 19 ops]
+        direction LR
+        C1[MIX / MIX_REG]
+        C2[13 blend modes]
+        C3[HUE_SAT / COLORRAMP]
+        C4[INVERT / GAMMA]
+        C5[BRIGHT_CONTRAST]
+    end
+
+    subgraph MATH[Math - 40 ops]
+        direction LR
+        M1[21 scalar math]
+        M2[18 vector math]
+        M3[MAP_RANGE / CLAMP]
+    end
+
+    subgraph INPUT[Input - 11 ops]
+        direction LR
+        I1[WORLD_POS / LOCAL_POS]
+        I2[VIEW_DIR / NORMAL]
+        I3[VERTEX_COLOR]
+        I4[OBJECT_RANDOM]
+        I5[LAYER_WEIGHT / FRESNEL]
+    end
+
+    subgraph OUT[Output - 10 ops]
+        direction LR
+        O1[COLOR / ROUGH / METAL]
+        O2[ALPHA / EMISSION]
+        O3[TRANSMISSION / IOR]
+        O4[UV / BUMP / NORMAL]
+    end
+
+    style VM fill:#E06030,color:white
+    style TEX fill:#4A6380,color:white
+    style COL fill:#37474F,color:white
+    style MATH fill:#2E2E30,color:white
+    style INPUT fill:#B34A24,color:white
+    style OUT fill:#00695C,color:white
 ```
 
 ## Instruction Format

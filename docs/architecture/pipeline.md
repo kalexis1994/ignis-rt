@@ -35,10 +35,10 @@ flowchart TD
     CONTINUE --> TRACE
     SKY --> OUTPUT[Accumulate Radiance]
 
-    style TRACE fill:#e65100,color:white
-    style EVAL fill:#2e7d32,color:white
-    style NEE fill:#1565c0,color:white
-    style MARCH fill:#6a1b9a,color:white
+    style TRACE fill:#E06030,color:white
+    style EVAL fill:#00695C,color:white
+    style NEE fill:#4A6380,color:white
+    style MARCH fill:#2E2E30,color:white
 ```
 
 ## Material Evaluation
@@ -76,9 +76,9 @@ flowchart LR
     TONE --> DITHER[8-bit Dither]
     DITHER --> DISPLAY[Blender Viewport]
 
-    style RR fill:#76ff03,color:black
-    style SR fill:#1565c0,color:white
-    style TONE fill:#2e7d32,color:white
+    style RR fill:#00695C,color:white
+    style SR fill:#4A6380,color:white
+    style TONE fill:#E06030,color:white
 ```
 
 ## Supported Blender Nodes

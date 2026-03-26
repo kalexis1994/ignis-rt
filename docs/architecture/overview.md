@@ -35,9 +35,9 @@ flowchart TB
     DLSS_M --> TM
     TM --> DISP[Display]
 
-    style Blender fill:#1a237e,color:white
-    style DLL fill:#b71c1c,color:white
-    style GPU fill:#e65100,color:white
+    style Blender fill:#4A6380,color:white
+    style DLL fill:#2E2E30,color:white
+    style GPU fill:#E06030,color:white
 ```
 
 ## Data Flow
