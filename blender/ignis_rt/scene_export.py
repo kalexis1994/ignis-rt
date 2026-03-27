@@ -264,39 +264,11 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
         "roughness_2": getattr(settings, 'roughness_2', 0.0),
         "roughness_endpoint": getattr(settings, 'roughness_endpoint', 0.0),
         "child_mode": 1 if child_type == 'SIMPLE' else 0,  # 0=INTERPOLATED, 1=SIMPLE
-        "child_radius": getattr(settings, 'child_radius', 0.0),
-        "use_parent_particles": bool(getattr(settings, 'use_parent_particles', True)),
         "kink_shape": getattr(settings, 'kink_shape', 0.0),
         "kink_flat": getattr(settings, 'kink_flat', 0.0),
-        "kink_amp_random": getattr(settings, 'kink_amplitude_random', 0.0),
-        "opaque_hair": _is_hair_opaque(eval_obj, settings),
+        "kink_amp_random": getattr(settings, 'kink_amp_random', 0.0),
+        "opaque_hair": getattr(settings, 'opaque_hair', False),
     }
-
-
-def _is_hair_opaque(eval_obj, settings):
-    """Check if hair material is fully opaque (no alpha/transparency).
-    Opaque hair gets VK_GEOMETRY_OPAQUE_BIT for faster BVH traversal."""
-    mat_slot = getattr(settings, 'material', 1) - 1
-    if mat_slot < 0:
-        mat_slot = 0
-    slots = eval_obj.material_slots
-    if mat_slot >= len(slots) or slots[mat_slot].material is None:
-        return True  # no material = opaque
-    mat = slots[mat_slot].material
-    if not mat.use_nodes or not mat.node_tree:
-        return True
-    # Check if material has Transparent BSDF or alpha < 1
-    for node in mat.node_tree.nodes:
-        if node.type == 'BSDF_TRANSPARENT':
-            return False
-        if node.type == 'BSDF_PRINCIPLED':
-            alpha_inp = node.inputs.get('Alpha')
-            if alpha_inp and (alpha_inp.is_linked or float(alpha_inp.default_value) < 0.999):
-                return False
-            trans_inp = node.inputs.get('Transmission Weight') or node.inputs.get('Transmission')
-            if trans_inp and (trans_inp.is_linked or float(trans_inp.default_value) > 0.001):
-                return False
-    return True
 
     # CPU fallback (kept for reference, not reached)
     if child_type != 'NONE' and child_nbr > 0:

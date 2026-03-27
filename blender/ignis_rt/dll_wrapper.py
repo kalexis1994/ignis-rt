@@ -316,7 +316,7 @@ def generate_hair_gpu(parent_keys, n_parents: int, keys_per_strand: int,
                       child_mode: int = 0,
                       kink_shape: float = 0.0, kink_flat: float = 0.0,
                       kink_amp_random: float = 0.0,
-                      opaque_hair: bool = True) -> int:
+                      opaque_hair: bool = False) -> int:
     """Generate hair children + ribbon geometry entirely on GPU. Returns BLAS index."""
     import numpy as np
     k = _np_f32(parent_keys)

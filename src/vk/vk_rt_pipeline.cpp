@@ -1669,7 +1669,7 @@ void RTPipeline::UpdateTLASDescriptor() {
             metaData[i].normalBufferAddress = blasList[i].normalBuf.deviceAddress;
             metaData[i].uvBufferAddress = blasList[i].uvBuf.deviceAddress;
             metaData[i].primMaterialBufferAddress = blasList[i].primMaterialBuf.deviceAddress;
-            metaData[i].bitangentBufferAddress = 0;
+            metaData[i].bitangentBufferAddress = blasList[i].isHair ? 1u : 0u;
             metaData[i].primYBoundsAddress = blasList[i].primYBoundsBuf.deviceAddress;
             metaData[i].colorBufferAddress = blasList[i].colorBuf.deviceAddress;
             metaData[i].vertexCount = blasList[i].vertexCount;

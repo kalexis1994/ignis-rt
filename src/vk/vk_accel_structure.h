@@ -34,6 +34,7 @@ struct BLAS {
     AccelBuffer primYBoundsBuf; // float2 per primitive: (nodeMinY, nodeMaxY) for canopy AO
     float minY = 0.0f;  // Bounding box min Y (for canopy AO gradient)
     float maxY = 0.0f;  // Bounding box max Y
+    bool isHair = false;
 };
 
 struct GeometryBuffers {
