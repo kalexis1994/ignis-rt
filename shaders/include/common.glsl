@@ -8,6 +8,16 @@
 
 const float PI = 3.14159265359;
 const float INV_PI = 1.0 / PI;
+
+// Exact dielectric Fresnel (Cycles-accurate, for glass/transmission)
+float fresnelDielectric(float cosTheta, float eta) {
+    float sinThetaTSq = eta * eta * (1.0 - cosTheta * cosTheta);
+    if (sinThetaTSq > 1.0) return 1.0; // total internal reflection
+    float cosThetaT = sqrt(1.0 - sinThetaTSq);
+    float rs = (cosTheta - eta * cosThetaT) / (cosTheta + eta * cosThetaT);
+    float rp = (eta * cosTheta - cosThetaT) / (eta * cosTheta + cosThetaT);
+    return 0.5 * (rs * rs + rp * rp);
+}
 const int MAX_BOUNCES_LIMIT = 8;
 const float MIN_HIT_DIST = 0.001;
 const float MAX_RADIANCE = 30.0;  // clamp fireflies but allow HDR headroom for bright lights

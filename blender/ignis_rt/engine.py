@@ -278,10 +278,19 @@ def _on_depsgraph_update(scene, depsgraph=None):
         uid = update.id
         if isinstance(uid, bpy.types.Object):
             _ignis_changed_objects.add(uid.name)
-            if uid.name in _ignis_blas_handles:
-                _ignis_deformed_meshes.add(uid.name)
-                _needs_redraw = True
-                _log(f"[dg_handler] Object '{uid.name}' → deform candidate")
+            # Only flag for deformation if object has deforming modifiers
+            if uid.name in _ignis_blas_handles and len(uid.modifiers) > 0:
+                # Filter: only modifiers that deform geometry (not Boolean cutters, etc.)
+                _DEFORM_TYPES = {'SIMPLE_DEFORM', 'LATTICE', 'ARMATURE', 'MESH_DEFORM',
+                                 'SHRINKWRAP', 'SMOOTH', 'CORRECTIVE_SMOOTH', 'LAPLACIANSMOOTH',
+                                 'SURFACE_DEFORM', 'WARP', 'WAVE', 'CLOTH', 'SOFT_BODY',
+                                 'HOOK', 'DISPLACE', 'CAST', 'CURVE', 'LAPLACIANDEFORM',
+                                 'SUBSURF', 'MULTIRES', 'SKIN', 'SOLIDIFY', 'ARRAY',
+                                 'MIRROR', 'SCREW', 'BEVEL', 'NODES'}
+                has_deform = any(m.type in _DEFORM_TYPES for m in uid.modifiers)
+                if has_deform:
+                    _ignis_deformed_meshes.add(uid.name)
+                    _needs_redraw = True
         elif isinstance(uid, bpy.types.Mesh):
             obj_keys = _ignis_mesh_to_objkeys.get(uid.name)
             if obj_keys:
@@ -1592,16 +1601,20 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                     mesh = eval_obj.to_mesh()
                     if mesh is None:
                         continue
-                    # Extract vertex positions
+                    # Quick hash on first 32 verts to detect geometry change cheaply
                     vert_count = len(mesh.vertices)
-                    positions = np.empty(vert_count * 3, dtype=np.float32)
-                    mesh.vertices.foreach_get('co', positions)
-                    # Compare hash to detect actual geometry change (not just transform)
-                    vhash = hash(positions.tobytes())
+                    sample_n = min(vert_count, 32) * 3
+                    sample_buf = np.empty(sample_n, dtype=np.float32)
+                    mesh.vertices[:min(vert_count, 32)].foreach_get('co', sample_buf)
+                    vhash = hash(sample_buf.tobytes())
                     old_hash = _ignis_vert_hashes.get(obj_key)
                     if vhash == old_hash:
                         eval_obj.to_mesh_clear()
                         continue
+                    _ignis_vert_hashes[obj_key] = vhash
+                    # Full vertex extraction (geometry actually changed)
+                    positions = np.empty(vert_count * 3, dtype=np.float32)
+                    mesh.vertices.foreach_get('co', positions)
                     _ignis_vert_hashes[obj_key] = vhash
                     # Unroll vertices per-triangle (same layout as initial export)
                     if len(mesh.loop_triangles) == 0:

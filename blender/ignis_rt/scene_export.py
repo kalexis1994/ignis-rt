@@ -4095,13 +4095,99 @@ def _lerp_color(a, b, t):
             a[2] * (1 - t) + b[2] * t)
 
 
+def _try_eval_light_path_factor(socket, depth=0):
+    """Try to evaluate a linked factor as a compile-time constant when it
+    traces back to Light Path outputs (possibly through Math/Clamp/Reroute).
+    Returns float value if fully evaluable, or None if dynamic (Fresnel, textures, etc.).
+
+    Light Path outputs are constants in our path tracer:
+      Is Camera Ray = 1.0, all others = 0.0
+    """
+    if depth > 8:
+        return None
+    if not socket.is_linked:
+        try:
+            return float(socket.default_value)
+        except Exception:
+            return None
+    node = socket.links[0].from_node
+    out_name = socket.links[0].from_socket.name
+
+    if node.type == 'LIGHT_PATH':
+        return 1.0 if out_name == 'Is Camera Ray' else 0.0
+
+    if node.type == 'REROUTE':
+        inp = node.inputs[0]
+        return _try_eval_light_path_factor(inp, depth + 1)
+
+    if node.type == 'CLAMP':
+        val = _try_eval_light_path_factor(node.inputs[0], depth + 1)
+        if val is None:
+            return None
+        mn = _try_eval_light_path_factor(node.inputs[1], depth + 1)
+        mx = _try_eval_light_path_factor(node.inputs[2], depth + 1)
+        if mn is None: mn = 0.0
+        if mx is None: mx = 1.0
+        return max(mn, min(mx, val))
+
+    if node.type == 'MATH':
+        a = _try_eval_light_path_factor(node.inputs[0], depth + 1)
+        b = _try_eval_light_path_factor(node.inputs[1], depth + 1) if len(node.inputs) > 1 else None
+        if a is None:
+            return None
+        if b is None and node.operation not in ('ABSOLUTE', 'ROUND', 'FLOOR', 'CEIL',
+                                                  'SINE', 'COSINE', 'TANGENT', 'SQRT'):
+            b = float(node.inputs[1].default_value) if len(node.inputs) > 1 else 0.0
+            if b is None:
+                return None
+        op = node.operation
+        if op == 'ADD': return a + (b or 0)
+        if op == 'SUBTRACT': return a - (b or 0)
+        if op == 'MULTIPLY': return a * (b or 0)
+        if op == 'DIVIDE': return a / b if b and b != 0 else 0.0
+        if op == 'MINIMUM': return min(a, b or 0)
+        if op == 'MAXIMUM': return max(a, b or 0)
+        if op == 'POWER': return a ** (b or 1) if a >= 0 else 0.0
+        if op == 'ABSOLUTE': return abs(a)
+        if op == 'GREATER_THAN': return 1.0 if a > (b or 0.5) else 0.0
+        if op == 'LESS_THAN': return 1.0 if a < (b or 0.5) else 0.0
+        return None
+
+    if node.type == 'MAP_RANGE':
+        val = _try_eval_light_path_factor(node.inputs[0], depth + 1)
+        if val is None:
+            return None
+        from_min = _try_eval_light_path_factor(node.inputs[1], depth + 1)
+        from_max = _try_eval_light_path_factor(node.inputs[2], depth + 1)
+        to_min = _try_eval_light_path_factor(node.inputs[3], depth + 1)
+        to_max = _try_eval_light_path_factor(node.inputs[4], depth + 1)
+        if None in (from_min, from_max, to_min, to_max):
+            return None
+        rng = from_max - from_min
+        if abs(rng) < 1e-6:
+            return to_min
+        t = (val - from_min) / rng
+        t = max(0.0, min(1.0, t))
+        return to_min + t * (to_max - to_min)
+
+    # Value node
+    if node.type == 'VALUE':
+        return float(node.outputs[0].default_value)
+
+    return None  # dynamic node (Fresnel, Layer Weight, Texture, etc.)
+
+
 def _resolve_mix_shader(mix_node, register_image_fn):
     """Resolve a Mix Shader node into blended PBR properties."""
     fac_inp = mix_node.inputs.get('Fac')
     if fac_inp and fac_inp.is_linked:
-        # Dynamic factor (Fresnel, Layer Weight, Geometry, etc.)
-        # Can't evaluate per-pixel on CPU — use 0.5 as neutral blend
-        fac = 0.5
+        # Try to evaluate as compile-time constant (Light Path patterns)
+        evaluated = _try_eval_light_path_factor(fac_inp)
+        if evaluated is not None:
+            fac = max(0.0, min(1.0, evaluated))
+        else:
+            # Truly dynamic factor (Fresnel, Layer Weight, Geometry, etc.)
+            fac = 0.5
     else:
         fac = float(fac_inp.default_value) if fac_inp else 0.5
 

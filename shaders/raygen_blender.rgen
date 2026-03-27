@@ -905,9 +905,14 @@ void main() {
         vec3 geoNormalRaw = normalize(cross(wp1 - wp0, wp2 - wp0)); // true triangle normal
         vec3 geoNormal = geoNormalRaw;
         if (dot(geoNormal, -rayDir) < 0.0) geoNormal = -geoNormal; // flip toward camera
+        // Save smooth-interpolated normal BEFORE normal map — used for glass refraction.
+        // Smooth shading should affect refraction (the surface IS smooth),
+        // but normal maps should NOT (they're detail perturbation, not geometry).
+        vec3 smoothN = worldN;
         float NdotNg = dot(worldN, geoNormal);
         if (NdotNg < 0.0) {
-            // Normal is below the surface — snap to geometric normal
+            // Shadow terminator fix: snap worldN to geometric normal for shading.
+            // But keep smoothN as-is for glass refraction (preserve smooth interpolation).
             worldN = geoNormal;
         }
 
@@ -1982,11 +1987,12 @@ void main() {
             glassBounces++;
             if (glassBounces >= MAX_GLASS_BOUNCES) break;
 
-            // Use GEOMETRIC normal for refraction — normal maps should not distort it.
-            // Determine entry/exit from the RAW triangle normal (geoNormalRaw),
-            // NOT geoNormal which was pre-flipped toward camera (always frontFace=true).
+            // Use SMOOTH interpolated normal for refraction (no normal map).
+            // Smooth shading affects refraction (surface IS smooth), normal maps don't.
+            // Entry/exit from raw triangle normal (unambiguous winding).
             bool enteringGlass = dot(geoNormalRaw, -rayDir) >= 0.0;
-            vec3 refractN = enteringGlass ? geoNormalRaw : -geoNormalRaw; // face toward ray
+            // Orient smooth normal toward the incoming ray (required by refract())
+            vec3 refractN = dot(smoothN, -rayDir) >= 0.0 ? smoothN : -smoothN;
             float eta = enteringGlass ? (1.0 / pbrHit.ior) : pbrHit.ior;
             float alpha = pbrHit.roughness * pbrHit.roughness;
 
@@ -2008,11 +2014,9 @@ void main() {
                 H = refractN;
             }
 
-            // Fresnel at microfacet
+            // Dielectric Fresnel (exact, not Schlick approximation — matches Cycles)
             float cosI = abs(dot(V, H));
-            float f0 = (pbrHit.ior - 1.0) / (pbrHit.ior + 1.0);
-            f0 = f0 * f0;
-            float fresnel = f0 + (1.0 - f0) * pow(1.0 - cosI, 5.0);
+            float fresnel = fresnelDielectric(cosI, eta);
 
             // Decide reflect vs refract based on Fresnel
             vec3 refracted = refract(-V, H, eta);
