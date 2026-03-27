@@ -871,8 +871,8 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
 
     VkDevice device = context_->GetDevice();
     uint32_t totalChildren = nParents * childrenPerParent;
-    // Catmull-Rom subdivision: 4 sub-segments per key segment (must match shader SUBDIV)
-    const uint32_t SUBDIV = 4;
+    // Catmull-Rom subdivision: 8 sub-segments per key segment (must match shader SUBDIV)
+    const uint32_t SUBDIV = 8;
     uint32_t subdivPoints = (keysPerStrand - 1) * SUBDIV + 1;
     uint32_t vertsPerChild = subdivPoints * 2;
     uint32_t trisPerChild = (subdivPoints - 1) * 2;

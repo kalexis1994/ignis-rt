@@ -264,6 +264,8 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
         "roughness_2": getattr(settings, 'roughness_2', 0.0),
         "roughness_endpoint": getattr(settings, 'roughness_endpoint', 0.0),
         "child_mode": 1 if child_type == 'SIMPLE' else 0,  # 0=INTERPOLATED, 1=SIMPLE
+        "child_radius": getattr(settings, 'child_radius', 0.0),
+        "use_parent_particles": bool(getattr(settings, 'use_parent_particles', True)),
     }
 
     # CPU fallback (kept for reference, not reached)

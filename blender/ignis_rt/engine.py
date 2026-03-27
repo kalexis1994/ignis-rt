@@ -675,6 +675,9 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                             except Exception:
                                 pass
                             child_nbr = max(m["child_nbr"], 1)
+                            # use_parent_particles: add 1 extra "child" per parent (zero offset = parent itself)
+                            if m.get("use_parent_particles", False) and child_nbr > 0:
+                                child_nbr += 1
                             n_p = m["n_parents"]
                             pk = m["parent_keys"].reshape(-1, 3)
                             # Estimate spacing
@@ -701,7 +704,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                                 cam_x=float(cam_pos[0]),
                                 cam_y=float(cam_pos[1]),
                                 cam_z=float(cam_pos[2]),
-                                avg_spacing=m.get("avg_spacing", avg_sp),
+                                avg_spacing=m.get("child_radius", m.get("avg_spacing", avg_sp)) if m.get("child_mode", 0) == 1 else m.get("avg_spacing", avg_sp),
                                 kink_amplitude=m.get("kink_amplitude", 0.0),
                                 kink_frequency=m.get("kink_frequency", 2.0),
                                 clump_factor=m.get("clump_factor", 0.0),
@@ -713,9 +716,9 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                                 child_mode=m.get("child_mode", 0))
                             if blas >= 0:
                                 _ignis_blas_handles[mesh_key] = blas
-                                # Compute tri count for material assignment (must match shader SUBDIV=4)
+                                # Compute tri count for material assignment (must match shader SUBDIV=8)
                                 total_children = n_p * child_nbr
-                                subdiv_points = (m["n_keys"] - 1) * 4 + 1
+                                subdiv_points = (m["n_keys"] - 1) * 8 + 1
                                 tris_per_child = (subdiv_points - 1) * 2
                                 m["_gpu_tri_count"] = total_children * tris_per_child
                                 _log(f"  GPU hair OK: '{mesh_key}' → BLAS {blas} ({m['_gpu_tri_count']} tris)")

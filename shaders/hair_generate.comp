@@ -98,8 +98,8 @@ void main() {
     if (childIdx >= pc.totalChildren) return;
 
     uint K = pc.keysPerStrand;
-    // Catmull-Rom subdivision: 4 sub-segments per key segment → smoother curves
-    const uint SUBDIV = 4u;
+    // Catmull-Rom subdivision: 8 sub-segments per key segment → resolves high-freq kink
+    const uint SUBDIV = 8u;
     uint S = (K - 1) * SUBDIV + 1;  // total subdivided points
     uint vertsPerStrand = S * 2;
     uint trisPerStrand = (S - 1) * 2;
@@ -161,7 +161,10 @@ void main() {
         vec3 sp2 = normalize(cross(strandDir, sp1));
 
         float angle = randFloat(seed + 500u) * 6.28318;
-        float dist = (0.3 + randFloat(seed + 501u) * 0.7) * pc.avgSpacing * 0.5;
+        // Use child_radius (Blender's actual setting) for distribution distance
+        // avgSpacing carries child_radius for SIMPLE mode (set by Python)
+        float childRad = pc.avgSpacing;  // repurposed for SIMPLE mode
+        float dist = sqrt(randFloat(seed + 501u)) * childRad;  // sqrt for uniform disk
         vec3 offset = sp1 * cos(angle) * dist + sp2 * sin(angle) * dist;
 
         // Copy parent keys + uniform offset
@@ -273,11 +276,31 @@ void main() {
             childKeys[ki] = mix(childKeys[ki], primaryKeys[ki], clamp(clump, 0.0, 1.0));
         }
 
-        // ── Kink/Curl: helical displacement ──
+        // ── Kink/Curl (Blender-exact: rotate kink vector around parent tangent) ──
         if (pc.kinkAmplitude > 0.0) {
-            float angle = t * pc.kinkFrequency * 6.28318 + rPhase;
-            float amp = pc.kinkAmplitude * t;
-            childKeys[ki] += modPerp1 * cos(angle) * amp + modPerp2 * sin(angle) * amp;
+            // Blender: t_kink = time * freq * PI (not 2*PI)
+            float kinkT = t * pc.kinkFrequency * 3.14159;
+
+            // Kink vector: perpendicular to parent tangent, scaled by amplitude
+            vec3 parentTang = vec3(0.0);
+            if (ki < K - 1)
+                parentTang = normalize(parents.keys[bestIdx[0] * K + ki + 1].xyz -
+                                       parents.keys[bestIdx[0] * K + ki].xyz);
+            else
+                parentTang = normalize(parents.keys[bestIdx[0] * K + ki].xyz -
+                                       parents.keys[bestIdx[0] * K + ki - 1].xyz);
+
+            // Build kink vector perpendicular to parent tangent
+            vec3 kinkVec = modPerp1 * pc.kinkAmplitude;
+
+            // Rotate kink vector around parent tangent by kinkT (Rodrigues rotation)
+            float cosA = cos(kinkT + rPhase);
+            float sinA = sin(kinkT + rPhase);
+            vec3 rotated = kinkVec * cosA +
+                           cross(parentTang, kinkVec) * sinA +
+                           parentTang * dot(parentTang, kinkVec) * (1.0 - cosA);
+
+            childKeys[ki] += rotated;
         }
 
         // ── Roughness 1: uniform noise displacement ──

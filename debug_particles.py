@@ -36,6 +36,12 @@ for obj in bpy.data.objects:
         print(f"  kink={getattr(s, 'kink', '?')}")
         print(f"  kink_amplitude={getattr(s, 'kink_amplitude', '?')}")
         print(f"  kink_frequency={getattr(s, 'kink_frequency', '?')}")
+        print(f"  child_size={getattr(s, 'child_size', '?')}")
+        print(f"  child_size_random={getattr(s, 'child_size_random', '?')}")
+        print(f"  child_radius={getattr(s, 'child_radius', '?')}")
+        print(f"  child_roundness={getattr(s, 'child_roundness', '?')}")
+        print(f"  child_length={getattr(s, 'child_length', '?')}")
+        print(f"  use_parent_particles={getattr(s, 'use_parent_particles', '?')}")
         print(f"  len(particles)={len(ps.particles)}")
         n_child = len(ps.child_particles) if hasattr(ps, 'child_particles') else 0
         print(f"  len(child_particles)={n_child}")
