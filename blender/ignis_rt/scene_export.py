@@ -4204,6 +4204,14 @@ def _resolve_mix_shader(mix_node, register_image_fn):
     p1 = _extract_shader_props(shader1_node, register_image_fn)
     p2 = _extract_shader_props(shader2_node, register_image_fn)
 
+    # ---- Factor is 0 or 1: use dominant shader directly (like Cycles) ----
+    # When Light Path or constant factor resolves to 0/1, skip all special
+    # cases and use the winning shader's properties unchanged.
+    if fac <= 0.001:
+        return dict(p1)  # 100% Shader 1
+    if fac >= 0.999:
+        return dict(p2)  # 100% Shader 2
+
     # ---- Alpha cutout detection (fence, leaf, wireframe materials) ----
     # When Mix Shader Factor is linked to an Image Texture Alpha and one side
     # is Transparent BSDF, this is a texture-driven alpha cutout — NOT stochastic.

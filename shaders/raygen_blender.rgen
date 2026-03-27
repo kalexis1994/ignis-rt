@@ -1989,10 +1989,10 @@ void main() {
 
             // Use SMOOTH interpolated normal for refraction (no normal map).
             // Smooth shading affects refraction (surface IS smooth), normal maps don't.
-            // Entry/exit from raw triangle normal (unambiguous winding).
-            bool enteringGlass = dot(geoNormalRaw, -rayDir) >= 0.0;
-            // Orient smooth normal toward the incoming ray (required by refract())
-            vec3 refractN = dot(smoothN, -rayDir) >= 0.0 ? smoothN : -smoothN;
+            // Entry/exit from smooth vertex normals (always outward-facing from Blender,
+            // more reliable than geoNormalRaw which depends on triangle winding order).
+            bool enteringGlass = dot(smoothN, -rayDir) >= 0.0;
+            vec3 refractN = enteringGlass ? smoothN : -smoothN;
             float eta = enteringGlass ? (1.0 / pbrHit.ior) : pbrHit.ior;
             float alpha = pbrHit.roughness * pbrHit.roughness;
 
