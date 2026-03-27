@@ -341,14 +341,16 @@ IGNIS_API int ignis_generate_hair_gpu(const float* parentKeys, uint32_t nParents
                                        const float* emitterCDF,
                                        float rootRadius, float tipFactor,
                                        float camX, float camY, float camZ,
-                                       float avgSpacing) {
+                                       float avgSpacing,
+                                       float kinkAmplitude, float kinkFrequency) {
     if (!g_renderer || !parentKeys || nParents == 0) return -1;
     return g_renderer->GenerateHairGPU(parentKeys, nParents, keysPerStrand,
                                         childrenPerParent,
                                         emitterVerts, nEmitterVerts,
                                         emitterTris, nEmitterTris, emitterCDF,
                                         rootRadius, tipFactor,
-                                        camX, camY, camZ, avgSpacing);
+                                        camX, camY, camZ, avgSpacing,
+                                        kinkAmplitude, kinkFrequency);
 }
 
 // Previous frame camera matrices for motion vectors

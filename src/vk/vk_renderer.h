@@ -63,7 +63,8 @@ public:
                         const uint32_t* emitterTris, uint32_t nEmitterTris,
                         const float* emitterCDF,
                         float rootRadius, float tipFactor,
-                        float camX, float camY, float camZ, float avgSpacing);
+                        float camX, float camY, float camZ, float avgSpacing,
+                        float kinkAmplitude, float kinkFrequency);
     void UpdateCamera(const CameraUBO& camera);
     void RenderFrameRT();
 

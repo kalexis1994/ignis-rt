@@ -791,11 +791,11 @@ bool Renderer::CreateHairComputePipeline() {
     layoutInfo.pBindings = bindings;
     vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &hairComputeDescSetLayout_);
 
-    // Push constants (10 floats/uints = 40 bytes)
+    // Push constants (12 floats/uints = 48 bytes)
     VkPushConstantRange pushRange{};
     pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pushRange.offset = 0;
-    pushRange.size = 40;
+    pushRange.size = 48;
 
     VkPipelineLayoutCreateInfo plInfo{};
     plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -860,7 +860,8 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
                                const uint32_t* emitterTris, uint32_t nEmitterTris,
                                const float* emitterCDF,
                                float rootRadius, float tipFactor,
-                               float camX, float camY, float camZ, float avgSpacing) {
+                               float camX, float camY, float camZ, float avgSpacing,
+                               float kinkAmplitude, float kinkFrequency) {
     if (!accelBuilder_) return -1;
     if (!CreateHairComputePipeline()) return -1;
 
@@ -1042,8 +1043,11 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
         float tipFactor;
         float cameraX, cameraY, cameraZ;
         float avgSpacing;
+        float kinkAmplitude;
+        float kinkFrequency;
     } pc = {nParents, keysPerStrand, totalChildren, nEmitterTris,
-            rootRadius, tipFactor, camX, camY, camZ, avgSpacing};
+            rootRadius, tipFactor, camX, camY, camZ, avgSpacing,
+            kinkAmplitude, kinkFrequency};
     vkCmdPushConstants(cmd, hairComputePipelineLayout_,
         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 

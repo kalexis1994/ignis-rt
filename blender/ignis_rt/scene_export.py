@@ -255,6 +255,8 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
         "n_emitter_verts": len(emitter_verts) // 3,
         "n_emitter_tris": len(emitter_tris) // 3,
         "avg_spacing": avg_spacing,
+        "kink_amplitude": getattr(settings, 'kink_amplitude', 0.0),
+        "kink_frequency": getattr(settings, 'kink_frequency', 2.0),
     }
 
     # CPU fallback (kept for reference, not reached)

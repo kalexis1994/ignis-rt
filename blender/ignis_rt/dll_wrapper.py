@@ -137,6 +137,7 @@ def load():
         POINTER(c_uint32), c_uint32,                           # emitterTris, nEmitterTris
         POINTER(c_float),                                      # emitterCDF
         c_float, c_float, c_float, c_float, c_float, c_float, # rootRadius, tipFactor, camXYZ, avgSpacing
+        c_float, c_float,                                      # kinkAmplitude, kinkFrequency
     ]
     _lib.ignis_generate_hair_gpu.restype = c_int
 
@@ -303,7 +304,8 @@ def generate_hair_gpu(parent_keys, n_parents: int, keys_per_strand: int,
                       emitter_cdf=None,
                       root_radius: float = 0.003, tip_factor: float = 0.0,
                       cam_x: float = 0, cam_y: float = 0, cam_z: float = 5,
-                      avg_spacing: float = 0.01) -> int:
+                      avg_spacing: float = 0.01,
+                      kink_amplitude: float = 0.0, kink_frequency: float = 2.0) -> int:
     """Generate hair children + ribbon geometry entirely on GPU. Returns BLAS index."""
     import numpy as np
     k = _np_f32(parent_keys)
@@ -317,7 +319,8 @@ def generate_hair_gpu(parent_keys, n_parents: int, keys_per_strand: int,
         et.ctypes.data_as(POINTER(c_uint32)), c_uint32(n_emitter_tris),
         ec.ctypes.data_as(POINTER(c_float)),
         c_float(root_radius), c_float(tip_factor),
-        c_float(cam_x), c_float(cam_y), c_float(cam_z), c_float(avg_spacing))
+        c_float(cam_x), c_float(cam_y), c_float(cam_z), c_float(avg_spacing),
+        c_float(kink_amplitude), c_float(kink_frequency))
 
 
 def refit_blas(blas_handle: int, vertices, vertex_count: int, indices, index_count: int) -> bool:

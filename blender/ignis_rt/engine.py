@@ -701,7 +701,9 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                                 cam_x=float(cam_pos[0]),
                                 cam_y=float(cam_pos[1]),
                                 cam_z=float(cam_pos[2]),
-                                avg_spacing=m.get("avg_spacing", avg_sp))
+                                avg_spacing=m.get("avg_spacing", avg_sp),
+                                kink_amplitude=m.get("kink_amplitude", 0.0),
+                                kink_frequency=m.get("kink_frequency", 2.0))
                             if blas >= 0:
                                 _ignis_blas_handles[mesh_key] = blas
                                 # Compute tri count for material assignment
