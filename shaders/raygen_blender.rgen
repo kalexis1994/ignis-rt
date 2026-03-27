@@ -1257,7 +1257,10 @@ void main() {
         // Glass/transmission surfaces don't scatter light — skip NEE entirely.
         // Light reaches through glass via refraction paths, not direct illumination.
         // This matches Cycles behavior where Glass BSDF has no diffuse lobe for NEE.
-        bool isGlass = (pbrHit.transmission > 0.5);
+        // Only skip NEE for pure glass (no metallic). Mixed metallic+glass
+        // materials need NEE for the metallic reflection lobe.
+        float _glassP = (1.0 - pbrHit.metallic) * pbrHit.transmission;
+        bool isGlass = (_glassP > 0.99);
         if (isGlass) {
             skipSunNEE = true;
             skipLocalNEE = true;
@@ -1981,9 +1984,14 @@ void main() {
         }
 
         // ---- Transmission / Glass (GGX Microfacet, like Cycles) ----
-        // Glass bounces have a separate budget (like Cycles' transmission bounce limit)
-        // so they don't steal bounces from scene illumination.
-        if (pbrHit.transmission > 0.5) {
+        // Cycles: metallic controls conductor vs dielectric split.
+        // Transmission only affects the dielectric portion:
+        //   P(metallic reflection) = metallic
+        //   P(glass refraction)    = (1 - metallic) * transmission
+        //   P(diffuse)             = (1 - metallic) * (1 - transmission)
+        // Stochastic lobe selection: if rand < metallic → skip glass, do metallic BRDF.
+        float glassProb = (1.0 - pbrHit.metallic) * pbrHit.transmission;
+        if (glassProb > 0.01 && rand01() < glassProb) {
             glassBounces++;
             if (glassBounces >= MAX_GLASS_BOUNCES) break;
 
@@ -2031,7 +2039,7 @@ void main() {
                 rayDir = refracted;
                 rayOrigin = pbrHit.worldPos - refractN * 0.001;
             }
-            throughput *= pbrHit.baseColor;
+            throughput *= pbrHit.baseColor / max(glassProb, 0.01);  // MIS weight for lobe selection
             if (bounce == 0) { isDiffusePath = false; captureSpecularMV = true; }
             bounce--;  // glass doesn't count against main bounce budget
             continue;
