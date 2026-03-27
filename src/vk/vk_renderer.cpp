@@ -791,11 +791,11 @@ bool Renderer::CreateHairComputePipeline() {
     layoutInfo.pBindings = bindings;
     vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &hairComputeDescSetLayout_);
 
-    // Push constants (20 floats/uints = 80 bytes)
+    // Push constants (22 floats/uints = 88 bytes)
     VkPushConstantRange pushRange{};
     pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pushRange.offset = 0;
-    pushRange.size = 80;
+    pushRange.size = 88;
 
     VkPipelineLayoutCreateInfo plInfo{};
     plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -865,7 +865,8 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
                                float clumpFactor, float clumpShape,
                                float rough1, float rough1Size,
                                float rough2, float roughEnd,
-                               uint32_t childMode) {
+                               uint32_t childMode,
+                               float kinkShape, float kinkFlat, float kinkAmpRandom) {
     if (!accelBuilder_) return -1;
     if (!CreateHairComputePipeline()) return -1;
 
@@ -1059,12 +1060,14 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
         float rough2;
         float roughEnd;
         uint32_t childMode;
-        uint32_t pad0;
+        float kinkShape;
+        float kinkFlat;
+        float kinkAmpRandom;
     } pc = {nParents, keysPerStrand, totalChildren, nEmitterTris,
             rootRadius, tipFactor, camX, camY, camZ, avgSpacing,
             kinkAmplitude, kinkFrequency,
             clumpFactor, clumpShape, rough1, rough1Size, rough2, roughEnd,
-            childMode, 0u};
+            childMode, kinkShape, kinkFlat, kinkAmpRandom};
     vkCmdPushConstants(cmd, hairComputePipelineLayout_,
         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 

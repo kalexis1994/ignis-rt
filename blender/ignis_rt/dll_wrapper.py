@@ -140,6 +140,7 @@ def load():
         c_float, c_float,                                      # kinkAmplitude, kinkFrequency
         c_float, c_float, c_float, c_float, c_float, c_float, # clump, rough
         c_uint32,                                              # childMode
+        c_float, c_float, c_float,                             # kinkShape, kinkFlat, kinkAmpRandom
     ]
     _lib.ignis_generate_hair_gpu.restype = c_int
 
@@ -311,7 +312,9 @@ def generate_hair_gpu(parent_keys, n_parents: int, keys_per_strand: int,
                       clump_factor: float = 0.0, clump_shape: float = 0.0,
                       rough1: float = 0.0, rough1_size: float = 1.0,
                       rough2: float = 0.0, rough_end: float = 0.0,
-                      child_mode: int = 0) -> int:
+                      child_mode: int = 0,
+                      kink_shape: float = 0.0, kink_flat: float = 0.0,
+                      kink_amp_random: float = 0.0) -> int:
     """Generate hair children + ribbon geometry entirely on GPU. Returns BLAS index."""
     import numpy as np
     k = _np_f32(parent_keys)
@@ -329,7 +332,8 @@ def generate_hair_gpu(parent_keys, n_parents: int, keys_per_strand: int,
         c_float(kink_amplitude), c_float(kink_frequency),
         c_float(clump_factor), c_float(clump_shape),
         c_float(rough1), c_float(rough1_size), c_float(rough2), c_float(rough_end),
-        c_uint32(child_mode))
+        c_uint32(child_mode),
+        c_float(kink_shape), c_float(kink_flat), c_float(kink_amp_random))
 
 
 def refit_blas(blas_handle: int, vertices, vertex_count: int, indices, index_count: int) -> bool:

@@ -346,7 +346,8 @@ IGNIS_API int ignis_generate_hair_gpu(const float* parentKeys, uint32_t nParents
                                        float clumpFactor, float clumpShape,
                                        float rough1, float rough1Size,
                                        float rough2, float roughEnd,
-                                       uint32_t childMode) {
+                                       uint32_t childMode,
+                                       float kinkShape, float kinkFlat, float kinkAmpRandom) {
     if (!g_renderer || !parentKeys || nParents == 0) return -1;
     return g_renderer->GenerateHairGPU(parentKeys, nParents, keysPerStrand,
                                         childrenPerParent,
@@ -357,7 +358,8 @@ IGNIS_API int ignis_generate_hair_gpu(const float* parentKeys, uint32_t nParents
                                         kinkAmplitude, kinkFrequency,
                                         clumpFactor, clumpShape,
                                         rough1, rough1Size, rough2, roughEnd,
-                                        childMode);
+                                        childMode,
+                                        kinkShape, kinkFlat, kinkAmpRandom);
 }
 
 // Previous frame camera matrices for motion vectors

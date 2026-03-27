@@ -68,7 +68,8 @@ public:
                         float clumpFactor, float clumpShape,
                         float rough1, float rough1Size,
                         float rough2, float roughEnd,
-                        uint32_t childMode);
+                        uint32_t childMode,
+                        float kinkShape, float kinkFlat, float kinkAmpRandom);
     void UpdateCamera(const CameraUBO& camera);
     void RenderFrameRT();
 

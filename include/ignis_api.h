@@ -56,7 +56,8 @@ IGNIS_API int    ignis_generate_hair_gpu(const float* parentKeys, uint32_t nPare
                                           float clumpFactor, float clumpShape,
                                           float rough1, float rough1Size,
                                           float rough2, float roughEnd,
-                                          uint32_t childMode);
+                                          uint32_t childMode,
+                                          float kinkShape, float kinkFlat, float kinkAmpRandom);
 
 // Camera
 IGNIS_API void   ignis_set_camera(const float* viewInverse, const float* projInverse,

@@ -65,7 +65,9 @@ layout(push_constant) uniform PushConstants {
     float rough2;          // random roughness amplitude
     float roughEnd;        // endpoint roughness amplitude
     uint childMode;        // 0=INTERPOLATED, 1=SIMPLE
-    uint pad0;
+    float kinkShape;       // time remap exponent
+    float kinkFlat;        // flatness: lerp child toward parent
+    float kinkAmpRandom;   // per-strand amplitude variation
 } pc;
 
 // Shared memory for parent root positions (brute-force nearest search)
@@ -227,158 +229,131 @@ void main() {
     }
 
     // ═══════════════════════════════════════════════════
-    // 6b. Apply child modifiers (Blender-exact formulas)
+    // 6b. Pre-compute per-strand modifier constants
     // ═══════════════════════════════════════════════════
-
-    // Primary parent position per key (for clump target)
-    // In SIMPLE mode, clump pulls toward the assigned parent directly.
-    // In INTERPOLATED mode, clump pulls toward the nearest parent + offset.
-    vec3 primaryKeys[16];
-    if (pc.childMode == 1u) {
-        // SIMPLE: parent keys are already at the right position
-        vec3 clumpOffset = childKeys[0] - parents.keys[bestIdx[0] * K].xyz;
-        for (uint ki = 0; ki < K && ki < 16; ki++)
-            primaryKeys[ki] = parents.keys[bestIdx[0] * K + ki].xyz + clumpOffset;
-    } else {
-        // INTERPOLATED: use childRoot offset from nearest parent
-        vec3 off0 = childRoot - parents.keys[bestIdx[0] * K].xyz;
-        for (uint ki = 0; ki < K && ki < 16; ki++)
-            primaryKeys[ki] = parents.keys[bestIdx[0] * K + ki].xyz + off0;
-    }
-
-    // Per-strand perpendicular frame for modifiers
     vec3 strandDir = normalize(childKeys[K-1] - childKeys[0]);
     vec3 modRef = abs(strandDir.z) < 0.9 ? vec3(0,0,1) : vec3(1,0,0);
     vec3 modPerp1 = normalize(cross(strandDir, modRef));
     vec3 modPerp2 = normalize(cross(strandDir, modPerp1));
-
-    // Per-strand random values (deterministic from seed)
     float rPhase = randFloat(seed + 800u) * 6.28318;
-    float rClump = 0.5 + randFloat(seed + 801u) * 0.5; // pa_clump: 0.5-1.0
+    float rClump = 0.5 + randFloat(seed + 801u) * 0.5;
     vec3 rLoc = vec3(randFloat(seed+802u), randFloat(seed+803u), randFloat(seed+804u));
+    float kinkAmp = pc.kinkAmplitude * (1.0 - pc.kinkAmpRandom * (0.5 + 0.5 * randFloat(seed + 850u)));
 
-    for (uint ki = 1; ki < K; ki++) {
-        float t = float(ki) / float(K - 1);
-
-        // ── Clump: pull child toward primary parent ──
-        // Blender: clump = clumpfac * pa_clump * pow(t, cpow)
-        // interp_v3_v3v3(result, co, par_co, clump)
-        if (abs(pc.clumpFactor) > 0.001) {
-            float cpow = pc.clumpShape < 0.0
-                ? 1.0 + pc.clumpShape
-                : 1.0 + 9.0 * pc.clumpShape;
-            cpow = max(cpow, 0.001);
-            float clump;
-            if (pc.clumpFactor < 0.0)
-                clump = -pc.clumpFactor * rClump * pow(1.0 - t, cpow);
-            else
-                clump = pc.clumpFactor * rClump * pow(t, cpow);
-            childKeys[ki] = mix(childKeys[ki], primaryKeys[ki], clamp(clump, 0.0, 1.0));
-        }
-
-        // ── Kink/Curl (Blender-exact: rotate kink vector around parent tangent) ──
-        if (pc.kinkAmplitude > 0.0) {
-            // Blender: t_kink = time * freq * PI (not 2*PI)
-            float kinkT = t * pc.kinkFrequency * 3.14159;
-
-            // Kink vector: perpendicular to parent tangent, scaled by amplitude
-            vec3 parentTang = vec3(0.0);
-            if (ki < K - 1)
-                parentTang = normalize(parents.keys[bestIdx[0] * K + ki + 1].xyz -
-                                       parents.keys[bestIdx[0] * K + ki].xyz);
-            else
-                parentTang = normalize(parents.keys[bestIdx[0] * K + ki].xyz -
-                                       parents.keys[bestIdx[0] * K + ki - 1].xyz);
-
-            // Build kink vector perpendicular to parent tangent
-            vec3 kinkVec = modPerp1 * pc.kinkAmplitude;
-
-            // Rotate kink vector around parent tangent by kinkT (Rodrigues rotation)
-            float cosA = cos(kinkT + rPhase);
-            float sinA = sin(kinkT + rPhase);
-            vec3 rotated = kinkVec * cosA +
-                           cross(parentTang, kinkVec) * sinA +
-                           parentTang * dot(parentTang, kinkVec) * (1.0 - cosA);
-
-            childKeys[ki] += rotated;
-        }
-
-        // ── Roughness 1: uniform noise displacement ──
-        if (pc.rough1 > 0.0) {
-            // Simplified turbulence: use per-strand random + t variation
-            vec3 rco = rLoc * t;
-            float r0 = -1.0 + 2.0 * fract(sin(dot(rco, vec3(12.9898,78.233,45.164))) * 43758.5453);
-            float r1 = -1.0 + 2.0 * fract(sin(dot(rco, vec3(93.989,67.345,11.874))) * 23421.6312);
-            float r2 = -1.0 + 2.0 * fract(sin(dot(rco, vec3(27.163,41.975,83.573))) * 65834.1247);
-            childKeys[ki] += modPerp1 * pc.rough1 * r0 * pc.rough1Size * 0.1;
-            childKeys[ki] += modPerp2 * pc.rough1 * r1 * pc.rough1Size * 0.1;
-            childKeys[ki] += strandDir * pc.rough1 * r2 * pc.rough1Size * 0.05;
-        }
-
-        // ── Roughness 2: random displacement ──
-        if (pc.rough2 > 0.0) {
-            float r0 = -1.0 + 2.0 * randFloat(seed + ki * 5u + 900u);
-            float r1 = -1.0 + 2.0 * randFloat(seed + ki * 5u + 901u);
-            childKeys[ki] += modPerp1 * pc.rough2 * r0 * 0.1;
-            childKeys[ki] += modPerp2 * pc.rough2 * r1 * 0.1;
-        }
-
-        // ── Roughness Endpoint: increases toward tip ──
-        if (pc.roughEnd > 0.0) {
-            float roughfac = pc.roughEnd * t * t; // shape=2 (quadratic increase)
-            float r0 = -1.0 + 2.0 * rLoc.x;
-            float r1 = -1.0 + 2.0 * rLoc.y;
-            childKeys[ki] += modPerp1 * roughfac * r0 * 0.1;
-            childKeys[ki] += modPerp2 * roughfac * r1 * 0.1;
-        }
-    }
+    // Primary parent keys (for clump target) — also need Catmull-Rom evaluation
+    vec3 primaryKeys[16];
+    vec3 clumpOff = childKeys[0] - parents.keys[bestIdx[0] * K].xyz;
+    for (uint ki = 0; ki < K && ki < 16; ki++)
+        primaryKeys[ki] = parents.keys[bestIdx[0] * K + ki].xyz + clumpOff;
 
     // ═══════════════════════════════════════════════════
-    // 7. Catmull-Rom subdivision + ribbon generation
+    // 7. Catmull-Rom subdivision → apply modifiers → ribbon
+    //    Modifiers applied POST-subdivision (like Blender)
     // ═══════════════════════════════════════════════════
 
     float strandAngle = randFloat(seed + 900u) * 6.28318;
     uint vertBase = childIdx * vertsPerStrand;
     uint idxBase = childIdx * idxPerStrand;
 
-    // Generate S subdivided points via Catmull-Rom interpolation
     for (uint si = 0; si < S; si++) {
-        // Map si to segment + local t
-        float globalT = float(si) / float(S - 1);  // 0→1 along entire strand
+        float globalT = float(si) / float(S - 1);
         float segF = globalT * float(K - 1);
         uint seg = min(uint(segF), K - 2);
         float localT = segF - float(seg);
 
-        // Catmull-Rom: 4 control points (clamp at boundaries)
+        // Catmull-Rom evaluation of CHILD keys
         uint i0 = (seg > 0) ? seg - 1 : 0;
         uint i1 = seg;
         uint i2 = min(seg + 1, K - 1);
         uint i3 = min(seg + 2, K - 1);
+        float t2 = localT * localT;
+        float t3 = t2 * localT;
 
         vec3 p0 = childKeys[i0], p1 = childKeys[i1];
         vec3 p2 = childKeys[i2], p3 = childKeys[i3];
+        vec3 pos = 0.5 * ((2.0*p1) + (-p0+p2)*localT +
+                          (2.0*p0-5.0*p1+4.0*p2-p3)*t2 + (-p0+3.0*p1-3.0*p2+p3)*t3);
 
-        // Catmull-Rom basis (tension=0.5)
-        float t2 = localT * localT;
-        float t3 = t2 * localT;
-        vec3 pos = 0.5 * ((2.0*p1) +
-                          (-p0 + p2) * localT +
-                          (2.0*p0 - 5.0*p1 + 4.0*p2 - p3) * t2 +
-                          (-p0 + 3.0*p1 - 3.0*p2 + p3) * t3);
+        // Catmull-Rom evaluation of PRIMARY PARENT keys (for clump + kink reference)
+        vec3 pp0 = primaryKeys[i0], pp1 = primaryKeys[i1];
+        vec3 pp2 = primaryKeys[i2], pp3 = primaryKeys[i3];
+        vec3 parPos = 0.5 * ((2.0*pp1) + (-pp0+pp2)*localT +
+                             (2.0*pp0-5.0*pp1+4.0*pp2-pp3)*t2 + (-pp0+3.0*pp1-3.0*pp2+pp3)*t3);
 
-        // Tangent (derivative of Catmull-Rom)
-        vec3 tang = 0.5 * ((-p0 + p2) +
-                           (4.0*p0 - 10.0*p1 + 8.0*p2 - 2.0*p3) * localT +
-                           (-3.0*p0 + 9.0*p1 - 9.0*p2 + 3.0*p3) * t2);
+        // Parent tangent at this subdivided point
+        vec3 parTang = 0.5 * ((-pp0+pp2) + (4.0*pp0-10.0*pp1+8.0*pp2-2.0*pp3)*localT +
+                              (-3.0*pp0+9.0*pp1-9.0*pp2+3.0*pp3)*t2);
+        parTang = normalize(parTang);
+
+        // ── Apply modifiers to this subdivided point ──
+        float t = globalT;
+
+        // Clump
+        if (abs(pc.clumpFactor) > 0.001) {
+            float cpow = pc.clumpShape < 0.0 ? 1.0+pc.clumpShape : 1.0+9.0*pc.clumpShape;
+            cpow = max(cpow, 0.001);
+            float clump = pc.clumpFactor < 0.0
+                ? -pc.clumpFactor * rClump * pow(1.0-t, cpow)
+                : pc.clumpFactor * rClump * pow(t, cpow);
+            pos = mix(pos, parPos, clamp(clump, 0.0, 1.0));
+        }
+
+        // Kink/Curl (Blender-exact, applied post-subdivision)
+        if (kinkAmp > 0.0 && t > 0.001) {
+            float kinkTime = t;
+            if (abs(pc.kinkShape) > 0.001)
+                kinkTime = pc.kinkShape < 0.0
+                    ? pow(max(t,0.001), 1.0+pc.kinkShape)
+                    : pow(max(t,0.001), 1.0/max(1.0-pc.kinkShape, 0.001));
+            float kinkAngle = kinkTime * pc.kinkFrequency * 3.14159;
+            float dt = 1.0;
+            if (abs(kinkAngle) < 3.14159) dt = sin(abs(kinkAngle) * 0.5);
+
+            vec3 kinkVec = modPerp1 - parTang * dot(modPerp1, parTang);
+            float kl = length(kinkVec);
+            if (kl > 0.001) kinkVec /= kl;
+            vec3 curlOff = kinkVec * kinkAmp * dt;
+            float cosA = cos(kinkAngle + rPhase);
+            float sinA = sin(kinkAngle + rPhase);
+            vec3 rotated = curlOff*cosA + cross(parTang,curlOff)*sinA +
+                           parTang*dot(parTang,curlOff)*(1.0-cosA);
+            pos = mix(pos, parPos, pc.kinkFlat) + rotated;
+        }
+
+        // Roughness 1
+        if (pc.rough1 > 0.0) {
+            vec3 rco = rLoc * t;
+            float r0 = -1.0+2.0*fract(sin(dot(rco,vec3(12.9898,78.233,45.164)))*43758.5453);
+            float r1 = -1.0+2.0*fract(sin(dot(rco,vec3(93.989,67.345,11.874)))*23421.6312);
+            pos += modPerp1*pc.rough1*r0*pc.rough1Size*0.1 + modPerp2*pc.rough1*r1*pc.rough1Size*0.1;
+        }
+
+        // Roughness 2
+        if (pc.rough2 > 0.0) {
+            uint rsi = si;
+            float r0 = -1.0+2.0*randFloat(seed+rsi*5u+900u);
+            float r1 = -1.0+2.0*randFloat(seed+rsi*5u+901u);
+            pos += modPerp1*pc.rough2*r0*0.1 + modPerp2*pc.rough2*r1*0.1;
+        }
+
+        // Roughness Endpoint
+        if (pc.roughEnd > 0.0) {
+            float rf = pc.roughEnd*t*t;
+            pos += modPerp1*rf*(-1.0+2.0*rLoc.x)*0.1 + modPerp2*rf*(-1.0+2.0*rLoc.y)*0.1;
+        }
+
+        // ── Tangent for ribbon generation ──
+        vec3 tang = 0.5 * ((-p0+p2) + (4.0*p0-10.0*p1+8.0*p2-2.0*p3)*localT +
+                           (-3.0*p0+9.0*p1-9.0*p2+3.0*p3)*t2);
         tang = normalize(tang);
 
         float radius = pc.rootRadius * (1.0 - globalT + globalT * pc.tipFactor);
 
         // Perpendicular frame
         vec3 ref = abs(tang.z) < 0.9 ? vec3(0,0,1) : vec3(1,0,0);
-        vec3 pp1 = normalize(cross(tang, ref));
-        vec3 pp2 = normalize(cross(tang, pp1));
-        vec3 perp = pp1 * cos(strandAngle) + pp2 * sin(strandAngle);
+        vec3 rp1 = normalize(cross(tang, ref));
+        vec3 rp2 = normalize(cross(tang, rp1));
+        vec3 perp = rp1 * cos(strandAngle) + rp2 * sin(strandAngle);
 
         vec3 normal = normalize(cross(perp, tang));
         vec3 left  = pos - perp * radius;

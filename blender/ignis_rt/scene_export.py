@@ -266,6 +266,9 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
         "child_mode": 1 if child_type == 'SIMPLE' else 0,  # 0=INTERPOLATED, 1=SIMPLE
         "child_radius": getattr(settings, 'child_radius', 0.0),
         "use_parent_particles": bool(getattr(settings, 'use_parent_particles', True)),
+        "kink_shape": getattr(settings, 'kink_shape', 0.0),
+        "kink_flat": getattr(settings, 'kink_flat', 0.0),
+        "kink_amp_random": getattr(settings, 'kink_amplitude_random', 0.0),
     }
 
     # CPU fallback (kept for reference, not reached)

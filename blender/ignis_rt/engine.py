@@ -713,7 +713,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                                 rough1_size=m.get("roughness_1_size", 1.0),
                                 rough2=m.get("roughness_2", 0.0),
                                 rough_end=m.get("roughness_endpoint", 0.0),
-                                child_mode=m.get("child_mode", 0))
+                                child_mode=m.get("child_mode", 0),
+                                kink_shape=m.get("kink_shape", 0.0),
+                                kink_flat=m.get("kink_flat", 0.0),
+                                kink_amp_random=m.get("kink_amp_random", 0.0))
                             if blas >= 0:
                                 _ignis_blas_handles[mesh_key] = blas
                                 # Compute tri count for material assignment (must match shader SUBDIV=8)
