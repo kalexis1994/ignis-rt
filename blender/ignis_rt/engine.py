@@ -637,8 +637,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 _load_unique_meshes, _load_scene_instances, _load_obj_to_mesh_key, _load_hidden = scene_export.export_meshes(depsgraph)
                 _load_mesh_keys = list(_load_unique_meshes.keys())
                 _load_mesh_idx = 0
-                total_tris = sum(m["tri_count"] for m in _load_unique_meshes.values())
-                total_verts = sum(m["vertex_count"] for m in _load_unique_meshes.values())
+                total_tris = sum(m.get("tri_count", 0) for m in _load_unique_meshes.values())
+                total_verts = sum(m.get("vertex_count", 0) for m in _load_unique_meshes.values())
                 dt = time.perf_counter() - t0
                 _log(f"Stage EXPORT: {len(_load_mesh_keys)} meshes, "
                      f"{total_tris:,} tris, {total_verts:,} verts, "
@@ -664,18 +664,58 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 mesh_key = _load_mesh_keys[i]
                 m = _load_unique_meshes[mesh_key]
                 try:
-                    blas = dll_wrapper.upload_mesh(
-                        m["positions"], m["vertex_count"],
-                        m["indices"], m["index_count"],
-                    )
-                    if blas < 0:
-                        _log(f"  FAILED upload_mesh: {mesh_key}")
-                        continue
-                    _ignis_blas_handles[mesh_key] = blas
-                    dll_wrapper.upload_mesh_attributes(
-                        blas, m["normals"], m["uvs"], m["vertex_count"],
-                        m.get("vcols"),
-                    )
+                    if m.get("gpu_hair"):
+                        # ── GPU hair generation ──
+                        try:
+                            cam_pos = (0, 0, 5)
+                            try:
+                                rd = bpy.context.region_data
+                                if rd:
+                                    cam_pos = tuple(rd.view_matrix.inverted().translation)
+                            except Exception:
+                                pass
+                            child_nbr = min(max(m["child_nbr"], 1), 10)  # cap at 10 while testing
+                            n_p = m["n_parents"]
+                            pk = m["parent_keys"].reshape(-1, 3)
+                            # Estimate spacing
+                            if n_p > 10:
+                                rng_sp = np.random.RandomState(99)
+                                si = rng_sp.choice(n_p, min(100, n_p), replace=False)
+                                sample = pk[si * m["n_keys"]]  # root positions only
+                                diffs = sample[:, None, :] - pk[::m["n_keys"]][:10][None, :, :]
+                                avg_sp = float(np.median(np.sqrt((diffs*diffs).sum(axis=2).min(axis=1))))
+                            else:
+                                avg_sp = 0.01
+                            _log(f"  GPU hair: calling generate_hair_gpu({n_p} parents, {m['n_keys']} keys, {child_nbr} children)")
+                            blas = dll_wrapper.generate_hair_gpu(
+                                m["parent_keys"], n_p, m["n_keys"], child_nbr,
+                                m["root_radius"], m["tip_factor"],
+                                float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2]),
+                                avg_sp)
+                            if blas >= 0:
+                                _ignis_blas_handles[mesh_key] = blas
+                                # Compute tri count for material assignment
+                                total_children = n_p * child_nbr
+                                tris_per_child = (m["n_keys"] - 1) * 2
+                                m["_gpu_tri_count"] = total_children * tris_per_child
+                                _log(f"  GPU hair OK: '{mesh_key}' → BLAS {blas} ({m['_gpu_tri_count']} tris)")
+                            else:
+                                _log(f"  GPU hair FAILED: '{mesh_key}' returned {blas}")
+                        except Exception:
+                            _log_exception(f"GPU hair '{mesh_key}'")
+                    else:
+                        blas = dll_wrapper.upload_mesh(
+                            m["positions"], m["vertex_count"],
+                            m["indices"], m["index_count"],
+                        )
+                        if blas < 0:
+                            _log(f"  FAILED upload_mesh: {mesh_key}")
+                            continue
+                        _ignis_blas_handles[mesh_key] = blas
+                        dll_wrapper.upload_mesh_attributes(
+                            blas, m["normals"], m["uvs"], m["vertex_count"],
+                            m.get("vcols"),
+                        )
                 except Exception:
                     _log_exception(f"LOAD_MESHES uploading '{mesh_key}'")
 
@@ -824,8 +864,27 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 for ki in range(self._matid_idx, end):
                     mesh_key = self._matid_keys[ki]
                     m = _load_unique_meshes[mesh_key]
+                    if m.get("gpu_hair"):
+                        # Assign material to all hair tris (single material from particle settings)
+                        blas = _ignis_blas_handles.get(mesh_key)
+                        tri_count = m.get("_gpu_tri_count", 0)
+                        if blas is not None and tri_count > 0:
+                            first_inst = self._matid_first_inst.get(mesh_key)
+                            if first_inst:
+                                slots = first_inst["material_slots"]
+                                hair_mat_idx = m.get("mat_idx", 0)
+                                if hair_mat_idx < len(slots) and slots[hair_mat_idx] is not None:
+                                    mat = slots[hair_mat_idx]
+                                    mat_key = f"{mat.library.filepath}:{mat.name}" if mat.library else mat.name
+                                    global_idx = _load_mat_name_to_index.get(mat_key, 0)
+                                else:
+                                    global_idx = _load_mat_name_to_index.get('__ignis_default__', 0)
+                                mat_ids = np.full(tri_count, global_idx, dtype=np.uint32)
+                                dll_wrapper.upload_mesh_primitive_materials(blas, mat_ids, tri_count)
+                                _log(f"  matIDs hair '{mesh_key}': blas={blas} {tri_count} tris → mat={global_idx}")
+                        continue
                     blas = _ignis_blas_handles.get(mesh_key)
-                    if blas is not None and m["tri_count"] > 0:
+                    if blas is not None and m.get("tri_count", 0) > 0:
                         first_inst = self._matid_first_inst.get(mesh_key)
                         if first_inst is None:
                             continue

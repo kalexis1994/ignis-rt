@@ -130,6 +130,13 @@ def load():
 
     # ------------------------------------------------------------------
     # Acceleration structures
+    # GPU hair generation
+    _lib.ignis_generate_hair_gpu.argtypes = [
+        POINTER(c_float), c_uint32, c_uint32, c_uint32,
+        c_float, c_float, c_float, c_float, c_float, c_float,
+    ]
+    _lib.ignis_generate_hair_gpu.restype = c_int
+
     # ------------------------------------------------------------------
     _lib.ignis_build_tlas.argtypes = [c_void_p, c_uint32]
     _lib.ignis_build_tlas.restype = c_bool
@@ -284,6 +291,18 @@ def map_blas_deform_staging(blas_index: int, vertex_count: int):
 def commit_blas_deform(blas_index: int) -> bool:
     """DMA staging → GPU buffers + BLAS rebuild. No memcpy — data already in staging."""
     return _lib.ignis_commit_blas_deform(c_int(blas_index))
+
+
+def generate_hair_gpu(parent_keys, n_parents: int, keys_per_strand: int,
+                      children_per_parent: int, root_radius: float, tip_factor: float,
+                      cam_x: float, cam_y: float, cam_z: float, avg_spacing: float) -> int:
+    """Generate hair children + ribbon geometry entirely on GPU. Returns BLAS index."""
+    k = _np_f32(parent_keys)
+    return _lib.ignis_generate_hair_gpu(
+        k.ctypes.data_as(POINTER(c_float)),
+        c_uint32(n_parents), c_uint32(keys_per_strand), c_uint32(children_per_parent),
+        c_float(root_radius), c_float(tip_factor),
+        c_float(cam_x), c_float(cam_y), c_float(cam_z), c_float(avg_spacing))
 
 
 def refit_blas(blas_handle: int, vertices, vertex_count: int, indices, index_count: int) -> bool:

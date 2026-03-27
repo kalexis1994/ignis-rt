@@ -28,6 +28,7 @@ echo Compiling compute shaders...
 %GLSLC% %ARGS% "%SHADER_DIR%\exposure_resolve.comp" -o "%SHADER_DIR%\exposure_resolve.comp.spv"
 %GLSLC% %ARGS% "%SHADER_DIR%\sharc_resolve.comp"    -o "%SHADER_DIR%\sharc_resolve.comp.spv"
 %GLSLC% %ARGS% "%SHADER_DIR%\cluster_culling.comp"  -o "%SHADER_DIR%\cluster_culling.comp.spv"
+%GLSLC% %ARGS% "%SHADER_DIR%\hair_generate.comp"    -o "%SHADER_DIR%\hair_generate.comp.spv"
 
 echo Compiling rasterization shaders...
 %GLSLC% %ARGS% "%SHADER_DIR%\basic.vert"            -o "%SHADER_DIR%\basic.vert.spv"

@@ -38,6 +38,17 @@ IGNIS_API void   ignis_upload_materials(const void* data, uint32_t count);
 
 // Acceleration structures
 IGNIS_API bool   ignis_build_tlas(const void* instances, uint32_t count);
+IGNIS_API bool   ignis_refit_blas(int blasHandle, const float* vertices, uint32_t vertexCount,
+                                   const uint32_t* indices, uint32_t indexCount);
+IGNIS_API bool   ignis_update_instance_transforms(const uint32_t* indices,
+                                                    const float* transforms, uint32_t count);
+
+// GPU hair generation
+IGNIS_API int    ignis_generate_hair_gpu(const float* parentKeys, uint32_t nParents,
+                                          uint32_t keysPerStrand, uint32_t childrenPerParent,
+                                          float rootRadius, float tipFactor,
+                                          float camX, float camY, float camZ,
+                                          float avgSpacing);
 
 // Camera
 IGNIS_API void   ignis_set_camera(const float* viewInverse, const float* projInverse,

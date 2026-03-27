@@ -1,0 +1,177 @@
+#version 460
+
+// Hair Generation Compute Shader
+// Input: parent strand keys
+// Output: child ribbon vertices + indices (ready for BLAS build)
+// Each thread generates ONE complete child strand (ribbon).
+
+layout(local_size_x = 64) in;
+
+// Parent strand keys: flat array of vec4 (xyz=position, w=0)
+layout(binding = 0, set = 0, std430) readonly buffer ParentKeys {
+    vec4 keys[];  // [parent0_key0, parent0_key1, ..., parent1_key0, ...]
+} parents;
+
+// Output: ribbon vertex positions (3 floats per vertex)
+layout(binding = 1, set = 0, std430) writeonly buffer OutPositions {
+    float pos[];
+} outPos;
+
+// Output: ribbon vertex normals (3 floats per vertex)
+layout(binding = 2, set = 0, std430) writeonly buffer OutNormals {
+    float nrm[];
+} outNrm;
+
+// Output: ribbon indices (uint per index)
+layout(binding = 3, set = 0, std430) writeonly buffer OutIndices {
+    uint idx[];
+} outIdx;
+
+layout(push_constant) uniform PushConstants {
+    uint nParents;           // number of parent strands
+    uint keysPerStrand;      // keys per strand (e.g., 6)
+    uint childrenPerParent;  // children per parent
+    uint totalChildren;      // nParents * childrenPerParent
+    float rootRadius;        // hair width at root
+    float tipFactor;         // tip_radius / root_radius
+    float cameraX;           // camera position for billboard
+    float cameraY;
+    float cameraZ;
+    float avgSpacing;        // average distance between parents
+} pc;
+
+// PCG hash for deterministic random
+uint pcgHash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float randFloat(uint seed) {
+    return float(pcgHash(seed)) / 4294967295.0;
+}
+
+vec3 randVec3(uint seed) {
+    return vec3(
+        randFloat(seed),
+        randFloat(seed + 1u),
+        randFloat(seed + 2u)
+    ) * 2.0 - 1.0;
+}
+
+void main() {
+    uint childIdx = gl_GlobalInvocationID.x;
+    if (childIdx >= pc.totalChildren) return;
+
+    uint K = pc.keysPerStrand;
+    uint vertsPerStrand = K * 2;     // 2 verts per key (left/right of ribbon)
+    uint trisPerStrand = (K - 1) * 2; // 2 triangles per segment
+    uint idxPerStrand = trisPerStrand * 3;
+
+    // Pick primary parent + 2 NEARBY parents for interpolation
+    // Small spread = children stay close to their parent (spatially coherent)
+    uint primaryParent = childIdx % pc.nParents;
+    uint seed = childIdx * 7u + 31u;
+    int spread = max(int(sqrt(float(pc.nParents)) * 0.5), 2); // ~sqrt(N)/2 for surface proximity
+    int offset1 = int(randFloat(seed + 100u) * float(spread * 2)) - spread;
+    int offset2 = int(randFloat(seed + 200u) * float(spread * 2)) - spread;
+    uint p1 = clamp(int(primaryParent) + offset1, 0, int(pc.nParents) - 1);
+    uint p2 = clamp(int(primaryParent) + offset2, 0, int(pc.nParents) - 1);
+
+    // Random barycentric weights
+    float w0 = 0.1 + randFloat(seed + 300u) * 0.9;
+    float w1 = 0.1 + randFloat(seed + 400u) * 0.9;
+    float w2 = 0.1 + randFloat(seed + 500u) * 0.9;
+    float wSum = w0 + w1 + w2;
+    w0 /= wSum; w1 /= wSum; w2 /= wSum;
+
+    // Interpolate keys from 3 parents
+    vec3 childKeys[16]; // max keys supported
+    for (uint ki = 0; ki < K && ki < 16; ki++) {
+        vec3 k0 = parents.keys[primaryParent * K + ki].xyz;
+        vec3 k1 = parents.keys[p1 * K + ki].xyz;
+        vec3 k2 = parents.keys[p2 * K + ki].xyz;
+        childKeys[ki] = k0 * w0 + k1 * w1 + k2 * w2;
+
+        // Per-key noise (increases toward tip)
+        float t = float(ki) / float(K - 1);
+        vec3 noise = randVec3(seed + ki * 3u + 600u) * pc.avgSpacing * 0.05 * (0.5 + t * 1.5);
+        childKeys[ki] += noise;
+    }
+
+    // Compute tangents
+    vec3 tangents[16];
+    tangents[0] = normalize(childKeys[1] - childKeys[0]);
+    for (uint ki = 1; ki < K - 1; ki++) {
+        tangents[ki] = normalize(childKeys[ki + 1] - childKeys[ki - 1]);
+    }
+    tangents[K - 1] = normalize(childKeys[K - 1] - childKeys[K - 2]);
+
+    // Perpendicular frame: for Thick mode use a tube cross-section,
+    // for Ribbon mode orient toward camera.
+    // Cycles default = THICK (cylindrical tube).
+    vec3 camPos = vec3(pc.cameraX, pc.cameraY, pc.cameraZ);
+    vec3 toCam = normalize(camPos - childKeys[0]);
+
+    // Base perpendicular from tangent
+    vec3 basePerp;
+    {
+        vec3 ref = abs(tangents[0].z) < 0.9 ? vec3(0, 0, 1) : vec3(1, 0, 0);
+        basePerp = normalize(cross(tangents[0], ref));
+    }
+
+    // Per-strand random rotation for tube cross-section variation
+    float strandAngle = randFloat(seed + 900u) * 6.28318;
+
+    // Generate ribbon/tube vertices
+    uint vertBase = childIdx * vertsPerStrand;
+    for (uint ki = 0; ki < K; ki++) {
+        float t = float(ki) / float(K - 1);
+        float radius = pc.rootRadius * (1.0 - t + t * pc.tipFactor);
+
+        // Compute perpendicular at this key
+        vec3 perp;
+        if (pc.tipFactor >= -999.0) {
+            // THICK mode: use fixed perpendicular (tube-like, randomized per strand)
+            vec3 ref = abs(tangents[ki].z) < 0.9 ? vec3(0, 0, 1) : vec3(1, 0, 0);
+            vec3 p1 = normalize(cross(tangents[ki], ref));
+            vec3 p2 = normalize(cross(tangents[ki], p1));
+            perp = p1 * cos(strandAngle) + p2 * sin(strandAngle);
+        }
+
+        // Normal: face outward from ribbon center
+        vec3 normal = normalize(cross(perp, tangents[ki]));
+
+        // Left and right vertices
+        vec3 left = childKeys[ki] - perp * radius;
+        vec3 right = childKeys[ki] + perp * radius;
+
+        uint vi = vertBase + ki * 2;
+        outPos.pos[(vi) * 3 + 0] = left.x;
+        outPos.pos[(vi) * 3 + 1] = left.y;
+        outPos.pos[(vi) * 3 + 2] = left.z;
+        outPos.pos[(vi + 1) * 3 + 0] = right.x;
+        outPos.pos[(vi + 1) * 3 + 1] = right.y;
+        outPos.pos[(vi + 1) * 3 + 2] = right.z;
+
+        outNrm.nrm[(vi) * 3 + 0] = normal.x;
+        outNrm.nrm[(vi) * 3 + 1] = normal.y;
+        outNrm.nrm[(vi) * 3 + 2] = normal.z;
+        outNrm.nrm[(vi + 1) * 3 + 0] = normal.x;
+        outNrm.nrm[(vi + 1) * 3 + 1] = normal.y;
+        outNrm.nrm[(vi + 1) * 3 + 2] = normal.z;
+    }
+
+    // Generate indices (triangle strip)
+    uint idxBase = childIdx * idxPerStrand;
+    for (uint si = 0; si < K - 1; si++) {
+        uint i0 = vertBase + si * 2;
+        uint base = idxBase + si * 6;
+        outIdx.idx[base + 0] = i0;
+        outIdx.idx[base + 1] = i0 + 2;
+        outIdx.idx[base + 2] = i0 + 1;
+        outIdx.idx[base + 3] = i0 + 1;
+        outIdx.idx[base + 4] = i0 + 2;
+        outIdx.idx[base + 5] = i0 + 3;
+    }
+}

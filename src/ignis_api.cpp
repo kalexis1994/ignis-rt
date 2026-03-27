@@ -333,6 +333,18 @@ IGNIS_API bool ignis_update_instance_transforms(const uint32_t* indices,
     return g_renderer->UpdateInstanceTransforms(indices, transforms, count);
 }
 
+// ── GPU Hair Generation ──
+IGNIS_API int ignis_generate_hair_gpu(const float* parentKeys, uint32_t nParents,
+                                       uint32_t keysPerStrand, uint32_t childrenPerParent,
+                                       float rootRadius, float tipFactor,
+                                       float camX, float camY, float camZ,
+                                       float avgSpacing) {
+    if (!g_renderer || !parentKeys || nParents == 0) return -1;
+    return g_renderer->GenerateHairGPU(parentKeys, nParents, keysPerStrand,
+                                        childrenPerParent, rootRadius, tipFactor,
+                                        camX, camY, camZ, avgSpacing);
+}
+
 // Previous frame camera matrices for motion vectors
 static float s_viewPrev[16] = {0};
 static float s_projPrev[16] = {0};

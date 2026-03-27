@@ -748,6 +748,278 @@ bool Renderer::UpdateInstanceTransforms(const uint32_t* indices, const float* tr
     return true;
 }
 
+// ── GPU Hair Generation ──
+
+bool Renderer::CreateHairComputePipeline() {
+    if (hairComputeReady_) return true;
+    VkDevice device = context_->GetDevice();
+
+    // Load compute shader
+    std::string shaderPath = IgnisResolvePath("shaders/hair_generate.comp.spv");
+    std::ifstream file(shaderPath, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        Log(L"[Hair] Cannot open hair_generate.comp.spv\n");
+        return false;
+    }
+    size_t fileSize = (size_t)file.tellg();
+    std::vector<char> code(fileSize);
+    file.seekg(0);
+    file.read(code.data(), fileSize);
+    file.close();
+
+    VkShaderModuleCreateInfo moduleInfo{};
+    moduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    moduleInfo.codeSize = code.size();
+    moduleInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
+    VkShaderModule shaderModule;
+    if (vkCreateShaderModule(device, &moduleInfo, nullptr, &shaderModule) != VK_SUCCESS) {
+        Log(L"[Hair] Failed to create shader module\n");
+        return false;
+    }
+
+    // 4 storage buffers: parents(in), positions(out), normals(out), indices(out)
+    VkDescriptorSetLayoutBinding bindings[4] = {};
+    for (int i = 0; i < 4; i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = 4;
+    layoutInfo.pBindings = bindings;
+    vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &hairComputeDescSetLayout_);
+
+    // Push constants (10 floats/uints = 40 bytes)
+    VkPushConstantRange pushRange{};
+    pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushRange.offset = 0;
+    pushRange.size = 40;
+
+    VkPipelineLayoutCreateInfo plInfo{};
+    plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plInfo.setLayoutCount = 1;
+    plInfo.pSetLayouts = &hairComputeDescSetLayout_;
+    plInfo.pushConstantRangeCount = 1;
+    plInfo.pPushConstantRanges = &pushRange;
+    vkCreatePipelineLayout(device, &plInfo, nullptr, &hairComputePipelineLayout_);
+
+    VkPipelineShaderStageCreateInfo stageInfo{};
+    stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    stageInfo.module = shaderModule;
+    stageInfo.pName = "main";
+
+    VkComputePipelineCreateInfo pipeInfo{};
+    pipeInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipeInfo.stage = stageInfo;
+    pipeInfo.layout = hairComputePipelineLayout_;
+    auto result = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &hairComputePipeline_);
+    vkDestroyShaderModule(device, shaderModule, nullptr);
+
+    if (result != VK_SUCCESS) {
+        Log(L"[Hair] Failed to create compute pipeline\n");
+        return false;
+    }
+
+    // Descriptor pool
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4};
+    VkDescriptorPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.maxSets = 1;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    vkCreateDescriptorPool(device, &poolInfo, nullptr, &hairComputeDescPool_);
+
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = hairComputeDescPool_;
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &hairComputeDescSetLayout_;
+    vkAllocateDescriptorSets(device, &allocInfo, &hairComputeDescSet_);
+
+    hairComputeReady_ = true;
+    Log(L"[Hair] Compute pipeline created\n");
+    return true;
+}
+
+void Renderer::DestroyHairComputePipeline() {
+    VkDevice device = context_->GetDevice();
+    if (hairComputePipeline_) vkDestroyPipeline(device, hairComputePipeline_, nullptr);
+    if (hairComputePipelineLayout_) vkDestroyPipelineLayout(device, hairComputePipelineLayout_, nullptr);
+    if (hairComputeDescPool_) vkDestroyDescriptorPool(device, hairComputeDescPool_, nullptr);
+    if (hairComputeDescSetLayout_) vkDestroyDescriptorSetLayout(device, hairComputeDescSetLayout_, nullptr);
+    hairComputePipeline_ = VK_NULL_HANDLE;
+    hairComputeReady_ = false;
+}
+
+int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
+                               uint32_t keysPerStrand, uint32_t childrenPerParent,
+                               float rootRadius, float tipFactor,
+                               float camX, float camY, float camZ, float avgSpacing) {
+    if (!accelBuilder_) return -1;
+    if (!CreateHairComputePipeline()) return -1;
+
+    VkDevice device = context_->GetDevice();
+    uint32_t totalChildren = nParents * childrenPerParent;
+    uint32_t vertsPerChild = keysPerStrand * 2;
+    uint32_t trisPerChild = (keysPerStrand - 1) * 2;
+    uint32_t totalVerts = totalChildren * vertsPerChild;
+    uint32_t totalIndices = totalChildren * trisPerChild * 3;
+
+    VkDeviceSize parentSize = nParents * keysPerStrand * 4 * sizeof(float);  // vec4 per key
+    VkDeviceSize posSize = totalVerts * 3 * sizeof(float);
+    VkDeviceSize nrmSize = totalVerts * 3 * sizeof(float);
+    VkDeviceSize uvSize  = totalVerts * 2 * sizeof(float);
+    VkDeviceSize idxSize = totalIndices * sizeof(uint32_t);
+
+    Log(L"[Hair] Generating %u children from %u parents (%u keys each)\n",
+        totalChildren, nParents, keysPerStrand);
+    Log(L"[Hair] Output: %u verts, %u indices (%.1f MB)\n",
+        totalVerts, totalIndices, (float)(posSize + nrmSize + idxSize) / (1024*1024));
+
+    // Create GPU buffers
+    auto parentBuf = accelBuilder_->CreateAccelBuffer(parentSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    auto posBuf = accelBuilder_->CreateAccelBuffer(posSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    auto nrmBuf = accelBuilder_->CreateAccelBuffer(nrmSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    auto uvBuf = accelBuilder_->CreateAccelBuffer(uvSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    auto idxBuf = accelBuilder_->CreateAccelBuffer(idxSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    if (!parentBuf.buffer || !posBuf.buffer || !nrmBuf.buffer || !uvBuf.buffer || !idxBuf.buffer) {
+        Log(L"[Hair] Failed to create GPU buffers\n");
+        accelBuilder_->DestroyAccelBuffer(parentBuf);
+        accelBuilder_->DestroyAccelBuffer(posBuf);
+        accelBuilder_->DestroyAccelBuffer(nrmBuf);
+        accelBuilder_->DestroyAccelBuffer(uvBuf);
+        accelBuilder_->DestroyAccelBuffer(idxBuf);
+        return -1;
+    }
+
+    // Upload parent keys to GPU (convert float3 → vec4 for alignment)
+    auto stagingBuf = accelBuilder_->CreateAccelBuffer(parentSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    void* mapped;
+    vkMapMemory(device, stagingBuf.memory, 0, parentSize, 0, &mapped);
+    float* dst = reinterpret_cast<float*>(mapped);
+    for (uint32_t i = 0; i < nParents * keysPerStrand; i++) {
+        dst[i * 4 + 0] = parentKeys[i * 3 + 0];
+        dst[i * 4 + 1] = parentKeys[i * 3 + 1];
+        dst[i * 4 + 2] = parentKeys[i * 3 + 2];
+        dst[i * 4 + 3] = 0.0f;
+    }
+    vkUnmapMemory(device, stagingBuf.memory);
+
+    VkCommandBuffer cmd = context_->BeginSingleTimeCommands();
+    VkBufferCopy copy{};
+    copy.size = parentSize;
+    vkCmdCopyBuffer(cmd, stagingBuf.buffer, parentBuf.buffer, 1, &copy);
+
+    // Zero-fill UV buffer (hair UVs are all 0 for now)
+    vkCmdFillBuffer(cmd, uvBuf.buffer, 0, uvSize, 0);
+
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+    // Update descriptor set
+    VkDescriptorBufferInfo bufInfos[4] = {
+        {parentBuf.buffer, 0, parentSize},
+        {posBuf.buffer, 0, posSize},
+        {nrmBuf.buffer, 0, nrmSize},
+        {idxBuf.buffer, 0, idxSize},
+    };
+    VkWriteDescriptorSet writes[4] = {};
+    for (int i = 0; i < 4; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = hairComputeDescSet_;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+    vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
+
+    // Dispatch compute shader
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hairComputePipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        hairComputePipelineLayout_, 0, 1, &hairComputeDescSet_, 0, nullptr);
+
+    struct {
+        uint32_t nParents;
+        uint32_t keysPerStrand;
+        uint32_t childrenPerParent;
+        uint32_t totalChildren;
+        float rootRadius;
+        float tipFactor;
+        float cameraX, cameraY, cameraZ;
+        float avgSpacing;
+    } pc = {nParents, keysPerStrand, childrenPerParent, totalChildren,
+            rootRadius, tipFactor, camX, camY, camZ, avgSpacing};
+    vkCmdPushConstants(cmd, hairComputePipelineLayout_,
+        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+
+    uint32_t groups = (totalChildren + 63) / 64;
+    vkCmdDispatch(cmd, groups, 1, 1);
+
+    // Barrier: compute → BLAS build
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+    context_->EndSingleTimeCommands(cmd);
+    accelBuilder_->DestroyAccelBuffer(stagingBuf);
+
+    // Build BLAS directly from GPU-resident buffers
+    int blasIdx = accelBuilder_->BuildBLASFromGPUBuffers(
+        posBuf.deviceAddress, totalVerts,
+        idxBuf.deviceAddress, totalIndices,
+        -1, VK_NULL_HANDLE, false);
+
+    if (blasIdx >= 0) {
+        // Store normal buffer address in BLAS entry for shader access
+        auto& blas = const_cast<vk::BLAS&>(accelBuilder_->GetBLASList()[blasIdx]);
+        blas.normalBuf = nrmBuf;
+        blas.uvBuf = uvBuf;
+        blas.vertexBuf = posBuf;
+        blas.indexBuf = idxBuf;
+        blas.vertexCount = totalVerts;
+        blas.indexCount = totalIndices;
+        Log(L"[Hair] BLAS %d built: %u verts, %u tris\n",
+            blasIdx, totalVerts, totalIndices / 3);
+    } else {
+        Log(L"[Hair] BLAS build failed\n");
+        accelBuilder_->DestroyAccelBuffer(posBuf);
+        accelBuilder_->DestroyAccelBuffer(nrmBuf);
+        accelBuilder_->DestroyAccelBuffer(uvBuf);
+        accelBuilder_->DestroyAccelBuffer(idxBuf);
+    }
+
+    accelBuilder_->DestroyAccelBuffer(parentBuf);
+    return blasIdx;
+}
+
 void Renderer::UpdateCamera(const CameraUBO& camera) {
     if (rtPipeline_) {
         rtPipeline_->UpdateCamera(camera);

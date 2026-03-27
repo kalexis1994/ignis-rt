@@ -56,6 +56,11 @@ public:
     bool BuildTLASInstanced(const std::vector<vk::TLASInstance>& instances);
     // Update specific instance transforms in-place (TLAS refit, no full rebuild)
     bool UpdateInstanceTransforms(const uint32_t* indices, const float* transforms, uint32_t count);
+    // GPU hair generation: upload parent keys, compute shader generates children + ribbons, builds BLAS
+    int GenerateHairGPU(const float* parentKeys, uint32_t nParents,
+                        uint32_t keysPerStrand, uint32_t childrenPerParent,
+                        float rootRadius, float tipFactor,
+                        float camX, float camY, float camZ, float avgSpacing);
     void UpdateCamera(const CameraUBO& camera);
     void RenderFrameRT();
 
@@ -138,6 +143,16 @@ private:
     std::vector<float> prevInstanceTransforms_;
     uint32_t instanceTransformCount_ = 0;
     std::vector<vk::TLASInstance> cachedTLASInstances_; // full instance cache for partial updates
+
+    // GPU hair compute pipeline
+    VkPipeline hairComputePipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout hairComputePipelineLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout hairComputeDescSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorPool hairComputeDescPool_ = VK_NULL_HANDLE;
+    VkDescriptorSet hairComputeDescSet_ = VK_NULL_HANDLE;
+    bool hairComputeReady_ = false;
+    bool CreateHairComputePipeline();
+    void DestroyHairComputePipeline();
 
     // Camera
     float cameraDistance_ = 5.0f;
