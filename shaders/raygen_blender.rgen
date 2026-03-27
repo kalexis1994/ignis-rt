@@ -219,6 +219,8 @@ layout(buffer_reference, scalar) readonly buffer CurveKeys { vec4 k[]; };
 #include "include/gi_reservoir.glsl"
 #include "include/di_reservoir.glsl"
 #include "include/node_vm.glsl"
+#include "include/hair_bsdf.glsl"
+// octDecode already defined in gi_reservoir.glsl
 
 const uint SHADER_BLENDER_PBR = 100u;
 
@@ -911,17 +913,23 @@ void main() {
         // but normal maps should NOT (they're detail perturbation, not geometry).
         vec3 smoothN = worldN;
 
-        // Hair cylindrical normal override: use bitangentBufferAddress as isHair flag
+        // Hair: save v + smooth tangent from packed normals BEFORE any override
+        float hairV = 0.0;
+        vec3 hairSmoothT = vec3(1, 0, 0);
+
+        // Hair: decode smooth tangent + v from packed normal buffer
         if (geo.bitangentBufferAddress != 0u) {
-            // Extract hair tangent from the longest triangle edge
-            vec3 e0 = wp1 - wp0;
-            vec3 e1 = wp2 - wp1;
-            vec3 e2 = wp0 - wp2;
-            float l0 = dot(e0, e0), l1 = dot(e1, e1), l2 = dot(e2, e2);
-            vec3 hairTangent = (l0 >= l1 && l0 >= l2) ? normalize(e0) :
-                               (l1 >= l2) ? normalize(e1) : normalize(e2);
-            // Cylindrical normal: remove tangent component from view direction
-            vec3 cylN = normalize(-rayDir - hairTangent * dot(-rayDir, hairTangent));
+            hairV = clamp(worldN.x, -1.0, 1.0);
+            hairSmoothT = octDecode(vec2(worldN.y, worldN.z));
+
+            vec3 hairT = hairSmoothT;
+
+            // Cylindrical normal: component of -rayDir perpendicular to tangent
+            vec3 cylN = -rayDir - hairT * dot(-rayDir, hairT);
+            float cnLen = length(cylN);
+            if (cnLen > 1e-6) cylN /= cnLen;
+            else cylN = vec3(0, 1, 0);
+
             worldN = cylN;
             geoNormal = cylN;
             geoNormalRaw = cylN;
@@ -2075,6 +2083,51 @@ void main() {
         float specWeight = (F.r + F.g + F.b) / 3.0;
         // For metals, specWeight is high; for dielectrics at normal incidence, ~4%
 
+        // ── Hair BSDF: Chiang Principled Hair (R + TT + TRT) ──
+        bool isHairSurface = (geo.bitangentBufferAddress != 0u);
+        if (isHairSurface) {
+            vec3 hairT = hairSmoothT;
+
+            // Hair parameters from material
+            vec3 hairColor = pbrHit.baseColor;
+            float hairRoughness = max(pbrHit.roughness, 0.05);
+            float hairIOR = 1.55;
+            float hairAlpha = -0.035; // cuticle tilt ~2 degrees
+
+            // Absorption coefficient from color
+            vec3 sigma = -log(max(hairColor, vec3(0.001)));
+
+            // h = position across fiber from v-encoded normals (set before cylindrical override)
+            float h = hairV;
+
+            // Sample bounce direction: cosine-weighted hemisphere around tangent plane
+            // (simplified importance sampling for hair — full Chiang sampling is complex)
+            vec3 bounceN = worldN;
+            vec3 newDir = sampleCosineHemisphere(rand2(), bounceN);
+
+            // Evaluate Chiang BSDF
+            vec3 wi = -rayDir;   // toward surface (incoming)
+            vec3 wo = newDir;    // outgoing (bounce)
+            vec3 hairF = hair_chiang_eval(wi, wo, hairT, sigma,
+                                          hairRoughness, hairRoughness,
+                                          hairAlpha, hairIOR, h);
+
+            // PDF of cosine hemisphere sampling
+            float cosPdf = max(dot(newDir, bounceN), 0.0) * INV_PI;
+            if (cosPdf < 1e-6) break;
+
+            throughput *= hairF / cosPdf;
+            throughput = min(throughput, vec3(MAX_RADIANCE));
+
+            rayDir = newDir;
+            if (bounce == 0) isDiffusePath = true;
+
+            float rayOffset = 0.02; // skip sibling ribbon
+            rayOrigin = pbrHit.worldPos + bounceN * rayOffset;
+            prevBounceNormal = bounceN;
+            continue;
+        }
+
         bool chooseDiffuse = (rand01() > specWeight);
 
         if (chooseDiffuse && pbrHit.metallic < 1.0) {
@@ -2139,7 +2192,9 @@ void main() {
         throughput = min(throughput, vec3(MAX_RADIANCE));
 
         // Update ray origin (offset along geometric normal to avoid self-intersection)
-        rayOrigin = pbrHit.worldPos + N * 0.002;
+        // Hair DOTS: larger offset to skip past sibling ribbon of same strand
+        float rayOffset = (geo.bitangentBufferAddress != 0u) ? 0.02 : 0.002;
+        rayOrigin = pbrHit.worldPos + N * rayOffset;
         prevBounceNormal = N;  // store for SHARC query on next bounce
     }
 
