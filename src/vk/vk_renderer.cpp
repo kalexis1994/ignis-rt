@@ -866,7 +866,8 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
                                float rough1, float rough1Size,
                                float rough2, float roughEnd,
                                uint32_t childMode,
-                               float kinkShape, float kinkFlat, float kinkAmpRandom) {
+                               float kinkShape, float kinkFlat, float kinkAmpRandom,
+                               bool opaqueHair) {
     if (!accelBuilder_) return -1;
     if (!CreateHairComputePipeline()) return -1;
 
@@ -1092,7 +1093,7 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
     int blasIdx = accelBuilder_->BuildBLASFromGPUBuffers(
         posBuf.deviceAddress, totalVerts,
         idxBuf.deviceAddress, totalIndices,
-        -1, VK_NULL_HANDLE, false);
+        -1, VK_NULL_HANDLE, opaqueHair);
 
     if (blasIdx >= 0) {
         // Store normal buffer address in BLAS entry for shader access

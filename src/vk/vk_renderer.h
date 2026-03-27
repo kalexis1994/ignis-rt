@@ -69,7 +69,8 @@ public:
                         float rough1, float rough1Size,
                         float rough2, float roughEnd,
                         uint32_t childMode,
-                        float kinkShape, float kinkFlat, float kinkAmpRandom);
+                        float kinkShape, float kinkFlat, float kinkAmpRandom,
+                        bool opaqueHair);
     void UpdateCamera(const CameraUBO& camera);
     void RenderFrameRT();
 
