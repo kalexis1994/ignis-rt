@@ -130,10 +130,13 @@ def load():
 
     # ------------------------------------------------------------------
     # Acceleration structures
-    # GPU hair generation
+    # GPU hair generation (Blender-exact with emitter mesh)
     _lib.ignis_generate_hair_gpu.argtypes = [
-        POINTER(c_float), c_uint32, c_uint32, c_uint32,
-        c_float, c_float, c_float, c_float, c_float, c_float,
+        POINTER(c_float), c_uint32, c_uint32, c_uint32,       # parentKeys, nParents, keysPerStrand, childrenPerParent
+        POINTER(c_float), c_uint32,                            # emitterVerts, nEmitterVerts
+        POINTER(c_uint32), c_uint32,                           # emitterTris, nEmitterTris
+        POINTER(c_float),                                      # emitterCDF
+        c_float, c_float, c_float, c_float, c_float, c_float, # rootRadius, tipFactor, camXYZ, avgSpacing
     ]
     _lib.ignis_generate_hair_gpu.restype = c_int
 
@@ -294,13 +297,25 @@ def commit_blas_deform(blas_index: int) -> bool:
 
 
 def generate_hair_gpu(parent_keys, n_parents: int, keys_per_strand: int,
-                      children_per_parent: int, root_radius: float, tip_factor: float,
-                      cam_x: float, cam_y: float, cam_z: float, avg_spacing: float) -> int:
+                      children_per_parent: int,
+                      emitter_verts=None, n_emitter_verts: int = 0,
+                      emitter_tris=None, n_emitter_tris: int = 0,
+                      emitter_cdf=None,
+                      root_radius: float = 0.003, tip_factor: float = 0.0,
+                      cam_x: float = 0, cam_y: float = 0, cam_z: float = 5,
+                      avg_spacing: float = 0.01) -> int:
     """Generate hair children + ribbon geometry entirely on GPU. Returns BLAS index."""
+    import numpy as np
     k = _np_f32(parent_keys)
+    ev = _np_f32(emitter_verts) if emitter_verts is not None and len(emitter_verts) > 0 else np.zeros(3, dtype=np.float32)
+    et = _np_u32(emitter_tris) if emitter_tris is not None and len(emitter_tris) > 0 else np.zeros(3, dtype=np.uint32)
+    ec = _np_f32(emitter_cdf) if emitter_cdf is not None and len(emitter_cdf) > 0 else np.zeros(1, dtype=np.float32)
     return _lib.ignis_generate_hair_gpu(
         k.ctypes.data_as(POINTER(c_float)),
         c_uint32(n_parents), c_uint32(keys_per_strand), c_uint32(children_per_parent),
+        ev.ctypes.data_as(POINTER(c_float)), c_uint32(n_emitter_verts),
+        et.ctypes.data_as(POINTER(c_uint32)), c_uint32(n_emitter_tris),
+        ec.ctypes.data_as(POINTER(c_float)),
         c_float(root_radius), c_float(tip_factor),
         c_float(cam_x), c_float(cam_y), c_float(cam_z), c_float(avg_spacing))
 

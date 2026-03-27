@@ -59,6 +59,9 @@ public:
     // GPU hair generation: upload parent keys, compute shader generates children + ribbons, builds BLAS
     int GenerateHairGPU(const float* parentKeys, uint32_t nParents,
                         uint32_t keysPerStrand, uint32_t childrenPerParent,
+                        const float* emitterVerts, uint32_t nEmitterVerts,
+                        const uint32_t* emitterTris, uint32_t nEmitterTris,
+                        const float* emitterCDF,
                         float rootRadius, float tipFactor,
                         float camX, float camY, float camZ, float avgSpacing);
     void UpdateCamera(const CameraUBO& camera);

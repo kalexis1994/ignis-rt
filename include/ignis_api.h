@@ -43,9 +43,12 @@ IGNIS_API bool   ignis_refit_blas(int blasHandle, const float* vertices, uint32_
 IGNIS_API bool   ignis_update_instance_transforms(const uint32_t* indices,
                                                     const float* transforms, uint32_t count);
 
-// GPU hair generation
+// GPU hair generation (Blender-exact child distribution on emitter surface)
 IGNIS_API int    ignis_generate_hair_gpu(const float* parentKeys, uint32_t nParents,
                                           uint32_t keysPerStrand, uint32_t childrenPerParent,
+                                          const float* emitterVerts, uint32_t nEmitterVerts,
+                                          const uint32_t* emitterTris, uint32_t nEmitterTris,
+                                          const float* emitterCDF,
                                           float rootRadius, float tipFactor,
                                           float camX, float camY, float camZ,
                                           float avgSpacing);

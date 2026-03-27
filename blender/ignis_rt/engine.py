@@ -674,7 +674,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                                     cam_pos = tuple(rd.view_matrix.inverted().translation)
                             except Exception:
                                 pass
-                            child_nbr = min(max(m["child_nbr"], 1), 10)  # cap at 10 while testing
+                            child_nbr = max(m["child_nbr"], 1)
                             n_p = m["n_parents"]
                             pk = m["parent_keys"].reshape(-1, 3)
                             # Estimate spacing
@@ -686,12 +686,22 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                                 avg_sp = float(np.median(np.sqrt((diffs*diffs).sum(axis=2).min(axis=1))))
                             else:
                                 avg_sp = 0.01
-                            _log(f"  GPU hair: calling generate_hair_gpu({n_p} parents, {m['n_keys']} keys, {child_nbr} children)")
+                            n_ev = m.get("n_emitter_verts", 0)
+                            n_et = m.get("n_emitter_tris", 0)
+                            _log(f"  GPU hair: {n_p} parents, {m['n_keys']} keys, {child_nbr} children, emitter={n_ev}v/{n_et}t")
                             blas = dll_wrapper.generate_hair_gpu(
                                 m["parent_keys"], n_p, m["n_keys"], child_nbr,
-                                m["root_radius"], m["tip_factor"],
-                                float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2]),
-                                avg_sp)
+                                emitter_verts=m.get("emitter_verts"),
+                                n_emitter_verts=n_ev,
+                                emitter_tris=m.get("emitter_tris"),
+                                n_emitter_tris=n_et,
+                                emitter_cdf=m.get("emitter_cdf"),
+                                root_radius=m["root_radius"],
+                                tip_factor=m["tip_factor"],
+                                cam_x=float(cam_pos[0]),
+                                cam_y=float(cam_pos[1]),
+                                cam_z=float(cam_pos[2]),
+                                avg_spacing=m.get("avg_spacing", avg_sp))
                             if blas >= 0:
                                 _ignis_blas_handles[mesh_key] = blas
                                 # Compute tri count for material assignment

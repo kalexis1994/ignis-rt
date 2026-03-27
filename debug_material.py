@@ -1,8 +1,114 @@
-"""Full material audit: check ALL materials for unsupported/partially supported nodes."""
+"""Debug particle systems. Run in Blender Text Editor (Alt+P)."""
 import bpy
+import numpy as np
 
-# Node types we fully support
-FULLY_SUPPORTED = {
+print("="*60)
+print("PARTICLE SYSTEM DEBUG")
+print("="*60)
+
+for obj in bpy.data.objects:
+    if obj.type != 'MESH':
+        continue
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eval_obj = obj.evaluated_get(depsgraph)
+    for ps_idx, ps in enumerate(eval_obj.particle_systems):
+        if ps.settings.type != 'HAIR':
+            continue
+        s = ps.settings
+        print(f"\nObject: '{obj.name}' → ParticleSystem[{ps_idx}]: '{ps.name}'")
+        print(f"  type={s.type} render_as={s.render_type}")
+        print(f"  count (parents)={s.count}")
+        print(f"  child_type={s.child_type} child_nbr={s.child_nbr} rendered_child_count={s.rendered_child_count}")
+        print(f"  display_step={s.display_step} render_step={s.render_step}")
+        print(f"  radius_scale={s.radius_scale}")
+        print(f"  root_radius={getattr(s, 'root_radius', '?')}")
+        print(f"  tip_radius={getattr(s, 'tip_radius', '?')}")
+        print(f"  shape={getattr(s, 'shape', '?')}")
+        print(f"  totpart={ps.particles.__len__() if ps.particles else 0}")
+        print(f"  child_particles={len(ps.child_particles) if hasattr(ps, 'child_particles') else '?'}")
+
+        # Check first parent strand
+        if len(ps.particles) > 0:
+            p = ps.particles[0]
+            n_keys = len(p.hair_keys)
+            print(f"  parent[0] keys={n_keys}")
+            if n_keys >= 2:
+                # Find modifier
+                ps_mod = None
+                for mod in eval_obj.modifiers:
+                    if mod.type == 'PARTICLE_SYSTEM' and mod.particle_system == ps:
+                        ps_mod = mod
+                        break
+                if ps_mod:
+                    root = p.hair_keys[0].co_object(eval_obj, ps_mod, p)
+                    tip = p.hair_keys[-1].co_object(eval_obj, ps_mod, p)
+                    print(f"    co_object root=({root[0]:.4f},{root[1]:.4f},{root[2]:.4f})")
+                    print(f"    co_object tip=({tip[0]:.4f},{tip[1]:.4f},{tip[2]:.4f})")
+                root_co = p.hair_keys[0].co
+                tip_co = p.hair_keys[-1].co
+                print(f"    co (local) root=({root_co[0]:.4f},{root_co[1]:.4f},{root_co[2]:.4f})")
+                print(f"    co (local) tip=({tip_co[0]:.4f},{tip_co[1]:.4f},{tip_co[2]:.4f})")
+
+        # Check if we can access child particle data
+        if hasattr(ps, 'child_particles') and len(ps.child_particles) > 0:
+            print(f"  child_particles[0] attrs: {[a for a in dir(ps.child_particles[0]) if not a.startswith('_')]}")
+
+        # Check new Curves API (Blender 4.0+)
+        print(f"\n  Checking Curves API:")
+        for child_obj in bpy.data.objects:
+            if child_obj.type == 'CURVES' and child_obj.parent == obj:
+                curves = child_obj.data
+                print(f"    Found CURVES object: '{child_obj.name}'")
+                print(f"    curves_num={len(curves.curves)} points_num={len(curves.points)}")
+                if len(curves.curves) > 0:
+                    c0 = curves.curves[0]
+                    print(f"    curve[0]: first_point_index={c0.first_point_index} points_length={c0.points_length}")
+                    if c0.points_length > 0:
+                        p0 = curves.points[c0.first_point_index]
+                        print(f"    point[0]: position=({p0.position[0]:.4f},{p0.position[1]:.4f},{p0.position[2]:.4f}) radius={p0.radius:.4f}")
+
+print(f"\n{'='*60}")
+print("Done.")
+
+if False:
+
+MATERIAL_NAME = "Cristal"
+mat = bpy.data.materials.get(MATERIAL_NAME)
+if not mat:
+    print(f"ERROR: '{MATERIAL_NAME}' not found. Available: {[m.name for m in bpy.data.materials]}")
+elif mat.use_nodes and mat.node_tree:
+    tree = mat.node_tree
+    print(f"\n{'='*60}")
+    print(f"Material: '{mat.name}'")
+    print(f"  blend_method: {getattr(mat, 'blend_method', '?')}")
+    print(f"  use_backface_culling: {mat.use_backface_culling}")
+    print(f"{'='*60}")
+    print(f"\nNodes ({len(tree.nodes)}):")
+    for node in tree.nodes:
+        print(f"\n  [{node.type}] '{node.name}'")
+        for inp in node.inputs:
+            if inp.is_linked:
+                fn = inp.links[0].from_node
+                fs = inp.links[0].from_socket
+                print(f"    in: '{inp.name}' <- [{fn.type}] '{fn.name}'.'{fs.name}'")
+            else:
+                try:
+                    v = inp.default_value
+                    if hasattr(v, '__len__'):
+                        print(f"    in: '{inp.name}' = ({', '.join(f'{x:.4f}' for x in v)})")
+                    else:
+                        print(f"    in: '{inp.name}' = {v:.4f}")
+                except:
+                    print(f"    in: '{inp.name}' = ?")
+        for out in node.outputs:
+            if out.is_linked:
+                for lnk in out.links:
+                    print(f"    out: '{out.name}' -> [{lnk.to_node.type}] '{lnk.to_node.name}'.'{lnk.to_socket.name}'")
+    print(f"{'='*60}")
+
+# ---- Original audit script below (not executed) ----
+if False:
+ FULLY_SUPPORTED = {
     'BSDF_PRINCIPLED', 'OUTPUT_MATERIAL',
     'TEX_IMAGE', 'TEX_COORD', 'MAPPING',
     'VALTORGB',  # ColorRamp

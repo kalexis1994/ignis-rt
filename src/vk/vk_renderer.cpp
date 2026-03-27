@@ -777,9 +777,9 @@ bool Renderer::CreateHairComputePipeline() {
         return false;
     }
 
-    // 4 storage buffers: parents(in), positions(out), normals(out), indices(out)
-    VkDescriptorSetLayoutBinding bindings[4] = {};
-    for (int i = 0; i < 4; i++) {
+    // 7 storage buffers: parents, emitterV, emitterT, CDF, pos(out), nrm(out), idx(out)
+    VkDescriptorSetLayoutBinding bindings[7] = {};
+    for (int i = 0; i < 7; i++) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1;
@@ -787,7 +787,7 @@ bool Renderer::CreateHairComputePipeline() {
     }
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 4;
+    layoutInfo.bindingCount = 7;
     layoutInfo.pBindings = bindings;
     vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &hairComputeDescSetLayout_);
 
@@ -824,7 +824,7 @@ bool Renderer::CreateHairComputePipeline() {
     }
 
     // Descriptor pool
-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4};
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7};
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.maxSets = 1;
@@ -856,6 +856,9 @@ void Renderer::DestroyHairComputePipeline() {
 
 int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
                                uint32_t keysPerStrand, uint32_t childrenPerParent,
+                               const float* emitterVerts, uint32_t nEmitterVerts,
+                               const uint32_t* emitterTris, uint32_t nEmitterTris,
+                               const float* emitterCDF,
                                float rootRadius, float tipFactor,
                                float camX, float camY, float camZ, float avgSpacing) {
     if (!accelBuilder_) return -1;
@@ -901,6 +904,20 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
+    // Emitter mesh buffers
+    VkDeviceSize emVSize = std::max((VkDeviceSize)(nEmitterVerts * 4 * sizeof(float)), (VkDeviceSize)16);
+    VkDeviceSize emTSize = std::max((VkDeviceSize)(nEmitterTris * 4 * sizeof(uint32_t)), (VkDeviceSize)16);
+    VkDeviceSize emCSize = std::max((VkDeviceSize)(nEmitterTris * sizeof(float)), (VkDeviceSize)16);
+    auto emVertBuf = accelBuilder_->CreateAccelBuffer(emVSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    auto emTriBuf = accelBuilder_->CreateAccelBuffer(emTSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    auto emCDFBuf = accelBuilder_->CreateAccelBuffer(emCSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
     if (!parentBuf.buffer || !posBuf.buffer || !nrmBuf.buffer || !uvBuf.buffer || !idxBuf.buffer) {
         Log(L"[Hair] Failed to create GPU buffers\n");
         accelBuilder_->DestroyAccelBuffer(parentBuf);
@@ -934,6 +951,55 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
     // Zero-fill UV buffer (hair UVs are all 0 for now)
     vkCmdFillBuffer(cmd, uvBuf.buffer, 0, uvSize, 0);
 
+    // Upload emitter mesh data
+    // Upload emitter data — staging buffers must survive until EndSingleTimeCommands
+    vk::AccelBuffer emVStaging{}, emTStaging{}, emCStaging{};
+    if (nEmitterVerts > 0 && emitterVerts) {
+        emVStaging = accelBuilder_->CreateAccelBuffer(emVSize,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        void* emVM;
+        vkMapMemory(device, emVStaging.memory, 0, emVSize, 0, &emVM);
+        float* evDst = reinterpret_cast<float*>(emVM);
+        for (uint32_t i = 0; i < nEmitterVerts; i++) {
+            evDst[i*4+0] = emitterVerts[i*3+0];
+            evDst[i*4+1] = emitterVerts[i*3+1];
+            evDst[i*4+2] = emitterVerts[i*3+2];
+            evDst[i*4+3] = 0.0f;
+        }
+        vkUnmapMemory(device, emVStaging.memory);
+        copy.size = emVSize;
+        vkCmdCopyBuffer(cmd, emVStaging.buffer, emVertBuf.buffer, 1, &copy);
+    }
+    if (nEmitterTris > 0 && emitterTris) {
+        emTStaging = accelBuilder_->CreateAccelBuffer(emTSize,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        void* emTM;
+        vkMapMemory(device, emTStaging.memory, 0, emTSize, 0, &emTM);
+        uint32_t* etDst = reinterpret_cast<uint32_t*>(emTM);
+        for (uint32_t i = 0; i < nEmitterTris; i++) {
+            etDst[i*4+0] = emitterTris[i*3+0];
+            etDst[i*4+1] = emitterTris[i*3+1];
+            etDst[i*4+2] = emitterTris[i*3+2];
+            etDst[i*4+3] = 0;
+        }
+        vkUnmapMemory(device, emTStaging.memory);
+        copy.size = emTSize;
+        vkCmdCopyBuffer(cmd, emTStaging.buffer, emTriBuf.buffer, 1, &copy);
+    }
+    if (nEmitterTris > 0 && emitterCDF) {
+        emCStaging = accelBuilder_->CreateAccelBuffer(emCSize,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        void* emCM;
+        vkMapMemory(device, emCStaging.memory, 0, emCSize, 0, &emCM);
+        memcpy(emCM, emitterCDF, nEmitterTris * sizeof(float));
+        vkUnmapMemory(device, emCStaging.memory);
+        copy.size = emCSize;
+        vkCmdCopyBuffer(cmd, emCStaging.buffer, emCDFBuf.buffer, 1, &copy);
+    }
+
     VkMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -941,15 +1007,18 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
-    // Update descriptor set
-    VkDescriptorBufferInfo bufInfos[4] = {
-        {parentBuf.buffer, 0, parentSize},
-        {posBuf.buffer, 0, posSize},
-        {nrmBuf.buffer, 0, nrmSize},
-        {idxBuf.buffer, 0, idxSize},
+    // Update descriptor set (7 bindings matching shader layout)
+    VkDescriptorBufferInfo bufInfos[7] = {
+        {parentBuf.buffer, 0, parentSize},      // binding 0: parent keys
+        {emVertBuf.buffer, 0, emVSize},          // binding 1: emitter verts
+        {emTriBuf.buffer, 0, emTSize},           // binding 2: emitter tris
+        {emCDFBuf.buffer, 0, emCSize},           // binding 3: emitter CDF
+        {posBuf.buffer, 0, posSize},             // binding 4: output positions
+        {nrmBuf.buffer, 0, nrmSize},             // binding 5: output normals
+        {idxBuf.buffer, 0, idxSize},             // binding 6: output indices
     };
-    VkWriteDescriptorSet writes[4] = {};
-    for (int i = 0; i < 4; i++) {
+    VkWriteDescriptorSet writes[7] = {};
+    for (int i = 0; i < 7; i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = hairComputeDescSet_;
         writes[i].dstBinding = i;
@@ -957,7 +1026,7 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &bufInfos[i];
     }
-    vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
+    vkUpdateDescriptorSets(device, 7, writes, 0, nullptr);
 
     // Dispatch compute shader
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hairComputePipeline_);
@@ -967,13 +1036,13 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
     struct {
         uint32_t nParents;
         uint32_t keysPerStrand;
-        uint32_t childrenPerParent;
         uint32_t totalChildren;
+        uint32_t nEmitterTris;
         float rootRadius;
         float tipFactor;
         float cameraX, cameraY, cameraZ;
         float avgSpacing;
-    } pc = {nParents, keysPerStrand, childrenPerParent, totalChildren,
+    } pc = {nParents, keysPerStrand, totalChildren, nEmitterTris,
             rootRadius, tipFactor, camX, camY, camZ, avgSpacing};
     vkCmdPushConstants(cmd, hairComputePipelineLayout_,
         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
@@ -989,7 +1058,11 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
         0, 1, &barrier, 0, nullptr, 0, nullptr);
 
     context_->EndSingleTimeCommands(cmd);
+    // Safe to destroy staging now (GPU finished)
     accelBuilder_->DestroyAccelBuffer(stagingBuf);
+    if (emVStaging.buffer) accelBuilder_->DestroyAccelBuffer(emVStaging);
+    if (emTStaging.buffer) accelBuilder_->DestroyAccelBuffer(emTStaging);
+    if (emCStaging.buffer) accelBuilder_->DestroyAccelBuffer(emCStaging);
 
     // Build BLAS directly from GPU-resident buffers
     int blasIdx = accelBuilder_->BuildBLASFromGPUBuffers(
@@ -1017,6 +1090,9 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
     }
 
     accelBuilder_->DestroyAccelBuffer(parentBuf);
+    accelBuilder_->DestroyAccelBuffer(emVertBuf);
+    accelBuilder_->DestroyAccelBuffer(emTriBuf);
+    accelBuilder_->DestroyAccelBuffer(emCDFBuf);
     return blasIdx;
 }
 

@@ -199,8 +199,46 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
     child_nbr = getattr(settings, 'child_nbr',
                         getattr(settings, 'child_percent', 0))
 
-    # Store parent keys + settings for GPU generation later (in engine.py LOAD_TLAS)
-    # Return a special "gpu_hair" dict that engine.py will process
+    # ── Extract emitter mesh for GPU child distribution ──
+    emitter_verts = np.empty(0, dtype=np.float32)
+    emitter_tris = np.empty(0, dtype=np.uint32)
+    emitter_cdf = np.empty(0, dtype=np.float32)
+    try:
+        emesh = eval_obj.to_mesh()
+        if emesh and len(emesh.vertices) > 0:
+            ev = np.empty(len(emesh.vertices) * 3, dtype=np.float32)
+            emesh.vertices.foreach_get('co', ev)
+            emitter_verts = ev
+            if len(emesh.loop_triangles) == 0:
+                emesh.calc_loop_triangles()
+            if len(emesh.loop_triangles) > 0:
+                et = np.empty(len(emesh.loop_triangles) * 3, dtype=np.int32)
+                emesh.loop_triangles.foreach_get('vertices', et)
+                emitter_tris = et.astype(np.uint32)
+                # Area-weighted CDF for random face selection
+                verts_3d = ev.reshape(-1, 3)
+                tris_3d = emitter_tris.reshape(-1, 3)
+                v0 = verts_3d[tris_3d[:, 0]]
+                v1 = verts_3d[tris_3d[:, 1]]
+                v2 = verts_3d[tris_3d[:, 2]]
+                areas = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1)
+                total_area = areas.sum()
+                if total_area > 0:
+                    emitter_cdf = (np.cumsum(areas) / total_area).astype(np.float32)
+        eval_obj.to_mesh_clear()
+    except Exception:
+        pass
+
+    # Compute average parent spacing for GPU noise scaling
+    parent_roots = parents[:, 0, :]  # (P, 3)
+    avg_spacing = 0.01
+    if n_parents > 10:
+        rng_s = np.random.RandomState(99)
+        si = rng_s.choice(n_parents, min(100, n_parents), replace=False)
+        dists = np.linalg.norm(parent_roots[si][:, None, :] - parent_roots[None, :10, :], axis=2)
+        np.fill_diagonal(dists[:10, :10], 1e10)
+        avg_spacing = float(np.median(dists.min(axis=1)))
+
     return {
         "name": f"hair_{eval_obj.name}",
         "gpu_hair": True,
@@ -211,6 +249,12 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
         "root_radius": root_radius,
         "tip_factor": tip_factor,
         "mat_idx": mat_idx,
+        "emitter_verts": np.ascontiguousarray(emitter_verts, dtype=np.float32),
+        "emitter_tris": np.ascontiguousarray(emitter_tris, dtype=np.uint32),
+        "emitter_cdf": np.ascontiguousarray(emitter_cdf, dtype=np.float32),
+        "n_emitter_verts": len(emitter_verts) // 3,
+        "n_emitter_tris": len(emitter_tris) // 3,
+        "avg_spacing": avg_spacing,
     }
 
     # CPU fallback (kept for reference, not reached)
