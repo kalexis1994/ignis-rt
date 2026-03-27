@@ -56,8 +56,14 @@ layout(push_constant) uniform PushConstants {
     float tipFactor;
     float cameraX, cameraY, cameraZ;
     float avgSpacing;
-    float kinkAmplitude;   // CURL/WAVE amplitude
-    float kinkFrequency;   // CURL/WAVE frequency
+    float kinkAmplitude;
+    float kinkFrequency;
+    float clumpFactor;     // 0=none, >0=clump tips, <0=clump roots
+    float clumpShape;      // exponent curve
+    float rough1;          // uniform roughness amplitude
+    float rough1Size;      // uniform roughness noise scale
+    float rough2;          // random roughness amplitude
+    float roughEnd;        // endpoint roughness amplitude
 } pc;
 
 // Shared memory for parent root positions (brute-force nearest search)
@@ -204,24 +210,78 @@ void main() {
     }
 
     // ═══════════════════════════════════════════════════
-    // 6b. Apply kink modifiers (CURL)
+    // 6b. Apply child modifiers (Blender-exact formulas)
     // ═══════════════════════════════════════════════════
-    if (pc.kinkAmplitude > 0.0) {
-        // Compute strand tangent for perpendicular displacement
-        vec3 strandDir = normalize(childKeys[K-1] - childKeys[0]);
-        vec3 kinkRef = abs(strandDir.z) < 0.9 ? vec3(0,0,1) : vec3(1,0,0);
-        vec3 kinkPerp1 = normalize(cross(strandDir, kinkRef));
-        vec3 kinkPerp2 = normalize(cross(strandDir, kinkPerp1));
 
-        // Per-strand random phase
-        float phase = randFloat(seed + 800u) * 6.28318;
+    // Primary parent position per key (for clump target)
+    vec3 primaryKeys[16];
+    for (uint ki = 0; ki < K && ki < 16; ki++)
+        primaryKeys[ki] = parents.keys[bestIdx[0] * K + ki].xyz + offsets[0];
 
-        for (uint ki = 1; ki < K; ki++) {
-            float t = float(ki) / float(K - 1);
-            float angle = t * pc.kinkFrequency * 6.28318 + phase;
-            float amp = pc.kinkAmplitude * t;  // amplitude increases toward tip
-            vec3 curlOffset = kinkPerp1 * cos(angle) * amp + kinkPerp2 * sin(angle) * amp;
-            childKeys[ki] += curlOffset;
+    // Per-strand perpendicular frame for modifiers
+    vec3 strandDir = normalize(childKeys[K-1] - childKeys[0]);
+    vec3 modRef = abs(strandDir.z) < 0.9 ? vec3(0,0,1) : vec3(1,0,0);
+    vec3 modPerp1 = normalize(cross(strandDir, modRef));
+    vec3 modPerp2 = normalize(cross(strandDir, modPerp1));
+
+    // Per-strand random values (deterministic from seed)
+    float rPhase = randFloat(seed + 800u) * 6.28318;
+    float rClump = 0.5 + randFloat(seed + 801u) * 0.5; // pa_clump: 0.5-1.0
+    vec3 rLoc = vec3(randFloat(seed+802u), randFloat(seed+803u), randFloat(seed+804u));
+
+    for (uint ki = 1; ki < K; ki++) {
+        float t = float(ki) / float(K - 1);
+
+        // ── Clump: pull child toward primary parent ──
+        // Blender: clump = clumpfac * pa_clump * pow(t, cpow)
+        // interp_v3_v3v3(result, co, par_co, clump)
+        if (abs(pc.clumpFactor) > 0.001) {
+            float cpow = pc.clumpShape < 0.0
+                ? 1.0 + pc.clumpShape
+                : 1.0 + 9.0 * pc.clumpShape;
+            cpow = max(cpow, 0.001);
+            float clump;
+            if (pc.clumpFactor < 0.0)
+                clump = -pc.clumpFactor * rClump * pow(1.0 - t, cpow);
+            else
+                clump = pc.clumpFactor * rClump * pow(t, cpow);
+            childKeys[ki] = mix(childKeys[ki], primaryKeys[ki], clamp(clump, 0.0, 1.0));
+        }
+
+        // ── Kink/Curl: helical displacement ──
+        if (pc.kinkAmplitude > 0.0) {
+            float angle = t * pc.kinkFrequency * 6.28318 + rPhase;
+            float amp = pc.kinkAmplitude * t;
+            childKeys[ki] += modPerp1 * cos(angle) * amp + modPerp2 * sin(angle) * amp;
+        }
+
+        // ── Roughness 1: uniform noise displacement ──
+        if (pc.rough1 > 0.0) {
+            // Simplified turbulence: use per-strand random + t variation
+            vec3 rco = rLoc * t;
+            float r0 = -1.0 + 2.0 * fract(sin(dot(rco, vec3(12.9898,78.233,45.164))) * 43758.5453);
+            float r1 = -1.0 + 2.0 * fract(sin(dot(rco, vec3(93.989,67.345,11.874))) * 23421.6312);
+            float r2 = -1.0 + 2.0 * fract(sin(dot(rco, vec3(27.163,41.975,83.573))) * 65834.1247);
+            childKeys[ki] += modPerp1 * pc.rough1 * r0 * pc.rough1Size * 0.1;
+            childKeys[ki] += modPerp2 * pc.rough1 * r1 * pc.rough1Size * 0.1;
+            childKeys[ki] += strandDir * pc.rough1 * r2 * pc.rough1Size * 0.05;
+        }
+
+        // ── Roughness 2: random displacement ──
+        if (pc.rough2 > 0.0) {
+            float r0 = -1.0 + 2.0 * randFloat(seed + ki * 5u + 900u);
+            float r1 = -1.0 + 2.0 * randFloat(seed + ki * 5u + 901u);
+            childKeys[ki] += modPerp1 * pc.rough2 * r0 * 0.1;
+            childKeys[ki] += modPerp2 * pc.rough2 * r1 * 0.1;
+        }
+
+        // ── Roughness Endpoint: increases toward tip ──
+        if (pc.roughEnd > 0.0) {
+            float roughfac = pc.roughEnd * t * t; // shape=2 (quadratic increase)
+            float r0 = -1.0 + 2.0 * rLoc.x;
+            float r1 = -1.0 + 2.0 * rLoc.y;
+            childKeys[ki] += modPerp1 * roughfac * r0 * 0.1;
+            childKeys[ki] += modPerp2 * roughfac * r1 * 0.1;
         }
     }
 

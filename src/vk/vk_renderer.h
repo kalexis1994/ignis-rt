@@ -64,7 +64,10 @@ public:
                         const float* emitterCDF,
                         float rootRadius, float tipFactor,
                         float camX, float camY, float camZ, float avgSpacing,
-                        float kinkAmplitude, float kinkFrequency);
+                        float kinkAmplitude, float kinkFrequency,
+                        float clumpFactor, float clumpShape,
+                        float rough1, float rough1Size,
+                        float rough2, float roughEnd);
     void UpdateCamera(const CameraUBO& camera);
     void RenderFrameRT();
 

@@ -703,7 +703,13 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                                 cam_z=float(cam_pos[2]),
                                 avg_spacing=m.get("avg_spacing", avg_sp),
                                 kink_amplitude=m.get("kink_amplitude", 0.0),
-                                kink_frequency=m.get("kink_frequency", 2.0))
+                                kink_frequency=m.get("kink_frequency", 2.0),
+                                clump_factor=m.get("clump_factor", 0.0),
+                                clump_shape=m.get("clump_shape", 0.0),
+                                rough1=m.get("roughness_1", 0.0),
+                                rough1_size=m.get("roughness_1_size", 1.0),
+                                rough2=m.get("roughness_2", 0.0),
+                                rough_end=m.get("roughness_endpoint", 0.0))
                             if blas >= 0:
                                 _ignis_blas_handles[mesh_key] = blas
                                 # Compute tri count for material assignment

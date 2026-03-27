@@ -257,6 +257,12 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
         "avg_spacing": avg_spacing,
         "kink_amplitude": getattr(settings, 'kink_amplitude', 0.0),
         "kink_frequency": getattr(settings, 'kink_frequency', 2.0),
+        "clump_factor": getattr(settings, 'clump_factor', 0.0),
+        "clump_shape": getattr(settings, 'clump_shape', 0.0),
+        "roughness_1": getattr(settings, 'roughness_1', 0.0),
+        "roughness_1_size": getattr(settings, 'roughness_1_size', 1.0),
+        "roughness_2": getattr(settings, 'roughness_2', 0.0),
+        "roughness_endpoint": getattr(settings, 'roughness_endpoint', 0.0),
     }
 
     # CPU fallback (kept for reference, not reached)

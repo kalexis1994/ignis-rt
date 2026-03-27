@@ -791,11 +791,11 @@ bool Renderer::CreateHairComputePipeline() {
     layoutInfo.pBindings = bindings;
     vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &hairComputeDescSetLayout_);
 
-    // Push constants (12 floats/uints = 48 bytes)
+    // Push constants (18 floats/uints = 72 bytes)
     VkPushConstantRange pushRange{};
     pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pushRange.offset = 0;
-    pushRange.size = 48;
+    pushRange.size = 72;
 
     VkPipelineLayoutCreateInfo plInfo{};
     plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -861,7 +861,10 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
                                const float* emitterCDF,
                                float rootRadius, float tipFactor,
                                float camX, float camY, float camZ, float avgSpacing,
-                               float kinkAmplitude, float kinkFrequency) {
+                               float kinkAmplitude, float kinkFrequency,
+                               float clumpFactor, float clumpShape,
+                               float rough1, float rough1Size,
+                               float rough2, float roughEnd) {
     if (!accelBuilder_) return -1;
     if (!CreateHairComputePipeline()) return -1;
 
@@ -1045,9 +1048,16 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
         float avgSpacing;
         float kinkAmplitude;
         float kinkFrequency;
+        float clumpFactor;
+        float clumpShape;
+        float rough1;
+        float rough1Size;
+        float rough2;
+        float roughEnd;
     } pc = {nParents, keysPerStrand, totalChildren, nEmitterTris,
             rootRadius, tipFactor, camX, camY, camZ, avgSpacing,
-            kinkAmplitude, kinkFrequency};
+            kinkAmplitude, kinkFrequency,
+            clumpFactor, clumpShape, rough1, rough1Size, rough2, roughEnd};
     vkCmdPushConstants(cmd, hairComputePipelineLayout_,
         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
