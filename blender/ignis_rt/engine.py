@@ -709,12 +709,14 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                                 rough1=m.get("roughness_1", 0.0),
                                 rough1_size=m.get("roughness_1_size", 1.0),
                                 rough2=m.get("roughness_2", 0.0),
-                                rough_end=m.get("roughness_endpoint", 0.0))
+                                rough_end=m.get("roughness_endpoint", 0.0),
+                                child_mode=m.get("child_mode", 0))
                             if blas >= 0:
                                 _ignis_blas_handles[mesh_key] = blas
-                                # Compute tri count for material assignment
+                                # Compute tri count for material assignment (must match shader SUBDIV=4)
                                 total_children = n_p * child_nbr
-                                tris_per_child = (m["n_keys"] - 1) * 2
+                                subdiv_points = (m["n_keys"] - 1) * 4 + 1
+                                tris_per_child = (subdiv_points - 1) * 2
                                 m["_gpu_tri_count"] = total_children * tris_per_child
                                 _log(f"  GPU hair OK: '{mesh_key}' → BLAS {blas} ({m['_gpu_tri_count']} tris)")
                             else:

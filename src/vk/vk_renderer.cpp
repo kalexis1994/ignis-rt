@@ -791,11 +791,11 @@ bool Renderer::CreateHairComputePipeline() {
     layoutInfo.pBindings = bindings;
     vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &hairComputeDescSetLayout_);
 
-    // Push constants (18 floats/uints = 72 bytes)
+    // Push constants (20 floats/uints = 80 bytes)
     VkPushConstantRange pushRange{};
     pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pushRange.offset = 0;
-    pushRange.size = 72;
+    pushRange.size = 80;
 
     VkPipelineLayoutCreateInfo plInfo{};
     plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -864,14 +864,18 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
                                float kinkAmplitude, float kinkFrequency,
                                float clumpFactor, float clumpShape,
                                float rough1, float rough1Size,
-                               float rough2, float roughEnd) {
+                               float rough2, float roughEnd,
+                               uint32_t childMode) {
     if (!accelBuilder_) return -1;
     if (!CreateHairComputePipeline()) return -1;
 
     VkDevice device = context_->GetDevice();
     uint32_t totalChildren = nParents * childrenPerParent;
-    uint32_t vertsPerChild = keysPerStrand * 2;
-    uint32_t trisPerChild = (keysPerStrand - 1) * 2;
+    // Catmull-Rom subdivision: 4 sub-segments per key segment (must match shader SUBDIV)
+    const uint32_t SUBDIV = 4;
+    uint32_t subdivPoints = (keysPerStrand - 1) * SUBDIV + 1;
+    uint32_t vertsPerChild = subdivPoints * 2;
+    uint32_t trisPerChild = (subdivPoints - 1) * 2;
     uint32_t totalVerts = totalChildren * vertsPerChild;
     uint32_t totalIndices = totalChildren * trisPerChild * 3;
 
@@ -1054,10 +1058,13 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
         float rough1Size;
         float rough2;
         float roughEnd;
+        uint32_t childMode;
+        uint32_t pad0;
     } pc = {nParents, keysPerStrand, totalChildren, nEmitterTris,
             rootRadius, tipFactor, camX, camY, camZ, avgSpacing,
             kinkAmplitude, kinkFrequency,
-            clumpFactor, clumpShape, rough1, rough1Size, rough2, roughEnd};
+            clumpFactor, clumpShape, rough1, rough1Size, rough2, roughEnd,
+            childMode, 0u};
     vkCmdPushConstants(cmd, hairComputePipelineLayout_,
         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 

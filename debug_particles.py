@@ -35,6 +35,7 @@ for obj in bpy.data.objects:
         print(f"  roughness_endpoint={getattr(s, 'roughness_endpoint', '?')}")
         print(f"  kink={getattr(s, 'kink', '?')}")
         print(f"  kink_amplitude={getattr(s, 'kink_amplitude', '?')}")
+        print(f"  kink_frequency={getattr(s, 'kink_frequency', '?')}")
         print(f"  len(particles)={len(ps.particles)}")
         n_child = len(ps.child_particles) if hasattr(ps, 'child_particles') else 0
         print(f"  len(child_particles)={n_child}")

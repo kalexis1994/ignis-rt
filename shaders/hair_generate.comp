@@ -64,6 +64,8 @@ layout(push_constant) uniform PushConstants {
     float rough1Size;      // uniform roughness noise scale
     float rough2;          // random roughness amplitude
     float roughEnd;        // endpoint roughness amplitude
+    uint childMode;        // 0=INTERPOLATED, 1=SIMPLE
+    uint pad0;
 } pc;
 
 // Shared memory for parent root positions (brute-force nearest search)
@@ -96,8 +98,11 @@ void main() {
     if (childIdx >= pc.totalChildren) return;
 
     uint K = pc.keysPerStrand;
-    uint vertsPerStrand = K * 2;
-    uint trisPerStrand = (K - 1) * 2;
+    // Catmull-Rom subdivision: 4 sub-segments per key segment → smoother curves
+    const uint SUBDIV = 4u;
+    uint S = (K - 1) * SUBDIV + 1;  // total subdivided points
+    uint vertsPerStrand = S * 2;
+    uint trisPerStrand = (S - 1) * 2;
     uint idxPerStrand = trisPerStrand * 3;
     uint seed = childIdx * 17u + 43u;
 
@@ -132,80 +137,89 @@ void main() {
     }
 
     // ═══════════════════════════════════════════════════
-    // 4. Find 4 nearest parents (brute force with shared memory)
+    // 4-6. Parent selection + key interpolation
+    //      SIMPLE: each child → 1 parent + perpendicular offset
+    //      INTERPOLATED: each child → 4 nearest parents weighted
     // ═══════════════════════════════════════════════════
-    float bestDist[4] = float[4](1e30, 1e30, 1e30, 1e30);
     uint bestIdx[4] = uint[4](0, 0, 0, 0);
-
+    float weights[4] = float[4](1.0, 0.0, 0.0, 0.0);
+    vec3 childKeys[16];
     uint localId = gl_LocalInvocationID.x;
-    uint nBlocks = (pc.nParents + 63u) / 64u;
 
-    for (uint block = 0; block < nBlocks; block++) {
-        // Load parent roots into shared memory
-        uint loadIdx = block * 64u + localId;
-        if (loadIdx < pc.nParents) {
-            sharedRoots[localId] = parents.keys[loadIdx * K].xyz;
+    if (pc.childMode == 1u) {
+        // ── SIMPLE mode: assign to one parent, offset perpendicular ──
+        uint childPerParent = pc.totalChildren / max(pc.nParents, 1u);
+        uint assignedParent = min(childIdx / max(childPerParent, 1u), pc.nParents - 1u);
+        bestIdx[0] = assignedParent;
+
+        // Random perpendicular offset (constant along strand = same shape, shifted root)
+        vec3 parentRoot = parents.keys[assignedParent * K].xyz;
+        vec3 parentTip = parents.keys[assignedParent * K + K - 1].xyz;
+        vec3 strandDir = normalize(parentTip - parentRoot);
+        vec3 sRef = abs(strandDir.z) < 0.9 ? vec3(0,0,1) : vec3(1,0,0);
+        vec3 sp1 = normalize(cross(strandDir, sRef));
+        vec3 sp2 = normalize(cross(strandDir, sp1));
+
+        float angle = randFloat(seed + 500u) * 6.28318;
+        float dist = (0.3 + randFloat(seed + 501u) * 0.7) * pc.avgSpacing * 0.5;
+        vec3 offset = sp1 * cos(angle) * dist + sp2 * sin(angle) * dist;
+
+        // Copy parent keys + uniform offset
+        for (uint ki = 0; ki < K && ki < 16; ki++) {
+            childKeys[ki] = parents.keys[assignedParent * K + ki].xyz + offset;
         }
-        barrier();
+        childRoot = childKeys[0];
+    } else {
+        // ── INTERPOLATED mode: find 4 nearest parents ──
+        float bestDist[4] = float[4](1e30, 1e30, 1e30, 1e30);
+        uint nBlocks = (pc.nParents + 63u) / 64u;
 
-        // Check each parent in this block
-        uint blockEnd = min(64u, pc.nParents - block * 64u);
-        for (uint i = 0; i < blockEnd; i++) {
-            vec3 diff = childRoot - sharedRoots[i];
-            float d = dot(diff, diff); // squared distance
-            uint parentGlobalIdx = block * 64u + i;
+        for (uint block = 0; block < nBlocks; block++) {
+            uint loadIdx = block * 64u + localId;
+            if (loadIdx < pc.nParents) {
+                sharedRoots[localId] = parents.keys[loadIdx * K].xyz;
+            }
+            barrier();
 
-            // Insert into sorted top-4
-            if (d < bestDist[3]) {
-                bestDist[3] = d;
-                bestIdx[3] = parentGlobalIdx;
-                // Bubble sort to maintain order
-                for (int j = 2; j >= 0; j--) {
-                    if (bestDist[j+1] < bestDist[j]) {
-                        float td = bestDist[j]; bestDist[j] = bestDist[j+1]; bestDist[j+1] = td;
-                        uint ti = bestIdx[j]; bestIdx[j] = bestIdx[j+1]; bestIdx[j+1] = ti;
+            uint blockEnd = min(64u, pc.nParents - block * 64u);
+            for (uint i = 0; i < blockEnd; i++) {
+                vec3 diff = childRoot - sharedRoots[i];
+                float d = dot(diff, diff);
+                uint parentGlobalIdx = block * 64u + i;
+                if (d < bestDist[3]) {
+                    bestDist[3] = d;
+                    bestIdx[3] = parentGlobalIdx;
+                    for (int j = 2; j >= 0; j--) {
+                        if (bestDist[j+1] < bestDist[j]) {
+                            float td = bestDist[j]; bestDist[j] = bestDist[j+1]; bestDist[j+1] = td;
+                            uint ti = bestIdx[j]; bestIdx[j] = bestIdx[j+1]; bestIdx[j+1] = ti;
+                        }
                     }
                 }
             }
+            barrier();
         }
-        barrier();
-    }
 
-    // ═══════════════════════════════════════════════════
-    // 5. Compute Blender-exact distance weights
-    //    w[i] = 2^(-6 * dist[i] / max_dist), then normalize
-    // ═══════════════════════════════════════════════════
-    float maxDist = sqrt(bestDist[3]); // furthest of the 4
-    if (maxDist < 1e-8) maxDist = 1e-8;
-
-    float weights[4];
-    float wSum = 0.0;
-    for (int i = 0; i < 4; i++) {
-        float d = sqrt(bestDist[i]);
-        weights[i] = exp2(-6.0 * d / maxDist);
-        wSum += weights[i];
-    }
-    if (wSum > 0.0) {
-        for (int i = 0; i < 4; i++) weights[i] /= wSum;
-    } else {
-        weights[0] = 1.0; weights[1] = 0.0; weights[2] = 0.0; weights[3] = 0.0;
-    }
-
-    // ═══════════════════════════════════════════════════
-    // 6. Compute offsets and interpolate keys
-    // ═══════════════════════════════════════════════════
-    vec3 offsets[4];
-    for (int i = 0; i < 4; i++) {
-        vec3 parentRoot = parents.keys[bestIdx[i] * K].xyz;
-        offsets[i] = childRoot - parentRoot;
-    }
-
-    vec3 childKeys[16]; // max 16 keys
-    for (uint ki = 0; ki < K && ki < 16; ki++) {
-        childKeys[ki] = vec3(0.0);
+        // Distance weights: w[i] = 2^(-6 * dist / maxDist)
+        float maxD = sqrt(bestDist[3]);
+        if (maxD < 1e-8) maxD = 1e-8;
+        float wSum = 0.0;
         for (int i = 0; i < 4; i++) {
-            vec3 parentPos = parents.keys[bestIdx[i] * K + ki].xyz;
-            childKeys[ki] += weights[i] * (parentPos + offsets[i]);
+            weights[i] = exp2(-6.0 * sqrt(bestDist[i]) / maxD);
+            wSum += weights[i];
+        }
+        if (wSum > 0.0) for (int i = 0; i < 4; i++) weights[i] /= wSum;
+
+        // Compute offsets and interpolate keys
+        vec3 offsets[4];
+        for (int i = 0; i < 4; i++) {
+            offsets[i] = childRoot - parents.keys[bestIdx[i] * K].xyz;
+        }
+        for (uint ki = 0; ki < K && ki < 16; ki++) {
+            childKeys[ki] = vec3(0.0);
+            for (int i = 0; i < 4; i++) {
+                childKeys[ki] += weights[i] * (parents.keys[bestIdx[i] * K + ki].xyz + offsets[i]);
+            }
         }
     }
 
@@ -214,9 +228,20 @@ void main() {
     // ═══════════════════════════════════════════════════
 
     // Primary parent position per key (for clump target)
+    // In SIMPLE mode, clump pulls toward the assigned parent directly.
+    // In INTERPOLATED mode, clump pulls toward the nearest parent + offset.
     vec3 primaryKeys[16];
-    for (uint ki = 0; ki < K && ki < 16; ki++)
-        primaryKeys[ki] = parents.keys[bestIdx[0] * K + ki].xyz + offsets[0];
+    if (pc.childMode == 1u) {
+        // SIMPLE: parent keys are already at the right position
+        vec3 clumpOffset = childKeys[0] - parents.keys[bestIdx[0] * K].xyz;
+        for (uint ki = 0; ki < K && ki < 16; ki++)
+            primaryKeys[ki] = parents.keys[bestIdx[0] * K + ki].xyz + clumpOffset;
+    } else {
+        // INTERPOLATED: use childRoot offset from nearest parent
+        vec3 off0 = childRoot - parents.keys[bestIdx[0] * K].xyz;
+        for (uint ki = 0; ki < K && ki < 16; ki++)
+            primaryKeys[ki] = parents.keys[bestIdx[0] * K + ki].xyz + off0;
+    }
 
     // Per-strand perpendicular frame for modifiers
     vec3 strandDir = normalize(childKeys[K-1] - childKeys[0]);
@@ -286,35 +311,57 @@ void main() {
     }
 
     // ═══════════════════════════════════════════════════
-    // 7. Generate ribbon vertices
+    // 7. Catmull-Rom subdivision + ribbon generation
     // ═══════════════════════════════════════════════════
 
-    // Tangents per key
-    vec3 tangents[16];
-    tangents[0] = normalize(childKeys[1] - childKeys[0]);
-    for (uint ki = 1; ki < K - 1; ki++)
-        tangents[ki] = normalize(childKeys[ki+1] - childKeys[ki-1]);
-    tangents[K-1] = normalize(childKeys[K-1] - childKeys[K-2]);
-
-    // Per-strand random angle for ribbon orientation
     float strandAngle = randFloat(seed + 900u) * 6.28318;
-
     uint vertBase = childIdx * vertsPerStrand;
-    for (uint ki = 0; ki < K; ki++) {
-        float t = float(ki) / float(K - 1);
-        float radius = pc.rootRadius * (1.0 - t + t * pc.tipFactor);
+    uint idxBase = childIdx * idxPerStrand;
+
+    // Generate S subdivided points via Catmull-Rom interpolation
+    for (uint si = 0; si < S; si++) {
+        // Map si to segment + local t
+        float globalT = float(si) / float(S - 1);  // 0→1 along entire strand
+        float segF = globalT * float(K - 1);
+        uint seg = min(uint(segF), K - 2);
+        float localT = segF - float(seg);
+
+        // Catmull-Rom: 4 control points (clamp at boundaries)
+        uint i0 = (seg > 0) ? seg - 1 : 0;
+        uint i1 = seg;
+        uint i2 = min(seg + 1, K - 1);
+        uint i3 = min(seg + 2, K - 1);
+
+        vec3 p0 = childKeys[i0], p1 = childKeys[i1];
+        vec3 p2 = childKeys[i2], p3 = childKeys[i3];
+
+        // Catmull-Rom basis (tension=0.5)
+        float t2 = localT * localT;
+        float t3 = t2 * localT;
+        vec3 pos = 0.5 * ((2.0*p1) +
+                          (-p0 + p2) * localT +
+                          (2.0*p0 - 5.0*p1 + 4.0*p2 - p3) * t2 +
+                          (-p0 + 3.0*p1 - 3.0*p2 + p3) * t3);
+
+        // Tangent (derivative of Catmull-Rom)
+        vec3 tang = 0.5 * ((-p0 + p2) +
+                           (4.0*p0 - 10.0*p1 + 8.0*p2 - 2.0*p3) * localT +
+                           (-3.0*p0 + 9.0*p1 - 9.0*p2 + 3.0*p3) * t2);
+        tang = normalize(tang);
+
+        float radius = pc.rootRadius * (1.0 - globalT + globalT * pc.tipFactor);
 
         // Perpendicular frame
-        vec3 ref = abs(tangents[ki].z) < 0.9 ? vec3(0,0,1) : vec3(1,0,0);
-        vec3 p1 = normalize(cross(tangents[ki], ref));
-        vec3 p2 = normalize(cross(tangents[ki], p1));
-        vec3 perp = p1 * cos(strandAngle) + p2 * sin(strandAngle);
+        vec3 ref = abs(tang.z) < 0.9 ? vec3(0,0,1) : vec3(1,0,0);
+        vec3 pp1 = normalize(cross(tang, ref));
+        vec3 pp2 = normalize(cross(tang, pp1));
+        vec3 perp = pp1 * cos(strandAngle) + pp2 * sin(strandAngle);
 
-        vec3 normal = normalize(cross(perp, tangents[ki]));
-        vec3 left  = childKeys[ki] - perp * radius;
-        vec3 right = childKeys[ki] + perp * radius;
+        vec3 normal = normalize(cross(perp, tang));
+        vec3 left  = pos - perp * radius;
+        vec3 right = pos + perp * radius;
 
-        uint vi = vertBase + ki * 2;
+        uint vi = vertBase + si * 2;
         outPos.pos[vi*3+0] = left.x;  outPos.pos[vi*3+1] = left.y;  outPos.pos[vi*3+2] = left.z;
         outPos.pos[(vi+1)*3+0] = right.x; outPos.pos[(vi+1)*3+1] = right.y; outPos.pos[(vi+1)*3+2] = right.z;
         outNrm.nrm[vi*3+0] = normal.x; outNrm.nrm[vi*3+1] = normal.y; outNrm.nrm[vi*3+2] = normal.z;
@@ -322,8 +369,7 @@ void main() {
     }
 
     // Triangle strip indices
-    uint idxBase = childIdx * idxPerStrand;
-    for (uint si = 0; si < K - 1; si++) {
+    for (uint si = 0; si < S - 1; si++) {
         uint i0 = vertBase + si * 2;
         uint base = idxBase + si * 6;
         outIdx.idx[base+0] = i0;   outIdx.idx[base+1] = i0+2; outIdx.idx[base+2] = i0+1;
