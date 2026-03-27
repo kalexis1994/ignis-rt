@@ -902,8 +902,9 @@ void main() {
 
         // Shadow terminator fix: only correct normals that cross below the geometric plane.
         // Positive NdotNg = valid (even at grazing angles). Negative = below surface = fix.
-        vec3 geoNormal = normalize(cross(wp1 - wp0, wp2 - wp0));
-        if (dot(geoNormal, -rayDir) < 0.0) geoNormal = -geoNormal;
+        vec3 geoNormalRaw = normalize(cross(wp1 - wp0, wp2 - wp0)); // true triangle normal
+        vec3 geoNormal = geoNormalRaw;
+        if (dot(geoNormal, -rayDir) < 0.0) geoNormal = -geoNormal; // flip toward camera
         float NdotNg = dot(worldN, geoNormal);
         if (NdotNg < 0.0) {
             // Normal is below the surface — snap to geometric normal
@@ -1122,7 +1123,7 @@ void main() {
         // the camera, causing black bands. Fix: if N·V < 0, project N onto
         // the plane perpendicular to V so it stays in the correct hemisphere.
         vec3 N = pbrHit.worldNormal;
-        vec3 gN = geoNormal;  // unperturbed geometric normal
+        vec3 gN = geoNormal;  // camera-facing geometric normal
         bool frontFace = dot(gN, -rayDir) >= 0.0;
         if (!frontFace) {
             gN = -gN;
@@ -1981,30 +1982,33 @@ void main() {
             glassBounces++;
             if (glassBounces >= MAX_GLASS_BOUNCES) break;
 
-            float eta = frontFace ? (1.0 / pbrHit.ior) : pbrHit.ior;
+            // Use GEOMETRIC normal for refraction — normal maps should not distort it.
+            // Determine entry/exit from the RAW triangle normal (geoNormalRaw),
+            // NOT geoNormal which was pre-flipped toward camera (always frontFace=true).
+            bool enteringGlass = dot(geoNormalRaw, -rayDir) >= 0.0;
+            vec3 refractN = enteringGlass ? geoNormalRaw : -geoNormalRaw; // face toward ray
+            float eta = enteringGlass ? (1.0 / pbrHit.ior) : pbrHit.ior;
             float alpha = pbrHit.roughness * pbrHit.roughness;
 
             // Sample microfacet normal (GGX) for rough glass
-            // Cycles: when alpha² < 2e-10, treat as perfectly specular (H = N, no sampling)
             vec3 V = -rayDir;
             vec3 H;
-            bool singularGlass = (alpha < 0.0005);  // ~roughness < 0.022
+            bool singularGlass = (alpha < 0.0005);
             if (!singularGlass && alpha > 0.0) {
-                // GGX importance sampling of half-vector (rough glass)
                 alpha = max(alpha, 0.001);
                 vec2 xi = rand2();
                 float phi = 2.0 * PI * xi.x;
                 float cosTheta = sqrt((1.0 - xi.y) / (1.0 + (alpha * alpha - 1.0) * xi.y));
                 float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
-                vec3 up = abs(N.y) < 0.999 ? vec3(0,1,0) : vec3(1,0,0);
-                vec3 tanX = normalize(cross(up, N));
-                vec3 tanY = cross(N, tanX);
-                H = normalize(sinTheta * cos(phi) * tanX + sinTheta * sin(phi) * tanY + cosTheta * N);
+                vec3 up = abs(refractN.y) < 0.999 ? vec3(0,1,0) : vec3(1,0,0);
+                vec3 tanX = normalize(cross(up, refractN));
+                vec3 tanY = cross(refractN, tanX);
+                H = normalize(sinTheta * cos(phi) * tanX + sinTheta * sin(phi) * tanY + cosTheta * refractN);
             } else {
-                H = N;  // Perfect specular: no microfacet scatter
+                H = refractN;
             }
 
-            // Fresnel at microfacet (use full IOR for correct reflections)
+            // Fresnel at microfacet
             float cosI = abs(dot(V, H));
             float f0 = (pbrHit.ior - 1.0) / (pbrHit.ior + 1.0);
             f0 = f0 * f0;
@@ -2015,13 +2019,13 @@ void main() {
             bool canRefract = dot(refracted, refracted) > 0.0001;
 
             if (!canRefract || rand01() < fresnel) {
-                // Reflection off microfacet
+                // Reflection: stay on incident side
                 rayDir = reflect(rayDir, H);
-                rayOrigin = pbrHit.worldPos + N * 0.003;
+                rayOrigin = pbrHit.worldPos + refractN * 0.001;
             } else {
-                // Refraction through microfacet
+                // Refraction: cross to other side of surface
                 rayDir = refracted;
-                rayOrigin = pbrHit.worldPos + rayDir * 0.01;
+                rayOrigin = pbrHit.worldPos - refractN * 0.001;
             }
             throughput *= pbrHit.baseColor;
             if (bounce == 0) { isDiffusePath = false; captureSpecularMV = true; }
