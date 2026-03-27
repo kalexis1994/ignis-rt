@@ -2083,36 +2083,62 @@ void main() {
         float specWeight = (F.r + F.g + F.b) / 3.0;
         // For metals, specWeight is high; for dielectrics at normal incidence, ~4%
 
-        // ── Hair BSDF: Chiang Principled Hair (R + TT + TRT) ──
+        // ── Hair shading: distance-based LOD (Chiang → R-only → Lambert) ──
         bool isHairSurface = (geo.bitangentBufferAddress != 0u);
         if (isHairSurface) {
             vec3 hairT = hairSmoothT;
-
-            // Hair parameters from material
             vec3 hairColor = pbrHit.baseColor;
-            float hairRoughness = max(pbrHit.roughness, 0.05);
-            float hairIOR = 1.55;
-            float hairAlpha = -0.035; // cuticle tilt ~2 degrees
-
-            // Absorption coefficient from color
-            vec3 sigma = -log(max(hairColor, vec3(0.001)));
-
-            // h = position across fiber from v-encoded normals (set before cylindrical override)
-            float h = hairV;
-
-            // Sample bounce direction: cosine-weighted hemisphere around tangent plane
-            // (simplified importance sampling for hair — full Chiang sampling is complex)
             vec3 bounceN = worldN;
+
+            // Distance-based shader LOD — smooth transition, no popping
+            float hairDist = hitT;
+            // LOD levels: 0.0 = close (full Chiang), 1.0 = far (Lambert)
+            // Smooth ramp: full quality < 3 units, Lambert > 10 units
+            float lodFactor = clamp((hairDist - 3.0) / 7.0, 0.0, 1.0);
+
+            // Stochastic skip for distant hair bounces (bounce > 0 only)
+            // Far hair on secondary bounces contributes little — skip with probability
+            if (bounce > 0 && lodFactor > 0.3) {
+                float skipProb = lodFactor * 0.8; // up to 80% skip at max distance
+                if (rand01() < skipProb) {
+                    // Russian Roulette: compensate energy for surviving rays
+                    throughput /= max(1.0 - skipProb, 0.1);
+                    // Pass through hair — continue ray as if transparent
+                    rayOrigin = pbrHit.worldPos + rayDir * 0.02;
+                    bounce--;
+                    continue;
+                }
+                throughput /= max(1.0 - skipProb, 0.1);
+            }
+
             vec3 newDir = sampleCosineHemisphere(rand2(), bounceN);
+            vec3 hairF;
 
-            // Evaluate Chiang BSDF
-            vec3 wi = -rayDir;   // toward surface (incoming)
-            vec3 wo = newDir;    // outgoing (bounce)
-            vec3 hairF = hair_chiang_eval(wi, wo, hairT, sigma,
-                                          hairRoughness, hairRoughness,
-                                          hairAlpha, hairIOR, h);
+            if (lodFactor < 0.5) {
+                // ── Close: full Chiang BSDF (R + TT + TRT) ──
+                float hairRoughness = max(pbrHit.roughness, 0.05);
+                float hairIOR = 1.55;
+                float hairAlpha = -0.035;
+                vec3 sigma = -log(max(hairColor, vec3(0.001)));
+                float h = hairV;
 
-            // PDF of cosine hemisphere sampling
+                vec3 wi = -rayDir;
+                vec3 wo = newDir;
+                hairF = hair_chiang_eval(wi, wo, hairT, sigma,
+                                         hairRoughness, hairRoughness,
+                                         hairAlpha, hairIOR, h);
+
+                // Blend toward simplified at lodFactor 0.3-0.5
+                if (lodFactor > 0.3) {
+                    float blend = (lodFactor - 0.3) / 0.2;
+                    vec3 simpleF = hairColor * INV_PI * max(dot(newDir, bounceN), 0.0);
+                    hairF = mix(hairF, simpleF, blend);
+                }
+            } else {
+                // ── Far: simple Lambert (hairColor / PI) ──
+                hairF = hairColor * INV_PI * max(dot(newDir, bounceN), 0.0);
+            }
+
             float cosPdf = max(dot(newDir, bounceN), 0.0) * INV_PI;
             if (cosPdf < 1e-6) break;
 
@@ -2122,8 +2148,7 @@ void main() {
             rayDir = newDir;
             if (bounce == 0) isDiffusePath = true;
 
-            float rayOffset = 0.02; // skip sibling ribbon
-            rayOrigin = pbrHit.worldPos + bounceN * rayOffset;
+            rayOrigin = pbrHit.worldPos + bounceN * 0.02;
             prevBounceNormal = bounceN;
             continue;
         }
