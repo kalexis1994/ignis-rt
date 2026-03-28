@@ -674,12 +674,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                                     cam_pos = tuple(rd.view_matrix.inverted().translation)
                             except Exception:
                                 pass
-                            if m.get("precomputed_children", False):
-                                # All strands in parent_keys, useParentParticles=True
-                                # childrenPerParent=0, totalChildren = 0 + nParents = nParents
-                                child_nbr = 0
-                            else:
-                                child_nbr = max(m["child_nbr"], 1)
+                            child_nbr = max(m["child_nbr"], 1)
                             n_p = m["n_parents"]
                             pk = m["parent_keys"].reshape(-1, 3)
                             # Estimate spacing

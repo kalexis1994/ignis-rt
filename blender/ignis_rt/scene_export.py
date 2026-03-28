@@ -199,44 +199,11 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
     child_nbr = getattr(settings, 'child_nbr',
                         getattr(settings, 'child_percent', 0))
 
-    # ── Export pre-computed child positions from Blender (exact Cycles match) ──
-    # Uses co_hair() to get Blender's actual evaluated child positions.
-    # These become "parents" for the GPU (child_nbr=0 → no GPU child generation,
-    # GPU only does subdivision + DOTS ribbon generation).
-    child_keys_list = []
-    if child_type != 'NONE' and child_nbr > 0:
-        n_total_particles = len(particles)
-        dg_ps = particle_system
-        n_children = len(dg_ps.child_particles)
-
-        if n_children > 0:
-            # co_hair() returns world-space positions — convert to object space
-            # to match parent keys from co_object()
-            from mathutils import Vector
-            world_inv = eval_obj.matrix_world.inverted()
-
-            try:
-                for ci in range(n_children):
-                    particle_no = n_total_particles + ci
-                    keys = np.empty((n_keys, 3), dtype=np.float32)
-                    for ki in range(n_keys):
-                        co_world = dg_ps.co_hair(eval_obj, particle_no=particle_no, step=ki)
-                        co_local = world_inv @ Vector(co_world)
-                        keys[ki] = [co_local[0], co_local[1], co_local[2]]
-                    strand_length = np.linalg.norm(keys[-1] - keys[0])
-                    if strand_length > 1e-6:
-                        child_keys_list.append(keys)
-            except Exception as e:
-                import traceback; traceback.print_exc()
-                child_keys_list = []
-
-    # If we got pre-computed children, merge with parents
-    use_precomputed_children = len(child_keys_list) > 0
-    if use_precomputed_children:
-        all_strands = list(parent_list)  # start with parents
-        all_strands.extend(child_keys_list)  # add children
-        parents = np.array(all_strands, dtype=np.float32)
-        n_parents = parents.shape[0]
+    # Child distribution handled by GPU compute shader (emitter surface + frand table).
+    # co_hair() is in an undocumented internal path-cache space that doesn't have
+    # a clean transform to co_object space — GPU generation gives correct shapes
+    # (clump/kink/roughness match Cycles) with slightly different child placement.
+    use_precomputed_children = False
         child_nbr = 0  # GPU does NO child generation — all strands are "parents"
 
     # ── Extract emitter mesh for GPU child distribution ──
