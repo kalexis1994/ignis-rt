@@ -934,6 +934,7 @@ void main() {
                       + vec3(normals.n[i1*3+0], normals.n[i1*3+1], normals.n[i1*3+2]) * bary.y
                       + vec3(normals.n[i2*3+0], normals.n[i2*3+1], normals.n[i2*3+2]) * bary.z;
             vec3 localTangent = octDecode(vec2(rawN.y, rawN.z));
+            hairSmoothT = normalize(mat3(objToWorld) * localTangent);
 
             // Find center LINE of the ribbon and compute v as perpendicular distance.
             // 1. Find same-cross-section left/right pair (opposite v, consecutive indices)
@@ -959,6 +960,10 @@ void main() {
                 centerPt = (wp0 + wp1 + wp2) / 3.0;
                 widthEdge = wp2 - wp0;
             }
+            float widthLen = length(widthEdge);
+            vec3 wDir = (widthLen > 1e-6) ? widthEdge / widthLen : vec3(1, 0, 0);
+            float radius0 = max(widthLen * 0.5, 1e-6);
+
             // Read the ADJACENT triangle to get BOTH centers → exact center line
             uint adjPrimId = (primitiveId % 2u == 0u) ? uint(primitiveId) + 1u : uint(primitiveId) - 1u;
             uint adj_i0 = indices.i[adjPrimId * 3u + 0u];
@@ -977,33 +982,56 @@ void main() {
             float adj_nv1 = normals.n[adj_i1*3u];
             float adj_nv2 = normals.n[adj_i2*3u];
             vec3 otherCenter = (adj_wp0 + adj_wp1 + adj_wp2) / 3.0;  // fallback
+            vec3 otherWidthEdge = adj_wp2 - adj_wp0;
             if (adj_nv0 * adj_nv2 < 0.0 && abs(int(adj_i0)-int(adj_i2)) == 1)
+            {
                 otherCenter = (adj_wp0 + adj_wp2) * 0.5;
+                otherWidthEdge = adj_wp2 - adj_wp0;
+            }
             else if (adj_nv0 * adj_nv1 < 0.0 && abs(int(adj_i0)-int(adj_i1)) == 1)
+            {
                 otherCenter = (adj_wp0 + adj_wp1) * 0.5;
+                otherWidthEdge = adj_wp1 - adj_wp0;
+            }
             else if (adj_nv1 * adj_nv2 < 0.0 && abs(int(adj_i1)-int(adj_i2)) == 1)
+            {
                 otherCenter = (adj_wp1 + adj_wp2) * 0.5;
+                otherWidthEdge = adj_wp2 - adj_wp1;
+            }
+            float radius1 = max(length(otherWidthEdge) * 0.5, 1e-6);
 
-            // EXACT center line direction: from our center to the adjacent center
-            vec3 T = otherCenter - centerPt;
-            float Tlen = length(T);
-            if (Tlen > 1e-8) T /= Tlen; else T = hairSmoothT;
+            // Use the exact ribbon pair centers as the strand axis for projected-cylinder shading.
+            vec3 axisT = otherCenter - centerPt;
+            float axisLen = length(axisT);
+            if (axisLen > 1e-8) axisT /= axisLen; else axisT = hairSmoothT;
 
-            vec3 hitOffset = worldPos - centerPt;
-            vec3 perpOffset = hitOffset - T * dot(hitOffset, T);
-            vec3 wDir = normalize(widthEdge);
-            float halfWidth = length(widthEdge) * 0.5;
-            hairV = clamp(dot(perpOffset, wDir) / max(halfWidth, 1e-8), -1.0, 1.0);
-            // Transform tangent to world space
-            hairSmoothT = normalize(mat3(objToWorld) * localTangent);
+            float segT = (axisLen > 1e-8)
+                ? clamp(dot(worldPos - centerPt, axisT) / axisLen, 0.0, 1.0)
+                : 0.0;
+            segT = smoothstep(0.0, 1.0, segT);  // C1 continuity at segment boundaries
 
-            vec3 hairT = hairSmoothT;
+            vec3 sweepCenter = mix(centerPt, otherCenter, segT);
+            float localRadius = mix(radius0, radius1, segT);
+            const float projectedRadiusOverflow = 1.08;
+            float silhouetteRadius = localRadius * projectedRadiusOverflow;
+            vec3 toHit = worldPos - sweepCenter;
+            vec3 perpToAxis = toHit - axisT * dot(toHit, axisT);
 
-            // Cylindrical normal: component of -rayDir perpendicular to tangent
-            vec3 cylN = -rayDir - hairT * dot(-rayDir, hairT);
-            float cnLen = length(cylN);
-            if (cnLen > 1e-6) cylN /= cnLen;
-            else cylN = vec3(0, 1, 0);
+            // Camera-space left/right direction of the apparent cylinder.
+            vec3 camLR = cross(axisT, -rayDir);
+            float sinViewT = length(camLR);
+            if (sinViewT > 1e-6) camLR /= sinViewT; else camLR = wDir;
+
+            // Slightly inflate the projected cylinder to hide the dark ribbon fringe.
+            float signedV = dot(perpToAxis, camLR) / max(silhouetteRadius, 1e-8);
+            hairV = clamp(signedV, -1.0, 1.0);
+
+            vec3 viewFacing = -cross(axisT, camLR);
+            float vfLen = length(viewFacing);
+            if (vfLen > 1e-6) viewFacing /= vfLen; else viewFacing = geoNormal;
+
+            float cylCos = sqrt(max(0.0, 1.0 - hairV * hairV));
+            vec3 cylN = normalize(hairV * camLR + cylCos * viewFacing);
 
             worldN = cylN;
             geoNormal = cylN;
@@ -1048,21 +1076,8 @@ void main() {
             if (hasA && length(worldPos - centerA) < dotRadius) diagColor = vec3(0.8, 0, 0.8);
             if (hasB && length(worldPos - centerB) < dotRadius) diagColor = vec3(0.8, 0, 0.8);
 
-            // Cylinder shading: bright center → dark edges (like a real cylinder)
-            float segT = clamp(dot(worldPos - centerPt, T) / max(Tlen, 1e-8), 0.0, 1.0);
-            segT = smoothstep(0.0, 1.0, segT);  // C1 continuity at segment boundaries
-            vec3 sweepCenter = mix(centerPt, otherCenter, segT);
-            vec3 toHit = worldPos - sweepCenter;
-            vec3 perpToAxis = toHit - hairSmoothT * dot(toHit, hairSmoothT);
-
-            // camLR: left/right direction from camera (position-based)
-            vec3 camLR = cross(rayDir, hairSmoothT);
-            float sinViewT = length(camLR);
-            if (sinViewT > 1e-6) camLR /= sinViewT; else camLR = wDir;
-
-            // cylV: how far from center in the camera's left/right direction
-            float cylV = abs(dot(perpToAxis, camLR)) / max(halfWidth, 1e-8);
-            cylV = clamp(cylV, 0.0, 1.0);
+            // Cylinder shading: bright center → dark edges in camera projection.
+            float cylV = clamp(abs(signedV), 0.0, 1.0);
 
             // Cylinder cosine falloff: 1 at center (facing camera), 0 at edge
             float cylBrightness = sqrt(max(0.0, 1.0 - cylV * cylV));
