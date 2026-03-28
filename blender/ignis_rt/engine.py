@@ -674,7 +674,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                                     cam_pos = tuple(rd.view_matrix.inverted().translation)
                             except Exception:
                                 pass
-                            child_nbr = max(m["child_nbr"], 1)
+                            child_nbr = max(int(m.get("child_nbr", 0)), 0)
+                            render_parents = bool(m.get("use_parent_particles", False) or child_nbr == 0)
                             n_p = m["n_parents"]
                             pk = m["parent_keys"].reshape(-1, 3)
                             # Estimate spacing
@@ -688,7 +689,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                                 avg_sp = 0.01
                             n_ev = m.get("n_emitter_verts", 0)
                             n_et = m.get("n_emitter_tris", 0)
-                            _log(f"  GPU hair: {n_p} parents, {m['n_keys']} keys, {child_nbr} children, emitter={n_ev}v/{n_et}t")
+                            _log(f"  GPU hair: {n_p} strands, {m['n_keys']} keys, {child_nbr} generated children, "
+                                 f"render_parents={render_parents}, emitter={n_ev}v/{n_et}t")
                             # Generate Blender-exact frand table for this particle system
                             from . import blender_rng
                             _frand_tables = blender_rng.generate_psys_frand_tables()
@@ -721,13 +723,15 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                                 kink_amp_random=m.get("kink_amp_random", 0.0),
                                 opaque_hair=m.get("opaque_hair", False),
                                 child_size_random=m.get("child_size_random", 0.0),
-                                use_parent_particles=m.get("use_parent_particles", False),
+                                use_parent_particles=render_parents,
                                 blender_seed=_psys_seed,
                                 frand_table=_frand_scrambled)
                             if blas >= 0:
                                 _ignis_blas_handles[mesh_key] = blas
                                 # Compute tri count for material assignment (must match shader SUBDIV=8, DOTS=4 tris/seg)
                                 total_children = n_p * child_nbr
+                                if render_parents:
+                                    total_children += n_p
                                 subdiv_points = (m["n_keys"] - 1) * 16 + 1 + 4  # + TIP_EXTRA
                                 tris_per_child = (subdiv_points - 1) * 4
                                 m["_gpu_tri_count"] = total_children * tris_per_child

@@ -143,6 +143,45 @@ vec3 safePos(vec3 p, vec3 fallback) {
     return p;
 }
 
+vec3 makeStableRibbonPerp(vec3 tangent)
+{
+    vec3 ref = abs(tangent.z) < 0.9 ? vec3(0,0,1) : vec3(1,0,0);
+    vec3 perp = cross(tangent, ref);
+    float perpLen = length(perp);
+    if (perpLen < 1e-6) {
+        ref = vec3(0,1,0);
+        perp = cross(tangent, ref);
+        perpLen = length(perp);
+    }
+    if (perpLen < 1e-6)
+        return vec3(1,0,0);
+    return perp / perpLen;
+}
+
+vec3 transportRibbonPerp(vec3 prevPerp, vec3 prevTang, vec3 currTang)
+{
+    vec3 perp = prevPerp - currTang * dot(prevPerp, currTang);
+    float perpLen = length(perp);
+    if (perpLen < 1e-6) {
+        vec3 bendAxis = cross(prevTang, currTang);
+        float bendLen = length(bendAxis);
+        if (bendLen > 1e-6) {
+            vec3 bendN = bendAxis / bendLen;
+            perp = cross(bendN, currTang);
+            perpLen = length(perp);
+        }
+    }
+    if (perpLen < 1e-6) {
+        perp = makeStableRibbonPerp(currTang);
+    } else {
+        perp /= perpLen;
+    }
+
+    if (dot(perp, prevPerp) < 0.0)
+        perp = -perp;
+    return perp;
+}
+
 void main() {
     uint childIdx = gl_GlobalInvocationID.x;
     if (childIdx >= pc.totalChildren) return;
@@ -386,6 +425,8 @@ void main() {
                            (4.0*p0 - 10.0*p1 + 8.0*p2 - 2.0*p3) * localT +
                            (-3.0*p0 + 9.0*p1 - 9.0*p2 + 3.0*p3) * t2);
         tang = normalize(tang);
+        vec3 sectionPerp1 = transportRibbonPerp(prevPerpA, prevTang, tang);
+        vec3 sectionPerp2 = normalize(cross(tang, sectionPerp1));
 
         // Primary parent interpolated position at this globalT (for clump)
         float pSegF = globalT * float(K - 1);
@@ -421,8 +462,8 @@ void main() {
             pos = mix(pos, primaryPos, clamp(clump, 0.0, 1.0));
         }
 
-        // Kink/Curl: Blender do_kink (PART_KINK_CURL)
-        // Uses CONSTANT axis (strandDir) for stable helix — no wobble from varying tangent
+        // Kink/Curl: apply in the local transported frame of this section so
+        // the curl follows the strand instead of a single global strand axis.
         if (pc.kinkAmplitude > 0.0 && si > 0) {
             // Shape: remap time before frequency
             float kinkTime = globalT;
@@ -439,17 +480,15 @@ void main() {
             float dt = min(abs(kinkT), 3.14159);
             float kinkAmp = sin(dt * 0.5) * pc.kinkAmplitude * rKinkAmp * 0.1; // TUNING: find correct scale
 
-            // Constant kink vector: perpendicular to STRAND direction (stable, no wobble)
-            // modPerp1 is already perpendicular to strandDir — use directly
-            vec3 kinkVec = modPerp1;
+            vec3 kinkVec = sectionPerp1;
 
-            // Rodrigues rotation around STRAND direction (constant axis = clean helix)
+            // Rodrigues rotation around the LOCAL tangent, not the global strand direction.
             vec3 curlOff = kinkVec * kinkAmp;
             float cosA = cos(kinkT + rPhase);
             float sinA = sin(kinkT + rPhase);
             vec3 rotated = curlOff * cosA
-                         + cross(strandDir, curlOff) * sinA
-                         + strandDir * dot(strandDir, curlOff) * (1.0 - cosA);
+                         + cross(tang, curlOff) * sinA
+                         + tang * dot(tang, curlOff) * (1.0 - cosA);
 
             // Flat: interpolate base position between child and parent
             vec3 basePos = mix(pos, primaryPos, clamp(pc.kinkFlat, 0.0, 1.0));
@@ -463,17 +502,17 @@ void main() {
             float r0 = -1.0 + 2.0 * fract(sin(dot(rco, vec3(12.9898,78.233,45.164))) * 43758.5453);
             float r1 = -1.0 + 2.0 * fract(sin(dot(rco, vec3(93.989,67.345,11.874))) * 23421.6312);
             float r2 = -1.0 + 2.0 * fract(sin(dot(rco, vec3(27.163,41.975,83.573))) * 65834.1247);
-            pos += modPerp1 * pc.rough1 * r0 * pc.rough1Size * 0.1;
-            pos += modPerp2 * pc.rough1 * r1 * pc.rough1Size * 0.1;
-            pos += strandDir * pc.rough1 * r2 * pc.rough1Size * 0.05;
+            pos += sectionPerp1 * pc.rough1 * r0 * pc.rough1Size * 0.1;
+            pos += sectionPerp2 * pc.rough1 * r1 * pc.rough1Size * 0.1;
+            pos += tang * pc.rough1 * r2 * pc.rough1Size * 0.05;
         }
 
         // Roughness 2: random displacement
         if (pc.rough2 > 0.0 && si > 0) {
             float r0 = -1.0 + 2.0 * randFloat(seed + si * 5u + 900u);
             float r1 = -1.0 + 2.0 * randFloat(seed + si * 5u + 901u);
-            pos += modPerp1 * pc.rough2 * r0 * 0.1;
-            pos += modPerp2 * pc.rough2 * r1 * 0.1;
+            pos += sectionPerp1 * pc.rough2 * r0 * 0.1;
+            pos += sectionPerp2 * pc.rough2 * r1 * 0.1;
         }
 
         // Roughness Endpoint: increases toward tip
@@ -482,8 +521,8 @@ void main() {
             float roughfac = pc.roughEnd * t * t;
             float r0 = -1.0 + 2.0 * rLoc.x;
             float r1 = -1.0 + 2.0 * rLoc.y;
-            pos += modPerp1 * roughfac * r0 * 0.1;
-            pos += modPerp2 * roughfac * r1 * 0.1;
+            pos += sectionPerp1 * roughfac * r0 * 0.1;
+            pos += sectionPerp2 * roughfac * r1 * 0.1;
         }
 
         // NaN guard on final position
@@ -501,17 +540,16 @@ void main() {
         if (pc.childSizeRandom > 0.0)
             radius *= 1.0 - pc.childSizeRandom * randFloat(seed + 777u);
 
-        // ── Ribbon A: perpA projected into tangent plane ──
-        vec3 perpA = modPerp1 - tang * dot(modPerp1, tang);
-        float paLen = length(perpA);
-        if (paLen < 0.3) { perpA = modPerp2 - tang * dot(modPerp2, tang); paLen = length(perpA); }
-        if (paLen < 1e-6) perpA = vec3(1,0,0); else perpA /= paLen;
+        // Transport a local frame along the strand to keep the cross-section round
+        // regardless of world orientation. The old method projected one global axis
+        // into each tangent plane, which flattened horizontal strands.
+        vec3 perpA = sectionPerp1;
 
         vec3 leftA  = safePos(pos - perpA * radius, childRoot);
         vec3 rightA = safePos(pos + perpA * radius, childRoot);
 
         // ── Ribbon B: perpB = face normal of ribbon A (continuous strip) ──
-        vec3 perpB = cross(tang, perpA);
+        vec3 perpB = normalize(cross(tang, perpA));
 
         vec3 leftB  = safePos(pos - perpB * radius, childRoot);
         vec3 rightB = safePos(pos + perpB * radius, childRoot);
@@ -538,6 +576,8 @@ void main() {
         outUV.uv[(vi+2)*2+0] = uvU; outUV.uv[(vi+2)*2+1] = globalT;
         outUV.uv[(vi+3)*2+0] = uvU; outUV.uv[(vi+3)*2+1] = globalT;
 
+        prevPerpA = perpA;
+        prevTang = tang;
         prevPos = pos;
         prevRadius = radius;
 

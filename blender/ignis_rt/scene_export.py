@@ -199,11 +199,28 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
     child_nbr = getattr(settings, 'child_nbr',
                         getattr(settings, 'child_percent', 0))
 
-    # Child distribution handled by GPU compute shader (emitter surface + frand table).
-    # co_hair() is in an undocumented internal path-cache space that doesn't have
-    # a clean transform to co_object space — GPU generation gives correct shapes
-    # (clump/kink/roughness match Cycles) with slightly different child placement.
+    # Prefer Blender-evaluated child strands when available so the seed and
+    # final placement match Blender/Cycles exactly.
     use_precomputed_children = False
+    child_particles = getattr(ps, 'child_particles', None)
+    child_count = len(child_particles) if child_particles is not None else 0
+    if child_type != 'NONE' and child_count > 0:
+        try:
+            total_strands = n_parents + child_count
+            all_keys = np.empty((total_strands, n_keys, 3), dtype=np.float32)
+            eval_world = np.array(eval_obj.matrix_world, dtype=np.float64)
+            eval_world_inv = np.linalg.inv(eval_world)
+            for strand_idx in range(total_strands):
+                for ki in range(n_keys):
+                    co = ps.co_hair(eval_obj, particle_no=strand_idx, step=ki)
+                    co_world = np.array((co[0], co[1], co[2], 1.0), dtype=np.float64)
+                    co_local = eval_world_inv @ co_world
+                    all_keys[strand_idx, ki] = co_local[:3].astype(np.float32)
+            parents = all_keys
+            n_parents = total_strands
+            use_precomputed_children = True
+        except Exception:
+            use_precomputed_children = False
 
     # ── Extract emitter mesh for GPU child distribution ──
     emitter_verts = np.empty(0, dtype=np.float32)
