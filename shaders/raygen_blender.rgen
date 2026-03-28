@@ -1048,32 +1048,26 @@ void main() {
             if (hasA && length(worldPos - centerA) < dotRadius) diagColor = vec3(0.8, 0, 0.8);
             if (hasB && length(worldPos - centerB) < dotRadius) diagColor = vec3(0.8, 0, 0.8);
 
-            // Combined DOTS silhouette with sin/cos camera angle blending
+            // Cylinder shading: bright center → dark edges (like a real cylinder)
             float segT = clamp(dot(worldPos - centerPt, T) / max(Tlen, 1e-8), 0.0, 1.0);
+            segT = smoothstep(0.0, 1.0, segT);  // C1 continuity at segment boundaries
             vec3 sweepCenter = mix(centerPt, otherCenter, segT);
             vec3 toHit = worldPos - sweepCenter;
             vec3 perpToAxis = toHit - hairSmoothT * dot(toHit, hairSmoothT);
 
-            // sin of angle between view and tangent: 1 = side view, 0 = along strand
-            float sinViewT = length(cross(rayDir, hairSmoothT));
-
-            // Camera-relative cylV (accurate from the side)
+            // camLR: left/right direction from camera (position-based)
             vec3 camLR = cross(rayDir, hairSmoothT);
+            float sinViewT = length(camLR);
             if (sinViewT > 1e-6) camLR /= sinViewT; else camLR = wDir;
-            float projectedDist = abs(dot(perpToAxis, camLR));
-            vec3 perpWDir = normalize(cross(hairSmoothT, wDir));
-            float extA = abs(dot(wDir, camLR));
-            float extB = abs(dot(perpWDir, camLR));
-            float projectedMax = halfWidth * max(extA, extB);
-            float camCylV = projectedDist / max(projectedMax, 1e-8);
 
-            // Geometric cylV (always stable, for top/bottom view)
-            float geoCylV = length(perpToAxis) / max(halfWidth, 1e-8);
+            // cylV: how far from center in the camera's left/right direction
+            float cylV = abs(dot(perpToAxis, camLR)) / max(halfWidth, 1e-8);
+            cylV = clamp(cylV, 0.0, 1.0);
 
-            // Blend: side view (sin≈1) → camera-relative, top view (sin≈0) → geometric
-            float cylV = mix(geoCylV, camCylV, sinViewT);
-            float outline = smoothstep(0.7, 1.0, cylV);
-            diagColor = mix(vec3(0, 1, 0), vec3(1, 0, 0), outline);
+            // Cylinder cosine falloff: 1 at center (facing camera), 0 at edge
+            float cylBrightness = sqrt(max(0.0, 1.0 - cylV * cylV));
+
+            diagColor = vec3(0, cylBrightness, 0);
 
             totalRadiance += diagColor * throughput;
             break;
