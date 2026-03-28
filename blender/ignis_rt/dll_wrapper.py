@@ -144,6 +144,7 @@ def load():
         c_bool,                                                # opaqueHair
         c_float,                                               # childSizeRandom
         c_bool,                                                # useParentParticles
+        c_bool,                                                # precomputedStrands
         c_uint32,                                              # blenderSeed
         POINTER(c_float),                                      # frandTable
         c_uint32,                                              # frandCount
@@ -328,6 +329,7 @@ def generate_hair_gpu(parent_keys, n_parents: int, keys_per_strand: int,
                       opaque_hair: bool = False,
                       child_size_random: float = 0.0,
                       use_parent_particles: bool = False,
+                      precomputed_strands: bool = False,
                       blender_seed: int = 0,
                       frand_table=None) -> int:
     """Generate hair children + ribbon geometry entirely on GPU. Returns BLAS index."""
@@ -353,6 +355,7 @@ def generate_hair_gpu(parent_keys, n_parents: int, keys_per_strand: int,
         c_bool(opaque_hair),
         c_float(child_size_random),
         c_bool(use_parent_particles),
+        c_bool(precomputed_strands),
         c_uint32(blender_seed),
         ft.ctypes.data_as(POINTER(c_float)) if ft is not None else None,
         c_uint32(len(ft) if ft is not None else 0))

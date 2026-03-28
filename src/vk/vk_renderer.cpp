@@ -870,6 +870,7 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
                                float kinkShape, float kinkFlat, float kinkAmpRandom,
                                bool opaqueHair,
                                float childSizeRandom, bool useParentParticles,
+                               bool precomputedStrands,
                                uint32_t blenderSeed,
                                const float* frandTable, uint32_t frandCount) {
     if (!accelBuilder_) return -1;
@@ -881,7 +882,8 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
     // Catmull-Rom subdivision: 8 sub-segments per key segment (must match shader SUBDIV)
     const uint32_t SUBDIV = 16;
     const uint32_t TIP_EXTRA = 4;  // extra tip subdivisions for curved closure
-    uint32_t subdivPoints = (keysPerStrand - 1) * SUBDIV + 1 + TIP_EXTRA;
+    uint32_t subdivPoints = precomputedStrands ? keysPerStrand :
+        ((keysPerStrand - 1) * SUBDIV + 1 + TIP_EXTRA);
     // DOTS: ribbon A + ribbon B (both continuous strips, 4 verts per cross-section)
     uint32_t vertsPerChild = subdivPoints * 4;
     uint32_t trisPerChild = (subdivPoints - 1) * 4;
@@ -1090,13 +1092,15 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
         float kinkAmpRandom;
         float childSizeRandom;
         uint32_t useParentParticles;
+        uint32_t precomputedStrands;
         uint32_t blenderSeed;
     } pc = {nParents, keysPerStrand, totalChildren, nEmitterTris,
             rootRadius, tipFactor, clumpNoiseSize, childRoundness, childLength, avgSpacing,
             kinkAmplitude, kinkFrequency,
             clumpFactor, clumpShape, rough1, rough1Size, rough2, roughEnd,
             childMode, kinkShape, kinkFlat, kinkAmpRandom,
-            childSizeRandom, useParentParticles ? 1u : 0u, blenderSeed};
+            childSizeRandom, useParentParticles ? 1u : 0u,
+            precomputedStrands ? 1u : 0u, blenderSeed};
     vkCmdPushConstants(cmd, hairComputePipelineLayout_,
         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 

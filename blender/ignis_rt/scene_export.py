@@ -128,6 +128,49 @@ def _matrix_to_3x4_row_major(blender_matrix):
     return m[:3, :].flatten().tolist()
 
 
+def _particle_hair_step_count(settings, use_render_steps: bool):
+    """Match Blender/Cycles strand sampling resolution."""
+    step_prop = 'render_step' if use_render_steps else 'display_step'
+    step_exp = max(int(getattr(settings, step_prop, 0)), 0)
+    step_count = (1 << step_exp) + 1
+    if getattr(settings, 'kink', 'NO') == 'SPIRAL':
+        step_count += max(int(getattr(settings, 'kink_extra_steps', 0)), 0)
+    return max(step_count, 2)
+
+
+def _sample_particle_strands_exact(eval_obj, ps, total_strands: int, step_count: int):
+    """Sample strands exactly like Blender/Cycles using co_hair()."""
+    all_keys = np.empty((total_strands, step_count, 3), dtype=np.float32)
+    eval_world = np.array(eval_obj.matrix_world, dtype=np.float64)
+    eval_world_inv = np.linalg.inv(eval_world)
+    zero_world = np.zeros(3, dtype=np.float64)
+
+    for strand_idx in range(total_strands):
+        prev_co_world = None
+        for step_idx in range(step_count):
+            co = ps.co_hair(eval_obj, particle_no=strand_idx, step=step_idx)
+            co_world3 = np.array((co[0], co[1], co[2]), dtype=np.float64)
+
+            # RNA exposes BKE_particle_co_hair() as an output vector initialized to zero.
+            # When Blender has fewer cached keys for a shortened child strand, out-of-range
+            # steps leave that output untouched. Cycles seeds the call with prev_co_world,
+            # so invalid tail samples collapse to the previous valid key instead of (0,0,0).
+            if step_idx > 0 and prev_co_world is not None:
+                if not np.isfinite(co_world3).all():
+                    co_world3 = prev_co_world.copy()
+                elif np.allclose(co_world3, zero_world, atol=1e-12) and not np.allclose(
+                    prev_co_world, zero_world, atol=1e-12
+                ):
+                    co_world3 = prev_co_world.copy()
+
+            co_world = np.array((co_world3[0], co_world3[1], co_world3[2], 1.0), dtype=np.float64)
+            co_local = eval_world_inv @ co_world
+            all_keys[strand_idx, step_idx] = co_local[:3]
+            prev_co_world = co_world3
+
+    return all_keys
+
+
 def _export_particle_hair(eval_obj, particle_system, depsgraph):
     """Convert particle hair (parents + children) to ribbon geometry.
 
@@ -172,85 +215,83 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
     if n_keys < 2:
         return None
 
-    # Batch extract parent keys → (n_parents, n_keys, 3)
-    parent_list = []
-    for particle in particles:
-        hk = particle.hair_keys
-        if len(hk) != n_keys:
-            continue
-        keys = np.empty((n_keys, 3), dtype=np.float32)
-        if ps_modifier:
-            for ki in range(n_keys):
-                keys[ki] = hk[ki].co_object(eval_obj, ps_modifier, particle)
-        else:
-            raw = np.empty(n_keys * 3, dtype=np.float32)
-            hk.foreach_get("co", raw)
-            keys = raw.reshape(-1, 3)
-        parent_list.append(keys)
-
-    if not parent_list:
-        return None
-
-    parents = np.array(parent_list, dtype=np.float32)  # (P, K, 3)
-    n_parents = parents.shape[0]
-
-    # ── Child generation ──
     child_type = getattr(settings, 'child_type', 'NONE')
     child_nbr = getattr(settings, 'child_nbr',
                         getattr(settings, 'child_percent', 0))
-
-    # Prefer Blender-evaluated child strands when available so the seed and
-    # final placement match Blender/Cycles exactly.
-    use_precomputed_children = False
     child_particles = getattr(ps, 'child_particles', None)
     child_count = len(child_particles) if child_particles is not None else 0
-    if child_type != 'NONE' and child_count > 0:
+
+    use_render_steps = getattr(depsgraph, "mode", None) == 'RENDER'
+    exact_step_count = _particle_hair_step_count(settings, use_render_steps)
+    total_exact_strands = len(particles) + (child_count if child_type != 'NONE' else 0)
+    use_precomputed_children = False
+    use_precomputed_strands = False
+
+    # Batch extract parent keys → (n_parents, n_keys, 3)
+    exact_sampling_needed = (child_count > 0) or (exact_step_count != n_keys)
+    if exact_sampling_needed:
         try:
-            total_strands = n_parents + child_count
-            all_keys = np.empty((total_strands, n_keys, 3), dtype=np.float32)
-            eval_world = np.array(eval_obj.matrix_world, dtype=np.float64)
-            eval_world_inv = np.linalg.inv(eval_world)
-            for strand_idx in range(total_strands):
-                for ki in range(n_keys):
-                    co = ps.co_hair(eval_obj, particle_no=strand_idx, step=ki)
-                    co_world = np.array((co[0], co[1], co[2], 1.0), dtype=np.float64)
-                    co_local = eval_world_inv @ co_world
-                    all_keys[strand_idx, ki] = co_local[:3].astype(np.float32)
-            parents = all_keys
-            n_parents = total_strands
-            use_precomputed_children = True
+            parents = _sample_particle_strands_exact(eval_obj, ps, total_exact_strands, exact_step_count)
+            n_parents = parents.shape[0]
+            n_keys = exact_step_count
+            use_precomputed_strands = True
+            use_precomputed_children = child_type != 'NONE' and child_count > 0
         except Exception:
+            use_precomputed_strands = False
             use_precomputed_children = False
+
+    if not use_precomputed_strands:
+        parent_list = []
+        for particle in particles:
+            hk = particle.hair_keys
+            if len(hk) != n_keys:
+                continue
+            keys = np.empty((n_keys, 3), dtype=np.float32)
+            if ps_modifier:
+                for ki in range(n_keys):
+                    keys[ki] = hk[ki].co_object(eval_obj, ps_modifier, particle)
+            else:
+                raw = np.empty(n_keys * 3, dtype=np.float32)
+                hk.foreach_get("co", raw)
+                keys = raw.reshape(-1, 3)
+            parent_list.append(keys)
+
+        if not parent_list:
+            return None
+
+        parents = np.array(parent_list, dtype=np.float32)  # (P, K, 3)
+        n_parents = parents.shape[0]
 
     # ── Extract emitter mesh for GPU child distribution ──
     emitter_verts = np.empty(0, dtype=np.float32)
     emitter_tris = np.empty(0, dtype=np.uint32)
     emitter_cdf = np.empty(0, dtype=np.float32)
-    try:
-        emesh = eval_obj.to_mesh()
-        if emesh and len(emesh.vertices) > 0:
-            ev = np.empty(len(emesh.vertices) * 3, dtype=np.float32)
-            emesh.vertices.foreach_get('co', ev)
-            emitter_verts = ev
-            if len(emesh.loop_triangles) == 0:
-                emesh.calc_loop_triangles()
-            if len(emesh.loop_triangles) > 0:
-                et = np.empty(len(emesh.loop_triangles) * 3, dtype=np.int32)
-                emesh.loop_triangles.foreach_get('vertices', et)
-                emitter_tris = et.astype(np.uint32)
-                # Area-weighted CDF for random face selection
-                verts_3d = ev.reshape(-1, 3)
-                tris_3d = emitter_tris.reshape(-1, 3)
-                v0 = verts_3d[tris_3d[:, 0]]
-                v1 = verts_3d[tris_3d[:, 1]]
-                v2 = verts_3d[tris_3d[:, 2]]
-                areas = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1)
-                total_area = areas.sum()
-                if total_area > 0:
-                    emitter_cdf = (np.cumsum(areas) / total_area).astype(np.float32)
-        eval_obj.to_mesh_clear()
-    except Exception:
-        pass
+    if child_type != 'NONE' and child_nbr > 0 and not use_precomputed_strands:
+        try:
+            emesh = eval_obj.to_mesh()
+            if emesh and len(emesh.vertices) > 0:
+                ev = np.empty(len(emesh.vertices) * 3, dtype=np.float32)
+                emesh.vertices.foreach_get('co', ev)
+                emitter_verts = ev
+                if len(emesh.loop_triangles) == 0:
+                    emesh.calc_loop_triangles()
+                if len(emesh.loop_triangles) > 0:
+                    et = np.empty(len(emesh.loop_triangles) * 3, dtype=np.int32)
+                    emesh.loop_triangles.foreach_get('vertices', et)
+                    emitter_tris = et.astype(np.uint32)
+                    # Area-weighted CDF for random face selection
+                    verts_3d = ev.reshape(-1, 3)
+                    tris_3d = emitter_tris.reshape(-1, 3)
+                    v0 = verts_3d[tris_3d[:, 0]]
+                    v1 = verts_3d[tris_3d[:, 1]]
+                    v2 = verts_3d[tris_3d[:, 2]]
+                    areas = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1)
+                    total_area = areas.sum()
+                    if total_area > 0:
+                        emitter_cdf = (np.cumsum(areas) / total_area).astype(np.float32)
+            eval_obj.to_mesh_clear()
+        except Exception:
+            pass
 
     # Compute average parent spacing for GPU noise scaling
     parent_roots = parents[:, 0, :]  # (P, 3)
@@ -265,11 +306,12 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
     return {
         "name": f"hair_{eval_obj.name}",
         "gpu_hair": True,
+        "precomputed_strands": use_precomputed_strands,
         "precomputed_children": use_precomputed_children,
         "parent_keys": np.ascontiguousarray(parents.reshape(-1, 3).flatten(), dtype=np.float32),
         "n_parents": n_parents,
         "n_keys": n_keys,
-        "child_nbr": child_nbr if (child_type != 'NONE' and not use_precomputed_children) else 0,
+        "child_nbr": child_nbr if (child_type != 'NONE' and not use_precomputed_strands) else 0,
         "root_radius": root_radius,
         "tip_factor": tip_factor,
         "mat_idx": mat_idx,
@@ -279,27 +321,27 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
         "n_emitter_verts": len(emitter_verts) // 3,
         "n_emitter_tris": len(emitter_tris) // 3,
         "avg_spacing": avg_spacing,
-        # When using precomputed children, modifiers are already applied by Blender → zero them
-        "kink_amplitude": 0.0 if use_precomputed_children else getattr(settings, 'kink_amplitude', 0.0),
+        # When using precomputed strands, modifiers are already applied by Blender.
+        "kink_amplitude": 0.0 if use_precomputed_strands else getattr(settings, 'kink_amplitude', 0.0),
         "kink_frequency": getattr(settings, 'kink_frequency', 2.0),
-        "clump_factor": 0.0 if use_precomputed_children else getattr(settings, 'clump_factor', 0.0),
+        "clump_factor": 0.0 if use_precomputed_strands else getattr(settings, 'clump_factor', 0.0),
         "clump_shape": getattr(settings, 'clump_shape', 0.0),
-        "roughness_1": 0.0 if use_precomputed_children else getattr(settings, 'roughness_1', 0.0),
+        "roughness_1": 0.0 if use_precomputed_strands else getattr(settings, 'roughness_1', 0.0),
         "roughness_1_size": getattr(settings, 'roughness_1_size', 1.0),
-        "roughness_2": 0.0 if use_precomputed_children else getattr(settings, 'roughness_2', 0.0),
+        "roughness_2": 0.0 if use_precomputed_strands else getattr(settings, 'roughness_2', 0.0),
         "roughness_2_size": getattr(settings, 'roughness_2_size', 1.0),
-        "roughness_endpoint": 0.0 if use_precomputed_children else getattr(settings, 'roughness_endpoint', 0.0),
+        "roughness_endpoint": 0.0 if use_precomputed_strands else getattr(settings, 'roughness_endpoint', 0.0),
         "child_mode": 1 if child_type == 'SIMPLE' else 0,
         "kink_shape": getattr(settings, 'kink_shape', 0.0),
         "kink_flat": getattr(settings, 'kink_flat', 0.0),
-        "kink_amp_random": 0.0 if use_precomputed_children else getattr(settings, 'kink_amp_random', 0.0),
+        "kink_amp_random": 0.0 if use_precomputed_strands else getattr(settings, 'kink_amp_random', 0.0),
         "opaque_hair": True,
         "child_length": getattr(settings, 'child_length', 1.0),
         "clump_noise_size": getattr(settings, 'clump_noise_size', 1.0),
         "child_roundness": getattr(settings, 'child_roundness', 0.0),
         "child_size_random": getattr(settings, 'child_size_random', 0.0),
-        # When precomputed, ALL strands are "parents" → force useParentParticles
-        "use_parent_particles": True if use_precomputed_children else getattr(settings, 'use_parent_particles', False),
+        # When precomputed, ALL strands are explicit final curves → force useParentParticles.
+        "use_parent_particles": True if use_precomputed_strands else getattr(settings, 'use_parent_particles', False),
         "blender_seed": getattr(settings, 'seed', 0),
     }
 

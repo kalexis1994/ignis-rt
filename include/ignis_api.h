@@ -60,6 +60,7 @@ IGNIS_API int    ignis_generate_hair_gpu(const float* parentKeys, uint32_t nPare
                                           float kinkShape, float kinkFlat, float kinkAmpRandom,
                                           bool opaqueHair,
                                           float childSizeRandom, bool useParentParticles,
+                                          bool precomputedStrands,
                                           uint32_t blenderSeed,
                                           const float* frandTable, uint32_t frandCount);
 

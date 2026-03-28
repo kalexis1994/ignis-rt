@@ -73,6 +73,7 @@ public:
                         float kinkShape, float kinkFlat, float kinkAmpRandom,
                         bool opaqueHair,
                         float childSizeRandom, bool useParentParticles,
+                        bool precomputedStrands,
                         uint32_t blenderSeed,
                         const float* frandTable, uint32_t frandCount);
     void UpdateCamera(const CameraUBO& camera);

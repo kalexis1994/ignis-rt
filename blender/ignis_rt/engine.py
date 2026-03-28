@@ -676,6 +676,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                                 pass
                             child_nbr = max(int(m.get("child_nbr", 0)), 0)
                             render_parents = bool(m.get("use_parent_particles", False) or child_nbr == 0)
+                            precomputed_strands = bool(m.get("precomputed_strands", False))
                             n_p = m["n_parents"]
                             pk = m["parent_keys"].reshape(-1, 3)
                             # Estimate spacing
@@ -724,15 +725,19 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                                 opaque_hair=m.get("opaque_hair", False),
                                 child_size_random=m.get("child_size_random", 0.0),
                                 use_parent_particles=render_parents,
+                                precomputed_strands=precomputed_strands,
                                 blender_seed=_psys_seed,
                                 frand_table=_frand_scrambled)
                             if blas >= 0:
                                 _ignis_blas_handles[mesh_key] = blas
-                                # Compute tri count for material assignment (must match shader SUBDIV=8, DOTS=4 tris/seg)
+                                # Compute tri count for material assignment.
                                 total_children = n_p * child_nbr
                                 if render_parents:
                                     total_children += n_p
-                                subdiv_points = (m["n_keys"] - 1) * 16 + 1 + 4  # + TIP_EXTRA
+                                if precomputed_strands:
+                                    subdiv_points = m["n_keys"]
+                                else:
+                                    subdiv_points = (m["n_keys"] - 1) * 16 + 1 + 4  # + TIP_EXTRA
                                 tris_per_child = (subdiv_points - 1) * 4
                                 m["_gpu_tri_count"] = total_children * tris_per_child
                                 _log(f"  GPU hair OK: '{mesh_key}' → BLAS {blas} ({m['_gpu_tri_count']} tris)")

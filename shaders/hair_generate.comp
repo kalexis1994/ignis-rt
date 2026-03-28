@@ -88,6 +88,7 @@ layout(push_constant) uniform PushConstants {
     float kinkAmpRandom;   // per-strand kink amplitude randomization
     float childSizeRandom; // per-child random radius variation [0,1]
     uint useParentParticles; // 1 = also render parent strands (childIdx < nParents)
+    uint precomputedStrands;  // 1 = parentKeys already contain final Blender-evaluated samples
     uint blenderSeed;        // Blender particle system seed for deterministic randomness
 } pc;
 
@@ -143,6 +144,14 @@ vec3 safePos(vec3 p, vec3 fallback) {
     return p;
 }
 
+vec3 safeNormalize(vec3 v, vec3 fallback)
+{
+    float lenV = length(v);
+    if (lenV < 1e-6 || any(isnan(v)) || any(isinf(v)))
+        return fallback;
+    return v / lenV;
+}
+
 vec3 makeStableRibbonPerp(vec3 tangent)
 {
     vec3 ref = abs(tangent.z) < 0.9 ? vec3(0,0,1) : vec3(1,0,0);
@@ -185,6 +194,7 @@ vec3 transportRibbonPerp(vec3 prevPerp, vec3 prevTang, vec3 currTang)
 void main() {
     uint childIdx = gl_GlobalInvocationID.x;
     if (childIdx >= pc.totalChildren) return;
+    bool usePrecomputedStrands = (pc.precomputedStrands != 0u);
 
     // When useParentParticles=1, first nParents strands ARE the parents (direct copy)
     // Remaining strands are children as usual.
@@ -197,12 +207,91 @@ void main() {
     uint K = pc.keysPerStrand;
     const uint MAX_SUBDIV = 16u;
     const uint TIP_EXTRA = 4u;  // extra subdivisions for curved tip
-    uint S_max = (K - 1) * MAX_SUBDIV + 1 + TIP_EXTRA;
+    uint S_max = usePrecomputedStrands ? K : ((K - 1) * MAX_SUBDIV + 1 + TIP_EXTRA);
     // DOTS layout: ribbon A + ribbon B (both continuous strips, 4 verts per cross-section)
     uint vertsPerStrand = S_max * 4;
     uint trisPerStrand = (S_max - 1) * 4;
     uint idxPerStrand = trisPerStrand * 3;
     uint seed = childIdx * 17u + 43u + pc.blenderSeed * 1000003u;
+
+    if (usePrecomputedStrands) {
+        uint vertBase = childIdx * vertsPerStrand;
+        uint idxBase = childIdx * idxPerStrand;
+        uint strandBase = min(childIdx, pc.nParents - 1u) * K;
+        vec3 childRoot = parents.keys[strandBase].xyz;
+
+        vec3 strandDir = parents.keys[strandBase + K - 1u].xyz - childRoot;
+        if (length(strandDir) < 1e-6)
+            strandDir = vec3(0, 0, 1);
+        else
+            strandDir = normalize(strandDir);
+
+        vec3 prevTang = strandDir;
+        vec3 prevPerpA = makeStableRibbonPerp(prevTang);
+
+        for (uint si = 0; si < K; si++) {
+            vec3 pos = parents.keys[strandBase + si].xyz;
+            vec3 tang;
+            if (si == 0u)
+                tang = parents.keys[strandBase + 1u].xyz - pos;
+            else if (si + 1u >= K)
+                tang = pos - parents.keys[strandBase + si - 1u].xyz;
+            else
+                tang = parents.keys[strandBase + si + 1u].xyz - parents.keys[strandBase + si - 1u].xyz;
+
+            if (length(tang) < 1e-6)
+                tang = prevTang;
+            else
+                tang = normalize(tang);
+
+            vec3 perpA = (si == 0u) ? makeStableRibbonPerp(tang) : transportRibbonPerp(prevPerpA, prevTang, tang);
+            vec3 perpB = cross(tang, perpA);
+            perpB = safeNormalize(perpB, cross(tang, makeStableRibbonPerp(tang)));
+            perpB = safeNormalize(perpB, makeStableRibbonPerp(tang));
+
+            float globalT = float(si) / float(max(K - 1u, 1u));
+            float radius = pc.rootRadius * ((1.0 - globalT) * (1.0 - pc.tipFactor) + pc.tipFactor);
+            if (pc.childSizeRandom > 0.0)
+                radius *= 1.0 - pc.childSizeRandom * randFloat(seed + 777u);
+
+            vec3 leftA  = safePos(pos - perpA * radius, pos);
+            vec3 rightA = safePos(pos + perpA * radius, pos);
+            vec3 leftB  = safePos(pos - perpB * radius, pos);
+            vec3 rightB = safePos(pos + perpB * radius, pos);
+            vec2 octTang = octEncode(tang);
+
+            uint vi = vertBase + si * 4u;
+            outPos.pos[vi*3+0] = leftA.x;      outPos.pos[vi*3+1] = leftA.y;      outPos.pos[vi*3+2] = leftA.z;
+            outPos.pos[(vi+1u)*3+0] = rightA.x; outPos.pos[(vi+1u)*3+1] = rightA.y; outPos.pos[(vi+1u)*3+2] = rightA.z;
+            outPos.pos[(vi+2u)*3+0] = leftB.x;  outPos.pos[(vi+2u)*3+1] = leftB.y;  outPos.pos[(vi+2u)*3+2] = leftB.z;
+            outPos.pos[(vi+3u)*3+0] = rightB.x; outPos.pos[(vi+3u)*3+1] = rightB.y; outPos.pos[(vi+3u)*3+2] = rightB.z;
+
+            outNrm.nrm[vi*3+0] = -1.0;      outNrm.nrm[vi*3+1] = octTang.x;      outNrm.nrm[vi*3+2] = octTang.y;
+            outNrm.nrm[(vi+1u)*3+0] = 1.0;  outNrm.nrm[(vi+1u)*3+1] = octTang.x; outNrm.nrm[(vi+1u)*3+2] = octTang.y;
+            outNrm.nrm[(vi+2u)*3+0] = -1.0; outNrm.nrm[(vi+2u)*3+1] = octTang.x; outNrm.nrm[(vi+2u)*3+2] = octTang.y;
+            outNrm.nrm[(vi+3u)*3+0] = 1.0;  outNrm.nrm[(vi+3u)*3+1] = octTang.x; outNrm.nrm[(vi+3u)*3+2] = octTang.y;
+
+            float uvU = float(childIdx);
+            outUV.uv[vi*2+0] = uvU;      outUV.uv[vi*2+1] = globalT;
+            outUV.uv[(vi+1u)*2+0] = uvU; outUV.uv[(vi+1u)*2+1] = globalT;
+            outUV.uv[(vi+2u)*2+0] = uvU; outUV.uv[(vi+2u)*2+1] = globalT;
+            outUV.uv[(vi+3u)*2+0] = uvU; outUV.uv[(vi+3u)*2+1] = globalT;
+
+            prevTang = tang;
+            prevPerpA = perpA;
+        }
+
+        for (uint si = 0; si < K - 1u; si++) {
+            uint base = idxBase + si * 12u;
+            uint v0 = vertBase + si * 4u;
+            uint v4 = vertBase + (si + 1u) * 4u;
+            outIdx.idx[base+0] = v0;      outIdx.idx[base+1] = v4;      outIdx.idx[base+2] = v0+1u;
+            outIdx.idx[base+3] = v0+1u;   outIdx.idx[base+4] = v4;      outIdx.idx[base+5] = v4+1u;
+            outIdx.idx[base+6] = v0+2u;   outIdx.idx[base+7] = v4+2u;   outIdx.idx[base+8] = v0+3u;
+            outIdx.idx[base+9] = v0+3u;   outIdx.idx[base+10] = v4+2u;  outIdx.idx[base+11] = v4+3u;
+        }
+        return;
+    }
 
     vec3 childRoot;
     vec3 childKeys[16];
@@ -327,7 +416,7 @@ void main() {
     } // end of !isParentStrand child distribution
 
     // Apply child_length: scale child strand to fraction of parent length
-    if (pc.childLength < 0.999) {
+    if (!usePrecomputedStrands && pc.childLength < 0.999) {
         vec3 root = childKeys[0];
         for (uint ki = 1; ki < K && ki < 16; ki++) {
             childKeys[ki] = mix(root, childKeys[ki], pc.childLength);
@@ -350,26 +439,30 @@ void main() {
     }
 
     // ── Adaptive SUBDIV: measure curvature, choose subdivision level ──
-    // Straight strands waste less geometry, curly strands keep full quality
+    // Exact Blender-evaluated strands are already sampled at final resolution,
+    // so re-subdividing them would only waste memory and change the shape.
     float maxCurvature = 0.0;
-    for (uint ki = 0; ki + 2 < K; ki++) {
-        vec3 seg0 = childKeys[ki+1] - childKeys[ki];
-        vec3 seg1 = childKeys[ki+2] - childKeys[ki+1];
-        float l0 = length(seg0), l1 = length(seg1);
-        if (l0 > 1e-6 && l1 > 1e-6) {
-            float cosAngle = dot(seg0 / l0, seg1 / l1);
-            maxCurvature = max(maxCurvature, 1.0 - cosAngle); // 0=straight, 2=180° bend
+    if (!usePrecomputedStrands) {
+        for (uint ki = 0; ki + 2 < K; ki++) {
+            vec3 seg0 = childKeys[ki+1] - childKeys[ki];
+            vec3 seg1 = childKeys[ki+2] - childKeys[ki+1];
+            float l0 = length(seg0), l1 = length(seg1);
+            if (l0 > 1e-6 && l1 > 1e-6) {
+                float cosAngle = dot(seg0 / l0, seg1 / l1);
+                maxCurvature = max(maxCurvature, 1.0 - cosAngle); // 0=straight, 2=180° bend
+            }
         }
     }
     // Select SUBDIV: low curvature → fewer subdivisions
     //   < 0.01 (< ~8°):  SUBDIV=2 (nearly straight)
     //   < 0.1  (< ~26°): SUBDIV=4 (gentle curve)
     //   else:            SUBDIV=8 (curly, full quality)
-    uint SUBDIV = (maxCurvature < 0.01) ? 2u :
-                  (maxCurvature < 0.1)  ? 4u : MAX_SUBDIV;
+    uint SUBDIV = usePrecomputedStrands ? 1u :
+                  ((maxCurvature < 0.01) ? 2u :
+                   (maxCurvature < 0.1)  ? 4u : MAX_SUBDIV);
     uint S_body_full = (K - 1) * SUBDIV + 1;
     uint S_body = S_body_full;                 // body covers full curve (0→1)
-    uint S = S_body + TIP_EXTRA + 1;          // + tip extension beyond curve end
+    uint S = usePrecomputedStrands ? S_body : (S_body + TIP_EXTRA + 1u);
 
     // Per-strand perpendicular frame for modifiers (used only for non-kink modifiers at key level)
     vec3 strandDir = normalize(childKeys[K-1] - childKeys[0]);
@@ -397,132 +490,149 @@ void main() {
 
     // Generate S subdivided points via Catmull-Rom interpolation
     for (uint si = 0; si < S_body; si++) {
-        // Map si to segment + local t
         float globalT = float(si) / float(S_body - 1);  // 0->1 along full curve
-        float segF = globalT * float(K - 1);
-        uint seg = min(uint(segF), K - 2);
-        float localT = segF - float(seg);
+        vec3 pos;
+        vec3 tang;
+        vec3 primaryPos;
 
-        // Catmull-Rom: 4 control points (clamp at boundaries)
-        uint i0 = (seg > 0) ? seg - 1 : 0;
-        uint i1 = seg;
-        uint i2 = min(seg + 1, K - 1);
-        uint i3 = min(seg + 2, K - 1);
-
-        vec3 p0 = childKeys[i0], p1 = childKeys[i1];
-        vec3 p2 = childKeys[i2], p3 = childKeys[i3];
-
-        // Catmull-Rom basis (tension=0.5)
-        float t2 = localT * localT;
-        float t3 = t2 * localT;
-        vec3 pos = 0.5 * ((2.0*p1) +
-                          (-p0 + p2) * localT +
-                          (2.0*p0 - 5.0*p1 + 4.0*p2 - p3) * t2 +
-                          (-p0 + 3.0*p1 - 3.0*p2 + p3) * t3);
-
-        // Tangent (derivative of Catmull-Rom)
-        vec3 tang = 0.5 * ((-p0 + p2) +
-                           (4.0*p0 - 10.0*p1 + 8.0*p2 - 2.0*p3) * localT +
-                           (-3.0*p0 + 9.0*p1 - 9.0*p2 + 3.0*p3) * t2);
-        tang = normalize(tang);
-        vec3 sectionPerp1 = transportRibbonPerp(prevPerpA, prevTang, tang);
-        vec3 sectionPerp2 = normalize(cross(tang, sectionPerp1));
-
-        // Primary parent interpolated position at this globalT (for clump)
-        float pSegF = globalT * float(K - 1);
-        uint pSeg = min(uint(pSegF), K - 2);
-        float pLocalT = pSegF - float(pSeg);
-        uint pi0 = (pSeg > 0) ? pSeg - 1 : 0;
-        uint pi1 = pSeg;
-        uint pi2 = min(pSeg + 1, K - 1);
-        uint pi3 = min(pSeg + 2, K - 1);
-        vec3 pp0 = primaryKeys[pi0], pp1 = primaryKeys[pi1];
-        vec3 pp2 = primaryKeys[pi2], pp3 = primaryKeys[pi3];
-        float pt2 = pLocalT * pLocalT;
-        float pt3 = pt2 * pLocalT;
-        vec3 primaryPos = 0.5 * ((2.0*pp1) +
-                                  (-pp0 + pp2) * pLocalT +
-                                  (2.0*pp0 - 5.0*pp1 + 4.0*pp2 - pp3) * pt2 +
-                                  (-pp0 + 3.0*pp1 - 3.0*pp2 + pp3) * pt3);
-
-        // ── Post-subdivision modifiers (applied at subdivided point level) ──
-
-        // Clump: pull child toward primary parent
-        if (abs(pc.clumpFactor) > 0.001 && si > 0) {
-            float t = globalT;
-            float cpow = pc.clumpShape < 0.0
-                ? 1.0 + pc.clumpShape
-                : 1.0 + 9.0 * pc.clumpShape;
-            cpow = max(cpow, 0.001);
-            float clump;
-            if (pc.clumpFactor < 0.0)
-                clump = -pc.clumpFactor * rClump * pow(1.0 - t, cpow);
+        if (usePrecomputedStrands) {
+            pos = childKeys[si];
+            if (si == 0u)
+                tang = childKeys[1] - childKeys[0];
+            else if (si + 1u >= K)
+                tang = childKeys[K - 1u] - childKeys[K - 2u];
             else
-                clump = pc.clumpFactor * rClump * pow(t, cpow);
-            pos = mix(pos, primaryPos, clamp(clump, 0.0, 1.0));
-        }
+                tang = childKeys[si + 1u] - childKeys[si - 1u];
+            tang = normalize(tang);
+            primaryPos = primaryKeys[si];
+        } else {
+            // Map si to segment + local t
+            float segF = globalT * float(K - 1);
+            uint seg = min(uint(segF), K - 2);
+            float localT = segF - float(seg);
 
-        // Kink/Curl: apply in the local transported frame of this section so
-        // the curl follows the strand instead of a single global strand axis.
-        if (pc.kinkAmplitude > 0.0 && si > 0) {
-            // Shape: remap time before frequency
-            float kinkTime = globalT;
-            if (abs(pc.kinkShape) > 0.001) {
-                kinkTime = pc.kinkShape < 0.0
-                    ? pow(max(globalT, 0.001), 1.0 + pc.kinkShape)
-                    : pow(max(globalT, 0.001), 1.0 / max(1.0 - pc.kinkShape, 0.001));
+            // Catmull-Rom: 4 control points (clamp at boundaries)
+            uint i0 = (seg > 0) ? seg - 1 : 0;
+            uint i1 = seg;
+            uint i2 = min(seg + 1, K - 1);
+            uint i3 = min(seg + 2, K - 1);
+
+            vec3 p0 = childKeys[i0], p1 = childKeys[i1];
+            vec3 p2 = childKeys[i2], p3 = childKeys[i3];
+
+            // Catmull-Rom basis (tension=0.5)
+            float t2 = localT * localT;
+            float t3 = t2 * localT;
+            pos = 0.5 * ((2.0*p1) +
+                         (-p0 + p2) * localT +
+                         (2.0*p0 - 5.0*p1 + 4.0*p2 - p3) * t2 +
+                         (-p0 + 3.0*p1 - 3.0*p2 + p3) * t3);
+
+            // Tangent (derivative of Catmull-Rom)
+            tang = 0.5 * ((-p0 + p2) +
+                          (4.0*p0 - 10.0*p1 + 8.0*p2 - 2.0*p3) * localT +
+                          (-3.0*p0 + 9.0*p1 - 9.0*p2 + 3.0*p3) * t2);
+            tang = normalize(tang);
+
+            // Primary parent interpolated position at this globalT (for clump)
+            float pSegF = globalT * float(K - 1);
+            uint pSeg = min(uint(pSegF), K - 2);
+            float pLocalT = pSegF - float(pSeg);
+            uint pi0 = (pSeg > 0) ? pSeg - 1 : 0;
+            uint pi1 = pSeg;
+            uint pi2 = min(pSeg + 1, K - 1);
+            uint pi3 = min(pSeg + 2, K - 1);
+            vec3 pp0 = primaryKeys[pi0], pp1 = primaryKeys[pi1];
+            vec3 pp2 = primaryKeys[pi2], pp3 = primaryKeys[pi3];
+            float pt2 = pLocalT * pLocalT;
+            float pt3 = pt2 * pLocalT;
+            primaryPos = 0.5 * ((2.0*pp1) +
+                                (-pp0 + pp2) * pLocalT +
+                                (2.0*pp0 - 5.0*pp1 + 4.0*pp2 - pp3) * pt2 +
+                                (-pp0 + 3.0*pp1 - 3.0*pp2 + pp3) * pt3);
+        }
+        vec3 sectionPerp1 = transportRibbonPerp(prevPerpA, prevTang, tang);
+        vec3 sectionPerp2 = safeNormalize(cross(tang, sectionPerp1), makeStableRibbonPerp(tang));
+
+        // ── Post-subdivision modifiers (applied only to procedural strands) ──
+        if (!usePrecomputedStrands) {
+            // Clump: pull child toward primary parent
+            if (abs(pc.clumpFactor) > 0.001 && si > 0) {
+                float t = globalT;
+                float cpow = pc.clumpShape < 0.0
+                    ? 1.0 + pc.clumpShape
+                    : 1.0 + 9.0 * pc.clumpShape;
+                cpow = max(cpow, 0.001);
+                float clump;
+                if (pc.clumpFactor < 0.0)
+                    clump = -pc.clumpFactor * rClump * pow(1.0 - t, cpow);
+                else
+                    clump = pc.clumpFactor * rClump * pow(t, cpow);
+                pos = mix(pos, primaryPos, clamp(clump, 0.0, 1.0));
             }
 
-            // Blender: t = time * freq * PI
-            float kinkT = kinkTime * pc.kinkFrequency * 3.14159;
+            // Kink/Curl: apply in the local transported frame of this section so
+            // the curl follows the strand instead of a single global strand axis.
+            if (pc.kinkAmplitude > 0.0 && si > 0) {
+                // Shape: remap time before frequency
+                float kinkTime = globalT;
+                if (abs(pc.kinkShape) > 0.001) {
+                    kinkTime = pc.kinkShape < 0.0
+                        ? pow(max(globalT, 0.001), 1.0 + pc.kinkShape)
+                        : pow(max(globalT, 0.001), 1.0 / max(1.0 - pc.kinkShape, 0.001));
+                }
 
-            // Smooth start: sin(|t|/2), capped at 1.0 for stable geometry
-            float dt = min(abs(kinkT), 3.14159);
-            float kinkAmp = sin(dt * 0.5) * pc.kinkAmplitude * rKinkAmp * 0.1; // TUNING: find correct scale
+                // Blender: t = time * freq * PI
+                float kinkT = kinkTime * pc.kinkFrequency * 3.14159;
 
-            vec3 kinkVec = sectionPerp1;
+                // Smooth start: sin(|t|/2), capped at 1.0 for stable geometry
+                float dt = min(abs(kinkT), 3.14159);
+                float kinkAmp = sin(dt * 0.5) * pc.kinkAmplitude * rKinkAmp * 0.1; // TUNING: find correct scale
 
-            // Rodrigues rotation around the LOCAL tangent, not the global strand direction.
-            vec3 curlOff = kinkVec * kinkAmp;
-            float cosA = cos(kinkT + rPhase);
-            float sinA = sin(kinkT + rPhase);
-            vec3 rotated = curlOff * cosA
-                         + cross(tang, curlOff) * sinA
-                         + tang * dot(tang, curlOff) * (1.0 - cosA);
+                vec3 kinkVec = sectionPerp1;
 
-            // Flat: interpolate base position between child and parent
-            vec3 basePos = mix(pos, primaryPos, clamp(pc.kinkFlat, 0.0, 1.0));
-            pos = basePos + rotated;
-        }
+                // Rodrigues rotation around the LOCAL tangent, not the global strand direction.
+                vec3 curlOff = kinkVec * kinkAmp;
+                float cosA = cos(kinkT + rPhase);
+                float sinA = sin(kinkT + rPhase);
+                vec3 rotated = curlOff * cosA
+                             + cross(tang, curlOff) * sinA
+                             + tang * dot(tang, curlOff) * (1.0 - cosA);
 
-        // Roughness 1: uniform noise displacement
-        if (pc.rough1 > 0.0 && si > 0) {
-            float t = globalT;
-            vec3 rco = rLoc * t;
-            float r0 = -1.0 + 2.0 * fract(sin(dot(rco, vec3(12.9898,78.233,45.164))) * 43758.5453);
-            float r1 = -1.0 + 2.0 * fract(sin(dot(rco, vec3(93.989,67.345,11.874))) * 23421.6312);
-            float r2 = -1.0 + 2.0 * fract(sin(dot(rco, vec3(27.163,41.975,83.573))) * 65834.1247);
-            pos += sectionPerp1 * pc.rough1 * r0 * pc.rough1Size * 0.1;
-            pos += sectionPerp2 * pc.rough1 * r1 * pc.rough1Size * 0.1;
-            pos += tang * pc.rough1 * r2 * pc.rough1Size * 0.05;
-        }
+                // Flat: interpolate base position between child and parent
+                vec3 basePos = mix(pos, primaryPos, clamp(pc.kinkFlat, 0.0, 1.0));
+                pos = basePos + rotated;
+            }
 
-        // Roughness 2: random displacement
-        if (pc.rough2 > 0.0 && si > 0) {
-            float r0 = -1.0 + 2.0 * randFloat(seed + si * 5u + 900u);
-            float r1 = -1.0 + 2.0 * randFloat(seed + si * 5u + 901u);
-            pos += sectionPerp1 * pc.rough2 * r0 * 0.1;
-            pos += sectionPerp2 * pc.rough2 * r1 * 0.1;
-        }
+            // Roughness 1: uniform noise displacement
+            if (pc.rough1 > 0.0 && si > 0) {
+                float t = globalT;
+                vec3 rco = rLoc * t;
+                float r0 = -1.0 + 2.0 * fract(sin(dot(rco, vec3(12.9898,78.233,45.164))) * 43758.5453);
+                float r1 = -1.0 + 2.0 * fract(sin(dot(rco, vec3(93.989,67.345,11.874))) * 23421.6312);
+                float r2 = -1.0 + 2.0 * fract(sin(dot(rco, vec3(27.163,41.975,83.573))) * 65834.1247);
+                pos += sectionPerp1 * pc.rough1 * r0 * pc.rough1Size * 0.1;
+                pos += sectionPerp2 * pc.rough1 * r1 * pc.rough1Size * 0.1;
+                pos += tang * pc.rough1 * r2 * pc.rough1Size * 0.05;
+            }
 
-        // Roughness Endpoint: increases toward tip
-        if (pc.roughEnd > 0.0 && si > 0) {
-            float t = globalT;
-            float roughfac = pc.roughEnd * t * t;
-            float r0 = -1.0 + 2.0 * rLoc.x;
-            float r1 = -1.0 + 2.0 * rLoc.y;
-            pos += sectionPerp1 * roughfac * r0 * 0.1;
-            pos += sectionPerp2 * roughfac * r1 * 0.1;
+            // Roughness 2: random displacement
+            if (pc.rough2 > 0.0 && si > 0) {
+                float r0 = -1.0 + 2.0 * randFloat(seed + si * 5u + 900u);
+                float r1 = -1.0 + 2.0 * randFloat(seed + si * 5u + 901u);
+                pos += sectionPerp1 * pc.rough2 * r0 * 0.1;
+                pos += sectionPerp2 * pc.rough2 * r1 * 0.1;
+            }
+
+            // Roughness Endpoint: increases toward tip
+            if (pc.roughEnd > 0.0 && si > 0) {
+                float t = globalT;
+                float roughfac = pc.roughEnd * t * t;
+                float r0 = -1.0 + 2.0 * rLoc.x;
+                float r1 = -1.0 + 2.0 * rLoc.y;
+                pos += sectionPerp1 * roughfac * r0 * 0.1;
+                pos += sectionPerp2 * roughfac * r1 * 0.1;
+            }
         }
 
         // NaN guard on final position
@@ -545,14 +655,14 @@ void main() {
         // into each tangent plane, which flattened horizontal strands.
         vec3 perpA = sectionPerp1;
 
-        vec3 leftA  = safePos(pos - perpA * radius, childRoot);
-        vec3 rightA = safePos(pos + perpA * radius, childRoot);
+        vec3 leftA  = safePos(pos - perpA * radius, pos);
+        vec3 rightA = safePos(pos + perpA * radius, pos);
 
         // ── Ribbon B: perpB = face normal of ribbon A (continuous strip) ──
-        vec3 perpB = normalize(cross(tang, perpA));
+        vec3 perpB = safeNormalize(cross(tang, perpA), makeStableRibbonPerp(tang));
 
-        vec3 leftB  = safePos(pos - perpB * radius, childRoot);
-        vec3 rightB = safePos(pos + perpB * radius, childRoot);
+        vec3 leftB  = safePos(pos - perpB * radius, pos);
+        vec3 rightB = safePos(pos + perpB * radius, pos);
 
         // Pack v + smooth tangent in normal buffer:
         // .x = v (-1 left, +1 right), .yz = octahedral-encoded smooth tangent
@@ -605,7 +715,7 @@ void main() {
     // ── Tip subdivision: replaces last body points with denser curved closure ──
     // Body stopped at S_body (before tip). Now generate TIP_EXTRA+1 points from
     // body-end globalT to 1.0, with CONVEX radius decay (1 - t²) for rounded tip.
-    {
+    if (!usePrecomputedStrands) {
         // Tip extends BEYOND the curve end using last body tangent
         float bodyEndRadius = prevRadius;
 
@@ -622,7 +732,7 @@ void main() {
 
             // Extend from last body position along its tangent
             vec3 tipPos = prevPos + tipTang * tipLen * tipFrac;
-            tipPos = safePos(tipPos, childRoot);
+            tipPos = safePos(tipPos, prevPos);
 
             vec3 pA = perpA_tip;
             vec3 pB = perpB_tip;
@@ -630,10 +740,10 @@ void main() {
             // CONVEX radius: stays thick then closes — slightly more pointed (1 - t^1.5)
             float tipRadius = bodyEndRadius * (1.0 - tipFrac * sqrt(tipFrac));
 
-            vec3 lA = safePos(tipPos - pA * tipRadius, childRoot);
-            vec3 rA = safePos(tipPos + pA * tipRadius, childRoot);
-            vec3 lB = safePos(tipPos - pB * tipRadius, childRoot);
-            vec3 rB = safePos(tipPos + pB * tipRadius, childRoot);
+            vec3 lA = safePos(tipPos - pA * tipRadius, tipPos);
+            vec3 rA = safePos(tipPos + pA * tipRadius, tipPos);
+            vec3 lB = safePos(tipPos - pB * tipRadius, tipPos);
+            vec3 rB = safePos(tipPos + pB * tipRadius, tipPos);
 
             uint vi = vertBase + (S_body + ti) * 4;
             outPos.pos[vi*3+0] = lA.x;      outPos.pos[vi*3+1] = lA.y;      outPos.pos[vi*3+2] = lA.z;
