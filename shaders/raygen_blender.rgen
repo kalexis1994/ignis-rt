@@ -1048,30 +1048,30 @@ void main() {
             if (hasA && length(worldPos - centerA) < dotRadius) diagColor = vec3(0.8, 0, 0.8);
             if (hasB && length(worldPos - centerB) < dotRadius) diagColor = vec3(0.8, 0, 0.8);
 
-            // Combined DOTS silhouette: left/right from camera
+            // Combined DOTS silhouette with sin/cos camera angle blending
             float segT = clamp(dot(worldPos - centerPt, T) / max(Tlen, 1e-8), 0.0, 1.0);
             vec3 sweepCenter = mix(centerPt, otherCenter, segT);
             vec3 toHit = worldPos - sweepCenter;
             vec3 perpToAxis = toHit - hairSmoothT * dot(toHit, hairSmoothT);
 
-            // Left/right from camera = cross(rayDir, T)
-            // This is perpendicular to both view and tangent → screen left/right
+            // sin of angle between view and tangent: 1 = side view, 0 = along strand
+            float sinViewT = length(cross(rayDir, hairSmoothT));
+
+            // Camera-relative cylV (accurate from the side)
             vec3 camLR = cross(rayDir, hairSmoothT);
-            float lrLen = length(camLR);
-            if (lrLen > 1e-6) camLR /= lrLen; else camLR = wDir;
-
-            // How far the hit extends left/right from center as camera sees it
+            if (sinViewT > 1e-6) camLR /= sinViewT; else camLR = wDir;
             float projectedDist = abs(dot(perpToAxis, camLR));
-
-            // Max extent of DOTS cross in the camera left/right direction
-            // max(ribbonA, ribbonB) → same result regardless of which ribbon was hit
             vec3 perpWDir = normalize(cross(hairSmoothT, wDir));
             float extA = abs(dot(wDir, camLR));
             float extB = abs(dot(perpWDir, camLR));
             float projectedMax = halfWidth * max(extA, extB);
+            float camCylV = projectedDist / max(projectedMax, 1e-8);
 
-            // cylV: 0 center, 1 at projected combined edge
-            float cylV = projectedDist / max(projectedMax, 1e-8);
+            // Geometric cylV (always stable, for top/bottom view)
+            float geoCylV = length(perpToAxis) / max(halfWidth, 1e-8);
+
+            // Blend: side view (sin≈1) → camera-relative, top view (sin≈0) → geometric
+            float cylV = mix(geoCylV, camCylV, sinViewT);
             float outline = smoothstep(0.7, 1.0, cylV);
             diagColor = mix(vec3(0, 1, 0), vec3(1, 0, 0), outline);
 
