@@ -860,7 +860,8 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
                                const uint32_t* emitterTris, uint32_t nEmitterTris,
                                const float* emitterCDF,
                                float rootRadius, float tipFactor,
-                               float camX, float camY, float camZ, float avgSpacing,
+                               float clumpNoiseSize, float childRoundness,
+                               float childLength, float avgSpacing,
                                float kinkAmplitude, float kinkFrequency,
                                float clumpFactor, float clumpShape,
                                float rough1, float rough1Size,
@@ -1049,7 +1050,7 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
         uint32_t nEmitterTris;
         float rootRadius;
         float tipFactor;
-        float cameraX, cameraY, cameraZ;
+        float clumpNoiseSize, childRoundness, childLength;
         float avgSpacing;
         float kinkAmplitude;
         float kinkFrequency;
@@ -1064,7 +1065,7 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
         float kinkFlat;
         float kinkAmpRandom;
     } pc = {nParents, keysPerStrand, totalChildren, nEmitterTris,
-            rootRadius, tipFactor, camX, camY, camZ, avgSpacing,
+            rootRadius, tipFactor, clumpNoiseSize, childRoundness, childLength, avgSpacing,
             kinkAmplitude, kinkFrequency,
             clumpFactor, clumpShape, rough1, rough1Size, rough2, roughEnd,
             childMode, kinkShape, kinkFlat, kinkAmpRandom};

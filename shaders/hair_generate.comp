@@ -64,7 +64,9 @@ layout(push_constant) uniform PushConstants {
     uint nEmitterTris;
     float rootRadius;
     float tipFactor;
-    float cameraX, cameraY, cameraZ;
+    float clumpNoiseSize;  // Voronoi noise scale for clump variation (was cameraX)
+    float childRoundness;  // 0=circular, 1=flat child distribution (was cameraY)
+    float childLength;     // child strand length as fraction of parent (was cameraZ)
     float avgSpacing;
     float kinkAmplitude;
     float kinkFrequency;
@@ -113,6 +115,16 @@ vec2 octEncode(vec3 n) {
         p = (1.0 - abs(p.yx)) * vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
     }
     return p;
+}
+
+// Simple 3D cell noise (approximation of Voronoi for clump_noise_size)
+vec3 cellNoise3D(vec3 p) {
+    vec3 i = floor(p);
+    // Hash cell to get random point inside
+    float h1 = fract(sin(dot(i, vec3(127.1, 311.7, 74.7))) * 43758.5453);
+    float h2 = fract(sin(dot(i, vec3(269.5, 183.3, 246.1))) * 43758.5453);
+    float h3 = fract(sin(dot(i, vec3(113.5, 271.9, 124.6))) * 43758.5453);
+    return i + vec3(h1, h2, h3);
 }
 
 // NaN guard: replace NaN/Inf with fallback
@@ -192,7 +204,10 @@ void main() {
 
         float angle = randFloat(seed + 500u) * 6.28318;
         float dist = (0.3 + randFloat(seed + 501u) * 0.7) * pc.avgSpacing * 0.5;
-        vec3 offset = sp1 * cos(angle) * dist + sp2 * sin(angle) * dist;
+        // childRoundness: 0=circular distribution, 1=flat (compress one axis)
+        // Blender: child->co[0] *= flat; where flat = 1-roundness
+        float flatFactor = 1.0 - clamp(pc.childRoundness, 0.0, 1.0);
+        vec3 offset = sp1 * cos(angle) * dist * flatFactor + sp2 * sin(angle) * dist;
 
         // Copy parent keys + uniform offset
         for (uint ki = 0; ki < K && ki < 16; ki++) {
@@ -250,6 +265,14 @@ void main() {
             for (int i = 0; i < 4; i++) {
                 childKeys[ki] += weights[i] * (parents.keys[bestIdx[i] * K + ki].xyz + offsets[i]);
             }
+        }
+    }
+
+    // Apply child_length: scale child strand to fraction of parent length
+    if (pc.childLength < 0.999) {
+        vec3 root = childKeys[0];
+        for (uint ki = 1; ki < K && ki < 16; ki++) {
+            childKeys[ki] = mix(root, childKeys[ki], pc.childLength);
         }
     }
 

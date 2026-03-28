@@ -136,7 +136,7 @@ def load():
         POINTER(c_float), c_uint32,                            # emitterVerts, nEmitterVerts
         POINTER(c_uint32), c_uint32,                           # emitterTris, nEmitterTris
         POINTER(c_float),                                      # emitterCDF
-        c_float, c_float, c_float, c_float, c_float, c_float, # rootRadius, tipFactor, camXYZ, avgSpacing
+        c_float, c_float, c_float, c_float, c_float, c_float, # rootRadius, tipFactor, clumpNoiseSize, childRoundness, childLength, avgSpacing
         c_float, c_float,                                      # kinkAmplitude, kinkFrequency
         c_float, c_float, c_float, c_float, c_float, c_float, # clump, rough
         c_uint32,                                              # childMode
@@ -307,7 +307,8 @@ def generate_hair_gpu(parent_keys, n_parents: int, keys_per_strand: int,
                       emitter_tris=None, n_emitter_tris: int = 0,
                       emitter_cdf=None,
                       root_radius: float = 0.003, tip_factor: float = 0.0,
-                      cam_x: float = 0, cam_y: float = 0, cam_z: float = 5,
+                      clump_noise_size: float = 1.0, child_roundness: float = 0.0,
+                      child_length: float = 1.0,
                       avg_spacing: float = 0.01,
                       kink_amplitude: float = 0.0, kink_frequency: float = 2.0,
                       clump_factor: float = 0.0, clump_shape: float = 0.0,
@@ -330,7 +331,7 @@ def generate_hair_gpu(parent_keys, n_parents: int, keys_per_strand: int,
         et.ctypes.data_as(POINTER(c_uint32)), c_uint32(n_emitter_tris),
         ec.ctypes.data_as(POINTER(c_float)),
         c_float(root_radius), c_float(tip_factor),
-        c_float(cam_x), c_float(cam_y), c_float(cam_z), c_float(avg_spacing),
+        c_float(clump_noise_size), c_float(child_roundness), c_float(child_length), c_float(avg_spacing),
         c_float(kink_amplitude), c_float(kink_frequency),
         c_float(clump_factor), c_float(clump_shape),
         c_float(rough1), c_float(rough1_size), c_float(rough2), c_float(rough_end),

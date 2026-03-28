@@ -262,12 +262,16 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
         "roughness_1": getattr(settings, 'roughness_1', 0.0),
         "roughness_1_size": getattr(settings, 'roughness_1_size', 1.0),
         "roughness_2": getattr(settings, 'roughness_2', 0.0),
+        "roughness_2_size": getattr(settings, 'roughness_2_size', 1.0),
         "roughness_endpoint": getattr(settings, 'roughness_endpoint', 0.0),
         "child_mode": 1 if child_type == 'SIMPLE' else 0,  # 0=INTERPOLATED, 1=SIMPLE
         "kink_shape": getattr(settings, 'kink_shape', 0.0),
         "kink_flat": getattr(settings, 'kink_flat', 0.0),
         "kink_amp_random": getattr(settings, 'kink_amp_random', 0.0),
-        "opaque_hair": getattr(settings, 'opaque_hair', False),
+        "opaque_hair": True,
+        "child_length": getattr(settings, 'child_length', 1.0),
+        "clump_noise_size": getattr(settings, 'clump_noise_size', 1.0),
+        "child_roundness": getattr(settings, 'child_roundness', 0.0),
     }
 
     # CPU fallback (kept for reference, not reached)
