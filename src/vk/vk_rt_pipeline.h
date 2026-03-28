@@ -225,6 +225,9 @@ public:
     static constexpr uint32_t SURFEL_CAPACITY = 1u << 20;  // 1M entries
     bool CreateSurfelBuffers();
 
+    // Hot-reload shaders from disk (recompile + recreate pipeline)
+    bool ReloadShaders();
+
 private:
     bool CreateDescriptorSetLayout();
     bool CreatePipeline();
