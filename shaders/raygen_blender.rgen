@@ -916,7 +916,7 @@ void main() {
         // DISABLED: edge-on skip (for diagnostic)
         // if (geo.bitangentBufferAddress != 0u) {
         //     float edgeFacing = abs(dot(geoNormalRaw, -rayDir));
-        //     if (edgeFacing < 0.3) {
+        //     if (edgeFacing < 0.2) {
         //         rayOrigin = worldPos + rayDir * 0.001;
         //         bounce--;
         //         continue;
@@ -930,12 +930,70 @@ void main() {
 
         if (geo.bitangentBufferAddress != 0u) {
             // Decode packed data from RAW interpolation (NOT normalized!)
-            // normalize() distorts .x (v parameter) by dividing by vector length
             vec3 rawN = vec3(normals.n[i0*3+0], normals.n[i0*3+1], normals.n[i0*3+2]) * bary.x
                       + vec3(normals.n[i1*3+0], normals.n[i1*3+1], normals.n[i1*3+2]) * bary.y
                       + vec3(normals.n[i2*3+0], normals.n[i2*3+1], normals.n[i2*3+2]) * bary.z;
-            hairV = clamp(rawN.x, -1.0, 1.0);
             vec3 localTangent = octDecode(vec2(rawN.y, rawN.z));
+
+            // Find center LINE of the ribbon and compute v as perpendicular distance.
+            // 1. Find same-cross-section left/right pair (opposite v, consecutive indices)
+            // 2. Their midpoint = a point ON the center line
+            // 3. Center line direction = hair tangent
+            // 4. v = perpendicular distance from hit to center line / half-width
+            float nv0 = normals.n[i0*3];
+            float nv1 = normals.n[i1*3];
+            float nv2 = normals.n[i2*3];
+            vec3 centerPt;
+            vec3 widthEdge;
+            bool found = false;
+            if (!found && nv0 * nv2 < 0.0 && abs(int(i0) - int(i2)) == 1) {
+                centerPt = (wp0 + wp2) * 0.5; widthEdge = wp2 - wp0; found = true;
+            }
+            if (!found && nv0 * nv1 < 0.0 && abs(int(i0) - int(i1)) == 1) {
+                centerPt = (wp0 + wp1) * 0.5; widthEdge = wp1 - wp0; found = true;
+            }
+            if (!found && nv1 * nv2 < 0.0 && abs(int(i1) - int(i2)) == 1) {
+                centerPt = (wp1 + wp2) * 0.5; widthEdge = wp2 - wp1; found = true;
+            }
+            if (!found) {
+                centerPt = (wp0 + wp1 + wp2) / 3.0;
+                widthEdge = wp2 - wp0;
+            }
+            // Read the ADJACENT triangle to get BOTH centers → exact center line
+            uint adjPrimId = (primitiveId % 2u == 0u) ? uint(primitiveId) + 1u : uint(primitiveId) - 1u;
+            uint adj_i0 = indices.i[adjPrimId * 3u + 0u];
+            uint adj_i1 = indices.i[adjPrimId * 3u + 1u];
+            uint adj_i2 = indices.i[adjPrimId * 3u + 2u];
+
+            vec3 adj_p0 = vec3(vertices.v[adj_i0*3u], vertices.v[adj_i0*3u+1u], vertices.v[adj_i0*3u+2u]);
+            vec3 adj_p1 = vec3(vertices.v[adj_i1*3u], vertices.v[adj_i1*3u+1u], vertices.v[adj_i1*3u+2u]);
+            vec3 adj_p2 = vec3(vertices.v[adj_i2*3u], vertices.v[adj_i2*3u+1u], vertices.v[adj_i2*3u+2u]);
+            vec3 adj_wp0 = (objToWorld * vec4(adj_p0, 1.0));
+            vec3 adj_wp1 = (objToWorld * vec4(adj_p1, 1.0));
+            vec3 adj_wp2 = (objToWorld * vec4(adj_p2, 1.0));
+
+            // Find adjacent triangle's same-cross-section center
+            float adj_nv0 = normals.n[adj_i0*3u];
+            float adj_nv1 = normals.n[adj_i1*3u];
+            float adj_nv2 = normals.n[adj_i2*3u];
+            vec3 otherCenter = (adj_wp0 + adj_wp1 + adj_wp2) / 3.0;  // fallback
+            if (adj_nv0 * adj_nv2 < 0.0 && abs(int(adj_i0)-int(adj_i2)) == 1)
+                otherCenter = (adj_wp0 + adj_wp2) * 0.5;
+            else if (adj_nv0 * adj_nv1 < 0.0 && abs(int(adj_i0)-int(adj_i1)) == 1)
+                otherCenter = (adj_wp0 + adj_wp1) * 0.5;
+            else if (adj_nv1 * adj_nv2 < 0.0 && abs(int(adj_i1)-int(adj_i2)) == 1)
+                otherCenter = (adj_wp1 + adj_wp2) * 0.5;
+
+            // EXACT center line direction: from our center to the adjacent center
+            vec3 T = otherCenter - centerPt;
+            float Tlen = length(T);
+            if (Tlen > 1e-8) T /= Tlen; else T = hairSmoothT;
+
+            vec3 hitOffset = worldPos - centerPt;
+            vec3 perpOffset = hitOffset - T * dot(hitOffset, T);
+            vec3 wDir = normalize(widthEdge);
+            float halfWidth = length(widthEdge) * 0.5;
+            hairV = clamp(dot(perpOffset, wDir) / max(halfWidth, 1e-8), -1.0, 1.0);
             // Transform tangent to world space
             hairSmoothT = normalize(mat3(objToWorld) * localTangent);
 
@@ -952,10 +1010,57 @@ void main() {
             geoNormalRaw = cylN;
             smoothN = cylN;
 
-            // DIAGNOSTIC: gradient from green (center/left) to black (right)
-            // Uses the v parameter: -1 = left edge, 0 = center, +1 = right edge
-            float grad = clamp(hairV * 0.5 + 0.5, 0.0, 1.0); // 0 at left, 1 at right
-            totalRadiance += vec3(0, 1.0 - grad, 0) * throughput;
+            // DIAGNOSTIC: red dots at vertices, purple dots at left-right midpoints
+            float d0 = length(worldPos - wp0);
+            float d1 = length(worldPos - wp1);
+            float d2 = length(worldPos - wp2);
+            float dotRadius = 0.01;
+            vec3 diagColor = vec3(0, 0.5, 0);  // green base
+
+            // Grey triangle wireframe (thin lines at edges where barycentrics ≈ 0)
+            float edgeThickness = 0.02;
+            if (bary.x < edgeThickness || bary.y < edgeThickness || bary.z < edgeThickness)
+                diagColor = vec3(0.4);
+
+            // Red dots at all vertices
+            if (d0 < dotRadius) diagColor = vec3(1, 0, 0);
+            if (d1 < dotRadius) diagColor = vec3(1, 0, 0);
+            if (d2 < dotRadius) diagColor = vec3(1, 0, 0);
+
+            // Find the two center points (midpoints of same-cross-section pairs)
+            // and draw a line between them
+            vec3 centerA = vec3(0), centerB = vec3(0);
+            bool hasA = false, hasB = false;
+            if (nv0 * nv1 < 0.0 && abs(int(i0) - int(i1)) == 1) {
+                if (!hasA) { centerA = (wp0+wp1)*0.5; hasA = true; }
+                else { centerB = (wp0+wp1)*0.5; hasB = true; }
+            }
+            if (nv0 * nv2 < 0.0 && abs(int(i0) - int(i2)) == 1) {
+                if (!hasA) { centerA = (wp0+wp2)*0.5; hasA = true; }
+                else { centerB = (wp0+wp2)*0.5; hasB = true; }
+            }
+            if (nv1 * nv2 < 0.0 && abs(int(i1) - int(i2)) == 1) {
+                if (!hasA) { centerA = (wp1+wp2)*0.5; hasA = true; }
+                else { centerB = (wp1+wp2)*0.5; hasB = true; }
+            }
+
+            // Purple dots at centers
+            if (hasA && length(worldPos - centerA) < dotRadius) diagColor = vec3(0.8, 0, 0.8);
+            if (hasB && length(worldPos - centerB) < dotRadius) diagColor = vec3(0.8, 0, 0.8);
+
+            // Draw center line using adjacent triangle method
+            if (hasA) {
+                vec3 wDir2 = normalize(widthEdge);
+                float halfWidth2 = length(widthEdge) * 0.5;
+
+                // Draw center line
+                vec3 toHitCL = worldPos - centerPt;
+                float proj = dot(toHitCL, T);
+                vec3 closest = centerPt + T * proj;
+                float distToLine = length(worldPos - closest);
+                if (distToLine < dotRadius * 0.3) diagColor = vec3(0, 0, 0);
+            }
+            totalRadiance += diagColor * throughput;
             break;
         } else {
             // Standard shadow terminator fix (non-hair geometry only)
