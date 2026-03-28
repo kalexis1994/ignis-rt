@@ -349,16 +349,16 @@ vec2 computeHairSectionSupportRadii(vec3 center, vec3 dir, vec3 a, vec3 b, vec3 
     return vec2(max(-minProj, 1e-6), max(maxProj, 1e-6));
 }
 
-float evalHairDiagnosticFalloff(vec3 cylN, vec3 lightDir)
+float evalHairCylinderFalloff(vec3 cylN, vec3 lightDir)
 {
     float front = max(dot(cylN, lightDir), 0.0);
     float back = max(dot(cylN, -lightDir), 0.0);
     return max(front, back * 0.35);
 }
 
-vec3 evalHairDiagnosticColor(vec3 cylN, vec3 lightDir)
+vec3 evalHairCylinderColor(vec3 cylN, vec3 lightDir, vec3 baseColor)
 {
-    return vec3(0.0, evalHairDiagnosticFalloff(cylN, lightDir), 0.0);
+    return baseColor * evalHairCylinderFalloff(cylN, lightDir);
 }
 
 // ============================================================
@@ -1054,11 +1054,12 @@ void main() {
         float hairV = 0.0;
         vec3 hairSmoothT = vec3(1, 0, 0);
         vec3 hairMacroN = geoNormalRaw;
+        vec3 hairShadePos = worldPos;
         uint hairStrandId = INVALID_HAIR_STRAND;
-        bool hairDiagnosticMode = false;
+        bool isHairHit = false;
 
         if (geo.bitangentBufferAddress != 0u) {
-            hairDiagnosticMode = true;
+            isHairHit = true;
             // Decode packed data from RAW interpolation (NOT normalized!)
             vec3 rawN = vec3(normals.n[i0*3+0], normals.n[i0*3+1], normals.n[i0*3+2]) * bary.x
                       + vec3(normals.n[i1*3+0], normals.n[i1*3+1], normals.n[i1*3+2]) * bary.y
@@ -1220,53 +1221,56 @@ void main() {
             vec3 toHit = worldPos - sweepCenter;
             vec3 perpToAxis = toHit - hairSmoothT * dot(toHit, hairSmoothT);
 
-            // === "WINDOW" approach: screen-space cylinder mapping ===
-            // The entire silhouette is a window showing a virtual cylinder.
-            // hairV depends on SCREEN position, not which ribbon was hit.
-
-            // Cone radius at this position along the strand
             float coneRadius = mix(radius0, radius1, segT);
-
-            // Project center and hit to NDC
-            mat4 VP = cam.proj * cam.view;
-            vec4 centerClip = VP * vec4(sweepCenter, 1.0);
-            vec4 hitClip    = VP * vec4(worldPos, 1.0);
-            vec2 centerNDC  = centerClip.xy / max(abs(centerClip.w), 1e-6);
-            vec2 hitNDC     = hitClip.xy / max(abs(hitClip.w), 1e-6);
-
-            // Project tangent to get strand direction in screen space
-            vec4 tangClip = VP * vec4(sweepCenter + hairSmoothT * 0.01, 1.0);
-            vec2 tangNDC  = tangClip.xy / max(abs(tangClip.w), 1e-6);
-            vec2 screenTang = tangNDC - centerNDC;
-            float stLen = length(screenTang);
-            if (stLen > 1e-8) screenTang /= stLen;
-
-            // Signed perpendicular distance in screen (left/right of projected axis)
-            vec2 hitOff = hitNDC - centerNDC;
-            float screenDist = hitOff.x * screenTang.y - hitOff.y * screenTang.x;
-
-            // Project coneRadius to screen at this depth
+            float hitAxis = dot(worldPos - sweepCenter, hairSmoothT);
             vec3 camLR = cross(hairSmoothT, -rayDir);
-            float sinViewT = length(camLR);
-            if (sinViewT > 1e-6) camLR /= sinViewT;
-            else camLR = wDir;
-            vec4 radiusClip = VP * vec4(sweepCenter + coneRadius * camLR, 1.0);
-            vec2 radiusNDC  = radiusClip.xy / max(abs(radiusClip.w), 1e-6);
-            vec2 radiusOff  = radiusNDC - centerNDC;
-            float screenRadius = abs(radiusOff.x * screenTang.y - radiusOff.y * screenTang.x);
+            float lrLen = length(camLR);
+            if (lrLen > 1e-6) camLR /= lrLen; else camLR = wDir;
 
-            // hairV from SCREEN position — same for both ribbons at the same pixel
-            hairV = clamp(screenDist / max(screenRadius, 1e-8), -1.0, 1.0);
+            // === Ray-cylinder intersection: virtual cylinder normal ===
+            // Find where this ray ENTERS the virtual cylinder.
+            // The normal at the entry point is the same regardless of which ribbon was hit.
+            // This makes the entire silhouette a "window" onto the cylinder for ANY ray.
+            vec3 relOrigin = rayOrigin - sweepCenter;
+            vec3 D_perp = rayDir - hairSmoothT * dot(rayDir, hairSmoothT);
+            vec3 O_perp = relOrigin - hairSmoothT * dot(relOrigin, hairSmoothT);
+
+            float rcA = dot(D_perp, D_perp);
+            float rcB = 2.0 * dot(O_perp, D_perp);
+            float rcC = dot(O_perp, O_perp) - coneRadius * coneRadius;
+            float disc = rcB * rcB - 4.0 * rcA * rcC;
+
+            vec3 cylN;
+            if (disc >= 0.0 && rcA > 1e-8) {
+                float sqrtDisc = sqrt(max(disc, 0.0));
+                float t0 = (-rcB - sqrtDisc) / (2.0 * rcA);
+                float t1 = (-rcB + sqrtDisc) / (2.0 * rcA);
+                float t_cyl = (t0 > 1e-5) ? t0 : ((t1 > 1e-5) ? t1 : -1.0);
+
+                if (t_cyl > 0.0) {
+                    hairShadePos = rayOrigin + t_cyl * rayDir;
+                    vec3 cylEntry = hairShadePos - sweepCenter;
+                    cylEntry -= hairSmoothT * dot(cylEntry, hairSmoothT);
+                    float entryLen = length(cylEntry);
+                    if (entryLen > 1e-6) {
+                        cylN = cylEntry / entryLen;
+                    } else {
+                        cylN = (length(perpToAxis) > 1e-6) ? normalize(perpToAxis) : wDir;
+                        hairShadePos = sweepCenter + hairSmoothT * hitAxis + cylN * coneRadius;
+                    }
+                    hairV = clamp(dot(cylN * coneRadius, camLR) / max(coneRadius, 1e-8), -1.0, 1.0);
+                } else {
+                    cylN = (length(perpToAxis) > 1e-6) ? normalize(perpToAxis) : wDir;
+                    hairShadePos = sweepCenter + hairSmoothT * hitAxis + cylN * coneRadius;
+                    hairV = clamp(dot(cylN * coneRadius, camLR) / max(coneRadius, 1e-8), -1.0, 1.0);
+                }
+            } else {
+                // Degenerate: ray along tangent — use radial fallback
+                cylN = (length(perpToAxis) > 1e-6) ? normalize(perpToAxis) : wDir;
+                hairShadePos = sweepCenter + hairSmoothT * hitAxis + cylN * coneRadius;
+                hairV = clamp(dot(cylN * coneRadius, camLR) / max(coneRadius, 1e-8), -1.0, 1.0);
+            }
             if (bounce == 0) primaryHairV = hairV;
-
-            // Cylinder normal from screen-space hairV
-            vec3 viewFacing = -rayDir - hairSmoothT * dot(-rayDir, hairSmoothT);
-            float vpLen = length(viewFacing);
-            if (vpLen > 1e-4) viewFacing /= vpLen;
-            else viewFacing = (length(perpToAxis) > 1e-6) ? normalize(perpToAxis) : geoNormal;
-
-            float cylCos = sqrt(max(0.0, 1.0 - hairV * hairV));
-            vec3 cylN = normalize(hairV * camLR + cylCos * viewFacing);
 
             worldN = cylN;
             geoNormal = cylN;
@@ -1336,9 +1340,11 @@ void main() {
             wp0, wp1, wp2, uv0_, uv1_, uv2_, hitUV, rayDir,
             hitVertexColor, uint(instanceId), localPos
         );
-        if (hairDiagnosticMode) {
-            pbrHit.baseColor = vec3(0.0, 1.0, 0.0);
+        if (isHairHit) {
+            pbrHit.worldPos = hairShadePos;
+            pbrHit.worldNormal = worldN;
         }
+        // Hair: cylinder shading uses material baseColor from PBR evaluation
 
         // ---- Volume-only material: ray march with Beer-Lambert + in-scattering ----
         bool isVolumeOnly = (mat.flags & 4u) != 0u && (mat.flags & 8u) != 0u;
@@ -1659,7 +1665,7 @@ void main() {
 
         if (!skipSunNEE && sunIntensity > 0.0 && sunDir.y > -0.01) {
             float NdotL = isHairSurface
-                ? (hairDiagnosticMode ? evalHairDiagnosticFalloff(N, sunDir) : length(cross(hairSmoothT, sunDir)))
+                ? (isHairHit ? evalHairCylinderFalloff(N, sunDir) : length(cross(hairSmoothT, sunDir)))
                 : dot(N, sunDir);
             if (NdotL > 0.0) {
                 // Shadow ray with soft penumbra (sun angular radius)
@@ -1764,8 +1770,8 @@ void main() {
                 vec3 sunRadiance = sunColor * sunIntensity;
                 vec3 diffContrib, specContrib;
                 if (isHairSurface) {
-                    if (hairDiagnosticMode) {
-                        diffContrib = evalHairDiagnosticColor(N, sunDir);
+                    if (isHairHit) {
+                        diffContrib = evalHairCylinderColor(N, sunDir, pbrHit.baseColor);
                         specContrib = vec3(0.0);
                     } else {
                         // Hair: Kajiya-Kay diffuse + Karis specular
@@ -2025,8 +2031,8 @@ void main() {
                     vec3 fRadiance = fColInt.rgb * fColInt.w * fAtten * fSpotAtten;
                     vec3 fDiffC, fSpecC;
                     if (isHairSurface) {
-                        if (hairDiagnosticMode) {
-                            fDiffC = evalHairDiagnosticColor(N, fL);
+                        if (isHairHit) {
+                            fDiffC = evalHairCylinderColor(N, fL, pbrHit.baseColor);
                             fSpecC = vec3(0.0);
                         } else {
                             float sinTfL = length(cross(hairSmoothT, fL));
@@ -2210,8 +2216,8 @@ void main() {
             vec3 brdfL = isAreaLight ? shadowDir : L;
             vec3 diffC, specC;
             if (isHairSurface) {
-                if (hairDiagnosticMode) {
-                    diffC = evalHairDiagnosticColor(N, brdfL);
+                if (isHairHit) {
+                    diffC = evalHairCylinderColor(N, brdfL, pbrHit.baseColor);
                     specC = vec3(0.0);
                 } else {
                     float sinTbrdf = length(cross(hairSmoothT, brdfL));
@@ -2303,8 +2309,8 @@ void main() {
                         vec3 V = -rayDir;
                         vec3 eDiffC, eSpecC;
                         if (isHairSurface) {
-                            if (hairDiagnosticMode) {
-                                eDiffC = evalHairDiagnosticColor(N, eDir);
+                            if (isHairHit) {
+                                eDiffC = evalHairCylinderColor(N, eDir, pbrHit.baseColor);
                                 eSpecC = vec3(0.0);
                             } else {
                                 float sinTeDir = length(cross(hairSmoothT, eDir));
@@ -2527,10 +2533,6 @@ void main() {
             if (bounce == 0) { isDiffusePath = false; captureSpecularMV = true; }
             bounce--;  // glass doesn't count against main bounce budget
             continue;
-        }
-
-        if (hairDiagnosticMode) {
-            break;
         }
 
         // ---- Sample BRDF lobe ----
