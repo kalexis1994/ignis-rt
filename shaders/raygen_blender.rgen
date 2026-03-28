@@ -1199,18 +1199,33 @@ void main() {
             vec3 chordAxis = otherCenter - centerPt;
             float chordLen = length(chordAxis);
             vec3 chordT = (chordLen > 1e-8) ? chordAxis / chordLen : hairSmoothT;
+            vec3 hairGeomT = chordT;
+            if (havePrevCenter && haveNextCenter) {
+                vec3 smoothAxis = nextCenter - prevCenter;
+                float smoothLen = length(smoothAxis);
+                if (smoothLen > 1e-8) hairGeomT = smoothAxis / smoothLen;
+            } else if (havePrevCenter) {
+                vec3 prevAxis = otherCenter - prevCenter;
+                float prevLen = length(prevAxis);
+                if (prevLen > 1e-8) hairGeomT = prevAxis / prevLen;
+            } else if (haveNextCenter) {
+                vec3 nextAxis = nextCenter - centerPt;
+                float nextLen = length(nextAxis);
+                if (nextLen > 1e-8) hairGeomT = nextAxis / nextLen;
+            }
+            if (length(hairGeomT) < 1e-6) hairGeomT = hairSmoothT;
 
             float radius0;
             float radius1;
             if (haveHairSections) {
-                vec3 sec0o0 = sec0a - centerPt - chordT * dot(sec0a - centerPt, chordT);
-                vec3 sec0o1 = sec0b - centerPt - chordT * dot(sec0b - centerPt, chordT);
-                vec3 sec0o2 = sec0c - centerPt - chordT * dot(sec0c - centerPt, chordT);
-                vec3 sec0o3 = sec0d - centerPt - chordT * dot(sec0d - centerPt, chordT);
-                vec3 sec1o0 = sec1a - otherCenter - chordT * dot(sec1a - otherCenter, chordT);
-                vec3 sec1o1 = sec1b - otherCenter - chordT * dot(sec1b - otherCenter, chordT);
-                vec3 sec1o2 = sec1c - otherCenter - chordT * dot(sec1c - otherCenter, chordT);
-                vec3 sec1o3 = sec1d - otherCenter - chordT * dot(sec1d - otherCenter, chordT);
+                vec3 sec0o0 = sec0a - centerPt - hairGeomT * dot(sec0a - centerPt, hairGeomT);
+                vec3 sec0o1 = sec0b - centerPt - hairGeomT * dot(sec0b - centerPt, hairGeomT);
+                vec3 sec0o2 = sec0c - centerPt - hairGeomT * dot(sec0c - centerPt, hairGeomT);
+                vec3 sec0o3 = sec0d - centerPt - hairGeomT * dot(sec0d - centerPt, hairGeomT);
+                vec3 sec1o0 = sec1a - otherCenter - hairGeomT * dot(sec1a - otherCenter, hairGeomT);
+                vec3 sec1o1 = sec1b - otherCenter - hairGeomT * dot(sec1b - otherCenter, hairGeomT);
+                vec3 sec1o2 = sec1c - otherCenter - hairGeomT * dot(sec1c - otherCenter, hairGeomT);
+                vec3 sec1o3 = sec1d - otherCenter - hairGeomT * dot(sec1d - otherCenter, hairGeomT);
                 radius0 = max((length(sec0o0) + length(sec0o1) + length(sec0o2) + length(sec0o3)) * 0.25, 1e-6);
                 radius1 = max((length(sec1o0) + length(sec1o1) + length(sec1o2) + length(sec1o3)) * 0.25, 1e-6);
                 if (length(widthEdge) < 1e-6) widthEdge = sec0b - sec0a;
@@ -1228,11 +1243,10 @@ void main() {
             // Linear sweep center (matches at boundaries: segT=1 → otherCenter = next segT=0)
             vec3 sweepCenter = mix(centerPt, otherCenter, segT);
             vec3 toHit = worldPos - sweepCenter;
-            vec3 perpToAxis = toHit - hairSmoothT * dot(toHit, hairSmoothT);
+            vec3 perpToAxis = toHit - hairGeomT * dot(toHit, hairGeomT);
 
             float coneRadius = mix(radius0, radius1, segT);
-            float hitAxis = dot(worldPos - sweepCenter, hairSmoothT);
-            vec3 camLR = cross(hairSmoothT, -rayDir);
+            vec3 camLR = cross(hairGeomT, -rayDir);
             float lrLen = length(camLR);
             if (lrLen > 1e-6) camLR /= lrLen; else camLR = wDir;
 
@@ -1241,8 +1255,8 @@ void main() {
             // The normal at the entry point is the same regardless of which ribbon was hit.
             // This makes the entire silhouette a "window" onto the cylinder for ANY ray.
             vec3 relOrigin = rayOrigin - sweepCenter;
-            vec3 D_perp = rayDir - hairSmoothT * dot(rayDir, hairSmoothT);
-            vec3 O_perp = relOrigin - hairSmoothT * dot(relOrigin, hairSmoothT);
+            vec3 D_perp = rayDir - hairGeomT * dot(rayDir, hairGeomT);
+            vec3 O_perp = relOrigin - hairGeomT * dot(relOrigin, hairGeomT);
 
             float rcA = dot(D_perp, D_perp);
             float rcB = 2.0 * dot(O_perp, D_perp);
@@ -1259,24 +1273,24 @@ void main() {
                 if (t_cyl > 0.0) {
                     hairShadePos = rayOrigin + t_cyl * rayDir;
                     vec3 cylEntry = hairShadePos - sweepCenter;
-                    cylEntry -= hairSmoothT * dot(cylEntry, hairSmoothT);
+                    cylEntry -= hairGeomT * dot(cylEntry, hairGeomT);
                     float entryLen = length(cylEntry);
                     if (entryLen > 1e-6) {
                         cylN = cylEntry / entryLen;
                     } else {
                         cylN = (length(perpToAxis) > 1e-6) ? normalize(perpToAxis) : wDir;
-                        hairShadePos = sweepCenter + hairSmoothT * hitAxis + cylN * coneRadius;
+                        hairShadePos = sweepCenter + cylN * coneRadius;
                     }
                     hairV = clamp(dot(cylN * coneRadius, camLR) / max(coneRadius, 1e-8), -1.0, 1.0);
                 } else {
                     cylN = (length(perpToAxis) > 1e-6) ? normalize(perpToAxis) : wDir;
-                    hairShadePos = sweepCenter + hairSmoothT * hitAxis + cylN * coneRadius;
+                    hairShadePos = sweepCenter + cylN * coneRadius;
                     hairV = clamp(dot(cylN * coneRadius, camLR) / max(coneRadius, 1e-8), -1.0, 1.0);
                 }
             } else {
                 // Degenerate: ray along tangent — use radial fallback
                 cylN = (length(perpToAxis) > 1e-6) ? normalize(perpToAxis) : wDir;
-                hairShadePos = sweepCenter + hairSmoothT * hitAxis + cylN * coneRadius;
+                hairShadePos = sweepCenter + cylN * coneRadius;
                 hairV = clamp(dot(cylN * coneRadius, camLR) / max(coneRadius, 1e-8), -1.0, 1.0);
             }
             if (bounce == 0) primaryHairV = hairV;
@@ -1637,8 +1651,13 @@ void main() {
 
         // ---- NEE throughput early-out (skip shadow rays when contribution is negligible) ----
         float maxThroughput = max(throughput.r, max(throughput.g, throughput.b));
-        bool skipSunNEE = (bounce >= 2 && maxThroughput < 0.01);
-        bool skipLocalNEE = false;  // NEE on all bounces (Cycles behavior)
+        bool hairFastPrimary = isHairSurface;
+        bool hairFastSecondary = isHairSurface && bounce > 0;
+        // Full path before the dense-groom fast path:
+        // bool skipSunNEE = (bounce >= 2 && maxThroughput < 0.01);
+        // bool skipLocalNEE = false;  // NEE on all bounces (Cycles behavior)
+        bool skipSunNEE = (bounce >= 2 && maxThroughput < 0.01) || hairFastSecondary;
+        bool skipLocalNEE = hairFastSecondary;
 
         // Glass/transmission surfaces don't scatter light — skip NEE entirely.
         // Light reaches through glass via refraction paths, not direct illumination.
@@ -1657,7 +1676,7 @@ void main() {
         uint neeStart = 0u;
         uint neeEnd = min(cam.lightCount, 32u);
         float neeScale = 1.0;
-        if (bounce >= 2 && cam.lightCount > 1u && !skipLocalNEE) {
+        if ((bounce >= 2 || hairFastPrimary) && cam.lightCount > 1u && !skipLocalNEE) {
             uint randIdx = min(uint(rand01() * float(cam.lightCount)), cam.lightCount - 1u);
             neeStart = randIdx;
             neeEnd = randIdx + 1u;
@@ -1671,6 +1690,7 @@ void main() {
         vec3 sunDir = normalize(cam.sunLight.xyz);
         float sunIntensity = cam.sunLight.w;
         vec3 sunColor = cam.skyLight.rgb;
+        int sunShadowSkipMax = isHairSurface ? 4 : 16;
 
         if (!skipSunNEE && sunIntensity > 0.0 && sunDir.y > -0.01) {
             float NdotL = isHairSurface
@@ -1699,7 +1719,7 @@ void main() {
                 vec3 shadowOrigin = pbrHit.worldPos + N * shadowBias;
                 bool inShadow = false;
                 float shadowHitDist = 65504.0;
-                for (int shadowSkip = 0; shadowSkip < 16; shadowSkip++) {
+                for (int shadowSkip = 0; shadowSkip < sunShadowSkipMax; shadowSkip++) {
                     rayQueryEXT shadowRQ;
                     rayQueryInitializeEXT(shadowRQ, topLevelAS,
                         gl_RayFlagsOpaqueEXT,
@@ -1839,7 +1859,7 @@ void main() {
         // ReSTIR DI: reservoir-based light sampling (opt-in via UI toggle)
         // Better for scenes with many lights (16+), may cause splotches with few lights
         bool restirEnabled = (cam.lightPad2 >> 1u) != 0u;  // bit 1 of lightPad2
-        if (restirEnabled && !skipLocalNEE && bounce == 0 && cam.lightCount > 0u) {
+        if (restirEnabled && !skipLocalNEE && bounce == 0 && cam.lightCount > 0u && !isHairSurface) {
             DIReservoir reservoir = emptyDIReservoir();
             vec3 V = -rayDir;
             uint localRng = rngState;
@@ -2570,30 +2590,69 @@ void main() {
 
         // ── Hair BSDF: Karis simplified Marschner (R + TT + TRT) ──
         if (isHairSurface) {
+            if (bounce > 0) {
+                // Dense-groom fast path: secondary hair hits stop here.
+                // Full path before this optimization:
+                // keep tracing glossy/diffuse hair transport on every bounce.
+                break;
+            }
+
             vec3 hairT = hairSmoothT;
             vec3 hairColor = pbrHit.baseColor;
             vec3 bounceN = worldN;
             float hairRoughness = max(pbrHit.roughness, 0.05);
+            float hairIor = max(pbrHit.ior, 1.01);
+            float hairSpecularWeight = max(pbrHit.specularLevel * 2.0, 0.0);
+            float hairF0 = (hairIor - 1.0) / (hairIor + 1.0);
+            hairF0 *= hairF0;
 
-            vec3 newDir = sampleCosineHemisphere(rand2(), bounceN);
+            // Hair needs an explicit glossy branch for scene reflections.
+            // Otherwise low roughness only sharpens a lobe that is still sampled diffusely.
+            float specProb = clamp(hairSpecularWeight * (0.35 + 0.45 * (1.0 - hairRoughness)) + hairF0 * 2.0,
+                                   0.12, 0.9);
+            if (hairSpecularWeight <= 1e-5)
+                specProb = 0.0;
 
-            // Hair: Kajiya-Kay diffuse + Karis specular
-            // Diffuse: sin(T, bounceDir) — tangent-based, not normal-based
-            float sinTBounce = length(cross(hairT, newDir));
-            vec3 hairDiffuse = hairColor * INV_PI * sinTBounce;
-            vec3 hairSpec = hair_eval(-rayDir, newDir, hairT,
-                                      hairColor, hairRoughness, 0.035, max(pbrHit.ior, 1.01), hairV)
-                          * max(pbrHit.specularLevel * 2.0, 0.0);
-            vec3 hairF = hairDiffuse + hairSpec;
+            bool chooseHairSpec = specProb > 0.0 && rand01() < specProb;
+            vec3 newDir;
 
-            float cosPdf = max(dot(newDir, bounceN), 0.0) * INV_PI;
-            if (cosPdf < 1e-6) break;
+            if (chooseHairSpec) {
+                float alpha = max(hairRoughness * hairRoughness, 0.001);
+                vec3 H = sampleGGX_VNDF(rand2(), V, bounceN, alpha);
+                newDir = reflect(-V, H);
 
-            throughput *= hairF / cosPdf;
+                float NdotL = max(dot(bounceN, newDir), 0.0);
+                float NdotH = max(dot(bounceN, H), 0.0);
+                float NdotVHair = max(dot(bounceN, V), 0.001);
+                float VdotH = max(dot(V, H), 1e-6);
+                if (NdotL <= 0.0 || VdotH <= 1e-6)
+                    break;
+
+                float specPdf = (GGX_D(NdotH, alpha) * SmithG1(NdotVHair, alpha) * VdotH)
+                              / max(4.0 * NdotVHair * VdotH, 1e-6);
+                vec3 hairSpec = hair_eval(V, newDir, hairT,
+                                          hairColor, hairRoughness, 0.035, hairIor, hairV)
+                              * hairSpecularWeight;
+                float branchPdf = specProb * max(specPdf, 1e-6);
+                throughput *= hairSpec / branchPdf;
+                if (bounce == 0) { isDiffusePath = false; captureSpecularMV = true; }
+            } else {
+                newDir = sampleCosineHemisphere(rand2(), bounceN);
+
+                // Hair diffuse stays tangent-driven so the cylinder keeps its strand look.
+                float sinTBounce = length(cross(hairT, newDir));
+                vec3 hairDiffuse = hairColor * INV_PI * sinTBounce;
+                float cosPdf = max(dot(newDir, bounceN), 0.0) * INV_PI;
+                float branchPdf = max((1.0 - specProb) * cosPdf, 1e-6);
+                if (branchPdf <= 1e-6)
+                    break;
+
+                throughput *= hairDiffuse / branchPdf;
+                if (bounce == 0) isDiffusePath = true;
+            }
+
             throughput = min(throughput, vec3(MAX_RADIANCE));
-
             rayDir = newDir;
-            if (bounce == 0) isDiffusePath = true;
 
             rayOrigin = pbrHit.worldPos + bounceN * 0.02;
             prevBounceNormal = bounceN;

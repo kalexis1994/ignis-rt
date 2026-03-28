@@ -151,6 +151,9 @@ void main() {
     // Remaining strands are children as usual.
     // totalChildren already includes parents when useParentParticles is set (added in Python).
     bool isParentStrand = (pc.useParentParticles != 0u && childIdx < pc.nParents);
+    uint parentStrandCount = (pc.useParentParticles != 0u) ? pc.nParents : 0u;
+    uint generatedChildCount = max(pc.totalChildren - parentStrandCount, 1u);
+    uint childGenIdx = isParentStrand ? 0u : (childIdx - parentStrandCount);
 
     uint K = pc.keysPerStrand;
     const uint MAX_SUBDIV = 16u;
@@ -195,7 +198,7 @@ void main() {
             vec3 ev2 = emitter.verts[tri.z].xyz;
             childRoot = bw0 * ev0 + bw1 * ev1 + bw2 * ev2;
         } else {
-            uint pi = childIdx % pc.nParents;
+            uint pi = childGenIdx % pc.nParents;
             childRoot = parents.keys[pi * K].xyz;
             childRoot += vec3(randFloat(seed+3u), randFloat(seed+4u), randFloat(seed+5u)) * 0.01 - 0.005;
         }
@@ -205,8 +208,7 @@ void main() {
 
     if (pc.childMode == 1u) {
         // ── SIMPLE mode: assign to one parent, offset perpendicular ──
-        uint childPerParent = pc.totalChildren / max(pc.nParents, 1u);
-        uint assignedParent = min(childIdx / max(childPerParent, 1u), pc.nParents - 1u);
+        uint assignedParent = min((childGenIdx * pc.nParents) / generatedChildCount, pc.nParents - 1u);
         bestIdx[0] = assignedParent;
 
         // Random perpendicular offset (constant along strand = same shape, shifted root)
