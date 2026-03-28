@@ -55,3 +55,5 @@ nul
 external/SHARC/
 /site
 site/
+shaders/raygen_blender.rgen.spv
+shaders/Runtime_LUT.cube
