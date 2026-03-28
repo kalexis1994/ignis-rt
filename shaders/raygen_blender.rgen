@@ -235,6 +235,52 @@ vec3 EnvBRDFApprox(vec3 F0, float roughness, float NdotV) {
     return F0 * AB.x + vec3(AB.y);
 }
 
+const uint INVALID_HAIR_STRAND = 0xFFFFFFFFu;
+
+bool getHairRibbonLayout(GeometryMetadata geo,
+                         out uint strandCount,
+                         out uint vertsPerStrand,
+                         out uint trisPerStrand)
+{
+    strandCount = 0u;
+    vertsPerStrand = 0u;
+    trisPerStrand = 0u;
+
+    if (geo.bitangentBufferAddress == 0u || geo.indexCount < 12u || geo.vertexCount < 8u)
+        return false;
+
+    uint totalTris = geo.indexCount / 3u;
+    if (geo.vertexCount <= totalTris)
+        return false;
+
+    uint vertexMinusTris = geo.vertexCount - totalTris;
+    if ((vertexMinusTris & 3u) != 0u)
+        return false;
+
+    strandCount = vertexMinusTris / 4u;
+    if (strandCount == 0u || (totalTris % strandCount) != 0u)
+        return false;
+
+    trisPerStrand = totalTris / strandCount;
+    if ((trisPerStrand & 3u) != 0u)
+        return false;
+
+    vertsPerStrand = trisPerStrand + 4u;
+    if (geo.vertexCount != strandCount * vertsPerStrand)
+        return false;
+
+    return true;
+}
+
+uint getHairStrandId(GeometryMetadata geo, uint primId)
+{
+    uint strandCount, vertsPerStrand, trisPerStrand;
+    if (!getHairRibbonLayout(geo, strandCount, vertsPerStrand, trisPerStrand) || trisPerStrand == 0u)
+        return INVALID_HAIR_STRAND;
+
+    return primId / trisPerStrand;
+}
+
 // ============================================================
 // Sky Environment — Procedural Preetham/Rayleigh+Mie scattering
 // Ported from ac-path-tracer (physically plausible, ~30 ALU ops)
@@ -927,6 +973,8 @@ void main() {
         float hairV = 0.0;
         vec3 hairSmoothT = vec3(1, 0, 0);
         vec3 hairMacroN = geoNormalRaw;
+        float hairCylinderMask = 1.0;
+        uint hairStrandId = INVALID_HAIR_STRAND;
 
         if (geo.bitangentBufferAddress != 0u) {
             // Decode packed data from RAW interpolation (NOT normalized!)
@@ -946,6 +994,7 @@ void main() {
             float nv2 = normals.n[i2*3];
             vec3 centerPt;
             vec3 widthEdge;
+            vec3 otherWidthEdge;
             bool found = false;
             if (!found && nv0 * nv2 < 0.0 && abs(int(i0) - int(i2)) == 1) {
                 centerPt = (wp0 + wp2) * 0.5; widthEdge = wp2 - wp0; found = true;
@@ -960,9 +1009,6 @@ void main() {
                 centerPt = (wp0 + wp1 + wp2) / 3.0;
                 widthEdge = wp2 - wp0;
             }
-            float widthLen = length(widthEdge);
-            vec3 wDir = (widthLen > 1e-6) ? widthEdge / widthLen : vec3(1, 0, 0);
-            float radius0 = max(widthLen * 0.5, 1e-6);
 
             // Read the ADJACENT triangle to get BOTH centers → exact center line
             uint adjPrimId = (primitiveId % 2u == 0u) ? uint(primitiveId) + 1u : uint(primitiveId) - 1u;
@@ -982,7 +1028,7 @@ void main() {
             float adj_nv1 = normals.n[adj_i1*3u];
             float adj_nv2 = normals.n[adj_i2*3u];
             vec3 otherCenter = (adj_wp0 + adj_wp1 + adj_wp2) / 3.0;  // fallback
-            vec3 otherWidthEdge = adj_wp2 - adj_wp0;
+            otherWidthEdge = adj_wp2 - adj_wp0;
             if (adj_nv0 * adj_nv2 < 0.0 && abs(int(adj_i0)-int(adj_i2)) == 1)
             {
                 otherCenter = (adj_wp0 + adj_wp2) * 0.5;
@@ -998,12 +1044,59 @@ void main() {
                 otherCenter = (adj_wp1 + adj_wp2) * 0.5;
                 otherWidthEdge = adj_wp2 - adj_wp1;
             }
-            float radius1 = max(length(otherWidthEdge) * 0.5, 1e-6);
+
+            bool haveHairSections = false;
+            vec3 sec0a, sec0b, sec0c, sec0d;
+            vec3 sec1a, sec1b, sec1c, sec1d;
+            uint strandCount, vertsPerStrand, trisPerStrand;
+            if (getHairRibbonLayout(geo, strandCount, vertsPerStrand, trisPerStrand)) {
+                hairStrandId = uint(primitiveId) / trisPerStrand;
+                uint localPrimId = uint(primitiveId) % trisPerStrand;
+                uint segId = localPrimId / 4u;
+                uint section0Base = hairStrandId * vertsPerStrand + segId * 4u;
+                uint section1Base = section0Base + 4u;
+                if (section1Base + 3u < geo.vertexCount) {
+                    sec0a = (objToWorld * vec4(vec3(vertices.v[(section0Base + 0u)*3u + 0u], vertices.v[(section0Base + 0u)*3u + 1u], vertices.v[(section0Base + 0u)*3u + 2u]), 1.0));
+                    sec0b = (objToWorld * vec4(vec3(vertices.v[(section0Base + 1u)*3u + 0u], vertices.v[(section0Base + 1u)*3u + 1u], vertices.v[(section0Base + 1u)*3u + 2u]), 1.0));
+                    sec0c = (objToWorld * vec4(vec3(vertices.v[(section0Base + 2u)*3u + 0u], vertices.v[(section0Base + 2u)*3u + 1u], vertices.v[(section0Base + 2u)*3u + 2u]), 1.0));
+                    sec0d = (objToWorld * vec4(vec3(vertices.v[(section0Base + 3u)*3u + 0u], vertices.v[(section0Base + 3u)*3u + 1u], vertices.v[(section0Base + 3u)*3u + 2u]), 1.0));
+                    sec1a = (objToWorld * vec4(vec3(vertices.v[(section1Base + 0u)*3u + 0u], vertices.v[(section1Base + 0u)*3u + 1u], vertices.v[(section1Base + 0u)*3u + 2u]), 1.0));
+                    sec1b = (objToWorld * vec4(vec3(vertices.v[(section1Base + 1u)*3u + 0u], vertices.v[(section1Base + 1u)*3u + 1u], vertices.v[(section1Base + 1u)*3u + 2u]), 1.0));
+                    sec1c = (objToWorld * vec4(vec3(vertices.v[(section1Base + 2u)*3u + 0u], vertices.v[(section1Base + 2u)*3u + 1u], vertices.v[(section1Base + 2u)*3u + 2u]), 1.0));
+                    sec1d = (objToWorld * vec4(vec3(vertices.v[(section1Base + 3u)*3u + 0u], vertices.v[(section1Base + 3u)*3u + 1u], vertices.v[(section1Base + 3u)*3u + 2u]), 1.0));
+                    centerPt = (sec0a + sec0b + sec0c + sec0d) * 0.25;
+                    otherCenter = (sec1a + sec1b + sec1c + sec1d) * 0.25;
+                    widthEdge = (sec0b - sec0a) + (sec0d - sec0c);
+                    otherWidthEdge = (sec1b - sec1a) + (sec1d - sec1c);
+                    haveHairSections = true;
+                }
+            }
 
             // Use the exact ribbon pair centers as the strand axis for projected-cylinder shading.
             vec3 axisT = otherCenter - centerPt;
             float axisLen = length(axisT);
             if (axisLen > 1e-8) axisT /= axisLen; else axisT = hairSmoothT;
+
+            float radius0;
+            float radius1;
+            if (haveHairSections) {
+                vec3 sec0o0 = sec0a - centerPt - axisT * dot(sec0a - centerPt, axisT);
+                vec3 sec0o1 = sec0b - centerPt - axisT * dot(sec0b - centerPt, axisT);
+                vec3 sec0o2 = sec0c - centerPt - axisT * dot(sec0c - centerPt, axisT);
+                vec3 sec0o3 = sec0d - centerPt - axisT * dot(sec0d - centerPt, axisT);
+                vec3 sec1o0 = sec1a - otherCenter - axisT * dot(sec1a - otherCenter, axisT);
+                vec3 sec1o1 = sec1b - otherCenter - axisT * dot(sec1b - otherCenter, axisT);
+                vec3 sec1o2 = sec1c - otherCenter - axisT * dot(sec1c - otherCenter, axisT);
+                vec3 sec1o3 = sec1d - otherCenter - axisT * dot(sec1d - otherCenter, axisT);
+                radius0 = max((length(sec0o0) + length(sec0o1) + length(sec0o2) + length(sec0o3)) * 0.25, 1e-6);
+                radius1 = max((length(sec1o0) + length(sec1o1) + length(sec1o2) + length(sec1o3)) * 0.25, 1e-6);
+                if (length(widthEdge) < 1e-6) widthEdge = sec0b - sec0a;
+            } else {
+                radius0 = max(length(widthEdge) * 0.5, 1e-6);
+                radius1 = max(length(otherWidthEdge) * 0.5, 1e-6);
+            }
+            float widthLen = length(widthEdge);
+            vec3 wDir = (widthLen > 1e-6) ? widthEdge / widthLen : vec3(1, 0, 0);
 
             float segT = (axisLen > 1e-8)
                 ? clamp(dot(worldPos - centerPt, axisT) / axisLen, 0.0, 1.0)
@@ -1037,55 +1130,10 @@ void main() {
             geoNormal = cylN;
             geoNormalRaw = cylN;
             smoothN = cylN;
-
-            // DIAGNOSTIC: red dots at vertices, purple dots at left-right midpoints
-            float d0 = length(worldPos - wp0);
-            float d1 = length(worldPos - wp1);
-            float d2 = length(worldPos - wp2);
-            float dotRadius = 0.01;
-            vec3 diagColor = vec3(0, 0.5, 0);  // green base
-
-            // Grey triangle wireframe (thin lines at edges where barycentrics ≈ 0)
-            float edgeThickness = 0.02;
-            if (bary.x < edgeThickness || bary.y < edgeThickness || bary.z < edgeThickness)
-                diagColor = vec3(0.4);
-
-            // Red dots at all vertices
-            if (d0 < dotRadius) diagColor = vec3(1, 0, 0);
-            if (d1 < dotRadius) diagColor = vec3(1, 0, 0);
-            if (d2 < dotRadius) diagColor = vec3(1, 0, 0);
-
-            // Find the two center points (midpoints of same-cross-section pairs)
-            // and draw a line between them
-            vec3 centerA = vec3(0), centerB = vec3(0);
-            bool hasA = false, hasB = false;
-            if (nv0 * nv1 < 0.0 && abs(int(i0) - int(i1)) == 1) {
-                if (!hasA) { centerA = (wp0+wp1)*0.5; hasA = true; }
-                else { centerB = (wp0+wp1)*0.5; hasB = true; }
-            }
-            if (nv0 * nv2 < 0.0 && abs(int(i0) - int(i2)) == 1) {
-                if (!hasA) { centerA = (wp0+wp2)*0.5; hasA = true; }
-                else { centerB = (wp0+wp2)*0.5; hasB = true; }
-            }
-            if (nv1 * nv2 < 0.0 && abs(int(i1) - int(i2)) == 1) {
-                if (!hasA) { centerA = (wp1+wp2)*0.5; hasA = true; }
-                else { centerB = (wp1+wp2)*0.5; hasB = true; }
-            }
-
-            // Purple dots at centers
-            if (hasA && length(worldPos - centerA) < dotRadius) diagColor = vec3(0.8, 0, 0.8);
-            if (hasB && length(worldPos - centerB) < dotRadius) diagColor = vec3(0.8, 0, 0.8);
-
-            // Cylinder shading: bright center → dark edges in camera projection.
             float cylV = clamp(abs(signedV), 0.0, 1.0);
-
-            // Cylinder cosine falloff: 1 at center (facing camera), 0 at edge
             float cylBrightness = sqrt(max(0.0, 1.0 - cylV * cylV));
-
-            diagColor = vec3(0, cylBrightness, 0);
-
-            totalRadiance += diagColor * throughput;
-            break;
+            const float cylinderEdgeFloor = 0.35;
+            hairCylinderMask = mix(cylinderEdgeFloor, 1.0, cylBrightness);
         } else {
             // Standard shadow terminator fix (non-hair geometry only)
             float NdotNg = dot(worldN, geoNormal);
@@ -1150,6 +1198,10 @@ void main() {
             wp0, wp1, wp2, uv0_, uv1_, uv2_, hitUV, rayDir,
             hitVertexColor, uint(instanceId), localPos
         );
+        if (geo.bitangentBufferAddress != 0u) {
+            // White projected-cylinder albedo; the path tracer lighting now shapes the strand.
+            pbrHit.baseColor = vec3(hairCylinderMask);
+        }
 
         // ---- Volume-only material: ray march with Beer-Lambert + in-scattering ----
         bool isVolumeOnly = (mat.flags & 4u) != 0u && (mat.flags & 8u) != 0u;
@@ -1308,9 +1360,9 @@ void main() {
         vec3 N = pbrHit.worldNormal;
         vec3 gN = geoNormal;  // camera-facing geometric normal
         bool isHairSurface = (geo.bitangentBufferAddress != 0u);
-        // Hair: large shadow bias to skip sibling DOTS ribbon + own strand geometry
-        // Prevents self-shadowing artifacts (inspired by ksTree alpha approach)
+        // Hair: large shadow bias plus same-strand skip prevents ribbon-on-ribbon shadows.
         float shadowBias = isHairSurface ? 0.1 : 0.002;
+        float hairSelfShadowSkipDist = isHairSurface ? 0.12 : 0.0;
         bool frontFace = dot(gN, -rayDir) >= 0.0;
         if (!frontFace) {
             gN = -gN;
@@ -1513,6 +1565,17 @@ void main() {
                     float sHitT = rayQueryGetIntersectionTEXT(shadowRQ, true);
 
                     GeometryMetadata sGeo = geometryMetadata.geometries[sCustIdx];
+                    uint sStrandId = getHairStrandId(sGeo, uint(max(sPrimId, 0)));
+                    bool skipSameStrandShadow = isHairSurface && sGeo.bitangentBufferAddress != 0u
+                        && sCustIdx == customIndex
+                        && hairStrandId != INVALID_HAIR_STRAND
+                        && sStrandId == hairStrandId;
+                    if (skipSameStrandShadow
+                        || (isHairSurface && sGeo.bitangentBufferAddress != 0u
+                            && sCustIdx == customIndex && sHitT < hairSelfShadowSkipDist)) {
+                        shadowOrigin += shadowDir * (sHitT + 0.01);
+                        continue;
+                    }
                     uint sMatIdx = 0u;
                     if (sGeo.primMaterialBufferAddress != 0u) {
                         PrimMaterials sPrimMats = PrimMaterials(sGeo.primMaterialBufferAddress);
@@ -1764,12 +1827,34 @@ void main() {
 
                 // Shadow ray
                 vec3 fShadowOrigin = pbrHit.worldPos + N * shadowBias;
-                rayQueryEXT fShadowRQ;
-                rayQueryInitializeEXT(fShadowRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
-                    0xFF, fShadowOrigin, 0.0, fL, fDist - 0.004);
-                while (rayQueryProceedEXT(fShadowRQ)) {}
-                bool fInShadow = (rayQueryGetIntersectionTypeEXT(fShadowRQ, true)
-                    != gl_RayQueryCommittedIntersectionNoneEXT);
+                bool fInShadow = false;
+                for (int fShadowSkip = 0; fShadowSkip < 4; fShadowSkip++) {
+                    rayQueryEXT fShadowRQ;
+                    rayQueryInitializeEXT(fShadowRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
+                        0xFF, fShadowOrigin, 0.0, fL, fDist - 0.004);
+                    while (rayQueryProceedEXT(fShadowRQ)) {}
+                    if (rayQueryGetIntersectionTypeEXT(fShadowRQ, true)
+                        == gl_RayQueryCommittedIntersectionNoneEXT) {
+                        break;
+                    }
+                    uint fCustIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(fShadowRQ, true);
+                    int fPrimId = rayQueryGetIntersectionPrimitiveIndexEXT(fShadowRQ, true);
+                    float fHitT = rayQueryGetIntersectionTEXT(fShadowRQ, true);
+                    GeometryMetadata fGeo = geometryMetadata.geometries[fCustIdx];
+                    uint fStrandId = getHairStrandId(fGeo, uint(max(fPrimId, 0)));
+                    bool skipSameStrandShadow = isHairSurface && fGeo.bitangentBufferAddress != 0u
+                        && fCustIdx == customIndex
+                        && hairStrandId != INVALID_HAIR_STRAND
+                        && fStrandId == hairStrandId;
+                    if (skipSameStrandShadow
+                        || (isHairSurface && fGeo.bitangentBufferAddress != 0u
+                            && fCustIdx == customIndex && fHitT < hairSelfShadowSkipDist)) {
+                        fShadowOrigin += fL * (fHitT + 0.01);
+                        continue;
+                    }
+                    fInShadow = true;
+                    break;
+                }
 
                 if (!fInShadow) {
                     float W = diReservoirWeight(reservoir);
@@ -1946,6 +2031,17 @@ void main() {
                 int ptsPrimId = rayQueryGetIntersectionPrimitiveIndexEXT(shadowRQ, true);
                 float ptsHitT = rayQueryGetIntersectionTEXT(shadowRQ, true);
                 GeometryMetadata ptsGeo = geometryMetadata.geometries[ptsCustIdx];
+                uint ptsStrandId = getHairStrandId(ptsGeo, uint(max(ptsPrimId, 0)));
+                bool skipSameStrandShadow = isHairSurface && ptsGeo.bitangentBufferAddress != 0u
+                    && ptsCustIdx == customIndex
+                    && hairStrandId != INVALID_HAIR_STRAND
+                    && ptsStrandId == hairStrandId;
+                if (skipSameStrandShadow
+                    || (isHairSurface && ptsGeo.bitangentBufferAddress != 0u
+                        && ptsCustIdx == customIndex && ptsHitT < hairSelfShadowSkipDist)) {
+                    ptShadowOrigin += shadowDir * (ptsHitT + 0.01);
+                    continue;
+                }
                 uint ptsMatIdx = 0u;
                 if (ptsGeo.primMaterialBufferAddress != 0u) {
                     PrimMaterials ptsPM = PrimMaterials(ptsGeo.primMaterialBufferAddress);
@@ -2025,6 +2121,17 @@ void main() {
                         int ePrimId = rayQueryGetIntersectionPrimitiveIndexEXT(eShadowRQ, true);
                         float eHitT = rayQueryGetIntersectionTEXT(eShadowRQ, true);
                         GeometryMetadata eGeo = geometryMetadata.geometries[eCustIdx];
+                        uint eStrandId = getHairStrandId(eGeo, uint(max(ePrimId, 0)));
+                        bool skipSameStrandShadow = isHairSurface && eGeo.bitangentBufferAddress != 0u
+                            && eCustIdx == customIndex
+                            && hairStrandId != INVALID_HAIR_STRAND
+                            && eStrandId == hairStrandId;
+                        if (skipSameStrandShadow
+                            || (isHairSurface && eGeo.bitangentBufferAddress != 0u
+                                && eCustIdx == customIndex && eHitT < hairSelfShadowSkipDist)) {
+                            eShadowOrigin += eDir * (eHitT + 0.01);
+                            continue;
+                        }
                         uint eMatIdx = 0u;
                         if (eGeo.primMaterialBufferAddress != 0u) {
                             PrimMaterials ePM = PrimMaterials(eGeo.primMaterialBufferAddress);
