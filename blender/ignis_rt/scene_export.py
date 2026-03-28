@@ -3351,6 +3351,36 @@ _GPU_MATERIAL_VM = struct.Struct('<' + 'I' * 260)
 _GPU_MATERIAL_SIZE = _GPU_MATERIAL_BASE.size + _GPU_MATERIAL_VM.size  # 140 + 1040 = 1180
 
 _NO_TEX = 0xFFFFFFFF
+_MAT_FLAG_HAIR = 32
+
+
+def _hair_roughness_factor(azimuthal_roughness):
+    x = max(0.0, min(float(azimuthal_roughness), 1.0))
+    return (((((0.245 * x) + 5.574) * x - 10.73) * x + 2.532) * x - 0.215) * x + 5.969
+
+
+def _hair_sigma_from_reflectance(color, azimuthal_roughness):
+    fac = max(_hair_roughness_factor(azimuthal_roughness), 1e-6)
+    out = []
+    for c in color[:3]:
+        out.append((math.log(max(float(c), 1e-6)) / fac) ** 2)
+    return tuple(out)
+
+
+def _hair_sigma_from_concentration(eumelanin, pheomelanin):
+    return (
+        eumelanin * 0.506 + pheomelanin * 0.343,
+        eumelanin * 0.841 + pheomelanin * 0.733,
+        eumelanin * 1.653 + pheomelanin * 1.924,
+    )
+
+
+def _hair_reflectance_from_sigma(sigma, azimuthal_roughness):
+    fac = _hair_roughness_factor(azimuthal_roughness)
+    return tuple(
+        max(0.0, min(1.0, math.exp(-fac * math.sqrt(max(float(s), 0.0)))))
+        for s in sigma[:3]
+    )
 
 
 def _pack_gpu_material(
@@ -3385,6 +3415,8 @@ def _pack_gpu_material(
     volume_noise_lacunarity=2.0,
     volume_noise_contrast=0.0,
     volume_mapping_offset=(0.0, 0.0, 0.0),
+    hair_shift=0.035,
+    hair_radial_roughness=0.3,
 ):
     """Pack one material into 1180 bytes matching GPUMaterial."""
     base = _GPU_MATERIAL_BASE.pack(
@@ -3410,8 +3442,10 @@ def _pack_gpu_material(
         _NO_TEX, _NO_TEX, _NO_TEX, _NO_TEX, _NO_TEX, _NO_TEX,
         # multR=transmission, multG=alpha, multB=transparentProb, rest unused
         transmission, alpha, transparent_prob, uv_scale_x, uv_scale_y, color_value, color_saturation,
-        # sunSpecular → volume_density, sunSpecularEXP → volume_anisotropy
-        volume_density, volume_anisotropy,
+        # sunSpecular/sunSpecularEXP are reused for extra per-material scalars.
+        # Volume materials: density + anisotropy. Hair materials: shift + radial roughness.
+        hair_shift if (flags & _MAT_FLAG_HAIR) != 0 else volume_density,
+        hair_radial_roughness if (flags & _MAT_FLAG_HAIR) != 0 else volume_anisotropy,
     )
 
     # Node VM bytecode
@@ -3977,21 +4011,21 @@ def _encode_bmp(rgba_u8, w, h):
     return bytes(hdr) + bytes(pixel_data)
 
 
-class _GroupPrincipledProxy:
-    """Makes a GROUP node look like a Principled BSDF for material export.
-
-    Maps the GROUP's external inputs to the internal Principled BSDF's input names,
-    so code that reads principled_node.inputs.get('Base Color') works transparently.
-    """
-    def __init__(self, group_node, inner_principled):
-        self.type = 'BSDF_PRINCIPLED'
+class _GroupShaderProxy:
+    """Makes a GROUP node look like one of the supported shader nodes for export."""
+    def __init__(self, group_node, inner_shader):
+        self.type = inner_shader.type
         self.name = f"{group_node.name} (proxy)"
         self._group = group_node
-        self._inner = inner_principled
+        self._inner = inner_shader
 
-        # Map: inner Principled input name → GROUP external socket
+        for attr_name in ("model", "parametrization", "component"):
+            if hasattr(inner_shader, attr_name):
+                setattr(self, attr_name, getattr(inner_shader, attr_name))
+
+        # Map: inner shader input name → GROUP external socket
         self._input_map = {}
-        for inp in inner_principled.inputs:
+        for inp in inner_shader.inputs:
             if inp.is_linked:
                 from_node = inp.links[0].from_node
                 if from_node.type == 'GROUP_INPUT':
@@ -4001,7 +4035,7 @@ class _GroupPrincipledProxy:
                     if ext_inp:
                         self._input_map[inp.name] = ext_inp
 
-        self.inputs = _GroupInputsProxy(self._input_map, inner_principled.inputs)
+        self.inputs = _GroupInputsProxy(self._input_map, inner_shader.inputs)
 
 
 class _GroupInputsProxy:
@@ -4024,20 +4058,18 @@ class _GroupInputsProxy:
         return self._original[idx]
 
 
-def _find_principled_in_group(group_node):
-    """Find a Principled BSDF inside a GROUP node and return a proxy.
-
-    Returns a _GroupPrincipledProxy that maps external group inputs to
-    the internal Principled BSDF's inputs, or None if not found.
-    """
+def _find_supported_shader_in_group(group_node):
+    """Find a supported BSDF node inside a GROUP node and return a proxy."""
     inner_tree = group_node.node_tree
     if not inner_tree:
         return None
 
-    # Find Principled BSDF inside the group
+    supported = ('BSDF_PRINCIPLED', 'BSDF_HAIR_PRINCIPLED', 'BSDF_HAIR',
+                 'BSDF_DIFFUSE', 'BSDF_GLOSSY', 'BSDF_GLASS', 'BSDF_TRANSPARENT', 'EMISSION')
+
     for inode in inner_tree.nodes:
-        if inode.type == 'BSDF_PRINCIPLED':
-            return _GroupPrincipledProxy(group_node, inode)
+        if inode.type in supported:
+            return _GroupShaderProxy(group_node, inode)
 
     # Follow GROUP_OUTPUT → shader chain inside the group
     for inode in inner_tree.nodes:
@@ -4045,9 +4077,15 @@ def _find_principled_in_group(group_node):
             for inp in inode.inputs:
                 if inp.is_linked:
                     src = inp.links[0].from_node
-                    if src.type == 'BSDF_PRINCIPLED':
-                        return _GroupPrincipledProxy(group_node, src)
+                    if src.type in supported:
+                        return _GroupShaderProxy(group_node, src)
     return None
+
+
+def _find_principled_in_group(group_node):
+    """Backward-compatible wrapper used by older call sites."""
+    proxy = _find_supported_shader_in_group(group_node)
+    return proxy if proxy and proxy.type == 'BSDF_PRINCIPLED' else None
 
 
 def _find_surface_shader(node_tree):
@@ -4130,6 +4168,10 @@ def _extract_shader_props(node, register_image_fn):
         'transmission': 0.0,
         'ior': 1.5,
         'transparent_prob': 0.0,
+        'specular_level': 0.5,
+        'hair_shift': 0.035,
+        'hair_radial_roughness': 0.3,
+        'hair_material': False,
     }
     if node is None:
         return props
@@ -4232,9 +4274,103 @@ def _extract_shader_props(node, register_image_fn):
         spec_inp = node.inputs.get('Specular IOR Level') or node.inputs.get('Specular')
         if spec_inp:
             props['specular_level'] = float(spec_inp.default_value)
+    elif node.type == 'BSDF_HAIR':
+        props['hair_material'] = True
+        props['specular_level'] = 0.5
+        props['ior'] = 1.55
+
+        color_inp = node.inputs.get('Color')
+        if color_inp:
+            c = _resolve_color_input(color_inp, (0.8, 0.8, 0.8))
+            props['base_color'] = (c[0], c[1], c[2])
+            tex_node = _find_image_texture_node(color_inp)
+            if tex_node and tex_node.image:
+                props['diffuse_tex'] = register_image_fn(tex_node.image)
+
+        rough_u_inp = node.inputs.get('RoughnessU')
+        if rough_u_inp:
+            props['roughness'] = float(rough_u_inp.default_value)
+        rough_v_inp = node.inputs.get('RoughnessV')
+        if rough_v_inp:
+            props['hair_radial_roughness'] = float(rough_v_inp.default_value)
+        else:
+            props['hair_radial_roughness'] = props['roughness']
+
+        offset_inp = node.inputs.get('Offset')
+        if offset_inp:
+            props['hair_shift'] = float(offset_inp.default_value)
+    elif node.type == 'BSDF_HAIR_PRINCIPLED':
+        props['hair_material'] = True
+        props['specular_level'] = 0.5
+
+        model = getattr(node, 'model', 'CHIANG')
+        parametrization = getattr(node, 'parametrization', 'COLOR')
+
+        rough_inp = node.inputs.get('Roughness')
+        if rough_inp:
+            props['roughness'] = float(rough_inp.default_value)
+
+        radial_roughness = props['roughness']
+        radial_inp = node.inputs.get('Radial Roughness')
+        if radial_inp and model == 'CHIANG':
+            radial_roughness = float(radial_inp.default_value)
+        props['hair_radial_roughness'] = radial_roughness
+
+        coat_inp = node.inputs.get('Coat')
+        if coat_inp and model == 'CHIANG':
+            coat = float(coat_inp.default_value)
+            props['roughness'] *= max(1.0 - 0.8 * coat, 0.2)
+
+        ior_inp = node.inputs.get('IOR')
+        if ior_inp:
+            props['ior'] = float(ior_inp.default_value)
+
+        offset_inp = node.inputs.get('Offset')
+        if offset_inp:
+            props['hair_shift'] = float(offset_inp.default_value)
+
+        if parametrization == 'MELANIN':
+            melanin_inp = node.inputs.get('Melanin')
+            redness_inp = node.inputs.get('Melanin Redness')
+            tint_inp = node.inputs.get('Tint')
+            melanin = float(melanin_inp.default_value) if melanin_inp else 0.8
+            redness = float(redness_inp.default_value) if redness_inp else 1.0
+            melanin = -math.log(max(1.0 - melanin, 0.0001))
+            eumelanin = melanin * (1.0 - redness)
+            pheomelanin = melanin * redness
+            sigma = list(_hair_sigma_from_concentration(eumelanin, pheomelanin))
+            tint = _resolve_color_input(tint_inp, (1.0, 1.0, 1.0)) if tint_inp else (1.0, 1.0, 1.0)
+            tint_sigma = _hair_sigma_from_reflectance(tint, radial_roughness)
+            sigma = tuple(sigma[i] + tint_sigma[i] for i in range(3))
+            props['base_color'] = _hair_reflectance_from_sigma(sigma, radial_roughness)
+        elif parametrization == 'ABSORPTION':
+            abs_inp = node.inputs.get('Absorption Coefficient')
+            if abs_inp:
+                sigma = tuple(float(abs_inp.default_value[i]) for i in range(3))
+                props['base_color'] = _hair_reflectance_from_sigma(sigma, radial_roughness)
+        else:
+            color_inp = node.inputs.get('Color')
+            if color_inp:
+                c = _resolve_color_input(color_inp, (0.017513, 0.005763, 0.002059))
+                props['base_color'] = (c[0], c[1], c[2])
+                tex_node = _find_image_texture_node(color_inp)
+                if tex_node and tex_node.image:
+                    props['diffuse_tex'] = register_image_fn(tex_node.image)
+
+        if model == 'HUANG':
+            refl_inp = node.inputs.get('Reflection')
+            tt_inp = node.inputs.get('Transmission')
+            trt_inp = node.inputs.get('Secondary Reflection')
+            refl = float(refl_inp.default_value) if refl_inp else 1.0
+            tt = float(tt_inp.default_value) if tt_inp else 1.0
+            trt = float(trt_inp.default_value) if trt_inp else 1.0
+            props['specular_level'] = 0.5 * refl
+            colored_lobe_scale = max(0.0, 0.5 * (tt + trt))
+            props['base_color'] = tuple(max(0.0, min(1.0, c * colored_lobe_scale))
+                                        for c in props['base_color'])
     elif node.type == 'GROUP':
         # Resolve Group node — find Principled BSDF inside
-        proxy = _find_principled_in_group(node)
+        proxy = _find_supported_shader_in_group(node)
         if proxy:
             props = _extract_shader_props(proxy, register_image_fn)
         else:
@@ -4280,6 +4416,11 @@ def _extract_shader_props(node, register_image_fn):
                 'normal_tex': p1.get('normal_tex', _NO_TEX),
                 'normal_strength': p1.get('normal_strength', 1.0),
                 'transparent_prob': 0.0,
+                'specular_level': (p1.get('specular_level', 0.5) + p2.get('specular_level', 0.5)) * 0.5,
+                'hair_shift': (p1.get('hair_shift', 0.035) + p2.get('hair_shift', 0.035)) * 0.5,
+                'hair_radial_roughness': (p1.get('hair_radial_roughness', p1['roughness']) +
+                                          p2.get('hair_radial_roughness', p2['roughness'])) * 0.5,
+                'hair_material': p1.get('hair_material', False) or p2.get('hair_material', False),
             }
         props['transparent_prob'] = combined_tp
         if combined_tp > 0.0:
@@ -4532,6 +4673,10 @@ def _resolve_mix_shader(mix_node, register_image_fn):
         'ior': p1['ior'] * (1 - fac) + p2['ior'] * fac,
         'transparent_prob': blended_tp,
         'specular_level': spec1 * (1 - fac) + spec2 * fac,
+        'hair_shift': p1.get('hair_shift', 0.035) * (1 - fac) + p2.get('hair_shift', 0.035) * fac,
+        'hair_radial_roughness': p1.get('hair_radial_roughness', p1['roughness']) * (1 - fac) +
+                                 p2.get('hair_radial_roughness', p2['roughness']) * fac,
+        'hair_material': p1.get('hair_material', False) or p2.get('hair_material', False),
         # Texture: prefer the dominant shader's texture
         'diffuse_tex': p1['diffuse_tex'] if fac <= 0.5 else p2['diffuse_tex'],
         'emission_tex': p1['emission_tex'] if p1['emission_tex'] != _NO_TEX else p2['emission_tex'],
@@ -4745,6 +4890,8 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         color_saturation = 1.0
         flags = 0
         alpha_ref = 0.5
+        hair_shift = 0.035
+        hair_radial_roughness = 0.3
 
         # Volume material properties
         volume_density = 0.0
@@ -4879,6 +5026,9 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                     if 'transparent_prob' in props: transparent_prob = props['transparent_prob']
                     if 'alpha_ref' in props: alpha_ref = props['alpha_ref']
                     if 'specular_level' in props: specular_level = props['specular_level']
+                    if 'hair_shift' in props: hair_shift = props['hair_shift']
+                    if 'hair_radial_roughness' in props: hair_radial_roughness = props['hair_radial_roughness']
+                    if props.get('hair_material', False): flags |= _MAT_FLAG_HAIR
                     _mix_shader_resolved = True
                     import os
                     try:
@@ -4932,9 +5082,26 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                     inp = surface_node.inputs[0] if surface_node.inputs else None
                     surface_node = inp.links[0].from_node if (inp and inp.is_linked) else None
                 elif surface_node.type == 'GROUP':
-                    proxy = _find_principled_in_group(surface_node)
+                    proxy = _find_supported_shader_in_group(surface_node)
                     if proxy:
-                        principled_node = proxy
+                        if proxy.type == 'BSDF_PRINCIPLED':
+                            principled_node = proxy
+                            break
+                        props = _extract_shader_props(proxy, _register_image)
+                        base_color = props['base_color']
+                        roughness = props['roughness']
+                        metallic = props['metallic']
+                        emission = props['emission']
+                        emission_strength = props['emission_strength']
+                        diffuse_tex = props['diffuse_tex']
+                        transmission = props.get('transmission', 0.0)
+                        ior = props.get('ior', 1.5)
+                        if 'normal_tex' in props: normal_tex = props['normal_tex']
+                        if 'normal_strength' in props: normal_strength = props['normal_strength']
+                        if 'specular_level' in props: specular_level = props['specular_level']
+                        if 'hair_shift' in props: hair_shift = props['hair_shift']
+                        if 'hair_radial_roughness' in props: hair_radial_roughness = props['hair_radial_roughness']
+                        if props.get('hair_material', False): flags |= _MAT_FLAG_HAIR
                         break
                     inner_tree = surface_node.node_tree
                     if inner_tree:
@@ -4949,7 +5116,8 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                     else:
                         surface_node = None
                 elif surface_node.type in ('BSDF_DIFFUSE', 'BSDF_GLOSSY', 'BSDF_GLASS',
-                                           'BSDF_TRANSPARENT', 'EMISSION'):
+                                           'BSDF_TRANSPARENT', 'EMISSION',
+                                           'BSDF_HAIR', 'BSDF_HAIR_PRINCIPLED'):
                     props = _extract_shader_props(surface_node, _register_image)
                     base_color = props['base_color']
                     roughness = props['roughness']
@@ -4959,6 +5127,12 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                     diffuse_tex = props['diffuse_tex']
                     transmission = props.get('transmission', 0.0)
                     ior = props.get('ior', 1.5)
+                    if 'normal_tex' in props: normal_tex = props['normal_tex']
+                    if 'normal_strength' in props: normal_strength = props['normal_strength']
+                    if 'specular_level' in props: specular_level = props['specular_level']
+                    if 'hair_shift' in props: hair_shift = props['hair_shift']
+                    if 'hair_radial_roughness' in props: hair_radial_roughness = props['hair_radial_roughness']
+                    if props.get('hair_material', False): flags |= _MAT_FLAG_HAIR
                     break
                 else:
                     # Unknown node — follow first linked input
@@ -4980,9 +5154,26 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                         principled_node = node
                         break
                     if node.type == 'GROUP':
-                        proxy = _find_principled_in_group(node)
+                        proxy = _find_supported_shader_in_group(node)
                         if proxy:
-                            principled_node = proxy
+                            if proxy.type == 'BSDF_PRINCIPLED':
+                                principled_node = proxy
+                                break
+                            props = _extract_shader_props(proxy, _register_image)
+                            base_color = props['base_color']
+                            roughness = props['roughness']
+                            metallic = props['metallic']
+                            emission = props['emission']
+                            emission_strength = props['emission_strength']
+                            diffuse_tex = props['diffuse_tex']
+                            transmission = props.get('transmission', 0.0)
+                            ior = props.get('ior', 1.5)
+                            if 'normal_tex' in props: normal_tex = props['normal_tex']
+                            if 'normal_strength' in props: normal_strength = props['normal_strength']
+                            if 'specular_level' in props: specular_level = props['specular_level']
+                            if 'hair_shift' in props: hair_shift = props['hair_shift']
+                            if 'hair_radial_roughness' in props: hair_radial_roughness = props['hair_radial_roughness']
+                            if props.get('hair_material', False): flags |= _MAT_FLAG_HAIR
                             break
                 else:
                     # No Mix Shader — scan individual nodes
@@ -4999,28 +5190,21 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                                 emission_strength = float(strength_inp.default_value)
                             base_color = emission
                             continue
-                        if node.type in ('BSDF_DIFFUSE', 'BSDF_GLOSSY', 'BSDF_GLASS'):
-                            color_inp = node.inputs.get('Color')
-                            if color_inp:
-                                tex_node = _find_image_texture_node(color_inp)
-                                if tex_node and tex_node.image:
-                                    diffuse_tex = _register_image(tex_node.image)
-                                c = color_inp.default_value
-                                base_color = (c[0], c[1], c[2])
-                            if node.type == 'BSDF_DIFFUSE':
-                                # Lambertian = fully rough in PBR terms
-                                roughness = 1.0
-                            else:
-                                rough_inp = node.inputs.get('Roughness')
-                                if rough_inp:
-                                    roughness = float(rough_inp.default_value)
-                            if node.type == 'BSDF_GLOSSY':
-                                metallic = 1.0
-                            if node.type == 'BSDF_GLASS':
-                                transmission = 1.0
-                                ior_inp = node.inputs.get('IOR')
-                                if ior_inp:
-                                    ior = float(ior_inp.default_value)
+                        if node.type in ('BSDF_DIFFUSE', 'BSDF_GLOSSY', 'BSDF_GLASS',
+                                         'BSDF_HAIR', 'BSDF_HAIR_PRINCIPLED'):
+                            props = _extract_shader_props(node, _register_image)
+                            base_color = props['base_color']
+                            roughness = props['roughness']
+                            metallic = props['metallic']
+                            diffuse_tex = props['diffuse_tex']
+                            transmission = props.get('transmission', 0.0)
+                            ior = props.get('ior', 1.5)
+                            if 'normal_tex' in props: normal_tex = props['normal_tex']
+                            if 'normal_strength' in props: normal_strength = props['normal_strength']
+                            if 'specular_level' in props: specular_level = props['specular_level']
+                            if 'hair_shift' in props: hair_shift = props['hair_shift']
+                            if 'hair_radial_roughness' in props: hair_radial_roughness = props['hair_radial_roughness']
+                            if props.get('hair_material', False): flags |= _MAT_FLAG_HAIR
                             break
 
             if principled_node is not None and not _mix_shader_resolved:
@@ -5296,6 +5480,8 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
             volume_noise_lacunarity=volume_noise_lacunarity,
             volume_noise_contrast=volume_noise_contrast,
             volume_mapping_offset=volume_mapping_offset,
+            hair_shift=hair_shift,
+            hair_radial_roughness=hair_radial_roughness,
         )
 
         _mat_dt = _time.perf_counter() - _mat_t0

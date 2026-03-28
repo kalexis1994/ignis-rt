@@ -40,11 +40,12 @@ float hair_azimuthal_N(float phi, float delta_phi, float exponent) {
 // tangent = hair fiber direction
 // hairColor = base color of the hair
 // roughness = longitudinal roughness [0,1]
+// radialRoughness = azimuthal roughness [0,1]
 // shift = cuticle tilt in radians (~0.035 for human hair)
 // ior = index of refraction (1.55 for hair)
 // h = position across fiber [-1,1] (from DOTS v parameter)
 vec3 hair_eval(vec3 wi, vec3 wo, vec3 tangent,
-               vec3 hairColor, float roughness, float shift, float ior, float h) {
+               vec3 hairColor, float roughness, float radialRoughness, float shift, float ior, float h) {
 
     vec3 T = normalize(tangent);
 
@@ -71,6 +72,7 @@ vec3 hair_eval(vec3 wi, vec3 wo, vec3 tangent,
     float beta_R   = beta;          // R: primary roughness
     float beta_TT  = beta * 0.5;    // TT: tighter (light passes straight through)
     float beta_TRT = beta * 2.0;    // TRT: broader (internal bounce spreads it)
+    float betaPhi = max(radialRoughness, 0.05);
 
     // ── Cuticle tilt per lobe ──
     float alpha = shift;
@@ -104,17 +106,17 @@ vec3 hair_eval(vec3 wi, vec3 wo, vec3 tangent,
     // Azimuthal exponents control highlight sharpness (lower = softer, wider)
     // R: primary specular (white highlight)
     float M_R = hair_gaussian_M(theta_h - alpha_R, beta_R);
-    float N_R = hair_azimuthal_N(phi, dphi_R, 8.0);
+    float N_R = hair_azimuthal_N(phi, dphi_R, mix(48.0, 3.0, betaPhi));
     vec3 F_total = A_R * M_R * N_R;
 
     // TT: transmission (backlit glow through fiber)
     float M_TT = hair_gaussian_M(theta_h - alpha_TT, beta_TT);
-    float N_TT = hair_azimuthal_N(phi, dphi_TT, 3.0);
+    float N_TT = hair_azimuthal_N(phi, dphi_TT, mix(18.0, 1.5, betaPhi));
     F_total += A_TT * M_TT * N_TT;
 
     // TRT: secondary colored specular (warm glint)
     float M_TRT = hair_gaussian_M(theta_h - alpha_TRT, beta_TRT);
-    float N_TRT = hair_azimuthal_N(phi, dphi_TRT, 4.0);
+    float N_TRT = hair_azimuthal_N(phi, dphi_TRT, mix(28.0, 2.0, betaPhi));
     F_total += A_TRT * M_TRT * N_TRT;
 
     // Energy conservation: clamp to physically plausible range
@@ -122,4 +124,9 @@ vec3 hair_eval(vec3 wi, vec3 wo, vec3 tangent,
 
     // Clamp cos_theta_i to prevent blackout at grazing angles
     return max(F_total, vec3(0.0)) * max(abs(cos_theta_i), 0.15);
+}
+
+vec3 hair_eval(vec3 wi, vec3 wo, vec3 tangent,
+               vec3 hairColor, float roughness, float shift, float ior, float h) {
+    return hair_eval(wi, wo, tangent, hairColor, roughness, roughness, shift, ior, h);
 }

@@ -239,6 +239,7 @@ vec3 EnvBRDFApprox(vec3 F0, float roughness, float NdotV) {
 }
 
 const uint INVALID_HAIR_STRAND = 0xFFFFFFFFu;
+const uint MAT_FLAG_HAIR = 32u;
 
 bool getHairRibbonLayout(GeometryMetadata geo,
                          out uint strandCount,
@@ -358,16 +359,19 @@ float evalHairCylinderFalloff(vec3 cylN, vec3 lightDir)
 
 void evaluateHairCylinderBSDF(
     vec3 cylN, vec3 viewDir, vec3 lightDir, vec3 hairT,
-    vec3 baseColor, float roughness, float specularLevel, float ior, float hairV,
+    vec3 baseColor, float roughness, float radialRoughness, float specularLevel,
+    float ior, float hairShift, float hairV,
     out vec3 diffuseContrib, out vec3 specularContrib)
 {
-    diffuseContrib = baseColor * evalHairCylinderFalloff(cylN, lightDir);
+    diffuseContrib = baseColor * evalHairCylinderFalloff(cylN, lightDir) * 0.35;
 
     float hairIor = max(ior, 1.01);
     float hairRoughness = max(roughness, 0.05);
-    float specularWeight = max(specularLevel * 2.0, 0.0);
+    float hairRadialRoughness = max(radialRoughness, 0.05);
+    float specularWeight = max(specularLevel, 0.0);
     specularContrib = hair_eval(viewDir, lightDir, hairT,
-                                baseColor, hairRoughness, 0.035, hairIor, hairV) * specularWeight;
+                                baseColor, hairRoughness, hairRadialRoughness, hairShift, hairIor, hairV)
+                    * specularWeight;
 }
 
 // ============================================================
@@ -533,6 +537,8 @@ struct PBRHit {
     float alpha;
     float ior;
     float transmission;
+    float hairShift;
+    float hairRadialRoughness;
 };
 
 PBRHit evaluateBlenderMaterial(
@@ -550,6 +556,10 @@ PBRHit evaluateBlenderMaterial(
     hit.roughness = clamp(mat.ksSpecularEXP, 0.01, 1.0);
     hit.metallic = clamp(mat.fresnelC, 0.0, 1.0);
     hit.specularLevel = mat.fresnelEXP;
+    hit.hairShift = ((mat.flags & MAT_FLAG_HAIR) != 0u) ? mat.sunSpecular : 0.035;
+    hit.hairRadialRoughness = ((mat.flags & MAT_FLAG_HAIR) != 0u) ?
+                              clamp(mat.sunSpecularEXP, 0.01, 1.0) :
+                              hit.roughness;
 
     // If material has stochastic passthrough, disable glass refraction.
     // Passthrough handles transparency; remaining rays do reflection (metallic=1).
@@ -1802,7 +1812,8 @@ void main() {
                     if (isHairHit) {
                         evaluateHairCylinderBSDF(
                             N, V, sunDir, hairSmoothT,
-                            pbrHit.baseColor, pbrHit.roughness, pbrHit.specularLevel, pbrHit.ior, hairV,
+                            pbrHit.baseColor, pbrHit.roughness, pbrHit.hairRadialRoughness,
+                            pbrHit.specularLevel, pbrHit.ior, pbrHit.hairShift, hairV,
                             diffContrib, specContrib);
                     } else {
                         // Hair: Kajiya-Kay diffuse + Karis specular
@@ -1811,8 +1822,9 @@ void main() {
                         vec3 hairDiffuse = pbrHit.baseColor * INV_PI * sinTL;
                         vec3 hairSpec = hair_eval(V, sunDir, hairSmoothT,
                                                  pbrHit.baseColor, max(pbrHit.roughness, 0.05),
-                                                 0.035, max(pbrHit.ior, 1.01), hairV)
-                                      * max(pbrHit.specularLevel * 2.0, 0.0);
+                                                 max(pbrHit.hairRadialRoughness, 0.05),
+                                                 pbrHit.hairShift, max(pbrHit.ior, 1.01), hairV)
+                                      * max(pbrHit.specularLevel, 0.0);
                         diffContrib = hairDiffuse + hairSpec;
                         specContrib = vec3(0.0); // already included in hairDirect
                     }
@@ -2066,14 +2078,17 @@ void main() {
                         if (isHairHit) {
                             evaluateHairCylinderBSDF(
                                 N, -rayDir, fL, hairSmoothT,
-                                pbrHit.baseColor, pbrHit.roughness, pbrHit.specularLevel, pbrHit.ior, hairV,
+                                pbrHit.baseColor, pbrHit.roughness, pbrHit.hairRadialRoughness,
+                                pbrHit.specularLevel, pbrHit.ior, pbrHit.hairShift, hairV,
                                 fDiffC, fSpecC);
                         } else {
                             float sinTfL = length(cross(hairSmoothT, fL));
                             fDiffC = pbrHit.baseColor * INV_PI * sinTfL
                                    + hair_eval(V, fL, hairSmoothT, pbrHit.baseColor,
-                                              max(pbrHit.roughness, 0.05), 0.035, max(pbrHit.ior, 1.01), hairV)
-                                   * max(pbrHit.specularLevel * 2.0, 0.0);
+                                              max(pbrHit.roughness, 0.05),
+                                              max(pbrHit.hairRadialRoughness, 0.05),
+                                              pbrHit.hairShift, max(pbrHit.ior, 1.01), hairV)
+                                   * max(pbrHit.specularLevel, 0.0);
                             fSpecC = vec3(0.0);
                         }
                     } else {
@@ -2254,14 +2269,17 @@ void main() {
                 if (isHairHit) {
                     evaluateHairCylinderBSDF(
                         N, V, brdfL, hairSmoothT,
-                        pbrHit.baseColor, pbrHit.roughness, pbrHit.specularLevel, pbrHit.ior, hairV,
+                        pbrHit.baseColor, pbrHit.roughness, pbrHit.hairRadialRoughness,
+                        pbrHit.specularLevel, pbrHit.ior, pbrHit.hairShift, hairV,
                         diffC, specC);
                 } else {
                     float sinTbrdf = length(cross(hairSmoothT, brdfL));
                     diffC = pbrHit.baseColor * INV_PI * sinTbrdf
                           + hair_eval(V, brdfL, hairSmoothT, pbrHit.baseColor,
-                                      max(pbrHit.roughness, 0.05), 0.035, max(pbrHit.ior, 1.01), hairV)
-                          * max(pbrHit.specularLevel * 2.0, 0.0);
+                                      max(pbrHit.roughness, 0.05),
+                                      max(pbrHit.hairRadialRoughness, 0.05),
+                                      pbrHit.hairShift, max(pbrHit.ior, 1.01), hairV)
+                          * max(pbrHit.specularLevel, 0.0);
                     specC = vec3(0.0);
                 }
             } else {
@@ -2350,14 +2368,17 @@ void main() {
                             if (isHairHit) {
                                 evaluateHairCylinderBSDF(
                                     N, V, eDir, hairSmoothT,
-                                    pbrHit.baseColor, pbrHit.roughness, pbrHit.specularLevel, pbrHit.ior, hairV,
+                                    pbrHit.baseColor, pbrHit.roughness, pbrHit.hairRadialRoughness,
+                                    pbrHit.specularLevel, pbrHit.ior, pbrHit.hairShift, hairV,
                                     eDiffC, eSpecC);
                             } else {
                                 float sinTeDir = length(cross(hairSmoothT, eDir));
                                 eDiffC = pbrHit.baseColor * INV_PI * sinTeDir
                                        + hair_eval(V, eDir, hairSmoothT, pbrHit.baseColor,
-                                                  max(pbrHit.roughness, 0.05), 0.035, max(pbrHit.ior, 1.01), hairV)
-                                       * max(pbrHit.specularLevel * 2.0, 0.0);
+                                                  max(pbrHit.roughness, 0.05),
+                                                  max(pbrHit.hairRadialRoughness, 0.05),
+                                                  pbrHit.hairShift, max(pbrHit.ior, 1.01), hairV)
+                                       * max(pbrHit.specularLevel, 0.0);
                                 eSpecC = vec3(0.0);
                             }
                         } else {
@@ -2631,7 +2652,8 @@ void main() {
                 float specPdf = (GGX_D(NdotH, alpha) * SmithG1(NdotVHair, alpha) * VdotH)
                               / max(4.0 * NdotVHair * VdotH, 1e-6);
                 vec3 hairSpec = hair_eval(V, newDir, hairT,
-                                          hairColor, hairRoughness, 0.035, hairIor, hairV)
+                                          hairColor, hairRoughness, max(pbrHit.hairRadialRoughness, 0.05),
+                                          pbrHit.hairShift, hairIor, hairV)
                               * hairSpecularWeight;
                 float branchPdf = specProb * max(specPdf, 1e-6);
                 throughput *= hairSpec / branchPdf;
