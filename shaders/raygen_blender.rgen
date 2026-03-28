@@ -1048,59 +1048,32 @@ void main() {
             if (hasA && length(worldPos - centerA) < dotRadius) diagColor = vec3(0.8, 0, 0.8);
             if (hasB && length(worldPos - centerB) < dotRadius) diagColor = vec3(0.8, 0, 0.8);
 
-            // Camera-relative cylinder via screen-space projection of DOTS cross
-            // Project center and hit to NDC
-            vec4 axisClip = cam.proj * cam.view * vec4(centerPt, 1.0);
-            vec4 hitClip = cam.proj * cam.view * vec4(worldPos, 1.0);
-            vec2 axisNDC = axisClip.xy / max(abs(axisClip.w), 1e-6);
-            vec2 hitNDC = hitClip.xy / max(abs(hitClip.w), 1e-6);
+            // Combined DOTS silhouette: left/right from camera
+            float segT = clamp(dot(worldPos - centerPt, T) / max(Tlen, 1e-8), 0.0, 1.0);
+            vec3 sweepCenter = mix(centerPt, otherCenter, segT);
+            vec3 toHit = worldPos - sweepCenter;
+            vec3 perpToAxis = toHit - hairSmoothT * dot(toHit, hairSmoothT);
 
-            // Project tangent to screen to get strand direction in 2D
-            vec4 tangClip = cam.proj * cam.view * vec4(centerPt + hairSmoothT * 0.01, 1.0);
-            vec2 tangNDC = tangClip.xy / max(abs(tangClip.w), 1e-6);
-            vec2 screenTangDir = tangNDC - axisNDC;
-            float stLen = length(screenTangDir);
-            if (stLen > 1e-8) screenTangDir /= stLen;
+            // Left/right from camera = cross(rayDir, T)
+            // This is perpendicular to both view and tangent → screen left/right
+            vec3 camLR = cross(rayDir, hairSmoothT);
+            float lrLen = length(camLR);
+            if (lrLen > 1e-6) camLR /= lrLen; else camLR = wDir;
 
-            // Signed perpendicular distance of hit from projected axis
-            vec2 screenOffset = hitNDC - axisNDC;
-            float screenDist = screenOffset.x * screenTangDir.y - screenOffset.y * screenTangDir.x;
+            // How far the hit extends left/right from center as camera sees it
+            float projectedDist = abs(dot(perpToAxis, camLR));
 
-            // DOTS cross silhouette: project all 4 extremes (both perpendicular ribbons)
-            vec3 perpWDir = normalize(cross(T, wDir));
-            vec3 extA_pos = centerPt + halfWidth * wDir;
-            vec3 extA_neg = centerPt - halfWidth * wDir;
-            vec3 extB_pos = centerPt + halfWidth * perpWDir;
-            vec3 extB_neg = centerPt - halfWidth * perpWDir;
-            vec4 eApC = cam.proj * cam.view * vec4(extA_pos, 1.0);
-            vec4 eAnC = cam.proj * cam.view * vec4(extA_neg, 1.0);
-            vec4 eBpC = cam.proj * cam.view * vec4(extB_pos, 1.0);
-            vec4 eBnC = cam.proj * cam.view * vec4(extB_neg, 1.0);
-            vec2 oAp = eApC.xy / max(abs(eApC.w), 1e-6) - axisNDC;
-            vec2 oAn = eAnC.xy / max(abs(eAnC.w), 1e-6) - axisNDC;
-            vec2 oBp = eBpC.xy / max(abs(eBpC.w), 1e-6) - axisNDC;
-            vec2 oBn = eBnC.xy / max(abs(eBnC.w), 1e-6) - axisNDC;
-            float sdAp = abs(oAp.x * screenTangDir.y - oAp.y * screenTangDir.x);
-            float sdAn = abs(oAn.x * screenTangDir.y - oAn.y * screenTangDir.x);
-            float sdBp = abs(oBp.x * screenTangDir.y - oBp.y * screenTangDir.x);
-            float sdBn = abs(oBn.x * screenTangDir.y - oBn.y * screenTangDir.x);
-            float screenRadius = max(max(sdAp, sdAn), max(sdBp, sdBn));
+            // Max extent of DOTS cross in the camera left/right direction
+            // max(ribbonA, ribbonB) → same result regardless of which ribbon was hit
+            vec3 perpWDir = normalize(cross(hairSmoothT, wDir));
+            float extA = abs(dot(wDir, camLR));
+            float extB = abs(dot(perpWDir, camLR));
+            float projectedMax = halfWidth * max(extA, extB);
 
-            // cylV: signed position across projected cylinder [-1, 1]
-            float cylV = clamp(screenDist / max(screenRadius, 1e-8), -1.0, 1.0);
-            diagColor = vec3(0, 1, 0);
-
-            // Red outline at projected contour edges
-            if (abs(cylV) > 0.85) diagColor = vec3(1, 0, 0);
-
-            // Center line disabled
-            // if (hasA) {
-            //     vec3 toHitCL = worldPos - centerPt;
-            //     float projCL = dot(toHitCL, T);
-            //     vec3 closestCL = centerPt + T * projCL;
-            //     float distToLine = length(worldPos - closestCL);
-            //     if (distToLine < dotRadius * 0.2) diagColor = vec3(0, 0, 0);
-            // }
+            // cylV: 0 center, 1 at projected combined edge
+            float cylV = projectedDist / max(projectedMax, 1e-8);
+            float outline = smoothstep(0.7, 1.0, cylV);
+            diagColor = mix(vec3(0, 1, 0), vec3(1, 0, 0), outline);
 
             totalRadiance += diagColor * throughput;
             break;
