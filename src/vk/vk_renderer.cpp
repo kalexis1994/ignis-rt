@@ -795,7 +795,7 @@ bool Renderer::CreateHairComputePipeline() {
     VkPushConstantRange pushRange{};
     pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pushRange.offset = 0;
-    pushRange.size = 88;
+    pushRange.size = 96; // 24 fields × 4 bytes
 
     VkPipelineLayoutCreateInfo plInfo{};
     plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -868,12 +868,14 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
                                float rough2, float roughEnd,
                                uint32_t childMode,
                                float kinkShape, float kinkFlat, float kinkAmpRandom,
-                               bool opaqueHair) {
+                               bool opaqueHair,
+                               float childSizeRandom, bool useParentParticles) {
     if (!accelBuilder_) return -1;
     if (!CreateHairComputePipeline()) return -1;
 
     VkDevice device = context_->GetDevice();
     uint32_t totalChildren = nParents * childrenPerParent;
+    if (useParentParticles) totalChildren += nParents; // parents rendered as first nParents strands
     // Catmull-Rom subdivision: 8 sub-segments per key segment (must match shader SUBDIV)
     const uint32_t SUBDIV = 8;
     uint32_t subdivPoints = (keysPerStrand - 1) * SUBDIV + 1;
@@ -1064,11 +1066,14 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
         float kinkShape;
         float kinkFlat;
         float kinkAmpRandom;
+        float childSizeRandom;
+        uint32_t useParentParticles;
     } pc = {nParents, keysPerStrand, totalChildren, nEmitterTris,
             rootRadius, tipFactor, clumpNoiseSize, childRoundness, childLength, avgSpacing,
             kinkAmplitude, kinkFrequency,
             clumpFactor, clumpShape, rough1, rough1Size, rough2, roughEnd,
-            childMode, kinkShape, kinkFlat, kinkAmpRandom};
+            childMode, kinkShape, kinkFlat, kinkAmpRandom,
+            childSizeRandom, useParentParticles ? 1u : 0u};
     vkCmdPushConstants(cmd, hairComputePipelineLayout_,
         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 

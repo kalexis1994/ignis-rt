@@ -80,6 +80,8 @@ layout(push_constant) uniform PushConstants {
     float kinkShape;       // Blender kink shape parameter
     float kinkFlat;        // Blender kink flatness
     float kinkAmpRandom;   // per-strand kink amplitude randomization
+    float childSizeRandom; // per-child random radius variation [0,1]
+    uint useParentParticles; // 1 = also render parent strands (childIdx < nParents)
 } pc;
 
 // Shared memory for parent root positions (brute-force nearest search)
@@ -137,8 +139,12 @@ void main() {
     uint childIdx = gl_GlobalInvocationID.x;
     if (childIdx >= pc.totalChildren) return;
 
+    // When useParentParticles=1, first nParents strands ARE the parents (direct copy)
+    // Remaining strands are children as usual.
+    // totalChildren already includes parents when useParentParticles is set (added in Python).
+    bool isParentStrand = (pc.useParentParticles != 0u && childIdx < pc.nParents);
+
     uint K = pc.keysPerStrand;
-    // Max SUBDIV=8 for buffer layout — actual SUBDIV chosen per-strand after curvature analysis
     const uint MAX_SUBDIV = 8u;
     uint S_max = (K - 1) * MAX_SUBDIV + 1;
     // DOTS layout: ribbon A + ribbon B (both continuous strips, 4 verts per cross-section)
@@ -148,45 +154,46 @@ void main() {
     uint idxPerStrand = trisPerStrand * 3;
     uint seed = childIdx * 17u + 43u;
 
-    // ═══════════════════════════════════════════════════
-    // 1. Pick random face on emitter (area-weighted CDF)
-    // ═══════════════════════════════════════════════════
-    float rFace = randFloat(seed);
-    uint faceIdx = 0;
-    if (pc.nEmitterTris > 0) {
-        faceIdx = searchCDF(rFace, pc.nEmitterTris);
-    }
-
-    // 2. Random barycentric coordinates on triangle
-    float u = randFloat(seed + 1u);
-    float v = randFloat(seed + 2u);
-    if (u + v > 1.0) { u = 1.0 - u; v = 1.0 - v; }
-    float bw0 = 1.0 - u - v, bw1 = u, bw2 = v;
-
-    // 3. Compute child root position on emitter surface
     vec3 childRoot;
-    if (pc.nEmitterTris > 0) {
-        uvec3 tri = emitterTris.tris[faceIdx].xyz;
-        vec3 ev0 = emitter.verts[tri.x].xyz;
-        vec3 ev1 = emitter.verts[tri.y].xyz;
-        vec3 ev2 = emitter.verts[tri.z].xyz;
-        childRoot = bw0 * ev0 + bw1 * ev1 + bw2 * ev2;
-    } else {
-        // Fallback: random offset from a parent
-        uint pi = childIdx % pc.nParents;
-        childRoot = parents.keys[pi * K].xyz;
-        childRoot += vec3(randFloat(seed+3u), randFloat(seed+4u), randFloat(seed+5u)) * 0.01 - 0.005;
-    }
-
-    // ═══════════════════════════════════════════════════
-    // 4-6. Parent selection + key interpolation
-    //      SIMPLE: each child -> 1 parent + perpendicular offset
-    //      INTERPOLATED: each child -> 4 nearest parents weighted
-    // ═══════════════════════════════════════════════════
+    vec3 childKeys[16];
     uint bestIdx[4] = uint[4](0, 0, 0, 0);
     float weights[4] = float[4](1.0, 0.0, 0.0, 0.0);
-    vec3 childKeys[16];
     uint localId = gl_LocalInvocationID.x;
+
+    if (isParentStrand) {
+        // ── Parent strand: copy keys directly, no child distribution ──
+        for (uint ki = 0; ki < K && ki < 16; ki++)
+            childKeys[ki] = parents.keys[childIdx * K + ki].xyz;
+        childRoot = childKeys[0];
+        bestIdx[0] = childIdx;
+    } else {
+        // ═══════════════════════════════════════════════════
+        // 1. Pick random face on emitter (area-weighted CDF)
+        // ═══════════════════════════════════════════════════
+        float rFace = randFloat(seed);
+        uint faceIdx = 0;
+        if (pc.nEmitterTris > 0)
+            faceIdx = searchCDF(rFace, pc.nEmitterTris);
+
+        float u = randFloat(seed + 1u);
+        float v = randFloat(seed + 2u);
+        if (u + v > 1.0) { u = 1.0 - u; v = 1.0 - v; }
+        float bw0 = 1.0 - u - v, bw1 = u, bw2 = v;
+
+        if (pc.nEmitterTris > 0) {
+            uvec3 tri = emitterTris.tris[faceIdx].xyz;
+            vec3 ev0 = emitter.verts[tri.x].xyz;
+            vec3 ev1 = emitter.verts[tri.y].xyz;
+            vec3 ev2 = emitter.verts[tri.z].xyz;
+            childRoot = bw0 * ev0 + bw1 * ev1 + bw2 * ev2;
+        } else {
+            uint pi = childIdx % pc.nParents;
+            childRoot = parents.keys[pi * K].xyz;
+            childRoot += vec3(randFloat(seed+3u), randFloat(seed+4u), randFloat(seed+5u)) * 0.01 - 0.005;
+        }
+    // ═══════════════════════════════════════════════════
+    // 4-6. Parent selection + key interpolation
+    // ═══════════════════════════════════════════════════
 
     if (pc.childMode == 1u) {
         // ── SIMPLE mode: assign to one parent, offset perpendicular ──
@@ -267,6 +274,8 @@ void main() {
             }
         }
     }
+
+    } // end of !isParentStrand child distribution
 
     // Apply child_length: scale child strand to fraction of parent length
     if (pc.childLength < 0.999) {
@@ -477,6 +486,9 @@ void main() {
         pos = safePos(pos, childRoot);
 
         float radius = pc.rootRadius * (1.0 - globalT + globalT * pc.tipFactor);
+        // child_size_random: per-strand random radius variation (Blender: size *= 1 - random * childrandsize)
+        if (pc.childSizeRandom > 0.0)
+            radius *= 1.0 - pc.childSizeRandom * randFloat(seed + 777u);
 
         // ── Ribbon A: perpA projected into tangent plane ──
         vec3 perpA = modPerp1 - tang * dot(modPerp1, tang);

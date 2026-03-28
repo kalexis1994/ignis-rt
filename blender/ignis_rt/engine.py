@@ -714,7 +714,9 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                                 kink_shape=m.get("kink_shape", 0.0),
                                 kink_flat=m.get("kink_flat", 0.0),
                                 kink_amp_random=m.get("kink_amp_random", 0.0),
-                                opaque_hair=m.get("opaque_hair", False))
+                                opaque_hair=m.get("opaque_hair", False),
+                                child_size_random=m.get("child_size_random", 0.0),
+                                use_parent_particles=m.get("use_parent_particles", False))
                             if blas >= 0:
                                 _ignis_blas_handles[mesh_key] = blas
                                 # Compute tri count for material assignment (must match shader SUBDIV=8, DOTS=4 tris/seg)

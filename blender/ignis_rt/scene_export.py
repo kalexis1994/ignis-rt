@@ -149,11 +149,11 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
             ps_modifier = mod
             break
 
-    # Radius settings (Cycles formula)
+    # Radius settings (matches Cycles: radius = radius_scale * root_radius)
     rad_scale = getattr(settings, 'radius_scale', 0.01)
     rad_root = getattr(settings, 'root_radius', 1.0)
     rad_tip_val = getattr(settings, 'tip_radius', 0.0)
-    root_radius = rad_scale * 0.5 * rad_root
+    root_radius = rad_scale * rad_root
     tip_factor = rad_tip_val / max(rad_root, 1e-6) if rad_root > 0 else 0.0
     if root_radius <= 0:
         root_radius = 0.003
@@ -272,6 +272,8 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
         "child_length": getattr(settings, 'child_length', 1.0),
         "clump_noise_size": getattr(settings, 'clump_noise_size', 1.0),
         "child_roundness": getattr(settings, 'child_roundness', 0.0),
+        "child_size_random": getattr(settings, 'child_size_random', 0.0),
+        "use_parent_particles": getattr(settings, 'use_parent_particles', False),
     }
 
     # CPU fallback (kept for reference, not reached)
