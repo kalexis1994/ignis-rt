@@ -1048,18 +1048,24 @@ void main() {
             if (hasA && length(worldPos - centerA) < dotRadius) diagColor = vec3(0.8, 0, 0.8);
             if (hasB && length(worldPos - centerB) < dotRadius) diagColor = vec3(0.8, 0, 0.8);
 
-            // Draw center line using adjacent triangle method
-            if (hasA) {
-                vec3 wDir2 = normalize(widthEdge);
-                float halfWidth2 = length(widthEdge) * 0.5;
+            // Cylindrical shading: use rawN.x for smooth cross-segment continuity
+            // (shared vertices between quads = continuous values, no segment cuts)
+            float cylV = clamp(rawN.x, -1.0, 1.0);
+            float theta = cylV * 1.5707963;  // π/2
+            float cylBrightness = cos(theta);  // 1 at center, 0 at edges
+            cylBrightness = max(cylBrightness, 0.0);
 
-                // Draw center line
+            diagColor = vec3(0, cylBrightness, 0);  // green cylinder
+
+            // Keep center line for reference
+            if (hasA) {
                 vec3 toHitCL = worldPos - centerPt;
-                float proj = dot(toHitCL, T);
-                vec3 closest = centerPt + T * proj;
-                float distToLine = length(worldPos - closest);
-                if (distToLine < dotRadius * 0.3) diagColor = vec3(0, 0, 0);
+                float projCL = dot(toHitCL, T);
+                vec3 closestCL = centerPt + T * projCL;
+                float distToLine = length(worldPos - closestCL);
+                if (distToLine < dotRadius * 0.2) diagColor = vec3(0, 0, 0);
             }
+
             totalRadiance += diagColor * throughput;
             break;
         } else {
