@@ -275,6 +275,13 @@ private:
     bool CreateSurfelResolvePipeline();
     void UpdateSurfelResolveDescriptors();
 
+    // Hair contour detection compute pass
+    VkPipeline hairContourPipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout hairContourPipelineLayout_ = VK_NULL_HANDLE;
+    bool hairContourReady_ = false;
+    bool CreateHairContourPipeline();
+    void ShutdownHairContour();
+
     // ImGui overlay
     VkRenderPass imguiRenderPass_ = VK_NULL_HANDLE;
     VkFramebuffer imguiFramebuffer_[2] = {};

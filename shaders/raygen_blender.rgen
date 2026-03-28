@@ -190,6 +190,9 @@ layout(binding = 29, set = 0, r8) uniform image2D reactiveMaskImg;
 layout(binding = 30, set = 0, r8) uniform image2D diffConfidenceImg;
 layout(binding = 31, set = 0, r8) uniform image2D specConfidenceImg;
 
+// Hair contour: per-pixel hairV for screen-space edge detection
+layout(binding = 34, set = 0, r16f) uniform image2D hairVImg;
+
 // Pick buffer
 layout(binding = 17, set = 0, scalar) buffer PickBuffer {
     uint pickCustomIndex;
@@ -295,6 +298,55 @@ vec3 fetchHairSectionCenter(Vertices vertices, mat4x3 objToWorld, uint baseVerte
           + fetchHairVertexWorld(vertices, objToWorld, baseVertex + 1u)
           + fetchHairVertexWorld(vertices, objToWorld, baseVertex + 2u)
           + fetchHairVertexWorld(vertices, objToWorld, baseVertex + 3u)) * 0.25;
+}
+
+float hairSegmentParamFromRay(vec3 rayO, vec3 rayD, vec3 p0, vec3 p1)
+{
+    vec3 axis = p1 - p0;
+    float axisLen2 = dot(axis, axis);
+    if (axisLen2 < 1e-8) return 0.0;
+
+    vec3 rel = rayO - p0;
+    float rayAxis = dot(rayD, axis);
+    float rayRel = dot(rayD, rel);
+    float axisRel = dot(axis, rel);
+    float denom = axisLen2 - rayAxis * rayAxis;  // rayD assumed normalized
+
+    if (abs(denom) > 1e-8) {
+        return clamp((rayAxis * rayRel - axisRel) / denom, 0.0, 1.0);
+    }
+
+    return clamp(dot(-rel, axis) / axisLen2, 0.0, 1.0);
+}
+
+float hermiteScalar(float p0, float p1, float m0, float m1, float t)
+{
+    float t2 = t * t;
+    float t3 = t2 * t;
+    return (2.0 * t3 - 3.0 * t2 + 1.0) * p0
+         + (-2.0 * t3 + 3.0 * t2) * p1
+         + (t3 - 2.0 * t2 + t) * m0
+         + (t3 - t2) * m1;
+}
+
+float computeHairSectionRadius(vec3 center, vec3 tangent, vec3 a, vec3 b, vec3 c, vec3 d)
+{
+    vec3 ao = a - center - tangent * dot(a - center, tangent);
+    vec3 bo = b - center - tangent * dot(b - center, tangent);
+    vec3 co = c - center - tangent * dot(c - center, tangent);
+    vec3 dO = d - center - tangent * dot(d - center, tangent);
+    return max((length(ao) + length(bo) + length(co) + length(dO)) * 0.25, 1e-6);
+}
+
+vec2 computeHairSectionSupportRadii(vec3 center, vec3 dir, vec3 a, vec3 b, vec3 c, vec3 d)
+{
+    float pa = dot(a - center, dir);
+    float pb = dot(b - center, dir);
+    float pc = dot(c - center, dir);
+    float pd = dot(d - center, dir);
+    float minProj = min(min(pa, pb), min(pc, pd));
+    float maxProj = max(max(pa, pb), max(pc, pd));
+    return vec2(max(-minProj, 1e-6), max(maxProj, 1e-6));
 }
 
 float evalHairDiagnosticFalloff(vec3 cylN, vec3 lightDir)
@@ -773,6 +825,7 @@ void main() {
     int  primaryInstanceId = 0;
     float primaryPenumbra = 65504.0;
     float primaryNdotL = 0.0;
+    float primaryHairV = 2.0;  // sentinel: 2.0 = not hair, [-1,1] = hair cylinder position
     bool captureSpecularMV = false;
     vec2 specularMV = vec2(0.0);
     vec3 savedRayOrigin = (cam.viewInverse * vec4(0, 0, 0, 1)).xyz;
@@ -1077,15 +1130,20 @@ void main() {
             bool haveHairSections = false;
             vec3 sec0a, sec0b, sec0c, sec0d;
             vec3 sec1a, sec1b, sec1c, sec1d;
+            vec3 prevSecA, prevSecB, prevSecC, prevSecD;
+            vec3 nextSecA, nextSecB, nextSecC, nextSecD;
             vec3 prevCenter = centerPt;
             vec3 nextCenter = otherCenter;
             bool havePrevCenter = false;
             bool haveNextCenter = false;
+            bool havePrevSection = false;
+            bool haveNextSection = false;
             uint strandCount, vertsPerStrand, trisPerStrand;
+            uint segId = 0u;
             if (getHairRibbonLayout(geo, strandCount, vertsPerStrand, trisPerStrand)) {
                 hairStrandId = uint(primitiveId) / trisPerStrand;
                 uint localPrimId = uint(primitiveId) % trisPerStrand;
-                uint segId = localPrimId / 4u;
+                segId = localPrimId / 4u;
                 uint strandBase = hairStrandId * vertsPerStrand;
                 uint strandEnd = strandBase + vertsPerStrand;
                 uint section0Base = hairStrandId * vertsPerStrand + segId * 4u;
@@ -1106,12 +1164,24 @@ void main() {
                     haveHairSections = true;
 
                     if (segId > 0u && section0Base >= strandBase + 4u) {
-                        prevCenter = fetchHairSectionCenter(vertices, objToWorld, section0Base - 4u);
+                        uint prevSectionBase = section0Base - 4u;
+                        prevSecA = fetchHairVertexWorld(vertices, objToWorld, prevSectionBase + 0u);
+                        prevSecB = fetchHairVertexWorld(vertices, objToWorld, prevSectionBase + 1u);
+                        prevSecC = fetchHairVertexWorld(vertices, objToWorld, prevSectionBase + 2u);
+                        prevSecD = fetchHairVertexWorld(vertices, objToWorld, prevSectionBase + 3u);
+                        prevCenter = (prevSecA + prevSecB + prevSecC + prevSecD) * 0.25;
                         havePrevCenter = true;
+                        havePrevSection = true;
                     }
                     if (section1Base + 7u < strandEnd) {
-                        nextCenter = fetchHairSectionCenter(vertices, objToWorld, section1Base + 4u);
+                        uint nextSectionBase = section1Base + 4u;
+                        nextSecA = fetchHairVertexWorld(vertices, objToWorld, nextSectionBase + 0u);
+                        nextSecB = fetchHairVertexWorld(vertices, objToWorld, nextSectionBase + 1u);
+                        nextSecC = fetchHairVertexWorld(vertices, objToWorld, nextSectionBase + 2u);
+                        nextSecD = fetchHairVertexWorld(vertices, objToWorld, nextSectionBase + 3u);
+                        nextCenter = (nextSecA + nextSecB + nextSecC + nextSecD) * 0.25;
                         haveNextCenter = true;
+                        haveNextSection = true;
                     }
                 }
             }
@@ -1141,55 +1211,31 @@ void main() {
             float widthLen = length(widthEdge);
             vec3 wDir = (widthLen > 1e-6) ? widthEdge / widthLen : vec3(1, 0, 0);
 
-            float segT = (chordLen > 1e-8)
-                ? clamp(dot(worldPos - centerPt, chordT) / chordLen, 0.0, 1.0)
-                : 0.0;
-            vec3 startTangent = chordT;
-            vec3 endTangent = chordT;
-            if (havePrevCenter) {
-                vec3 startAxis = otherCenter - prevCenter;
-                float startLen = length(startAxis);
-                if (startLen > 1e-8) startTangent = startAxis / startLen;
-            }
-            if (haveNextCenter) {
-                vec3 endAxis = nextCenter - centerPt;
-                float endLen = length(endAxis);
-                if (endLen > 1e-8) endTangent = endAxis / endLen;
-            }
+            // Simple segT with smoothstep for C1 continuity
+            float segT = clamp(dot(worldPos - centerPt, chordT) / max(chordLen, 1e-8), 0.0, 1.0);
+            segT = smoothstep(0.0, 1.0, segT);
 
-            vec3 m0 = startTangent * chordLen;
-            vec3 m1 = endTangent * chordLen;
-            float t2 = segT * segT;
-            float t3 = t2 * segT;
-            vec3 sweepCenter =
-                (2.0 * t3 - 3.0 * t2 + 1.0) * centerPt +
-                (-2.0 * t3 + 3.0 * t2) * otherCenter +
-                (t3 - 2.0 * t2 + segT) * m0 +
-                (t3 - t2) * m1;
-            vec3 axisVec =
-                (6.0 * t2 - 6.0 * segT) * centerPt +
-                (-6.0 * t2 + 6.0 * segT) * otherCenter +
-                (3.0 * t2 - 4.0 * segT + 1.0) * m0 +
-                (3.0 * t2 - 2.0 * segT) * m1;
-            vec3 axisT = (length(axisVec) > 1e-8) ? normalize(axisVec) : chordT;
-            float localRadius = mix(radius0, radius1, segT);
-            const float projectedRadiusOverflow = 1.08;
-            float silhouetteRadius = localRadius * projectedRadiusOverflow;
+            // Linear sweep center (matches at boundaries: segT=1 → otherCenter = next segT=0)
+            vec3 sweepCenter = mix(centerPt, otherCenter, segT);
             vec3 toHit = worldPos - sweepCenter;
-            vec3 perpToAxis = toHit - axisT * dot(toHit, axisT);
+            vec3 perpToAxis = toHit - hairSmoothT * dot(toHit, hairSmoothT);
 
-            // Camera-space left/right direction of the apparent cylinder.
-            vec3 camLR = cross(axisT, -rayDir);
+            // Camera left/right (smooth per-vertex tangent, no discontinuity)
+            vec3 camLR = cross(hairSmoothT, -rayDir);
             float sinViewT = length(camLR);
             if (sinViewT > 1e-6) camLR /= sinViewT; else camLR = wDir;
 
-            // Slightly inflate the projected cylinder to hide the dark ribbon fringe.
-            float signedV = dot(perpToAxis, camLR) / max(silhouetteRadius, 1e-8);
-            hairV = clamp(signedV, -1.0, 1.0);
+            // Cone radius: linear interpolation between section radii
+            float coneRadius = mix(radius0, radius1, segT);
 
-            vec3 viewFacing = -cross(axisT, camLR);
-            float vfLen = length(viewFacing);
-            if (vfLen > 1e-6) viewFacing /= vfLen; else viewFacing = geoNormal;
+            // cylV: position across truncated cone
+            float lateral = dot(perpToAxis, camLR);
+            hairV = clamp(lateral / max(coneRadius, 1e-8), -1.0, 1.0);
+            if (bounce == 0) primaryHairV = hairV;
+
+            // viewFacing: -rayDir projected perpendicular to tangent (toward camera)
+            vec3 viewFacing = normalize(-rayDir - hairSmoothT * dot(-rayDir, hairSmoothT));
+            if (length(-rayDir - hairSmoothT * dot(-rayDir, hairSmoothT)) < 1e-6) viewFacing = geoNormal;
 
             float cylCos = sqrt(max(0.0, 1.0 - hairV * hairV));
             vec3 cylN = normalize(hairV * camLR + cylCos * viewFacing);
@@ -2711,6 +2757,7 @@ void main() {
         vec4 clipPos = cam.proj * vec4(0.0, 0.0, primaryViewZ, 1.0);
         float ndcZ = clamp(clipPos.z / clipPos.w, 0.0, 1.0);
         imageStore(dlssDepthImg, pixel, vec4(ndcZ, 0, 0, 0));
+        imageStore(hairVImg, pixel, vec4(primaryHairV, 0, 0, 0));
     } else {
         // Sky miss: write defaults for NRD
         imageStore(normalRoughnessImg, pixel, NRD_PackNormalRoughness(vec3(0, 0, 1), 1.0));
@@ -2733,6 +2780,7 @@ void main() {
         imageStore(specularAlbedoImg, pixel, vec4(0, 0, 0, 0));
         imageStore(specularMVImg, pixel, vec4(0, 0, 0, 0));
         imageStore(dlssDepthImg, pixel, vec4(1.0, 0, 0, 0));
+        imageStore(hairVImg, pixel, vec4(2.0, 0, 0, 0));  // sentinel: not hair
     }
 
     // Write penumbra for SIGMA shadow denoiser

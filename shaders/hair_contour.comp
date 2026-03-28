@@ -1,0 +1,55 @@
+#version 460
+
+// Hair Contour Detection — screen-space edge detection on hairV buffer
+// Reads hairV image (R16F): [-1,1] = hair cylinder position, 2.0 = not hair
+// Detects silhouette edges where hair meets non-hair (or different strands)
+// Writes contour result back to hairV: marks edge pixels with value 1.5
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 34, set = 0, r16f) uniform image2D hairVImg;
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+} pc;
+
+bool isHair(float v) {
+    return v < 1.5;  // sentinel is 2.0, hair is [-1, 1]
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(pc.width) || pixel.y >= int(pc.height)) return;
+
+    float centerV = imageLoad(hairVImg, pixel).r;
+
+    // Only process hair pixels
+    if (!isHair(centerV)) return;
+
+    // Check 3x3 neighborhood for non-hair pixels (silhouette edge)
+    bool atEdge = false;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            ivec2 neighbor = pixel + ivec2(dx, dy);
+            // Screen boundary = edge
+            if (neighbor.x < 0 || neighbor.y < 0 ||
+                neighbor.x >= int(pc.width) || neighbor.y >= int(pc.height)) {
+                atEdge = true;
+                break;
+            }
+            float nv = imageLoad(hairVImg, neighbor).r;
+            if (!isHair(nv)) {
+                atEdge = true;
+                break;
+            }
+        }
+        if (atEdge) break;
+    }
+
+    if (atEdge) {
+        // Mark as contour: write 1.5 (distinguishable from hair [-1,1] and sentinel 2.0)
+        imageStore(hairVImg, pixel, vec4(1.5, 0, 0, 0));
+    }
+}

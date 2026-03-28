@@ -202,6 +202,7 @@ public:
     VkDescriptorSet GetDescriptorSet() const { return descriptorSet_; }
     VkImage GetSpecConfidenceImage() const { return specConfidenceGBuffer_.image; }
     bool HasGBuffers() const { return gbuffersCreated_; }
+    VkImageView GetHairVView() const { return hairVGBuffer_.view; }
 
     // Shadow temporal accumulation — swap ping-pong buffers each frame
     void SwapShadowAccumBuffers();
@@ -278,6 +279,7 @@ private:
     GBufferImage reactiveMaskGBuffer_;      // binding 29, R8_UNORM — DLSS reactive mask
     GBufferImage diffConfidenceGBuffer_;    // binding 30, R8_UNORM — NRD diffuse confidence
     GBufferImage specConfidenceGBuffer_;    // binding 31, R8_UNORM — NRD specular confidence
+    GBufferImage hairVGBuffer_;              // binding 34, R16F — hair cylinder V for contour detection
     bool gbuffersCreated_ = false;
     uint32_t gbufferWidth_ = 0;
     uint32_t gbufferHeight_ = 0;

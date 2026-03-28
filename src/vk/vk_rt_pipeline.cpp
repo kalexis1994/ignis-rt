@@ -520,6 +520,7 @@ void RTPipeline::Shutdown() {
         DestroyGBufferImage(reactiveMaskGBuffer_);
         DestroyGBufferImage(diffConfidenceGBuffer_);
         DestroyGBufferImage(specConfidenceGBuffer_);
+        DestroyGBufferImage(hairVGBuffer_);
         gbuffersCreated_ = false;
     }
 
@@ -637,6 +638,7 @@ bool RTPipeline::CreateGBuffers(uint32_t width, uint32_t height) {
         DestroyGBufferImage(reactiveMaskGBuffer_);
         DestroyGBufferImage(diffConfidenceGBuffer_);
         DestroyGBufferImage(specConfidenceGBuffer_);
+        DestroyGBufferImage(hairVGBuffer_);
     }
 
     if (!CreateGBufferImage(normalRoughnessGBuffer_, VK_FORMAT_R16G16B16A16_SFLOAT, width, height, "normalRoughness")) return false;
@@ -652,6 +654,7 @@ bool RTPipeline::CreateGBuffers(uint32_t width, uint32_t height) {
     if (!CreateGBufferImage(reactiveMaskGBuffer_, VK_FORMAT_R8_UNORM, width, height, "reactiveMask")) return false;
     if (!CreateGBufferImage(diffConfidenceGBuffer_, VK_FORMAT_R8_UNORM, width, height, "diffConfidence")) return false;
     if (!CreateGBufferImage(specConfidenceGBuffer_, VK_FORMAT_R8_UNORM, width, height, "specConfidence")) return false;
+    if (!CreateGBufferImage(hairVGBuffer_, VK_FORMAT_R16_SFLOAT, width, height, "hairV")) return false;
 
     gbuffersCreated_ = true;
     gbufferWidth_ = width;
@@ -672,7 +675,7 @@ bool RTPipeline::CreateGBuffers(uint32_t width, uint32_t height) {
     // Update descriptor set with real G-buffer images
     VkDevice device = context_->GetDevice();
 
-    VkDescriptorImageInfo gbufferInfos[13];
+    VkDescriptorImageInfo gbufferInfos[14];
     gbufferInfos[0] = {VK_NULL_HANDLE, normalRoughnessGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
     gbufferInfos[1] = {VK_NULL_HANDLE, viewDepthGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
     gbufferInfos[2] = {VK_NULL_HANDLE, motionVectorsGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
@@ -686,10 +689,11 @@ bool RTPipeline::CreateGBuffers(uint32_t width, uint32_t height) {
     gbufferInfos[10] = {VK_NULL_HANDLE, reactiveMaskGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
     gbufferInfos[11] = {VK_NULL_HANDLE, diffConfidenceGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
     gbufferInfos[12] = {VK_NULL_HANDLE, specConfidenceGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
+    gbufferInfos[13] = {VK_NULL_HANDLE, hairVGBuffer_.view, VK_IMAGE_LAYOUT_GENERAL};
 
-    int bindings[] = {6, 7, 8, 9, 10, 13, 15, 16, 18, 22, 29, 30, 31};
-    std::vector<VkWriteDescriptorSet> writes(13);
-    for (int i = 0; i < 13; i++) {
+    int bindings[] = {6, 7, 8, 9, 10, 13, 15, 16, 18, 22, 29, 30, 31, 34};
+    std::vector<VkWriteDescriptorSet> writes(14);
+    for (int i = 0; i < 14; i++) {
         writes[i] = {};
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = descriptorSet_;
@@ -1075,7 +1079,7 @@ bool RTPipeline::CreateDescriptorSetLayout() {
     bindings[31].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // bindings 32-33: Surfel GI cache (SSBOs)
-    bindings.resize(34);
+    bindings.resize(35);
     for (int i = 32; i <= 33; i++) {
         bindings[i] = {};
         bindings[i].binding = i;
@@ -1084,8 +1088,15 @@ bool RTPipeline::CreateDescriptorSetLayout() {
         bindings[i].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
     }
 
+    // binding 34: hair V buffer (R16F storage image for contour detection)
+    bindings[34] = {};
+    bindings[34].binding = 34;
+    bindings[34].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bindings[34].descriptorCount = 1;
+    bindings[34].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
+
     // Binding flags for partially bound descriptors
-    std::vector<VkDescriptorBindingFlags> bindingFlags(34, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
+    std::vector<VkDescriptorBindingFlags> bindingFlags(35, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
 
     VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo{};
     flagsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
@@ -1315,7 +1326,7 @@ bool RTPipeline::CreateSBT() {
 bool RTPipeline::CreateDescriptorPool() {
     VkDescriptorPoolSize poolSizes[] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 21},   // 13 base + 1 reserved(27) + 3 masks(29-31) + padding
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 22},   // 13 base + 1 reserved(27) + 3 masks(29-31) + 1 hairV(34) + padding
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 11},  // 3 base + 2 SHARC + 1 prevTransforms(28) + 2 GI reservoir(24-25) + 1 emissive(26) + 2 surfel(32-33)
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1034},  // 1024 textures + 10 other samplers

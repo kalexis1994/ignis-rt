@@ -1322,6 +1322,33 @@ void Renderer::RenderFrameRT() {
         vkCmdDispatch(cmd, groups, 1, 1);
     }
 
+    // Hair contour detection: screen-space edge detection on hairV buffer
+    if (hairContourReady_ && rtPipeline_ && rtPipeline_->HasGBuffers()) {
+        VkMemoryBarrier rtToHairContour{};
+        rtToHairContour.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        rtToHairContour.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        rtToHairContour.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &rtToHairContour, 0, nullptr, 0, nullptr);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hairContourPipeline_);
+        VkDescriptorSet rtDescSet = rtPipeline_->GetDescriptorSet();
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            hairContourPipelineLayout_, 0, 1, &rtDescSet, 0, nullptr);
+
+        struct { uint32_t width; uint32_t height; } hairContourPC;
+        hairContourPC.width = renderWidth_;
+        hairContourPC.height = renderHeight_;
+        vkCmdPushConstants(cmd, hairContourPipelineLayout_,
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(hairContourPC), &hairContourPC);
+
+        uint32_t gx = (renderWidth_ + 7) / 8;
+        uint32_t gy = (renderHeight_ + 7) / 8;
+        vkCmdDispatch(cmd, gx, gy, 1);
+    }
+
     // Wavefront path: skip NRD denoise + composite — K5 wrote G-buffers + output
     // But DLSS SR + tonemap still need to run if DLSS is active
     bool wavefrontActive = wavefrontPipeline_ && wavefrontPipeline_->IsReady();
@@ -2059,6 +2086,11 @@ bool Renderer::InitNRD() {
     // Create Surfel GI resolve pipeline
     if (!CreateSurfelResolvePipeline()) {
         Log(L"[VK Renderer] WARNING: Surfel resolve pipeline creation failed (non-fatal)\n");
+    }
+
+    // Create hair contour detection pipeline
+    if (!CreateHairContourPipeline()) {
+        Log(L"[VK Renderer] WARNING: Hair contour pipeline creation failed (non-fatal)\n");
     }
 
     return true;
@@ -2998,6 +3030,86 @@ void Renderer::ShutdownSHARCResolve() {
     sharcResolveReady_ = false;
 }
 
+bool Renderer::CreateHairContourPipeline() {
+    VkDevice device = context_->GetDevice();
+    if (!rtPipeline_) return false;
+
+    // Reuse the RT pipeline's descriptor set layout (already has binding 34 for hairV)
+    VkDescriptorSetLayout rtDescSetLayout = rtPipeline_->GetDescriptorSetLayout();
+
+    // Pipeline layout with push constants (width, height)
+    VkPushConstantRange pushRange{};
+    pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushRange.offset = 0;
+    pushRange.size = sizeof(uint32_t) * 2;  // width, height
+
+    VkPipelineLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &rtDescSetLayout;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &pushRange;
+    if (vkCreatePipelineLayout(device, &layoutInfo, nullptr, &hairContourPipelineLayout_) != VK_SUCCESS) {
+        Log(L"[VK Renderer] WARNING: Failed to create hair contour pipeline layout\n");
+        return false;
+    }
+
+    // Load compute shader
+    std::ifstream file(IgnisResolvePath("shaders/hair_contour.comp.spv"), std::ios::ate | std::ios::binary);
+    if (!file.is_open()) {
+        Log(L"[VK Renderer] WARNING: hair_contour.comp.spv not found\n");
+        return false;
+    }
+    size_t fileSize = (size_t)file.tellg();
+    std::vector<char> code(fileSize);
+    file.seekg(0);
+    file.read(code.data(), fileSize);
+    file.close();
+
+    VkShaderModuleCreateInfo moduleInfo{};
+    moduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    moduleInfo.codeSize = code.size();
+    moduleInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
+
+    VkShaderModule shaderModule;
+    if (vkCreateShaderModule(device, &moduleInfo, nullptr, &shaderModule) != VK_SUCCESS) {
+        Log(L"[VK Renderer] WARNING: Failed to create hair contour shader module\n");
+        return false;
+    }
+
+    VkPipelineShaderStageCreateInfo stageInfo{};
+    stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    stageInfo.module = shaderModule;
+    stageInfo.pName = "main";
+
+    VkComputePipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipelineInfo.stage = stageInfo;
+    pipelineInfo.layout = hairContourPipelineLayout_;
+
+    VkResult result = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &hairContourPipeline_);
+    vkDestroyShaderModule(device, shaderModule, nullptr);
+
+    if (result != VK_SUCCESS) {
+        Log(L"[VK Renderer] WARNING: Failed to create hair contour pipeline\n");
+        return false;
+    }
+
+    hairContourReady_ = true;
+    Log(L"[VK Renderer] Hair contour pipeline created\n");
+    return true;
+}
+
+void Renderer::ShutdownHairContour() {
+    VkDevice device = context_ ? context_->GetDevice() : VK_NULL_HANDLE;
+    if (device == VK_NULL_HANDLE) return;
+
+    if (hairContourPipeline_) { vkDestroyPipeline(device, hairContourPipeline_, nullptr); hairContourPipeline_ = VK_NULL_HANDLE; }
+    if (hairContourPipelineLayout_) { vkDestroyPipelineLayout(device, hairContourPipelineLayout_, nullptr); hairContourPipelineLayout_ = VK_NULL_HANDLE; }
+    hairContourReady_ = false;
+}
+
 bool Renderer::CreateSurfelResolvePipeline() {
     VkDevice device = context_->GetDevice();
 
@@ -3201,7 +3313,8 @@ void Renderer::Shutdown() {
         }
     }
 
-    // Shutdown SHARC resolve + auto-exposure + NRD + composite + DLSS
+    // Shutdown hair contour + SHARC resolve + auto-exposure + NRD + composite + DLSS
+    ShutdownHairContour();
     ShutdownSHARCResolve();
     ShutdownExposureResolve();
     ShutdownNRD();
