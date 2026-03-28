@@ -149,11 +149,11 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
             ps_modifier = mod
             break
 
-    # Radius settings (matches Cycles: radius = radius_scale * root_radius)
+    # Radius settings (Cycles: radius = radius_scale * 0.5 * root_radius)
     rad_scale = getattr(settings, 'radius_scale', 0.01)
     rad_root = getattr(settings, 'root_radius', 1.0)
     rad_tip_val = getattr(settings, 'tip_radius', 0.0)
-    root_radius = rad_scale * rad_root
+    root_radius = rad_scale * 0.5 * rad_root
     tip_factor = rad_tip_val / max(rad_root, 1e-6) if rad_root > 0 else 0.0
     if root_radius <= 0:
         root_radius = 0.003
@@ -204,7 +204,6 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
     # a clean transform to co_object space — GPU generation gives correct shapes
     # (clump/kink/roughness match Cycles) with slightly different child placement.
     use_precomputed_children = False
-        child_nbr = 0  # GPU does NO child generation — all strands are "parents"
 
     # ── Extract emitter mesh for GPU child distribution ──
     emitter_verts = np.empty(0, dtype=np.float32)

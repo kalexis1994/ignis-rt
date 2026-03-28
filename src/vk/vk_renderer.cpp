@@ -879,8 +879,9 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
     uint32_t totalChildren = nParents * childrenPerParent;
     if (useParentParticles) totalChildren += nParents; // parents rendered as first nParents strands
     // Catmull-Rom subdivision: 8 sub-segments per key segment (must match shader SUBDIV)
-    const uint32_t SUBDIV = 8;
-    uint32_t subdivPoints = (keysPerStrand - 1) * SUBDIV + 1;
+    const uint32_t SUBDIV = 16;
+    const uint32_t TIP_EXTRA = 4;  // extra tip subdivisions for curved closure
+    uint32_t subdivPoints = (keysPerStrand - 1) * SUBDIV + 1 + TIP_EXTRA;
     // DOTS: ribbon A + ribbon B (both continuous strips, 4 verts per cross-section)
     uint32_t vertsPerChild = subdivPoints * 4;
     uint32_t trisPerChild = (subdivPoints - 1) * 4;

@@ -153,10 +153,10 @@ void main() {
     bool isParentStrand = (pc.useParentParticles != 0u && childIdx < pc.nParents);
 
     uint K = pc.keysPerStrand;
-    const uint MAX_SUBDIV = 8u;
-    uint S_max = (K - 1) * MAX_SUBDIV + 1;
+    const uint MAX_SUBDIV = 16u;
+    const uint TIP_EXTRA = 4u;  // extra subdivisions for curved tip
+    uint S_max = (K - 1) * MAX_SUBDIV + 1 + TIP_EXTRA;
     // DOTS layout: ribbon A + ribbon B (both continuous strips, 4 verts per cross-section)
-    // Previous: independent quads for B = S*2 + (S-1)*4 verts (commented out below)
     uint vertsPerStrand = S_max * 4;
     uint trisPerStrand = (S_max - 1) * 4;
     uint idxPerStrand = trisPerStrand * 3;
@@ -326,7 +326,10 @@ void main() {
     //   else:            SUBDIV=8 (curly, full quality)
     uint SUBDIV = (maxCurvature < 0.01) ? 2u :
                   (maxCurvature < 0.1)  ? 4u : MAX_SUBDIV;
-    uint S = (K - 1) * SUBDIV + 1;  // actual subdivided points for this strand
+    uint S_body_full = (K - 1) * SUBDIV + 1;
+    uint TIP_OVERLAP = min(TIP_EXTRA, S_body_full / 4u);  // tip replaces last 25% of body
+    uint S_body = S_body_full - TIP_OVERLAP;  // body stops early
+    uint S = S_body + TIP_EXTRA + 1;          // body + tip + final point
 
     // Per-strand perpendicular frame for modifiers (used only for non-kink modifiers at key level)
     vec3 strandDir = normalize(childKeys[K-1] - childKeys[0]);
@@ -353,7 +356,7 @@ void main() {
     float prevRadius = pc.rootRadius;
 
     // Generate S subdivided points via Catmull-Rom interpolation
-    for (uint si = 0; si < S; si++) {
+    for (uint si = 0; si < S_body; si++) {
         // Map si to segment + local t
         float globalT = float(si) / float(S - 1);  // 0->1 along entire strand
         float segF = globalT * float(K - 1);
@@ -417,16 +420,10 @@ void main() {
             pos = mix(pos, primaryPos, clamp(clump, 0.0, 1.0));
         }
 
-        // Kink/Curl: Blender-exact do_kink (PART_KINK_CURL)
-        // Reference: blender/blenkernel/intern/particle_child.cc:do_kink()
+        // Kink/Curl: Blender do_kink (PART_KINK_CURL)
+        // Uses CONSTANT axis (strandDir) for stable helix — no wobble from varying tangent
         if (pc.kinkAmplitude > 0.0 && si > 0) {
-            // Parent tangent at this subdivided point
-            vec3 parTang = 0.5 * ((-pp0+pp2) + (4.0*pp0-10.0*pp1+8.0*pp2-2.0*pp3)*localT +
-                                  (-3.0*pp0+9.0*pp1-9.0*pp2+3.0*pp3)*t2);
-            float ptLen = length(parTang);
-            if (ptLen > 1e-6) parTang /= ptLen; else parTang = tang;
-
-            // Shape: remap time before frequency (Blender power curve)
+            // Shape: remap time before frequency
             float kinkTime = globalT;
             if (abs(pc.kinkShape) > 0.001) {
                 kinkTime = pc.kinkShape < 0.0
@@ -434,28 +431,26 @@ void main() {
                     : pow(max(globalT, 0.001), 1.0 / max(1.0 - pc.kinkShape, 0.001));
             }
 
-            // Blender: t = time * freq * M_PI (NOT 2*PI)
+            // Blender: t = time * freq * PI
             float kinkT = kinkTime * pc.kinkFrequency * 3.14159;
 
-            // Smooth start: amplitude ramps up with sin(|t|/2), capped at π
+            // Smooth start: sin(|t|/2), capped at 1.0 for stable geometry
             float dt = min(abs(kinkT), 3.14159);
-            float smoothAmp = sin(dt * 0.5) * pc.kinkAmplitude * rKinkAmp;
+            float kinkAmp = sin(dt * 0.5) * pc.kinkAmplitude * rKinkAmp * 0.1; // TUNING: find correct scale
 
-            // Kink vector: perpendicular to parent tangent (Blender projects out tangent component)
-            vec3 kinkVec = modPerp1 - parTang * dot(modPerp1, parTang);
-            float kl = length(kinkVec);
-            if (kl > 0.001) kinkVec /= kl; else kinkVec = modPerp1;
+            // Constant kink vector: perpendicular to STRAND direction (stable, no wobble)
+            // modPerp1 is already perpendicular to strandDir — use directly
+            vec3 kinkVec = modPerp1;
 
-            // Curl offset = kink * amplitude, then rotated around parent tangent by angle kinkT
-            // Rodrigues rotation: v' = v*cos(θ) + cross(a,v)*sin(θ) + a*dot(a,v)*(1-cos(θ))
-            vec3 curlOff = kinkVec * smoothAmp;
+            // Rodrigues rotation around STRAND direction (constant axis = clean helix)
+            vec3 curlOff = kinkVec * kinkAmp;
             float cosA = cos(kinkT + rPhase);
             float sinA = sin(kinkT + rPhase);
             vec3 rotated = curlOff * cosA
-                         + cross(parTang, curlOff) * sinA
-                         + parTang * dot(parTang, curlOff) * (1.0 - cosA);
+                         + cross(strandDir, curlOff) * sinA
+                         + strandDir * dot(strandDir, curlOff) * (1.0 - cosA);
 
-            // Flat: interpolate base position between child and parent (Blender interp_v3_v3v3)
+            // Flat: interpolate base position between child and parent
             vec3 basePos = mix(pos, primaryPos, clamp(pc.kinkFlat, 0.0, 1.0));
             pos = basePos + rotated;
         }
@@ -493,7 +488,14 @@ void main() {
         // NaN guard on final position
         pos = safePos(pos, childRoot);
 
-        float radius = pc.rootRadius * (1.0 - globalT + globalT * pc.tipFactor);
+        // Taper: linear body + smooth tip closure
+        // Linear for 90% of strand, then smoothly closes to a point in last 10%
+        float taper = 1.0 - globalT;  // linear base
+        if (globalT > 0.9) {
+            float tipT = (globalT - 0.9) / 0.1;  // 0→1 in last 10%
+            taper *= (1.0 - tipT * tipT);  // quadratic squeeze at tip only
+        }
+        float radius = pc.rootRadius * (taper * (1.0 - pc.tipFactor) + pc.tipFactor);
         // child_size_random: per-strand random radius variation (Blender: size *= 1 - random * childrandsize)
         if (pc.childSizeRandom > 0.0)
             radius *= 1.0 - pc.childSizeRandom * randFloat(seed + 777u);
@@ -557,6 +559,71 @@ void main() {
          *     // 4 independent vertices per segment quad...
          * }
          */
+    }
+
+    // ── Tip subdivision: replaces last body points with denser curved closure ──
+    // Body stopped at S_body (before tip). Now generate TIP_EXTRA+1 points from
+    // body-end globalT to 1.0, with CONVEX radius decay (1 - t²) for rounded tip.
+    {
+        float bodyEndGT = float(S_body - 1) / float(S_body_full - 1);
+        float bodyEndTaper = 1.0 - bodyEndGT;
+        float bodyEndRadius = pc.rootRadius * (bodyEndTaper * (1.0 - pc.tipFactor) + pc.tipFactor);
+        if (pc.childSizeRandom > 0.0)
+            bodyEndRadius *= 1.0 - pc.childSizeRandom * randFloat(seed + 777u);
+
+        vec3 tipTang = strandDir;
+        vec2 tipOctTang = octEncode(tipTang);
+        vec3 perpA_tip = modPerp1 - tipTang * dot(modPerp1, tipTang);
+        float ptl = length(perpA_tip);
+        if (ptl < 0.3) { perpA_tip = modPerp2 - tipTang * dot(modPerp2, tipTang); ptl = length(perpA_tip); }
+        if (ptl < 1e-6) perpA_tip = vec3(1,0,0); else perpA_tip /= ptl;
+        vec3 perpB_tip = cross(tipTang, perpA_tip);
+
+        for (uint ti = 0; ti <= TIP_EXTRA; ti++) {
+            float tipFrac = float(ti) / float(TIP_EXTRA);  // 0 → 1
+            float tipGT = mix(bodyEndGT, 1.0, tipFrac);
+
+            // Evaluate curve position at tipGT via Catmull-Rom
+            float segF = tipGT * float(K - 1);
+            uint seg = min(uint(segF), K - 2);
+            float localT = segF - float(seg);
+            uint ci0 = (seg > 0) ? seg - 1 : 0;
+            uint ci1 = seg;
+            uint ci2 = min(seg + 1, K - 1);
+            uint ci3 = min(seg + 2, K - 1);
+            float lt2 = localT * localT;
+            float lt3 = lt2 * localT;
+            vec3 tipPos = 0.5 * ((2.0*childKeys[ci1]) +
+                          (-childKeys[ci0] + childKeys[ci2]) * localT +
+                          (2.0*childKeys[ci0] - 5.0*childKeys[ci1] + 4.0*childKeys[ci2] - childKeys[ci3]) * lt2 +
+                          (-childKeys[ci0] + 3.0*childKeys[ci1] - 3.0*childKeys[ci2] + childKeys[ci3]) * lt3);
+            tipPos = safePos(tipPos, childRoot);
+
+            // CONVEX radius: stays thick then closes — slightly more pointed (1 - t^1.5)
+            float tipRadius = bodyEndRadius * (1.0 - tipFrac * sqrt(tipFrac));
+
+            vec3 lA = safePos(tipPos - perpA_tip * tipRadius, childRoot);
+            vec3 rA = safePos(tipPos + perpA_tip * tipRadius, childRoot);
+            vec3 lB = safePos(tipPos - perpB_tip * tipRadius, childRoot);
+            vec3 rB = safePos(tipPos + perpB_tip * tipRadius, childRoot);
+
+            uint vi = vertBase + (S_body + ti) * 4;
+            outPos.pos[vi*3+0] = lA.x;      outPos.pos[vi*3+1] = lA.y;      outPos.pos[vi*3+2] = lA.z;
+            outPos.pos[(vi+1)*3+0] = rA.x;  outPos.pos[(vi+1)*3+1] = rA.y;  outPos.pos[(vi+1)*3+2] = rA.z;
+            outPos.pos[(vi+2)*3+0] = lB.x;  outPos.pos[(vi+2)*3+1] = lB.y;  outPos.pos[(vi+2)*3+2] = lB.z;
+            outPos.pos[(vi+3)*3+0] = rB.x;  outPos.pos[(vi+3)*3+1] = rB.y;  outPos.pos[(vi+3)*3+2] = rB.z;
+
+            outNrm.nrm[vi*3+0] = -1.0;     outNrm.nrm[vi*3+1] = tipOctTang.x;     outNrm.nrm[vi*3+2] = tipOctTang.y;
+            outNrm.nrm[(vi+1)*3+0] = 1.0;  outNrm.nrm[(vi+1)*3+1] = tipOctTang.x; outNrm.nrm[(vi+1)*3+2] = tipOctTang.y;
+            outNrm.nrm[(vi+2)*3+0] = -1.0; outNrm.nrm[(vi+2)*3+1] = tipOctTang.x; outNrm.nrm[(vi+2)*3+2] = tipOctTang.y;
+            outNrm.nrm[(vi+3)*3+0] = 1.0;  outNrm.nrm[(vi+3)*3+1] = tipOctTang.x; outNrm.nrm[(vi+3)*3+2] = tipOctTang.y;
+
+            float uvU = float(childIdx);
+            outUV.uv[vi*2+0] = uvU;     outUV.uv[vi*2+1] = tipGT;
+            outUV.uv[(vi+1)*2+0] = uvU; outUV.uv[(vi+1)*2+1] = tipGT;
+            outUV.uv[(vi+2)*2+0] = uvU; outUV.uv[(vi+2)*2+1] = tipGT;
+            outUV.uv[(vi+3)*2+0] = uvU; outUV.uv[(vi+3)*2+1] = tipGT;
+        }
     }
 
     // ── Fill unused vertex slots with degenerate geometry (adaptive SUBDIV) ──

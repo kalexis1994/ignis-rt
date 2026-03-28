@@ -728,7 +728,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                                 _ignis_blas_handles[mesh_key] = blas
                                 # Compute tri count for material assignment (must match shader SUBDIV=8, DOTS=4 tris/seg)
                                 total_children = n_p * child_nbr
-                                subdiv_points = (m["n_keys"] - 1) * 8 + 1
+                                subdiv_points = (m["n_keys"] - 1) * 16 + 1 + 4  # + TIP_EXTRA
                                 tris_per_child = (subdiv_points - 1) * 4
                                 m["_gpu_tri_count"] = total_children * tris_per_child
                                 _log(f"  GPU hair OK: '{mesh_key}' → BLAS {blas} ({m['_gpu_tri_count']} tris)")
