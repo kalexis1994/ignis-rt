@@ -218,6 +218,26 @@ class IGNIS_OT_reload_scene(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class IGNIS_OT_reload_shaders(bpy.types.Operator):
+    bl_idname = "ignis.reload_shaders"
+    bl_label = "Reload Shaders"
+    bl_description = "Hot-reload shaders from disk (recompile + recreate pipeline, keep geometry)"
+
+    def execute(self, context):
+        from . import dll_wrapper
+        try:
+            ok = dll_wrapper.reload_shaders()
+            self.report({'INFO'} if ok else {'ERROR'},
+                        "Shaders reloaded" if ok else "Shader reload failed — check log")
+        except Exception as e:
+            self.report({'ERROR'}, f"Shader reload error: {e}")
+        # Tag viewport for redraw
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+        return {'FINISHED'}
+
+
 class IGNIS_PT_sampling(bpy.types.Panel):
     bl_label = "Sampling"
     bl_idname = "IGNIS_PT_sampling"
@@ -326,6 +346,7 @@ class IGNIS_PT_advanced(bpy.types.Panel):
         layout.prop(props, "debug_view")
         layout.separator()
         layout.operator("ignis.reload_scene", icon='FILE_REFRESH')
+        layout.operator("ignis.reload_shaders", icon='SHADING_RENDERED')
 
 
 
@@ -368,6 +389,7 @@ def register():
     bpy.utils.register_class(IgnisRTPreferences)
     bpy.utils.register_class(IgnisRTSceneProperties)
     bpy.utils.register_class(IGNIS_OT_reload_scene)
+    bpy.utils.register_class(IGNIS_OT_reload_shaders)
     bpy.utils.register_class(IGNIS_PT_sampling)
     bpy.utils.register_class(IGNIS_PT_dlss)
     bpy.utils.register_class(IGNIS_PT_color)
@@ -440,6 +462,7 @@ def unregister():
     bpy.utils.unregister_class(IGNIS_PT_color)
     bpy.utils.unregister_class(IGNIS_PT_dlss)
     bpy.utils.unregister_class(IGNIS_PT_sampling)
+    bpy.utils.unregister_class(IGNIS_OT_reload_shaders)
     bpy.utils.unregister_class(IGNIS_OT_reload_scene)
     del bpy.types.Scene.ignis_rt
     bpy.utils.unregister_class(IgnisRTSceneProperties)

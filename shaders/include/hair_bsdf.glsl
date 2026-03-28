@@ -106,22 +106,25 @@ vec3 hair_eval(vec3 wi, vec3 wo, vec3 tangent,
     float dphi_TRT =  4.0 * gamma_t - 2.0 * gamma_o;
 
     // ── Sum R + TT + TRT ──
+    // Azimuthal exponents control highlight sharpness (lower = softer, wider)
     // R: primary specular (white highlight)
     float M_R = hair_gaussian_M(theta_h - alpha_R, beta_R);
-    float N_R = hair_azimuthal_N(phi, dphi_R, 20.0);
+    float N_R = hair_azimuthal_N(phi, dphi_R, 8.0);
     vec3 F_total = A_R * M_R * N_R;
 
     // TT: transmission (backlit glow through fiber)
     float M_TT = hair_gaussian_M(theta_h - alpha_TT, beta_TT);
-    float N_TT = hair_azimuthal_N(phi, dphi_TT, 6.0);
+    float N_TT = hair_azimuthal_N(phi, dphi_TT, 3.0);
     F_total += A_TT * M_TT * N_TT;
 
-    // TRT: secondary colored specular (warm glint — gives hair its character)
+    // TRT: secondary colored specular (warm glint)
     float M_TRT = hair_gaussian_M(theta_h - alpha_TRT, beta_TRT);
-    float N_TRT = hair_azimuthal_N(phi, dphi_TRT, 8.0);
+    float N_TRT = hair_azimuthal_N(phi, dphi_TRT, 4.0);
     F_total += A_TRT * M_TRT * N_TRT;
 
-    // Don't multiply by cos_theta_i — the ribbon geometry's cylindrical normal
-    // already handles viewing angle. Adding cos_theta_i causes blackout at grazing angles.
-    return max(F_total, vec3(0.0));
+    // Energy conservation: clamp to physically plausible range
+    F_total = min(F_total, vec3(1.0));
+
+    // Clamp cos_theta_i to prevent blackout at grazing angles
+    return max(F_total, vec3(0.0)) * max(abs(cos_theta_i), 0.15);
 }

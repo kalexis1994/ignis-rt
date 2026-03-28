@@ -57,6 +57,12 @@ layout(binding = 7, set = 0, std430) writeonly buffer OutUVs {
     float uv[];
 } outUV;
 
+// Binding 8: Blender frand table — float[1024] (pre-scrambled for this particle system seed)
+// Exact match with Blender/Cycles random distribution via psys_frand()
+layout(binding = 8, set = 0, std430) readonly buffer FrandTable {
+    float f[];
+} frandTable;
+
 layout(push_constant) uniform PushConstants {
     uint nParents;
     uint keysPerStrand;
@@ -82,6 +88,7 @@ layout(push_constant) uniform PushConstants {
     float kinkAmpRandom;   // per-strand kink amplitude randomization
     float childSizeRandom; // per-child random radius variation [0,1]
     uint useParentParticles; // 1 = also render parent strands (childIdx < nParents)
+    uint blenderSeed;        // Blender particle system seed for deterministic randomness
 } pc;
 
 // Shared memory for parent root positions (brute-force nearest search)
@@ -94,8 +101,9 @@ uint pcgHash(uint v) {
     return (word >> 22u) ^ word;
 }
 
+// Use Blender's pre-computed frand table for exact match with Cycles
 float randFloat(uint seed) {
-    return float(pcgHash(seed)) / 4294967295.0;
+    return frandTable.f[seed % 1024u];
 }
 
 // Binary search in CDF array
@@ -152,7 +160,7 @@ void main() {
     uint vertsPerStrand = S_max * 4;
     uint trisPerStrand = (S_max - 1) * 4;
     uint idxPerStrand = trisPerStrand * 3;
-    uint seed = childIdx * 17u + 43u;
+    uint seed = childIdx * 17u + 43u + pc.blenderSeed * 1000003u;
 
     vec3 childRoot;
     vec3 childKeys[16];

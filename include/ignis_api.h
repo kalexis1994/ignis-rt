@@ -59,7 +59,12 @@ IGNIS_API int    ignis_generate_hair_gpu(const float* parentKeys, uint32_t nPare
                                           uint32_t childMode,
                                           float kinkShape, float kinkFlat, float kinkAmpRandom,
                                           bool opaqueHair,
-                                          float childSizeRandom, bool useParentParticles);
+                                          float childSizeRandom, bool useParentParticles,
+                                          uint32_t blenderSeed,
+                                          const float* frandTable, uint32_t frandCount);
+
+// Hot-reload shaders from disk (recompile + recreate pipeline, keep geometry)
+IGNIS_API bool   ignis_reload_shaders();
 
 // Camera
 IGNIS_API void   ignis_set_camera(const float* viewInverse, const float* projInverse,

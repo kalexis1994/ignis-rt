@@ -913,9 +913,10 @@ void main() {
         // but normal maps should NOT (they're detail perturbation, not geometry).
         vec3 smoothN = worldN;
 
-        // Hair: save v + smooth tangent from packed normals BEFORE any override
+        // Hair: save values from packed normals BEFORE cylindrical override
         float hairV = 0.0;
         vec3 hairSmoothT = vec3(1, 0, 0);
+        vec3 hairMacroN = geoNormalRaw; // original geometric normal — follows scalp curvature
 
         // Hair: decode smooth tangent + v from packed normal buffer
         if (geo.bitangentBufferAddress != 0u) {
@@ -1317,7 +1318,9 @@ void main() {
         vec3 sunColor = cam.skyLight.rgb;
 
         if (!skipSunNEE && sunIntensity > 0.0 && sunDir.y > -0.01) {
-            float NdotL = dot(N, sunDir);
+            // Hair: use macro normal (scalp curvature) for light visibility gate
+            // This gives correct macro illumination (bright top, dark sides)
+            float NdotL = isHairSurface ? max(dot(hairMacroN, sunDir), 0.0) : dot(N, sunDir);
             if (NdotL > 0.0) {
                 // Shadow ray with soft penumbra (sun angular radius)
                 // Blue noise + Halton temporal sequence for stable penumbra convergence
@@ -1409,11 +1412,20 @@ void main() {
                 vec3 V = -rayDir;
                 vec3 sunRadiance = sunColor * sunIntensity;
                 vec3 diffContrib, specContrib;
-                evaluateCookTorrance(
-                    N, V, sunDir, pbrHit.baseColor, pbrHit.roughness,
-                    pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior,
-                    diffContrib, specContrib
-                );
+                if (isHairSurface) {
+                    // Hair: Karis BSDF × macro NdotL for correct macro illumination
+                    vec3 hairDirect = hair_eval(V, sunDir, hairSmoothT,
+                                               pbrHit.baseColor, max(pbrHit.roughness, 0.05),
+                                               0.035, 1.55, hairV) * NdotL;
+                    diffContrib = hairDirect;
+                    specContrib = vec3(0.0); // already included in hairDirect
+                } else {
+                    evaluateCookTorrance(
+                        N, V, sunDir, pbrHit.baseColor, pbrHit.roughness,
+                        pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior,
+                        diffContrib, specContrib
+                    );
+                }
 
                 if (bounce == 0) {
                     // Always apply shadow directly (works for both RR and NRD modes)
@@ -1631,8 +1643,14 @@ void main() {
 
                     vec3 fRadiance = fColInt.rgb * fColInt.w * fAtten * fSpotAtten;
                     vec3 fDiffC, fSpecC;
-                    evaluateCookTorrance(N, V, fL, pbrHit.baseColor, pbrHit.roughness,
-                        pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior, fDiffC, fSpecC);
+                    if (isHairSurface) {
+                        fDiffC = hair_eval(V, fL, hairSmoothT, pbrHit.baseColor,
+                                          max(pbrHit.roughness, 0.05), 0.035, 1.55, hairV);
+                        fSpecC = vec3(0.0);
+                    } else {
+                        evaluateCookTorrance(N, V, fL, pbrHit.baseColor, pbrHit.roughness,
+                            pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior, fDiffC, fSpecC);
+                    }
 
                     vec3 contribution = clampRadiance((fDiffC + fSpecC) * fRadiance * W);
                     diffuseRadiance += clampRadiance(fDiffC * fRadiance * W * throughput);
@@ -1792,9 +1810,15 @@ void main() {
             vec3 V = -rayDir;
             vec3 brdfL = isAreaLight ? shadowDir : L;
             vec3 diffC, specC;
-            evaluateCookTorrance(N, V, brdfL, pbrHit.baseColor, pbrHit.roughness,
-                                 pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior,
-                                 diffC, specC);
+            if (isHairSurface) {
+                diffC = hair_eval(V, brdfL, hairSmoothT, pbrHit.baseColor,
+                                  max(pbrHit.roughness, 0.05), 0.035, 1.55, hairV);
+                specC = vec3(0.0);
+            } else {
+                evaluateCookTorrance(N, V, brdfL, pbrHit.baseColor, pbrHit.roughness,
+                                     pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior,
+                                     diffC, specC);
+            }
 
             vec3 lightRadiance = lightColor * lightInt * attenuation;
             float shadow = inShadow ? 0.0 : 1.0;
@@ -1861,9 +1885,15 @@ void main() {
                         // Evaluate BRDF
                         vec3 V = -rayDir;
                         vec3 eDiffC, eSpecC;
-                        evaluateCookTorrance(N, V, eDir, pbrHit.baseColor, pbrHit.roughness,
-                                             pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior,
-                                             eDiffC, eSpecC);
+                        if (isHairSurface) {
+                            eDiffC = hair_eval(V, eDir, hairSmoothT, pbrHit.baseColor,
+                                              max(pbrHit.roughness, 0.05), 0.035, 1.55, hairV);
+                            eSpecC = vec3(0.0);
+                        } else {
+                            evaluateCookTorrance(N, V, eDir, pbrHit.baseColor, pbrHit.roughness,
+                                                 pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior,
+                                                 eDiffC, eSpecC);
+                        }
 
                         // Geometric term: emission / (dist^2) * cosTheta_emitter
                         vec3 eRadiance = eSample.emission * eCosTheta / (eDist * eDist);

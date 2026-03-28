@@ -144,8 +144,14 @@ def load():
         c_bool,                                                # opaqueHair
         c_float,                                               # childSizeRandom
         c_bool,                                                # useParentParticles
+        c_uint32,                                              # blenderSeed
+        POINTER(c_float),                                      # frandTable
+        c_uint32,                                              # frandCount
     ]
     _lib.ignis_generate_hair_gpu.restype = c_int
+
+    _lib.ignis_reload_shaders.argtypes = []
+    _lib.ignis_reload_shaders.restype = c_bool
 
     # ------------------------------------------------------------------
     _lib.ignis_build_tlas.argtypes = [c_void_p, c_uint32]
@@ -321,9 +327,12 @@ def generate_hair_gpu(parent_keys, n_parents: int, keys_per_strand: int,
                       kink_amp_random: float = 0.0,
                       opaque_hair: bool = False,
                       child_size_random: float = 0.0,
-                      use_parent_particles: bool = False) -> int:
+                      use_parent_particles: bool = False,
+                      blender_seed: int = 0,
+                      frand_table=None) -> int:
     """Generate hair children + ribbon geometry entirely on GPU. Returns BLAS index."""
     import numpy as np
+    ft = _np_f32(frand_table) if frand_table is not None and len(frand_table) > 0 else None
     k = _np_f32(parent_keys)
     ev = _np_f32(emitter_verts) if emitter_verts is not None and len(emitter_verts) > 0 else np.zeros(3, dtype=np.float32)
     et = _np_u32(emitter_tris) if emitter_tris is not None and len(emitter_tris) > 0 else np.zeros(3, dtype=np.uint32)
@@ -343,7 +352,15 @@ def generate_hair_gpu(parent_keys, n_parents: int, keys_per_strand: int,
         c_float(kink_shape), c_float(kink_flat), c_float(kink_amp_random),
         c_bool(opaque_hair),
         c_float(child_size_random),
-        c_bool(use_parent_particles))
+        c_bool(use_parent_particles),
+        c_uint32(blender_seed),
+        ft.ctypes.data_as(POINTER(c_float)) if ft is not None else None,
+        c_uint32(len(ft) if ft is not None else 0))
+
+
+def reload_shaders() -> bool:
+    """Hot-reload shaders: recompile from disk + recreate RT pipeline. Keeps geometry/TLAS."""
+    return _lib.ignis_reload_shaders()
 
 
 def refit_blas(blas_handle: int, vertices, vertex_count: int, indices, index_count: int) -> bool:

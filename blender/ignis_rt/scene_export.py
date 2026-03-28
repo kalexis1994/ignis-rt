@@ -194,10 +194,50 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
     parents = np.array(parent_list, dtype=np.float32)  # (P, K, 3)
     n_parents = parents.shape[0]
 
-    # ── Child generation: GPU path (fast) or CPU fallback ──
+    # ── Child generation ──
     child_type = getattr(settings, 'child_type', 'NONE')
     child_nbr = getattr(settings, 'child_nbr',
                         getattr(settings, 'child_percent', 0))
+
+    # ── Export pre-computed child positions from Blender (exact Cycles match) ──
+    # Uses co_hair() to get Blender's actual evaluated child positions.
+    # These become "parents" for the GPU (child_nbr=0 → no GPU child generation,
+    # GPU only does subdivision + DOTS ribbon generation).
+    child_keys_list = []
+    if child_type != 'NONE' and child_nbr > 0:
+        n_total_particles = len(particles)
+        dg_ps = particle_system
+        n_children = len(dg_ps.child_particles)
+
+        if n_children > 0:
+            # co_hair() returns world-space positions — convert to object space
+            # to match parent keys from co_object()
+            from mathutils import Vector
+            world_inv = eval_obj.matrix_world.inverted()
+
+            try:
+                for ci in range(n_children):
+                    particle_no = n_total_particles + ci
+                    keys = np.empty((n_keys, 3), dtype=np.float32)
+                    for ki in range(n_keys):
+                        co_world = dg_ps.co_hair(eval_obj, particle_no=particle_no, step=ki)
+                        co_local = world_inv @ Vector(co_world)
+                        keys[ki] = [co_local[0], co_local[1], co_local[2]]
+                    strand_length = np.linalg.norm(keys[-1] - keys[0])
+                    if strand_length > 1e-6:
+                        child_keys_list.append(keys)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                child_keys_list = []
+
+    # If we got pre-computed children, merge with parents
+    use_precomputed_children = len(child_keys_list) > 0
+    if use_precomputed_children:
+        all_strands = list(parent_list)  # start with parents
+        all_strands.extend(child_keys_list)  # add children
+        parents = np.array(all_strands, dtype=np.float32)
+        n_parents = parents.shape[0]
+        child_nbr = 0  # GPU does NO child generation — all strands are "parents"
 
     # ── Extract emitter mesh for GPU child distribution ──
     emitter_verts = np.empty(0, dtype=np.float32)
@@ -242,10 +282,11 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
     return {
         "name": f"hair_{eval_obj.name}",
         "gpu_hair": True,
+        "precomputed_children": use_precomputed_children,
         "parent_keys": np.ascontiguousarray(parents.reshape(-1, 3).flatten(), dtype=np.float32),
         "n_parents": n_parents,
         "n_keys": n_keys,
-        "child_nbr": child_nbr if child_type != 'NONE' else 0,
+        "child_nbr": child_nbr if (child_type != 'NONE' and not use_precomputed_children) else 0,
         "root_radius": root_radius,
         "tip_factor": tip_factor,
         "mat_idx": mat_idx,
@@ -255,25 +296,28 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
         "n_emitter_verts": len(emitter_verts) // 3,
         "n_emitter_tris": len(emitter_tris) // 3,
         "avg_spacing": avg_spacing,
-        "kink_amplitude": getattr(settings, 'kink_amplitude', 0.0),
+        # When using precomputed children, modifiers are already applied by Blender → zero them
+        "kink_amplitude": 0.0 if use_precomputed_children else getattr(settings, 'kink_amplitude', 0.0),
         "kink_frequency": getattr(settings, 'kink_frequency', 2.0),
-        "clump_factor": getattr(settings, 'clump_factor', 0.0),
+        "clump_factor": 0.0 if use_precomputed_children else getattr(settings, 'clump_factor', 0.0),
         "clump_shape": getattr(settings, 'clump_shape', 0.0),
-        "roughness_1": getattr(settings, 'roughness_1', 0.0),
+        "roughness_1": 0.0 if use_precomputed_children else getattr(settings, 'roughness_1', 0.0),
         "roughness_1_size": getattr(settings, 'roughness_1_size', 1.0),
-        "roughness_2": getattr(settings, 'roughness_2', 0.0),
+        "roughness_2": 0.0 if use_precomputed_children else getattr(settings, 'roughness_2', 0.0),
         "roughness_2_size": getattr(settings, 'roughness_2_size', 1.0),
-        "roughness_endpoint": getattr(settings, 'roughness_endpoint', 0.0),
-        "child_mode": 1 if child_type == 'SIMPLE' else 0,  # 0=INTERPOLATED, 1=SIMPLE
+        "roughness_endpoint": 0.0 if use_precomputed_children else getattr(settings, 'roughness_endpoint', 0.0),
+        "child_mode": 1 if child_type == 'SIMPLE' else 0,
         "kink_shape": getattr(settings, 'kink_shape', 0.0),
         "kink_flat": getattr(settings, 'kink_flat', 0.0),
-        "kink_amp_random": getattr(settings, 'kink_amp_random', 0.0),
+        "kink_amp_random": 0.0 if use_precomputed_children else getattr(settings, 'kink_amp_random', 0.0),
         "opaque_hair": True,
         "child_length": getattr(settings, 'child_length', 1.0),
         "clump_noise_size": getattr(settings, 'clump_noise_size', 1.0),
         "child_roundness": getattr(settings, 'child_roundness', 0.0),
         "child_size_random": getattr(settings, 'child_size_random', 0.0),
-        "use_parent_particles": getattr(settings, 'use_parent_particles', False),
+        # When precomputed, ALL strands are "parents" → force useParentParticles
+        "use_parent_particles": True if use_precomputed_children else getattr(settings, 'use_parent_particles', False),
+        "blender_seed": getattr(settings, 'seed', 0),
     }
 
     # CPU fallback (kept for reference, not reached)

@@ -1194,6 +1194,39 @@ bool RTPipeline::CreatePipeline() {
     return true;
 }
 
+bool RTPipeline::ReloadShaders() {
+    VkDevice device = context_->GetDevice();
+    vkDeviceWaitIdle(device);
+
+    // Destroy old pipeline (keep layout, descriptor sets, SBT buffer — only pipeline changes)
+    if (pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, pipeline_, nullptr);
+        pipeline_ = VK_NULL_HANDLE;
+    }
+
+    // Recompile shaders from disk
+    std::string compileCmd = "cd /d \"" + IgnisResolvePath("") + "\" && compile_shaders.bat >nul 2>&1";
+    int ret = system(compileCmd.c_str());
+    if (ret != 0) {
+        Log(L"[VK RTPipeline] WARNING: compile_shaders.bat returned %d\n", ret);
+    }
+
+    // Recreate pipeline from new .spv
+    if (!CreatePipeline()) {
+        Log(L"[VK RTPipeline] ERROR: Failed to reload shaders\n");
+        return false;
+    }
+
+    // Recreate SBT for the new pipeline
+    if (!CreateSBT()) {
+        Log(L"[VK RTPipeline] ERROR: Failed to recreate SBT after shader reload\n");
+        return false;
+    }
+
+    Log(L"[VK RTPipeline] Shaders reloaded successfully\n");
+    return true;
+}
+
 bool RTPipeline::CreateSBT() {
     VkDevice device = context_->GetDevice();
 

@@ -72,7 +72,9 @@ public:
                         uint32_t childMode,
                         float kinkShape, float kinkFlat, float kinkAmpRandom,
                         bool opaqueHair,
-                        float childSizeRandom, bool useParentParticles);
+                        float childSizeRandom, bool useParentParticles,
+                        uint32_t blenderSeed,
+                        const float* frandTable, uint32_t frandCount);
     void UpdateCamera(const CameraUBO& camera);
     void RenderFrameRT();
 

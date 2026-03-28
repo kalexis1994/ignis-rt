@@ -777,9 +777,9 @@ bool Renderer::CreateHairComputePipeline() {
         return false;
     }
 
-    // 8 storage buffers: parents, emitterV, emitterT, CDF, pos(out), nrm(out), idx(out), uv(out)
-    VkDescriptorSetLayoutBinding bindings[8] = {};
-    for (int i = 0; i < 8; i++) {
+    // 9 storage buffers: parents, emitterV, emitterT, CDF, pos(out), nrm(out), idx(out), uv(out), frandTable
+    VkDescriptorSetLayoutBinding bindings[9] = {};
+    for (int i = 0; i < 9; i++) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1;
@@ -787,7 +787,7 @@ bool Renderer::CreateHairComputePipeline() {
     }
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 8;
+    layoutInfo.bindingCount = 9;
     layoutInfo.pBindings = bindings;
     vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &hairComputeDescSetLayout_);
 
@@ -795,7 +795,7 @@ bool Renderer::CreateHairComputePipeline() {
     VkPushConstantRange pushRange{};
     pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pushRange.offset = 0;
-    pushRange.size = 96; // 24 fields × 4 bytes
+    pushRange.size = 100; // 25 fields × 4 bytes
 
     VkPipelineLayoutCreateInfo plInfo{};
     plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -824,7 +824,7 @@ bool Renderer::CreateHairComputePipeline() {
     }
 
     // Descriptor pool
-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8};
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9};
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.maxSets = 1;
@@ -869,7 +869,9 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
                                uint32_t childMode,
                                float kinkShape, float kinkFlat, float kinkAmpRandom,
                                bool opaqueHair,
-                               float childSizeRandom, bool useParentParticles) {
+                               float childSizeRandom, bool useParentParticles,
+                               uint32_t blenderSeed,
+                               const float* frandTable, uint32_t frandCount) {
     if (!accelBuilder_) return -1;
     if (!CreateHairComputePipeline()) return -1;
 
@@ -1011,6 +1013,24 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
         vkCmdCopyBuffer(cmd, emCStaging.buffer, emCDFBuf.buffer, 1, &copy);
     }
 
+    // Upload Blender frand table (1024 floats = 4KB)
+    VkDeviceSize frandSize = std::max((VkDeviceSize)(frandCount * sizeof(float)), (VkDeviceSize)16);
+    auto frandBuf = accelBuilder_->CreateAccelBuffer(frandSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    vk::AccelBuffer frandStaging{};
+    if (frandTable && frandCount > 0) {
+        frandStaging = accelBuilder_->CreateAccelBuffer(frandSize,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        void* frandM;
+        vkMapMemory(device, frandStaging.memory, 0, frandSize, 0, &frandM);
+        memcpy(frandM, frandTable, frandCount * sizeof(float));
+        vkUnmapMemory(device, frandStaging.memory);
+        copy.size = frandSize;
+        vkCmdCopyBuffer(cmd, frandStaging.buffer, frandBuf.buffer, 1, &copy);
+    }
+
     VkMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1018,8 +1038,8 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
-    // Update descriptor set (8 bindings matching shader layout)
-    VkDescriptorBufferInfo bufInfos[8] = {
+    // Update descriptor set (9 bindings matching shader layout)
+    VkDescriptorBufferInfo bufInfos[9] = {
         {parentBuf.buffer, 0, parentSize},      // binding 0: parent keys
         {emVertBuf.buffer, 0, emVSize},          // binding 1: emitter verts
         {emTriBuf.buffer, 0, emTSize},           // binding 2: emitter tris
@@ -1028,9 +1048,10 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
         {nrmBuf.buffer, 0, nrmSize},             // binding 5: output normals
         {idxBuf.buffer, 0, idxSize},             // binding 6: output indices
         {uvBuf.buffer, 0, uvSize},               // binding 7: output UVs
+        {frandBuf.buffer, 0, frandSize},         // binding 8: Blender frand table
     };
-    VkWriteDescriptorSet writes[8] = {};
-    for (int i = 0; i < 8; i++) {
+    VkWriteDescriptorSet writes[9] = {};
+    for (int i = 0; i < 9; i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = hairComputeDescSet_;
         writes[i].dstBinding = i;
@@ -1038,7 +1059,7 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &bufInfos[i];
     }
-    vkUpdateDescriptorSets(device, 8, writes, 0, nullptr);
+    vkUpdateDescriptorSets(device, 9, writes, 0, nullptr);
 
     // Dispatch compute shader
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hairComputePipeline_);
@@ -1068,12 +1089,13 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
         float kinkAmpRandom;
         float childSizeRandom;
         uint32_t useParentParticles;
+        uint32_t blenderSeed;
     } pc = {nParents, keysPerStrand, totalChildren, nEmitterTris,
             rootRadius, tipFactor, clumpNoiseSize, childRoundness, childLength, avgSpacing,
             kinkAmplitude, kinkFrequency,
             clumpFactor, clumpShape, rough1, rough1Size, rough2, roughEnd,
             childMode, kinkShape, kinkFlat, kinkAmpRandom,
-            childSizeRandom, useParentParticles ? 1u : 0u};
+            childSizeRandom, useParentParticles ? 1u : 0u, blenderSeed};
     vkCmdPushConstants(cmd, hairComputePipelineLayout_,
         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
@@ -1093,6 +1115,7 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
     if (emVStaging.buffer) accelBuilder_->DestroyAccelBuffer(emVStaging);
     if (emTStaging.buffer) accelBuilder_->DestroyAccelBuffer(emTStaging);
     if (emCStaging.buffer) accelBuilder_->DestroyAccelBuffer(emCStaging);
+    if (frandStaging.buffer) accelBuilder_->DestroyAccelBuffer(frandStaging);
 
     // Build BLAS directly from GPU-resident buffers
     int blasIdx = accelBuilder_->BuildBLASFromGPUBuffers(
