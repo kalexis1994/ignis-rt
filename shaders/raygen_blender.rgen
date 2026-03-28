@@ -281,6 +281,34 @@ uint getHairStrandId(GeometryMetadata geo, uint primId)
     return primId / trisPerStrand;
 }
 
+vec3 fetchHairVertexWorld(Vertices vertices, mat4x3 objToWorld, uint vertexIndex)
+{
+    return (objToWorld * vec4(
+        vec3(vertices.v[vertexIndex*3u + 0u],
+             vertices.v[vertexIndex*3u + 1u],
+             vertices.v[vertexIndex*3u + 2u]), 1.0));
+}
+
+vec3 fetchHairSectionCenter(Vertices vertices, mat4x3 objToWorld, uint baseVertex)
+{
+    return (fetchHairVertexWorld(vertices, objToWorld, baseVertex + 0u)
+          + fetchHairVertexWorld(vertices, objToWorld, baseVertex + 1u)
+          + fetchHairVertexWorld(vertices, objToWorld, baseVertex + 2u)
+          + fetchHairVertexWorld(vertices, objToWorld, baseVertex + 3u)) * 0.25;
+}
+
+float evalHairDiagnosticFalloff(vec3 cylN, vec3 lightDir)
+{
+    float front = max(dot(cylN, lightDir), 0.0);
+    float back = max(dot(cylN, -lightDir), 0.0);
+    return max(front, back * 0.35);
+}
+
+vec3 evalHairDiagnosticColor(vec3 cylN, vec3 lightDir)
+{
+    return vec3(0.0, evalHairDiagnosticFalloff(cylN, lightDir), 0.0);
+}
+
 // ============================================================
 // Sky Environment — Procedural Preetham/Rayleigh+Mie scattering
 // Ported from ac-path-tracer (physically plausible, ~30 ALU ops)
@@ -973,10 +1001,11 @@ void main() {
         float hairV = 0.0;
         vec3 hairSmoothT = vec3(1, 0, 0);
         vec3 hairMacroN = geoNormalRaw;
-        float hairCylinderMask = 1.0;
         uint hairStrandId = INVALID_HAIR_STRAND;
+        bool hairDiagnosticMode = false;
 
         if (geo.bitangentBufferAddress != 0u) {
+            hairDiagnosticMode = true;
             // Decode packed data from RAW interpolation (NOT normalized!)
             vec3 rawN = vec3(normals.n[i0*3+0], normals.n[i0*3+1], normals.n[i0*3+2]) * bary.x
                       + vec3(normals.n[i1*3+0], normals.n[i1*3+1], normals.n[i1*3+2]) * bary.y
@@ -1048,46 +1077,60 @@ void main() {
             bool haveHairSections = false;
             vec3 sec0a, sec0b, sec0c, sec0d;
             vec3 sec1a, sec1b, sec1c, sec1d;
+            vec3 prevCenter = centerPt;
+            vec3 nextCenter = otherCenter;
+            bool havePrevCenter = false;
+            bool haveNextCenter = false;
             uint strandCount, vertsPerStrand, trisPerStrand;
             if (getHairRibbonLayout(geo, strandCount, vertsPerStrand, trisPerStrand)) {
                 hairStrandId = uint(primitiveId) / trisPerStrand;
                 uint localPrimId = uint(primitiveId) % trisPerStrand;
                 uint segId = localPrimId / 4u;
+                uint strandBase = hairStrandId * vertsPerStrand;
+                uint strandEnd = strandBase + vertsPerStrand;
                 uint section0Base = hairStrandId * vertsPerStrand + segId * 4u;
                 uint section1Base = section0Base + 4u;
                 if (section1Base + 3u < geo.vertexCount) {
-                    sec0a = (objToWorld * vec4(vec3(vertices.v[(section0Base + 0u)*3u + 0u], vertices.v[(section0Base + 0u)*3u + 1u], vertices.v[(section0Base + 0u)*3u + 2u]), 1.0));
-                    sec0b = (objToWorld * vec4(vec3(vertices.v[(section0Base + 1u)*3u + 0u], vertices.v[(section0Base + 1u)*3u + 1u], vertices.v[(section0Base + 1u)*3u + 2u]), 1.0));
-                    sec0c = (objToWorld * vec4(vec3(vertices.v[(section0Base + 2u)*3u + 0u], vertices.v[(section0Base + 2u)*3u + 1u], vertices.v[(section0Base + 2u)*3u + 2u]), 1.0));
-                    sec0d = (objToWorld * vec4(vec3(vertices.v[(section0Base + 3u)*3u + 0u], vertices.v[(section0Base + 3u)*3u + 1u], vertices.v[(section0Base + 3u)*3u + 2u]), 1.0));
-                    sec1a = (objToWorld * vec4(vec3(vertices.v[(section1Base + 0u)*3u + 0u], vertices.v[(section1Base + 0u)*3u + 1u], vertices.v[(section1Base + 0u)*3u + 2u]), 1.0));
-                    sec1b = (objToWorld * vec4(vec3(vertices.v[(section1Base + 1u)*3u + 0u], vertices.v[(section1Base + 1u)*3u + 1u], vertices.v[(section1Base + 1u)*3u + 2u]), 1.0));
-                    sec1c = (objToWorld * vec4(vec3(vertices.v[(section1Base + 2u)*3u + 0u], vertices.v[(section1Base + 2u)*3u + 1u], vertices.v[(section1Base + 2u)*3u + 2u]), 1.0));
-                    sec1d = (objToWorld * vec4(vec3(vertices.v[(section1Base + 3u)*3u + 0u], vertices.v[(section1Base + 3u)*3u + 1u], vertices.v[(section1Base + 3u)*3u + 2u]), 1.0));
+                    sec0a = fetchHairVertexWorld(vertices, objToWorld, section0Base + 0u);
+                    sec0b = fetchHairVertexWorld(vertices, objToWorld, section0Base + 1u);
+                    sec0c = fetchHairVertexWorld(vertices, objToWorld, section0Base + 2u);
+                    sec0d = fetchHairVertexWorld(vertices, objToWorld, section0Base + 3u);
+                    sec1a = fetchHairVertexWorld(vertices, objToWorld, section1Base + 0u);
+                    sec1b = fetchHairVertexWorld(vertices, objToWorld, section1Base + 1u);
+                    sec1c = fetchHairVertexWorld(vertices, objToWorld, section1Base + 2u);
+                    sec1d = fetchHairVertexWorld(vertices, objToWorld, section1Base + 3u);
                     centerPt = (sec0a + sec0b + sec0c + sec0d) * 0.25;
                     otherCenter = (sec1a + sec1b + sec1c + sec1d) * 0.25;
                     widthEdge = (sec0b - sec0a) + (sec0d - sec0c);
                     otherWidthEdge = (sec1b - sec1a) + (sec1d - sec1c);
                     haveHairSections = true;
+
+                    if (segId > 0u && section0Base >= strandBase + 4u) {
+                        prevCenter = fetchHairSectionCenter(vertices, objToWorld, section0Base - 4u);
+                        havePrevCenter = true;
+                    }
+                    if (section1Base + 7u < strandEnd) {
+                        nextCenter = fetchHairSectionCenter(vertices, objToWorld, section1Base + 4u);
+                        haveNextCenter = true;
+                    }
                 }
             }
 
-            // Use the exact ribbon pair centers as the strand axis for projected-cylinder shading.
-            vec3 axisT = otherCenter - centerPt;
-            float axisLen = length(axisT);
-            if (axisLen > 1e-8) axisT /= axisLen; else axisT = hairSmoothT;
+            vec3 chordAxis = otherCenter - centerPt;
+            float chordLen = length(chordAxis);
+            vec3 chordT = (chordLen > 1e-8) ? chordAxis / chordLen : hairSmoothT;
 
             float radius0;
             float radius1;
             if (haveHairSections) {
-                vec3 sec0o0 = sec0a - centerPt - axisT * dot(sec0a - centerPt, axisT);
-                vec3 sec0o1 = sec0b - centerPt - axisT * dot(sec0b - centerPt, axisT);
-                vec3 sec0o2 = sec0c - centerPt - axisT * dot(sec0c - centerPt, axisT);
-                vec3 sec0o3 = sec0d - centerPt - axisT * dot(sec0d - centerPt, axisT);
-                vec3 sec1o0 = sec1a - otherCenter - axisT * dot(sec1a - otherCenter, axisT);
-                vec3 sec1o1 = sec1b - otherCenter - axisT * dot(sec1b - otherCenter, axisT);
-                vec3 sec1o2 = sec1c - otherCenter - axisT * dot(sec1c - otherCenter, axisT);
-                vec3 sec1o3 = sec1d - otherCenter - axisT * dot(sec1d - otherCenter, axisT);
+                vec3 sec0o0 = sec0a - centerPt - chordT * dot(sec0a - centerPt, chordT);
+                vec3 sec0o1 = sec0b - centerPt - chordT * dot(sec0b - centerPt, chordT);
+                vec3 sec0o2 = sec0c - centerPt - chordT * dot(sec0c - centerPt, chordT);
+                vec3 sec0o3 = sec0d - centerPt - chordT * dot(sec0d - centerPt, chordT);
+                vec3 sec1o0 = sec1a - otherCenter - chordT * dot(sec1a - otherCenter, chordT);
+                vec3 sec1o1 = sec1b - otherCenter - chordT * dot(sec1b - otherCenter, chordT);
+                vec3 sec1o2 = sec1c - otherCenter - chordT * dot(sec1c - otherCenter, chordT);
+                vec3 sec1o3 = sec1d - otherCenter - chordT * dot(sec1d - otherCenter, chordT);
                 radius0 = max((length(sec0o0) + length(sec0o1) + length(sec0o2) + length(sec0o3)) * 0.25, 1e-6);
                 radius1 = max((length(sec1o0) + length(sec1o1) + length(sec1o2) + length(sec1o3)) * 0.25, 1e-6);
                 if (length(widthEdge) < 1e-6) widthEdge = sec0b - sec0a;
@@ -1098,12 +1141,37 @@ void main() {
             float widthLen = length(widthEdge);
             vec3 wDir = (widthLen > 1e-6) ? widthEdge / widthLen : vec3(1, 0, 0);
 
-            float segT = (axisLen > 1e-8)
-                ? clamp(dot(worldPos - centerPt, axisT) / axisLen, 0.0, 1.0)
+            float segT = (chordLen > 1e-8)
+                ? clamp(dot(worldPos - centerPt, chordT) / chordLen, 0.0, 1.0)
                 : 0.0;
-            segT = smoothstep(0.0, 1.0, segT);  // C1 continuity at segment boundaries
+            vec3 startTangent = chordT;
+            vec3 endTangent = chordT;
+            if (havePrevCenter) {
+                vec3 startAxis = otherCenter - prevCenter;
+                float startLen = length(startAxis);
+                if (startLen > 1e-8) startTangent = startAxis / startLen;
+            }
+            if (haveNextCenter) {
+                vec3 endAxis = nextCenter - centerPt;
+                float endLen = length(endAxis);
+                if (endLen > 1e-8) endTangent = endAxis / endLen;
+            }
 
-            vec3 sweepCenter = mix(centerPt, otherCenter, segT);
+            vec3 m0 = startTangent * chordLen;
+            vec3 m1 = endTangent * chordLen;
+            float t2 = segT * segT;
+            float t3 = t2 * segT;
+            vec3 sweepCenter =
+                (2.0 * t3 - 3.0 * t2 + 1.0) * centerPt +
+                (-2.0 * t3 + 3.0 * t2) * otherCenter +
+                (t3 - 2.0 * t2 + segT) * m0 +
+                (t3 - t2) * m1;
+            vec3 axisVec =
+                (6.0 * t2 - 6.0 * segT) * centerPt +
+                (-6.0 * t2 + 6.0 * segT) * otherCenter +
+                (3.0 * t2 - 4.0 * segT + 1.0) * m0 +
+                (3.0 * t2 - 2.0 * segT) * m1;
+            vec3 axisT = (length(axisVec) > 1e-8) ? normalize(axisVec) : chordT;
             float localRadius = mix(radius0, radius1, segT);
             const float projectedRadiusOverflow = 1.08;
             float silhouetteRadius = localRadius * projectedRadiusOverflow;
@@ -1130,10 +1198,6 @@ void main() {
             geoNormal = cylN;
             geoNormalRaw = cylN;
             smoothN = cylN;
-            float cylV = clamp(abs(signedV), 0.0, 1.0);
-            float cylBrightness = sqrt(max(0.0, 1.0 - cylV * cylV));
-            const float cylinderEdgeFloor = 0.35;
-            hairCylinderMask = mix(cylinderEdgeFloor, 1.0, cylBrightness);
         } else {
             // Standard shadow terminator fix (non-hair geometry only)
             float NdotNg = dot(worldN, geoNormal);
@@ -1198,9 +1262,8 @@ void main() {
             wp0, wp1, wp2, uv0_, uv1_, uv2_, hitUV, rayDir,
             hitVertexColor, uint(instanceId), localPos
         );
-        if (geo.bitangentBufferAddress != 0u) {
-            // White projected-cylinder albedo; the path tracer lighting now shapes the strand.
-            pbrHit.baseColor = vec3(hairCylinderMask);
+        if (hairDiagnosticMode) {
+            pbrHit.baseColor = vec3(0.0, 1.0, 0.0);
         }
 
         // ---- Volume-only material: ray march with Beer-Lambert + in-scattering ----
@@ -1521,9 +1584,9 @@ void main() {
         vec3 sunColor = cam.skyLight.rgb;
 
         if (!skipSunNEE && sunIntensity > 0.0 && sunDir.y > -0.01) {
-            // Hair: tangent-based light gate (camera-independent, like Kajiya-Kay)
-            // sin(T, L) = how perpendicular the strand is to the light (1=bright, 0=aligned=dark)
-            float NdotL = isHairSurface ? length(cross(hairSmoothT, sunDir)) : dot(N, sunDir);
+            float NdotL = isHairSurface
+                ? (hairDiagnosticMode ? evalHairDiagnosticFalloff(N, sunDir) : length(cross(hairSmoothT, sunDir)))
+                : dot(N, sunDir);
             if (NdotL > 0.0) {
                 // Shadow ray with soft penumbra (sun angular radius)
                 // Blue noise + Halton temporal sequence for stable penumbra convergence
@@ -1627,15 +1690,20 @@ void main() {
                 vec3 sunRadiance = sunColor * sunIntensity;
                 vec3 diffContrib, specContrib;
                 if (isHairSurface) {
-                    // Hair: Kajiya-Kay diffuse + Karis specular
-                    // Diffuse: sin(T, L) — bright when light perpendicular to strand
-                    float sinTL = length(cross(hairSmoothT, sunDir));
-                    vec3 hairDiffuse = pbrHit.baseColor * INV_PI * sinTL;
-                    vec3 hairSpec = hair_eval(V, sunDir, hairSmoothT,
-                                             pbrHit.baseColor, max(pbrHit.roughness, 0.05),
-                                             0.035, 1.55, hairV);
-                    diffContrib = hairDiffuse + hairSpec;
-                    specContrib = vec3(0.0); // already included in hairDirect
+                    if (hairDiagnosticMode) {
+                        diffContrib = evalHairDiagnosticColor(N, sunDir);
+                        specContrib = vec3(0.0);
+                    } else {
+                        // Hair: Kajiya-Kay diffuse + Karis specular
+                        // Diffuse: sin(T, L) — bright when light perpendicular to strand
+                        float sinTL = length(cross(hairSmoothT, sunDir));
+                        vec3 hairDiffuse = pbrHit.baseColor * INV_PI * sinTL;
+                        vec3 hairSpec = hair_eval(V, sunDir, hairSmoothT,
+                                                 pbrHit.baseColor, max(pbrHit.roughness, 0.05),
+                                                 0.035, 1.55, hairV);
+                        diffContrib = hairDiffuse + hairSpec;
+                        specContrib = vec3(0.0); // already included in hairDirect
+                    }
                 } else {
                     evaluateCookTorrance(
                         N, V, sunDir, pbrHit.baseColor, pbrHit.roughness,
@@ -1883,11 +1951,16 @@ void main() {
                     vec3 fRadiance = fColInt.rgb * fColInt.w * fAtten * fSpotAtten;
                     vec3 fDiffC, fSpecC;
                     if (isHairSurface) {
-                        float sinTfL = length(cross(hairSmoothT, fL));
-                        fDiffC = pbrHit.baseColor * INV_PI * sinTfL
-                               + hair_eval(V, fL, hairSmoothT, pbrHit.baseColor,
-                                          max(pbrHit.roughness, 0.05), 0.035, 1.55, hairV);
-                        fSpecC = vec3(0.0);
+                        if (hairDiagnosticMode) {
+                            fDiffC = evalHairDiagnosticColor(N, fL);
+                            fSpecC = vec3(0.0);
+                        } else {
+                            float sinTfL = length(cross(hairSmoothT, fL));
+                            fDiffC = pbrHit.baseColor * INV_PI * sinTfL
+                                   + hair_eval(V, fL, hairSmoothT, pbrHit.baseColor,
+                                              max(pbrHit.roughness, 0.05), 0.035, 1.55, hairV);
+                            fSpecC = vec3(0.0);
+                        }
                     } else {
                         evaluateCookTorrance(N, V, fL, pbrHit.baseColor, pbrHit.roughness,
                             pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior, fDiffC, fSpecC);
@@ -2063,11 +2136,16 @@ void main() {
             vec3 brdfL = isAreaLight ? shadowDir : L;
             vec3 diffC, specC;
             if (isHairSurface) {
-                float sinTbrdf = length(cross(hairSmoothT, brdfL));
-                diffC = pbrHit.baseColor * INV_PI * sinTbrdf
-                      + hair_eval(V, brdfL, hairSmoothT, pbrHit.baseColor,
-                                  max(pbrHit.roughness, 0.05), 0.035, 1.55, hairV);
-                specC = vec3(0.0);
+                if (hairDiagnosticMode) {
+                    diffC = evalHairDiagnosticColor(N, brdfL);
+                    specC = vec3(0.0);
+                } else {
+                    float sinTbrdf = length(cross(hairSmoothT, brdfL));
+                    diffC = pbrHit.baseColor * INV_PI * sinTbrdf
+                          + hair_eval(V, brdfL, hairSmoothT, pbrHit.baseColor,
+                                      max(pbrHit.roughness, 0.05), 0.035, 1.55, hairV);
+                    specC = vec3(0.0);
+                }
             } else {
                 evaluateCookTorrance(N, V, brdfL, pbrHit.baseColor, pbrHit.roughness,
                                      pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior,
@@ -2151,11 +2229,16 @@ void main() {
                         vec3 V = -rayDir;
                         vec3 eDiffC, eSpecC;
                         if (isHairSurface) {
-                            float sinTeDir = length(cross(hairSmoothT, eDir));
-                            eDiffC = pbrHit.baseColor * INV_PI * sinTeDir
-                                   + hair_eval(V, eDir, hairSmoothT, pbrHit.baseColor,
-                                              max(pbrHit.roughness, 0.05), 0.035, 1.55, hairV);
-                            eSpecC = vec3(0.0);
+                            if (hairDiagnosticMode) {
+                                eDiffC = evalHairDiagnosticColor(N, eDir);
+                                eSpecC = vec3(0.0);
+                            } else {
+                                float sinTeDir = length(cross(hairSmoothT, eDir));
+                                eDiffC = pbrHit.baseColor * INV_PI * sinTeDir
+                                       + hair_eval(V, eDir, hairSmoothT, pbrHit.baseColor,
+                                                  max(pbrHit.roughness, 0.05), 0.035, 1.55, hairV);
+                                eSpecC = vec3(0.0);
+                            }
                         } else {
                             evaluateCookTorrance(N, V, eDir, pbrHit.baseColor, pbrHit.roughness,
                                                  pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior,
@@ -2370,6 +2453,10 @@ void main() {
             if (bounce == 0) { isDiffusePath = false; captureSpecularMV = true; }
             bounce--;  // glass doesn't count against main bounce budget
             continue;
+        }
+
+        if (hairDiagnosticMode) {
+            break;
         }
 
         // ---- Sample BRDF lobe ----
