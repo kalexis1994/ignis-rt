@@ -126,13 +126,13 @@ void main() {
     if (childIdx >= pc.totalChildren) return;
 
     uint K = pc.keysPerStrand;
-    const uint SUBDIV = 8u;
-    uint S = (K - 1) * SUBDIV + 1;
-    // DOTS layout: ribbon A (continuous strip) + ribbon B (independent perpendicular quads)
-    // Ribbon A: S*2 verts (shared at cross-sections)
-    // Ribbon B: (S-1)*4 verts (4 independent verts per segment, NOT shared)
-    uint vertsPerStrand = S * 2 + (S - 1) * 4;
-    uint trisPerStrand = (S - 1) * 4;  // 2 tris ribbonA + 2 tris ribbonB per segment
+    // Max SUBDIV=8 for buffer layout — actual SUBDIV chosen per-strand after curvature analysis
+    const uint MAX_SUBDIV = 8u;
+    uint S_max = (K - 1) * MAX_SUBDIV + 1;
+    // DOTS layout: ribbon A + ribbon B (both continuous strips, 4 verts per cross-section)
+    // Previous: independent quads for B = S*2 + (S-1)*4 verts (commented out below)
+    uint vertsPerStrand = S_max * 4;
+    uint trisPerStrand = (S_max - 1) * 4;
     uint idxPerStrand = trisPerStrand * 3;
     uint seed = childIdx * 17u + 43u;
 
@@ -267,6 +267,26 @@ void main() {
         for (uint ki = 0; ki < K && ki < 16; ki++)
             primaryKeys[ki] = parents.keys[bestIdx[0] * K + ki].xyz + off0;
     }
+
+    // ── Adaptive SUBDIV: measure curvature, choose subdivision level ──
+    // Straight strands waste less geometry, curly strands keep full quality
+    float maxCurvature = 0.0;
+    for (uint ki = 0; ki + 2 < K; ki++) {
+        vec3 seg0 = childKeys[ki+1] - childKeys[ki];
+        vec3 seg1 = childKeys[ki+2] - childKeys[ki+1];
+        float l0 = length(seg0), l1 = length(seg1);
+        if (l0 > 1e-6 && l1 > 1e-6) {
+            float cosAngle = dot(seg0 / l0, seg1 / l1);
+            maxCurvature = max(maxCurvature, 1.0 - cosAngle); // 0=straight, 2=180° bend
+        }
+    }
+    // Select SUBDIV: low curvature → fewer subdivisions
+    //   < 0.01 (< ~8°):  SUBDIV=2 (nearly straight)
+    //   < 0.1  (< ~26°): SUBDIV=4 (gentle curve)
+    //   else:            SUBDIV=8 (curly, full quality)
+    uint SUBDIV = (maxCurvature < 0.01) ? 2u :
+                  (maxCurvature < 0.1)  ? 4u : MAX_SUBDIV;
+    uint S = (K - 1) * SUBDIV + 1;  // actual subdivided points for this strand
 
     // Per-strand perpendicular frame for modifiers (used only for non-kink modifiers at key level)
     vec3 strandDir = normalize(childKeys[K-1] - childKeys[0]);
@@ -444,84 +464,90 @@ void main() {
         vec3 leftA  = safePos(pos - perpA * radius, childRoot);
         vec3 rightA = safePos(pos + perpA * radius, childRoot);
 
+        // ── Ribbon B: perpB = face normal of ribbon A (continuous strip) ──
+        vec3 perpB = cross(tang, perpA);
+
+        vec3 leftB  = safePos(pos - perpB * radius, childRoot);
+        vec3 rightB = safePos(pos + perpB * radius, childRoot);
+
         // Pack v + smooth tangent in normal buffer:
         // .x = v (-1 left, +1 right), .yz = octahedral-encoded smooth tangent
-        // The smooth tangent is the Catmull-Rom derivative — continuous across segments
         vec2 octTang = octEncode(tang);
 
-        uint vi = vertBase + si * 2;
-        outPos.pos[vi*3+0] = leftA.x;  outPos.pos[vi*3+1] = leftA.y;  outPos.pos[vi*3+2] = leftA.z;
-        outPos.pos[(vi+1)*3+0] = rightA.x; outPos.pos[(vi+1)*3+1] = rightA.y; outPos.pos[(vi+1)*3+2] = rightA.z;
-        outNrm.nrm[vi*3+0] = -1.0; outNrm.nrm[vi*3+1] = octTang.x; outNrm.nrm[vi*3+2] = octTang.y;
-        outNrm.nrm[(vi+1)*3+0] = 1.0; outNrm.nrm[(vi+1)*3+1] = octTang.x; outNrm.nrm[(vi+1)*3+2] = octTang.y;
+        // 4 vertices per cross-section: [A_left, A_right, B_left, B_right]
+        uint vi = vertBase + si * 4;
+        outPos.pos[vi*3+0] = leftA.x;      outPos.pos[vi*3+1] = leftA.y;      outPos.pos[vi*3+2] = leftA.z;
+        outPos.pos[(vi+1)*3+0] = rightA.x;  outPos.pos[(vi+1)*3+1] = rightA.y;  outPos.pos[(vi+1)*3+2] = rightA.z;
+        outPos.pos[(vi+2)*3+0] = leftB.x;   outPos.pos[(vi+2)*3+1] = leftB.y;   outPos.pos[(vi+2)*3+2] = leftB.z;
+        outPos.pos[(vi+3)*3+0] = rightB.x;  outPos.pos[(vi+3)*3+1] = rightB.y;  outPos.pos[(vi+3)*3+2] = rightB.z;
+
+        outNrm.nrm[vi*3+0] = -1.0;     outNrm.nrm[vi*3+1] = octTang.x;     outNrm.nrm[vi*3+2] = octTang.y;
+        outNrm.nrm[(vi+1)*3+0] = 1.0;  outNrm.nrm[(vi+1)*3+1] = octTang.x; outNrm.nrm[(vi+1)*3+2] = octTang.y;
+        outNrm.nrm[(vi+2)*3+0] = -1.0; outNrm.nrm[(vi+2)*3+1] = octTang.x; outNrm.nrm[(vi+2)*3+2] = octTang.y;
+        outNrm.nrm[(vi+3)*3+0] = 1.0;  outNrm.nrm[(vi+3)*3+1] = octTang.x; outNrm.nrm[(vi+3)*3+2] = octTang.y;
 
         float uvU = float(childIdx);
-        outUV.uv[vi*2+0] = uvU; outUV.uv[vi*2+1] = globalT;
+        outUV.uv[vi*2+0] = uvU;     outUV.uv[vi*2+1] = globalT;
         outUV.uv[(vi+1)*2+0] = uvU; outUV.uv[(vi+1)*2+1] = globalT;
-
-        // ── Ribbon B: independent perpendicular quad for PREVIOUS segment ──
-        // Uses prevPos/pos to define the segment, computes face normal of ribbon A
-        // at that segment, and creates a standalone quad perpendicular to it.
-        if (si > 0u) {
-            vec3 segDir = pos - prevPos;
-            float segLen = length(segDir);
-            vec3 segTang = (segLen > 1e-6) ? segDir / segLen : tang;
-
-            // Ribbon A's face normal at this segment = perpendicular to (segTang × perpA_at_segment)
-            vec3 segPerpA = modPerp1 - segTang * dot(modPerp1, segTang);
-            float spLen = length(segPerpA);
-            if (spLen < 0.3) { segPerpA = modPerp2 - segTang * dot(modPerp2, segTang); spLen = length(segPerpA); }
-            if (spLen < 1e-6) segPerpA = vec3(1,0,0); else segPerpA /= spLen;
-
-            // perpB = cross(segTang, segPerpA) — perpendicular to ribbon A's face at this segment
-            vec3 perpB = cross(segTang, segPerpA);
-
-            float curRadius = radius;
-
-            // 4 independent vertices (NOT shared with adjacent segments)
-            vec3 bv0 = safePos(prevPos - perpB * prevRadius, childRoot);
-            vec3 bv1 = safePos(prevPos + perpB * prevRadius, childRoot);
-            vec3 bv2 = safePos(pos     - perpB * curRadius,  childRoot);
-            vec3 bv3 = safePos(pos     + perpB * curRadius,  childRoot);
-
-            vec3 normalB = segPerpA;  // B's face normal = A's width direction
-
-            uint bvi = vertBase + S * 2 + (si - 1u) * 4;
-            outPos.pos[bvi*3+0] = bv0.x; outPos.pos[bvi*3+1] = bv0.y; outPos.pos[bvi*3+2] = bv0.z;
-            outPos.pos[(bvi+1)*3+0] = bv1.x; outPos.pos[(bvi+1)*3+1] = bv1.y; outPos.pos[(bvi+1)*3+2] = bv1.z;
-            outPos.pos[(bvi+2)*3+0] = bv2.x; outPos.pos[(bvi+2)*3+1] = bv2.y; outPos.pos[(bvi+2)*3+2] = bv2.z;
-            outPos.pos[(bvi+3)*3+0] = bv3.x; outPos.pos[(bvi+3)*3+1] = bv3.y; outPos.pos[(bvi+3)*3+2] = bv3.z;
-
-            // Pack v + smooth tangent for ribbon B (use segment tangent)
-            vec2 octSegTang = octEncode(segTang);
-            outNrm.nrm[bvi*3+0] = -1.0; outNrm.nrm[bvi*3+1] = octSegTang.x; outNrm.nrm[bvi*3+2] = octSegTang.y;
-            outNrm.nrm[(bvi+1)*3+0] = 1.0; outNrm.nrm[(bvi+1)*3+1] = octSegTang.x; outNrm.nrm[(bvi+1)*3+2] = octSegTang.y;
-            outNrm.nrm[(bvi+2)*3+0] = -1.0; outNrm.nrm[(bvi+2)*3+1] = octSegTang.x; outNrm.nrm[(bvi+2)*3+2] = octSegTang.y;
-            outNrm.nrm[(bvi+3)*3+0] = 1.0; outNrm.nrm[(bvi+3)*3+1] = octSegTang.x; outNrm.nrm[(bvi+3)*3+2] = octSegTang.y;
-
-            float prevGT = float(si-1) / float(S-1);
-            outUV.uv[bvi*2+0] = uvU; outUV.uv[bvi*2+1] = prevGT;
-            outUV.uv[(bvi+1)*2+0] = uvU; outUV.uv[(bvi+1)*2+1] = prevGT;
-            outUV.uv[(bvi+2)*2+0] = uvU; outUV.uv[(bvi+2)*2+1] = globalT;
-            outUV.uv[(bvi+3)*2+0] = uvU; outUV.uv[(bvi+3)*2+1] = globalT;
-        }
+        outUV.uv[(vi+2)*2+0] = uvU; outUV.uv[(vi+2)*2+1] = globalT;
+        outUV.uv[(vi+3)*2+0] = uvU; outUV.uv[(vi+3)*2+1] = globalT;
 
         prevPos = pos;
         prevRadius = radius;
+
+        /* ── COMMENTED OUT: Independent perpendicular quads (ribbon B) ──
+         * Each segment had 4 own vertices, NOT shared with neighbors.
+         * Guaranteed perpendicularity but left gaps between segments.
+         * Kept for reference — can be re-enabled by switching layout back to
+         * vertsPerStrand = S*2 + (S-1)*4 and uncommenting this block.
+         *
+         * if (si > 0u) {
+         *     vec3 segDir = pos - prevPos;
+         *     float segLen = length(segDir);
+         *     vec3 segTang = (segLen > 1e-6) ? segDir / segLen : tang;
+         *     vec3 segPerpA = modPerp1 - segTang * dot(modPerp1, segTang);
+         *     float spLen = length(segPerpA);
+         *     if (spLen < 0.3) { segPerpA = modPerp2 - segTang * dot(modPerp2, segTang); spLen = length(segPerpA); }
+         *     if (spLen < 1e-6) segPerpA = vec3(1,0,0); else segPerpA /= spLen;
+         *     vec3 perpB = cross(segTang, segPerpA);
+         *     uint bvi = vertBase + S * 2 + (si - 1u) * 4;
+         *     // 4 independent vertices per segment quad...
+         * }
+         */
     }
 
-    // ── Indices ──
-    uint ribbonBVertBase = vertBase + S * 2;
-    for (uint si = 0; si < S - 1; si++) {
+    // ── Fill unused vertex slots with degenerate geometry (adaptive SUBDIV) ──
+    vec3 degenPos = childRoot;
+    for (uint si = S; si < S_max; si++) {
+        uint vi = vertBase + si * 4;
+        for (uint v = 0; v < 4; v++) {
+            outPos.pos[(vi+v)*3+0] = degenPos.x;
+            outPos.pos[(vi+v)*3+1] = degenPos.y;
+            outPos.pos[(vi+v)*3+2] = degenPos.z;
+            outNrm.nrm[(vi+v)*3+0] = 0.0;
+            outNrm.nrm[(vi+v)*3+1] = 0.0;
+            outNrm.nrm[(vi+v)*3+2] = 0.0;
+            outUV.uv[(vi+v)*2+0] = 0.0;
+            outUV.uv[(vi+v)*2+1] = 0.0;
+        }
+    }
+
+    // ── Indices: 4 verts per cross-section, 4 tris per segment ──
+    for (uint si = 0; si < S_max - 1; si++) {
         uint base = idxBase + si * 12;
-        // Ribbon A (continuous strip)
-        uint a0 = vertBase + si * 2;
-        uint a1 = vertBase + (si + 1) * 2;
-        outIdx.idx[base+0] = a0;   outIdx.idx[base+1] = a1;   outIdx.idx[base+2] = a0+1;
-        outIdx.idx[base+3] = a0+1; outIdx.idx[base+4] = a1;   outIdx.idx[base+5] = a1+1;
-        // Ribbon B (independent quad per segment)
-        uint b = ribbonBVertBase + si * 4;
-        outIdx.idx[base+6]  = b;   outIdx.idx[base+7]  = b+2; outIdx.idx[base+8]  = b+1;
-        outIdx.idx[base+9]  = b+1; outIdx.idx[base+10] = b+2; outIdx.idx[base+11] = b+3;
+        if (si < S - 1) {
+            uint v0 = vertBase + si * 4;
+            uint v4 = vertBase + (si + 1) * 4;
+            // Ribbon A: [v0, v0+1] → [v4, v4+1]
+            outIdx.idx[base+0] = v0;   outIdx.idx[base+1] = v4;   outIdx.idx[base+2] = v0+1;
+            outIdx.idx[base+3] = v0+1; outIdx.idx[base+4] = v4;   outIdx.idx[base+5] = v4+1;
+            // Ribbon B: [v0+2, v0+3] → [v4+2, v4+3]
+            outIdx.idx[base+6]  = v0+2; outIdx.idx[base+7]  = v4+2; outIdx.idx[base+8]  = v0+3;
+            outIdx.idx[base+9]  = v0+3; outIdx.idx[base+10] = v4+2; outIdx.idx[base+11] = v4+3;
+        } else {
+            // Degenerate (zero area — BVH skips for free)
+            uint dv = vertBase;
+            for (uint j = 0; j < 12; j++) outIdx.idx[base+j] = dv;
+        }
     }
 }

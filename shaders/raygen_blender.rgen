@@ -919,6 +919,8 @@ void main() {
 
         // Hair: decode smooth tangent + v from packed normal buffer
         if (geo.bitangentBufferAddress != 0u) {
+            // v parameter for Karis BSDF h (fiber cross-section position)
+            // Used ONLY for internal scattering, NOT for normal direction
             hairV = clamp(worldN.x, -1.0, 1.0);
             hairSmoothT = octDecode(vec2(worldN.y, worldN.z));
 
@@ -1155,6 +1157,8 @@ void main() {
         // the plane perpendicular to V so it stays in the correct hemisphere.
         vec3 N = pbrHit.worldNormal;
         vec3 gN = geoNormal;  // camera-facing geometric normal
+        bool isHairSurface = (geo.bitangentBufferAddress != 0u);
+        float shadowBias = isHairSurface ? 0.01 : 0.002;
         bool frontFace = dot(gN, -rayDir) >= 0.0;
         if (!frontFace) {
             gN = -gN;
@@ -1334,7 +1338,7 @@ void main() {
                     vec3 sB = cross(sunDir, sT);
                     shadowDir = normalize(sunDir + sT * (cos(diskAngle) * diskR) + sB * (sin(diskAngle) * diskR));
                 }
-                vec3 shadowOrigin = pbrHit.worldPos + N * 0.002;
+                vec3 shadowOrigin = pbrHit.worldPos + N * shadowBias;
                 bool inShadow = false;
                 float shadowHitDist = 65504.0;
                 for (int shadowSkip = 0; shadowSkip < 16; shadowSkip++) {
@@ -1593,7 +1597,7 @@ void main() {
                 vec3 fL = fToLight / max(fDist, 0.001);
 
                 // Shadow ray
-                vec3 fShadowOrigin = pbrHit.worldPos + N * 0.002;
+                vec3 fShadowOrigin = pbrHit.worldPos + N * shadowBias;
                 rayQueryEXT fShadowRQ;
                 rayQueryInitializeEXT(fShadowRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
                     0xFF, fShadowOrigin, 0.0, fL, fDist - 0.004);
@@ -1751,7 +1755,7 @@ void main() {
             }
 
             // Shadow ray to jittered target (skip glass surfaces)
-            vec3 ptShadowOrigin = pbrHit.worldPos + N * 0.002;
+            vec3 ptShadowOrigin = pbrHit.worldPos + N * shadowBias;
             bool inShadow = false;
             for (int ptShadowSkip = 0; ptShadowSkip < 16; ptShadowSkip++) {
                 rayQueryEXT shadowRQ;
@@ -1823,7 +1827,7 @@ void main() {
 
                 if (eNdotL > 0.0 && eCosTheta > 0.0 && eDist > 0.01) {
                     // Shadow ray to emissive surface (skip glass)
-                    vec3 eShadowOrigin = pbrHit.worldPos + N * 0.002;
+                    vec3 eShadowOrigin = pbrHit.worldPos + N * shadowBias;
                     bool eInShadow = false;
                     for (int eShadowSkip = 0; eShadowSkip < 16; eShadowSkip++) {
                         rayQueryEXT eShadowRQ;
@@ -2083,61 +2087,16 @@ void main() {
         float specWeight = (F.r + F.g + F.b) / 3.0;
         // For metals, specWeight is high; for dielectrics at normal incidence, ~4%
 
-        // ── Hair shading: distance-based LOD (Chiang → R-only → Lambert) ──
-        bool isHairSurface = (geo.bitangentBufferAddress != 0u);
+        // ── Hair BSDF: Karis simplified Marschner (R + TT + TRT) ──
         if (isHairSurface) {
             vec3 hairT = hairSmoothT;
             vec3 hairColor = pbrHit.baseColor;
             vec3 bounceN = worldN;
-
-            // Distance-based shader LOD — smooth transition, no popping
-            float hairDist = hitT;
-            // LOD levels: 0.0 = close (full Chiang), 1.0 = far (Lambert)
-            // Smooth ramp: full quality < 3 units, Lambert > 10 units
-            float lodFactor = clamp((hairDist - 3.0) / 7.0, 0.0, 1.0);
-
-            // Stochastic skip for distant hair bounces (bounce > 0 only)
-            // Far hair on secondary bounces contributes little — skip with probability
-            if (bounce > 0 && lodFactor > 0.3) {
-                float skipProb = lodFactor * 0.8; // up to 80% skip at max distance
-                if (rand01() < skipProb) {
-                    // Russian Roulette: compensate energy for surviving rays
-                    throughput /= max(1.0 - skipProb, 0.1);
-                    // Pass through hair — continue ray as if transparent
-                    rayOrigin = pbrHit.worldPos + rayDir * 0.02;
-                    bounce--;
-                    continue;
-                }
-                throughput /= max(1.0 - skipProb, 0.1);
-            }
+            float hairRoughness = max(pbrHit.roughness, 0.05);
 
             vec3 newDir = sampleCosineHemisphere(rand2(), bounceN);
-            vec3 hairF;
-
-            if (lodFactor < 0.5) {
-                // ── Close: full Chiang BSDF (R + TT + TRT) ──
-                float hairRoughness = max(pbrHit.roughness, 0.05);
-                float hairIOR = 1.55;
-                float hairAlpha = -0.035;
-                vec3 sigma = -log(max(hairColor, vec3(0.001)));
-                float h = hairV;
-
-                vec3 wi = -rayDir;
-                vec3 wo = newDir;
-                hairF = hair_chiang_eval(wi, wo, hairT, sigma,
-                                         hairRoughness, hairRoughness,
-                                         hairAlpha, hairIOR, h);
-
-                // Blend toward simplified at lodFactor 0.3-0.5
-                if (lodFactor > 0.3) {
-                    float blend = (lodFactor - 0.3) / 0.2;
-                    vec3 simpleF = hairColor * INV_PI * max(dot(newDir, bounceN), 0.0);
-                    hairF = mix(hairF, simpleF, blend);
-                }
-            } else {
-                // ── Far: simple Lambert (hairColor / PI) ──
-                hairF = hairColor * INV_PI * max(dot(newDir, bounceN), 0.0);
-            }
+            vec3 hairF = hair_eval(-rayDir, newDir, hairT,
+                                   hairColor, hairRoughness, 0.035, 1.55, hairV);
 
             float cosPdf = max(dot(newDir, bounceN), 0.0) * INV_PI;
             if (cosPdf < 1e-6) break;
