@@ -327,9 +327,8 @@ void main() {
     uint SUBDIV = (maxCurvature < 0.01) ? 2u :
                   (maxCurvature < 0.1)  ? 4u : MAX_SUBDIV;
     uint S_body_full = (K - 1) * SUBDIV + 1;
-    uint TIP_OVERLAP = min(TIP_EXTRA, S_body_full / 4u);  // tip replaces last 25% of body
-    uint S_body = S_body_full - TIP_OVERLAP;  // body stops early
-    uint S = S_body + TIP_EXTRA + 1;          // body + tip + final point
+    uint S_body = S_body_full;                 // body covers full curve (0→1)
+    uint S = S_body + TIP_EXTRA + 1;          // + tip extension beyond curve end
 
     // Per-strand perpendicular frame for modifiers (used only for non-kink modifiers at key level)
     vec3 strandDir = normalize(childKeys[K-1] - childKeys[0]);
@@ -358,7 +357,7 @@ void main() {
     // Generate S subdivided points via Catmull-Rom interpolation
     for (uint si = 0; si < S_body; si++) {
         // Map si to segment + local t
-        float globalT = float(si) / float(S - 1);  // 0->1 along entire strand
+        float globalT = float(si) / float(S_body - 1);  // 0->1 along full curve
         float segF = globalT * float(K - 1);
         uint seg = min(uint(segF), K - 2);
         float localT = segF - float(seg);
@@ -565,47 +564,34 @@ void main() {
     // Body stopped at S_body (before tip). Now generate TIP_EXTRA+1 points from
     // body-end globalT to 1.0, with CONVEX radius decay (1 - t²) for rounded tip.
     {
-        float bodyEndGT = float(S_body - 1) / float(S_body_full - 1);
-        float bodyEndTaper = 1.0 - bodyEndGT;
-        float bodyEndRadius = pc.rootRadius * (bodyEndTaper * (1.0 - pc.tipFactor) + pc.tipFactor);
-        if (pc.childSizeRandom > 0.0)
-            bodyEndRadius *= 1.0 - pc.childSizeRandom * randFloat(seed + 777u);
+        // Tip extends BEYOND the curve end using last body tangent
+        float bodyEndRadius = prevRadius;
 
-        vec3 tipTang = strandDir;
+        vec3 tipTang = prevTang;
         vec2 tipOctTang = octEncode(tipTang);
-        vec3 perpA_tip = modPerp1 - tipTang * dot(modPerp1, tipTang);
-        float ptl = length(perpA_tip);
-        if (ptl < 0.3) { perpA_tip = modPerp2 - tipTang * dot(modPerp2, tipTang); ptl = length(perpA_tip); }
-        if (ptl < 1e-6) perpA_tip = vec3(1,0,0); else perpA_tip /= ptl;
+        vec3 perpA_tip = prevPerpA;
         vec3 perpB_tip = cross(tipTang, perpA_tip);
+
+        // Tip segment length: small extension proportional to last body radius
+        float tipLen = max(bodyEndRadius * 20.0, 0.001);
 
         for (uint ti = 0; ti <= TIP_EXTRA; ti++) {
             float tipFrac = float(ti) / float(TIP_EXTRA);  // 0 → 1
-            float tipGT = mix(bodyEndGT, 1.0, tipFrac);
 
-            // Evaluate curve position at tipGT via Catmull-Rom
-            float segF = tipGT * float(K - 1);
-            uint seg = min(uint(segF), K - 2);
-            float localT = segF - float(seg);
-            uint ci0 = (seg > 0) ? seg - 1 : 0;
-            uint ci1 = seg;
-            uint ci2 = min(seg + 1, K - 1);
-            uint ci3 = min(seg + 2, K - 1);
-            float lt2 = localT * localT;
-            float lt3 = lt2 * localT;
-            vec3 tipPos = 0.5 * ((2.0*childKeys[ci1]) +
-                          (-childKeys[ci0] + childKeys[ci2]) * localT +
-                          (2.0*childKeys[ci0] - 5.0*childKeys[ci1] + 4.0*childKeys[ci2] - childKeys[ci3]) * lt2 +
-                          (-childKeys[ci0] + 3.0*childKeys[ci1] - 3.0*childKeys[ci2] + childKeys[ci3]) * lt3);
+            // Extend from last body position along its tangent
+            vec3 tipPos = prevPos + tipTang * tipLen * tipFrac;
             tipPos = safePos(tipPos, childRoot);
+
+            vec3 pA = perpA_tip;
+            vec3 pB = perpB_tip;
 
             // CONVEX radius: stays thick then closes — slightly more pointed (1 - t^1.5)
             float tipRadius = bodyEndRadius * (1.0 - tipFrac * sqrt(tipFrac));
 
-            vec3 lA = safePos(tipPos - perpA_tip * tipRadius, childRoot);
-            vec3 rA = safePos(tipPos + perpA_tip * tipRadius, childRoot);
-            vec3 lB = safePos(tipPos - perpB_tip * tipRadius, childRoot);
-            vec3 rB = safePos(tipPos + perpB_tip * tipRadius, childRoot);
+            vec3 lA = safePos(tipPos - pA * tipRadius, childRoot);
+            vec3 rA = safePos(tipPos + pA * tipRadius, childRoot);
+            vec3 lB = safePos(tipPos - pB * tipRadius, childRoot);
+            vec3 rB = safePos(tipPos + pB * tipRadius, childRoot);
 
             uint vi = vertBase + (S_body + ti) * 4;
             outPos.pos[vi*3+0] = lA.x;      outPos.pos[vi*3+1] = lA.y;      outPos.pos[vi*3+2] = lA.z;
@@ -619,10 +605,10 @@ void main() {
             outNrm.nrm[(vi+3)*3+0] = 1.0;  outNrm.nrm[(vi+3)*3+1] = tipOctTang.x; outNrm.nrm[(vi+3)*3+2] = tipOctTang.y;
 
             float uvU = float(childIdx);
-            outUV.uv[vi*2+0] = uvU;     outUV.uv[vi*2+1] = tipGT;
-            outUV.uv[(vi+1)*2+0] = uvU; outUV.uv[(vi+1)*2+1] = tipGT;
-            outUV.uv[(vi+2)*2+0] = uvU; outUV.uv[(vi+2)*2+1] = tipGT;
-            outUV.uv[(vi+3)*2+0] = uvU; outUV.uv[(vi+3)*2+1] = tipGT;
+            outUV.uv[vi*2+0] = uvU;     outUV.uv[vi*2+1] = tipFrac;
+            outUV.uv[(vi+1)*2+0] = uvU; outUV.uv[(vi+1)*2+1] = tipFrac;
+            outUV.uv[(vi+2)*2+0] = uvU; outUV.uv[(vi+2)*2+1] = tipFrac;
+            outUV.uv[(vi+3)*2+0] = uvU; outUV.uv[(vi+3)*2+1] = tipFrac;
         }
     }
 

@@ -78,23 +78,18 @@ vec3 hair_eval(vec3 wi, vec3 wo, vec3 tangent,
     float alpha_TT  =  1.0 * alpha;   // TT: shifted toward root
     float alpha_TRT = -4.0 * alpha;   // TRT: double-shifted toward tip
 
-    // ── Absorption: Beer-Lambert through fiber ──
-    // Transmittance for light crossing the fiber at offset h
-    float cos_gamma_o = sqrt(max(0.0, 1.0 - h * h));
-    float cos_theta_t = sqrt(max(0.0, 1.0 - sin_theta_o * sin_theta_o / (ior * ior)));
-    float path = (cos_theta_t > 1e-4) ? 2.0 * cos_gamma_o / cos_theta_t : 0.0;
-    vec3 sigma = -log(max(hairColor, vec3(0.001)));
-    vec3 transmittance = exp(-sigma * path);
-
     // ── Fresnel at fiber surface ──
+    float cos_gamma_o = sqrt(max(0.0, 1.0 - h * h));
     float F0 = ((1.0 - ior) / (1.0 + ior));
     F0 = F0 * F0;
     float F = hair_fresnel_schlick(cos_theta_o * cos_gamma_o, F0);
 
     // ── Attenuation per lobe ──
-    vec3 A_R   = vec3(F);                                       // R: reflected
-    vec3 A_TT  = (1.0 - F) * (1.0 - F) * transmittance;       // TT: transmitted
-    vec3 A_TRT = A_TT * transmittance * F;                      // TRT: internal bounce
+    // For standard Principled BSDF materials: use color as direct tint (not absorption).
+    // Beer-Lambert absorption is too aggressive for non-Principled-Hair materials.
+    vec3 A_R   = vec3(F);                          // R: white specular highlight
+    vec3 A_TT  = (1.0 - F) * (1.0 - F) * hairColor;  // TT: colored transmission
+    vec3 A_TRT = A_TT * hairColor * F;                 // TRT: colored secondary highlight
 
     // ── Azimuthal shifts (Snell's law at fiber surface) ──
     float gamma_o = asin(clamp(h, -1.0, 1.0));

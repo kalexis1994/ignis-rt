@@ -913,17 +913,31 @@ void main() {
         // but normal maps should NOT (they're detail perturbation, not geometry).
         vec3 smoothN = worldN;
 
+        // DISABLED: edge-on skip (for diagnostic)
+        // if (geo.bitangentBufferAddress != 0u) {
+        //     float edgeFacing = abs(dot(geoNormalRaw, -rayDir));
+        //     if (edgeFacing < 0.3) {
+        //         rayOrigin = worldPos + rayDir * 0.001;
+        //         bounce--;
+        //         continue;
+        //     }
+        // }
+
         // Hair: save values from packed normals BEFORE cylindrical override
         float hairV = 0.0;
         vec3 hairSmoothT = vec3(1, 0, 0);
-        vec3 hairMacroN = geoNormalRaw; // original geometric normal — follows scalp curvature
+        vec3 hairMacroN = geoNormalRaw;
 
-        // Hair: decode smooth tangent + v from packed normal buffer
         if (geo.bitangentBufferAddress != 0u) {
-            // v parameter for Karis BSDF h (fiber cross-section position)
-            // Used ONLY for internal scattering, NOT for normal direction
-            hairV = clamp(worldN.x, -1.0, 1.0);
-            hairSmoothT = octDecode(vec2(worldN.y, worldN.z));
+            // Decode packed data from RAW interpolation (NOT normalized!)
+            // normalize() distorts .x (v parameter) by dividing by vector length
+            vec3 rawN = vec3(normals.n[i0*3+0], normals.n[i0*3+1], normals.n[i0*3+2]) * bary.x
+                      + vec3(normals.n[i1*3+0], normals.n[i1*3+1], normals.n[i1*3+2]) * bary.y
+                      + vec3(normals.n[i2*3+0], normals.n[i2*3+1], normals.n[i2*3+2]) * bary.z;
+            hairV = clamp(rawN.x, -1.0, 1.0);
+            vec3 localTangent = octDecode(vec2(rawN.y, rawN.z));
+            // Transform tangent to world space
+            hairSmoothT = normalize(mat3(objToWorld) * localTangent);
 
             vec3 hairT = hairSmoothT;
 
@@ -937,6 +951,12 @@ void main() {
             geoNormal = cylN;
             geoNormalRaw = cylN;
             smoothN = cylN;
+
+            // DIAGNOSTIC: gradient from green (center/left) to black (right)
+            // Uses the v parameter: -1 = left edge, 0 = center, +1 = right edge
+            float grad = clamp(hairV * 0.5 + 0.5, 0.0, 1.0); // 0 at left, 1 at right
+            totalRadiance += vec3(0, 1.0 - grad, 0) * throughput;
+            break;
         } else {
             // Standard shadow terminator fix (non-hair geometry only)
             float NdotNg = dot(worldN, geoNormal);
@@ -1159,7 +1179,9 @@ void main() {
         vec3 N = pbrHit.worldNormal;
         vec3 gN = geoNormal;  // camera-facing geometric normal
         bool isHairSurface = (geo.bitangentBufferAddress != 0u);
-        float shadowBias = isHairSurface ? 0.01 : 0.002;
+        // Hair: large shadow bias to skip sibling DOTS ribbon + own strand geometry
+        // Prevents self-shadowing artifacts (inspired by ksTree alpha approach)
+        float shadowBias = isHairSurface ? 0.1 : 0.002;
         bool frontFace = dot(gN, -rayDir) >= 0.0;
         if (!frontFace) {
             gN = -gN;
@@ -1318,9 +1340,9 @@ void main() {
         vec3 sunColor = cam.skyLight.rgb;
 
         if (!skipSunNEE && sunIntensity > 0.0 && sunDir.y > -0.01) {
-            // Hair: use macro normal (scalp curvature) for light visibility gate
-            // This gives correct macro illumination (bright top, dark sides)
-            float NdotL = isHairSurface ? max(dot(hairMacroN, sunDir), 0.0) : dot(N, sunDir);
+            // Hair: tangent-based light gate (camera-independent, like Kajiya-Kay)
+            // sin(T, L) = how perpendicular the strand is to the light (1=bright, 0=aligned=dark)
+            float NdotL = isHairSurface ? length(cross(hairSmoothT, sunDir)) : dot(N, sunDir);
             if (NdotL > 0.0) {
                 // Shadow ray with soft penumbra (sun angular radius)
                 // Blue noise + Halton temporal sequence for stable penumbra convergence
@@ -1413,11 +1435,14 @@ void main() {
                 vec3 sunRadiance = sunColor * sunIntensity;
                 vec3 diffContrib, specContrib;
                 if (isHairSurface) {
-                    // Hair: Karis BSDF × macro NdotL for correct macro illumination
-                    vec3 hairDirect = hair_eval(V, sunDir, hairSmoothT,
-                                               pbrHit.baseColor, max(pbrHit.roughness, 0.05),
-                                               0.035, 1.55, hairV) * NdotL;
-                    diffContrib = hairDirect;
+                    // Hair: Kajiya-Kay diffuse + Karis specular
+                    // Diffuse: sin(T, L) — bright when light perpendicular to strand
+                    float sinTL = length(cross(hairSmoothT, sunDir));
+                    vec3 hairDiffuse = pbrHit.baseColor * INV_PI * sinTL;
+                    vec3 hairSpec = hair_eval(V, sunDir, hairSmoothT,
+                                             pbrHit.baseColor, max(pbrHit.roughness, 0.05),
+                                             0.035, 1.55, hairV);
+                    diffContrib = hairDiffuse + hairSpec;
                     specContrib = vec3(0.0); // already included in hairDirect
                 } else {
                     evaluateCookTorrance(
@@ -1644,7 +1669,9 @@ void main() {
                     vec3 fRadiance = fColInt.rgb * fColInt.w * fAtten * fSpotAtten;
                     vec3 fDiffC, fSpecC;
                     if (isHairSurface) {
-                        fDiffC = hair_eval(V, fL, hairSmoothT, pbrHit.baseColor,
+                        float sinTfL = length(cross(hairSmoothT, fL));
+                        fDiffC = pbrHit.baseColor * INV_PI * sinTfL
+                               + hair_eval(V, fL, hairSmoothT, pbrHit.baseColor,
                                           max(pbrHit.roughness, 0.05), 0.035, 1.55, hairV);
                         fSpecC = vec3(0.0);
                     } else {
@@ -1811,7 +1838,9 @@ void main() {
             vec3 brdfL = isAreaLight ? shadowDir : L;
             vec3 diffC, specC;
             if (isHairSurface) {
-                diffC = hair_eval(V, brdfL, hairSmoothT, pbrHit.baseColor,
+                float sinTbrdf = length(cross(hairSmoothT, brdfL));
+                diffC = pbrHit.baseColor * INV_PI * sinTbrdf
+                      + hair_eval(V, brdfL, hairSmoothT, pbrHit.baseColor,
                                   max(pbrHit.roughness, 0.05), 0.035, 1.55, hairV);
                 specC = vec3(0.0);
             } else {
@@ -1886,7 +1915,9 @@ void main() {
                         vec3 V = -rayDir;
                         vec3 eDiffC, eSpecC;
                         if (isHairSurface) {
-                            eDiffC = hair_eval(V, eDir, hairSmoothT, pbrHit.baseColor,
+                            float sinTeDir = length(cross(hairSmoothT, eDir));
+                            eDiffC = pbrHit.baseColor * INV_PI * sinTeDir
+                                   + hair_eval(V, eDir, hairSmoothT, pbrHit.baseColor,
                                               max(pbrHit.roughness, 0.05), 0.035, 1.55, hairV);
                             eSpecC = vec3(0.0);
                         } else {
@@ -2125,8 +2156,14 @@ void main() {
             float hairRoughness = max(pbrHit.roughness, 0.05);
 
             vec3 newDir = sampleCosineHemisphere(rand2(), bounceN);
-            vec3 hairF = hair_eval(-rayDir, newDir, hairT,
-                                   hairColor, hairRoughness, 0.035, 1.55, hairV);
+
+            // Hair: Kajiya-Kay diffuse + Karis specular
+            // Diffuse: sin(T, bounceDir) — tangent-based, not normal-based
+            float sinTBounce = length(cross(hairT, newDir));
+            vec3 hairDiffuse = hairColor * INV_PI * sinTBounce;
+            vec3 hairSpec = hair_eval(-rayDir, newDir, hairT,
+                                      hairColor, hairRoughness, 0.035, 1.55, hairV);
+            vec3 hairF = hairDiffuse + hairSpec;
 
             float cosPdf = max(dot(newDir, bounceN), 0.0) * INV_PI;
             if (cosPdf < 1e-6) break;
