@@ -1220,22 +1220,50 @@ void main() {
             vec3 toHit = worldPos - sweepCenter;
             vec3 perpToAxis = toHit - hairSmoothT * dot(toHit, hairSmoothT);
 
-            // Camera left/right (smooth per-vertex tangent, no discontinuity)
-            vec3 camLR = cross(hairSmoothT, -rayDir);
-            float sinViewT = length(camLR);
-            if (sinViewT > 1e-6) camLR /= sinViewT; else camLR = wDir;
+            // === "WINDOW" approach: screen-space cylinder mapping ===
+            // The entire silhouette is a window showing a virtual cylinder.
+            // hairV depends on SCREEN position, not which ribbon was hit.
 
-            // Cone radius: linear interpolation between section radii
+            // Cone radius at this position along the strand
             float coneRadius = mix(radius0, radius1, segT);
 
-            // cylV: position across truncated cone
-            float lateral = dot(perpToAxis, camLR);
-            hairV = clamp(lateral / max(coneRadius, 1e-8), -1.0, 1.0);
+            // Project center and hit to NDC
+            mat4 VP = cam.proj * cam.view;
+            vec4 centerClip = VP * vec4(sweepCenter, 1.0);
+            vec4 hitClip    = VP * vec4(worldPos, 1.0);
+            vec2 centerNDC  = centerClip.xy / max(abs(centerClip.w), 1e-6);
+            vec2 hitNDC     = hitClip.xy / max(abs(hitClip.w), 1e-6);
+
+            // Project tangent to get strand direction in screen space
+            vec4 tangClip = VP * vec4(sweepCenter + hairSmoothT * 0.01, 1.0);
+            vec2 tangNDC  = tangClip.xy / max(abs(tangClip.w), 1e-6);
+            vec2 screenTang = tangNDC - centerNDC;
+            float stLen = length(screenTang);
+            if (stLen > 1e-8) screenTang /= stLen;
+
+            // Signed perpendicular distance in screen (left/right of projected axis)
+            vec2 hitOff = hitNDC - centerNDC;
+            float screenDist = hitOff.x * screenTang.y - hitOff.y * screenTang.x;
+
+            // Project coneRadius to screen at this depth
+            vec3 camLR = cross(hairSmoothT, -rayDir);
+            float sinViewT = length(camLR);
+            if (sinViewT > 1e-6) camLR /= sinViewT;
+            else camLR = wDir;
+            vec4 radiusClip = VP * vec4(sweepCenter + coneRadius * camLR, 1.0);
+            vec2 radiusNDC  = radiusClip.xy / max(abs(radiusClip.w), 1e-6);
+            vec2 radiusOff  = radiusNDC - centerNDC;
+            float screenRadius = abs(radiusOff.x * screenTang.y - radiusOff.y * screenTang.x);
+
+            // hairV from SCREEN position — same for both ribbons at the same pixel
+            hairV = clamp(screenDist / max(screenRadius, 1e-8), -1.0, 1.0);
             if (bounce == 0) primaryHairV = hairV;
 
-            // viewFacing: -rayDir projected perpendicular to tangent (toward camera)
-            vec3 viewFacing = normalize(-rayDir - hairSmoothT * dot(-rayDir, hairSmoothT));
-            if (length(-rayDir - hairSmoothT * dot(-rayDir, hairSmoothT)) < 1e-6) viewFacing = geoNormal;
+            // Cylinder normal from screen-space hairV
+            vec3 viewFacing = -rayDir - hairSmoothT * dot(-rayDir, hairSmoothT);
+            float vpLen = length(viewFacing);
+            if (vpLen > 1e-4) viewFacing /= vpLen;
+            else viewFacing = (length(perpToAxis) > 1e-6) ? normalize(perpToAxis) : geoNormal;
 
             float cylCos = sqrt(max(0.0, 1.0 - hairV * hairV));
             vec3 cylN = normalize(hairV * camLR + cylCos * viewFacing);
