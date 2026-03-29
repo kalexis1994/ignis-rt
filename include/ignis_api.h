@@ -84,6 +84,7 @@ IGNIS_API void   ignis_upload_emissive_triangles(const float* data, uint32_t tri
 IGNIS_API void   ignis_render_frame(void);
 IGNIS_API bool   ignis_readback(void* outPixels, uint32_t bufferSize);
 IGNIS_API bool   ignis_readback_float(float* outPixels, uint32_t pixelCount);
+IGNIS_API bool   ignis_readback_hdr_float(float* outPixels, uint32_t pixelCount);
 IGNIS_API bool   ignis_draw_gl(uint32_t viewportWidth, uint32_t viewportHeight);
 
 // Configuration

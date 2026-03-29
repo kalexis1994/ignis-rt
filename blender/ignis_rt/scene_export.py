@@ -1899,9 +1899,13 @@ class _NodeVmCompiler:
                     vec_inp = from_node.inputs.get('Vector')
                     if vec_inp and vec_inp.is_linked:
                         uv_reg = self._compile_uv_chain(vec_inp, _depth + 1)
-                    # sRGB flag: color textures need gamma decoding, data textures don't
-                    cs = getattr(from_node.image, 'colorspace_settings', None)
-                    is_srgb = 1 if (cs and cs.name in ('sRGB', 'Filmic sRGB', 'Filmic Log')) else 0
+                    # Blender image textures are evaluated in scene-linear unless explicitly marked
+                    # as data. We export non-data textures as raw RGBA16F scene-linear pixels, so
+                    # the VM never needs a second sRGB decode here.
+                    # Blender references:
+                    # - source/blender/makesrna/intern/rna_image_api.cc `Image.gl_load()`
+                    # - source/blender/draw/intern/shaders/draw_colormanagement_lib.glsl
+                    is_srgb = 0
                     # Sample full RGBA into a temp register
                     tex_reg = dst
                     self._emit(_OP_SAMPLE_TEX, tex_reg, srcA=uv_reg, imm_y=is_srgb, imm_z=tex_idx)
@@ -3352,6 +3356,13 @@ _GPU_MATERIAL_SIZE = _GPU_MATERIAL_BASE.size + _GPU_MATERIAL_VM.size  # 140 + 10
 
 _NO_TEX = 0xFFFFFFFF
 _MAT_FLAG_HAIR = 32
+_MAT_FLAG_DIFFUSE_SCENE_LINEAR = 64
+_MAT_FLAG_THIN_TRANSMISSION = 128
+_MAT_FLAG_LIGHTPATH_TRANSPARENT = 256
+_VM_HEADER_FLAG_BASE_COLOR = 1
+_VM_HEADER_FLAG_ALPHA = 2
+_VM_HEADER_FLAG_TRANSMISSION = 4
+_VM_HEADER_FLAG_SHADOW_DYNAMIC = 8
 
 
 def _hair_roughness_factor(azimuthal_roughness):
@@ -3452,7 +3463,27 @@ def _pack_gpu_material(
     vm_uints = [0] * 260  # header(1) + pad(3) + code(256)
     if node_vm_code:
         instr_count = min(len(node_vm_code), 64)
-        vm_uints[0] = instr_count  # nodeVmHeader
+        vm_flags = 0
+        for instr in node_vm_code[:64]:
+            opcode = instr[0] & 0xFF
+            if opcode == _OP_OUTPUT_COLOR:
+                vm_flags |= _VM_HEADER_FLAG_BASE_COLOR
+            elif opcode == _OP_OUTPUT_ALPHA:
+                vm_flags |= _VM_HEADER_FLAG_ALPHA
+            elif opcode == _OP_OUTPUT_TRANSMISSION:
+                vm_flags |= _VM_HEADER_FLAG_TRANSMISSION
+            if opcode in (
+                _OP_SAMPLE_TEX,
+                _OP_TEX_CHECKER,
+                _OP_TEX_NOISE,
+                _OP_TEX_GRADIENT,
+                _OP_TEX_VORONOI,
+                _OP_TEX_WAVE,
+                _OP_LOAD_WORLD_POS,
+                _OP_OBJECT_RANDOM,
+            ):
+                vm_flags |= _VM_HEADER_FLAG_SHADOW_DYNAMIC
+        vm_uints[0] = instr_count | (vm_flags << 8)  # nodeVmHeader: [7:0]=count, [15:8]=flags
         # Pack instructions: each is 4 uints (uvec4)
         for i, instr in enumerate(node_vm_code[:64]):
             for j in range(4):
@@ -3866,34 +3897,29 @@ def _find_color_ramp_in_chain(socket, _depth=0):
     return None
 
 
-def _bake_ramp_into_pixels(image, ramp_elements):
-    """Read image pixels, apply ColorRamp, return raw RGBA8 bytes (top-down)."""
+def _bake_ramp_into_pixels(image, ramp_elements, as_half_float=False):
+    """Read image pixels, apply ColorRamp, return raw RGBA pixels (top-down)."""
     import numpy as np
+
     w, h = image.size[0], image.size[1]
-    # Read all pixels as float array [R,G,B,A, R,G,B,A, ...]
     px = np.array(image.pixels[:], dtype=np.float32)
     ch = len(px) // (w * h)
     px = px.reshape(h, w, ch)
 
-    # Compute luminance as ramp factor
     if ch >= 3:
         lum = 0.2126 * px[:, :, 0] + 0.7152 * px[:, :, 1] + 0.0722 * px[:, :, 2]
     else:
         lum = px[:, :, 0]
 
-    # Sort ramp elements by position
     elements = sorted(ramp_elements, key=lambda e: e[0])
     positions = [e[0] for e in elements]
-    colors = [np.array(e[1], dtype=np.float32) for e in elements]  # each is [R,G,B,A]
+    colors = [np.array(e[1], dtype=np.float32) for e in elements]
 
     flat_lum = lum.flatten()
     out = np.zeros((len(flat_lum), 4), dtype=np.float32)
-
-    # Below first stop
     out[flat_lum <= positions[0]] = colors[0]
-    # Above last stop
     out[flat_lum >= positions[-1]] = colors[-1]
-    # Interpolate between stops
+
     for i in range(len(positions) - 1):
         p0, p1 = positions[i], positions[i + 1]
         if p1 <= p0:
@@ -3903,78 +3929,150 @@ def _bake_ramp_into_pixels(image, ramp_elements):
             t = ((flat_lum[mask] - p0) / (p1 - p0))[:, None]
             out[mask] = colors[i] * (1.0 - t) + colors[i + 1] * t
 
-    # Preserve original alpha if available
     if ch >= 4:
         out[:, 3] = px[:, :, 3].flatten()
 
-    # Flip both axes: Blender image.pixels[] is bottom-up + left-to-right,
-    # but stb_image (normal texture path) delivers top-down. The horizontal
-    # flip compensates for UV coordinate convention differences.
-    out = out.reshape(h, w, 4)[::-1, ::-1].copy()
-    return (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8).tobytes()
+    out = out.reshape(h, w, 4)[::-1].copy()
+    if as_half_float:
+        return out.astype(np.float16).tobytes()
+    return (np.clip(out, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8).tobytes()
 
 
-_image_bytes_cache = {}  # image.name → bytes (persists across export_materials calls)
+_IMAGE_CACHE_VERSION = 2
+_image_bytes_cache = {}  # (image pointer, export mode, color-space signature, cache version) → bytes
 
 
-def _get_image_bytes(image):
-    """Extract file bytes from a Blender image for stb_image decoding.
+def _srgb_to_linear_np(rgb):
+    rgb = np.maximum(rgb, 0.0)
+    return np.where(rgb <= 0.04045, rgb / 12.92, np.power((rgb + 0.055) / 1.055, 2.4))
 
-    Tries packed data first, then file on disk. Returns bytes or None.
-    Uses a persistent cache to avoid re-reading on material property tweaks.
+
+def _convert_pixels_to_scene_linear(image, px):
+    """Convert raw Image.pixels data to scene-linear.
+
+    Blender references:
+    - source/blender/makesrna/intern/rna_image.cc `rna_Image_pixels_get()`
+      Image.pixels exposes the underlying ImBuf buffer directly, without display/input
+      color-space conversion.
+    - source/blender/makesrna/intern/rna_image_api.cc `Image.gl_load()`
+      GPU textures are scene-linear after color management, but Image.pixels is not.
     """
-    if image.name in _image_bytes_cache:
-        return _image_bytes_cache[image.name]
+    cs = getattr(image, "colorspace_settings", None)
+    if cs is None or bool(getattr(cs, "is_data", False)) or px.shape[2] < 3:
+        return px
+
+    cs_name = getattr(cs, "name", "")
+    if cs_name in {"Linear", "Linear Rec.709", "scene_linear"}:
+        return px
+
+    out = np.array(px, dtype=np.float32, copy=True)
+
+    # Common path: standard 8-bit color textures imported as sRGB.
+    if cs_name in {"sRGB", "sRGB OETF"}:
+        out[:, :, :3] = _srgb_to_linear_np(out[:, :, :3])
+        return out
+
+    # Fallback: exact OCIO conversion for non-standard source spaces.
+    try:
+        import PyOpenColorIO as ocio
+
+        config = ocio.GetCurrentConfig()
+        processor = config.getProcessor(cs_name, ocio.ROLE_SCENE_LINEAR).getDefaultCPUProcessor()
+
+        if hasattr(ocio, "PackedImageDesc"):
+            flat = np.ascontiguousarray(out.reshape(-1, out.shape[2]), dtype=np.float32)
+            desc = ocio.PackedImageDesc(flat, out.shape[1], out.shape[0], out.shape[2])
+            processor.apply(desc)
+            return flat.reshape(out.shape)
+    except Exception as exc:
+        _log(f"Scene-linear texture conversion fallback for '{image.name}' ({cs_name}): {exc}")
+
+    return out
+
+
+def _image_cache_key(image, export_mode):
+    cs = getattr(image, "colorspace_settings", None)
+    return (
+        image.as_pointer(),
+        export_mode,
+        getattr(cs, "name", ""),
+        bool(getattr(cs, "is_data", False)),
+        int(image.size[0]),
+        int(image.size[1]),
+        getattr(image, "filepath_raw", ""),
+        bool(image.packed_file),
+        _IMAGE_CACHE_VERSION,
+    )
+
+
+def _get_image_bytes(image, export_mode="file"):
+    """Extract image bytes according to the export path used by the renderer.
+
+    Blender references:
+    - source/blender/makesrna/intern/rna_image_api.cc
+      `Image.gl_load()` documents that sampled image colors are scene-linear.
+    - source/blender/draw/intern/shaders/draw_colormanagement_lib.glsl
+      comments that image textures are sampled in scene linear by convention.
+    - source/blender/imbuf/intern/util_gpu.cc
+      keeps non-data textures in float formats when exact scene-linear values are needed.
+    """
+    cache_key = _image_cache_key(image, export_mode)
+    if cache_key in _image_bytes_cache:
+        return _image_bytes_cache[cache_key]
 
     import os
     import bpy
 
     data = None
 
-    # Packed in .blend: raw file bytes (PNG/JPG/etc.)
-    if image.packed_file:
-        raw = bytes(image.packed_file.data)
-        # Verify it's a format stb_image can handle (PNG/JPG/BMP headers)
-        # PNG: 89 50 4E 47, JPG: FF D8 FF, BMP: 42 4D
-        if (raw[:4] == b'\x89PNG' or raw[:3] == b'\xff\xd8\xff' or raw[:2] == b'BM'):
-            data = raw
-        # else: skip packed data — fall through to pixel extraction
+    if export_mode == "scene_linear_f16":
+        if image.size[0] > 0 and image.size[1] > 0:
+            w, h = image.size[0], image.size[1]
+            px = np.empty(w * h * 4, dtype=np.float32)
+            image.pixels.foreach_get(px)
+            px = px.reshape(h, w, 4)
+            px = _convert_pixels_to_scene_linear(image, px)
+            px = px[::-1].copy()
+            data = px.astype(np.float16).tobytes()
+    else:
+        if image.packed_file:
+            raw = bytes(image.packed_file.data)
+            if raw[:4] == b'\x89PNG' or raw[:3] == b'\xff\xd8\xff' or raw[:2] == b'BM':
+                data = raw
 
-    # File on disk
-    if data is None and not (image.size[0] > 0 and image.size[1] > 0 and len(image.pixels) > 0):
-        filepath = bpy.path.abspath(image.filepath_from_user())
-        if filepath and os.path.isfile(filepath):
-            with open(filepath, 'rb') as f:
-                data = f.read()
+        if data is None and not (image.size[0] > 0 and image.size[1] > 0 and len(image.pixels) > 0):
+            filepath = bpy.path.abspath(image.filepath_from_user())
+            if filepath and os.path.isfile(filepath):
+                with open(filepath, 'rb') as f:
+                    data = f.read()
 
-    # Pixel extraction fallback: read float pixels from Blender and encode as PNG
-    # Handles EXR, 16-bit PNG, generated images, and any format Blender can open
-    if data is None and image.size[0] > 0 and image.size[1] > 0:
-        import io, zlib, struct as _struct
-        w, h = image.size[0], image.size[1]
-        px = np.empty(w * h * 4, dtype=np.float32)
-        image.pixels.foreach_get(px)
-        px_u8 = (np.clip(px, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8).reshape(h, w, 4)
-        px_u8 = px_u8[::-1]  # flip Y (Blender bottom-up → PNG top-down)
-        # Minimal PNG encoder
-        def _png_chunk(out, ctype, cdata):
-            out.write(_struct.pack('>I', len(cdata)))
-            out.write(ctype)
-            out.write(cdata)
-            out.write(_struct.pack('>I', zlib.crc32(ctype + cdata) & 0xFFFFFFFF))
-        buf = io.BytesIO()
-        buf.write(b'\x89PNG\r\n\x1a\n')
-        _png_chunk(buf, b'IHDR', _struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0))
-        raw_rows = bytearray()
-        for y in range(h):
-            raw_rows.append(0)
-            raw_rows.extend(px_u8[y].tobytes())
-        _png_chunk(buf, b'IDAT', zlib.compress(bytes(raw_rows), 6))
-        _png_chunk(buf, b'IEND', b'')
-        data = buf.getvalue()
+        if data is None and image.size[0] > 0 and image.size[1] > 0:
+            import io, zlib, struct as _struct
+            w, h = image.size[0], image.size[1]
+            px = np.empty(w * h * 4, dtype=np.float32)
+            image.pixels.foreach_get(px)
+            px_u8 = (np.clip(px, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8).reshape(h, w, 4)
+            px_u8 = px_u8[::-1]
+
+            def _png_chunk(out, ctype, cdata):
+                out.write(_struct.pack('>I', len(cdata)))
+                out.write(ctype)
+                out.write(cdata)
+                out.write(_struct.pack('>I', zlib.crc32(ctype + cdata) & 0xFFFFFFFF))
+
+            buf = io.BytesIO()
+            buf.write(b'\x89PNG\r\n\x1a\n')
+            _png_chunk(buf, b'IHDR', _struct.pack('>IIBBBBB', w, h, 8, 6, 0, 0, 0))
+            raw_rows = bytearray()
+            for y in range(h):
+                raw_rows.append(0)
+                raw_rows.extend(px_u8[y].tobytes())
+            _png_chunk(buf, b'IDAT', zlib.compress(bytes(raw_rows), 6))
+            _png_chunk(buf, b'IEND', b'')
+            data = buf.getvalue()
 
     if data is not None:
-        _image_bytes_cache[image.name] = data
+        _image_bytes_cache[cache_key] = data
     return data
 
 
@@ -4538,9 +4636,50 @@ def _try_eval_light_path_factor(socket, depth=0):
     return None  # dynamic node (Fresnel, Layer Weight, Texture, etc.)
 
 
+def _collect_light_path_outputs(socket, depth=0):
+    """Collect Light Path output names that influence a factor socket.
+
+    Returns a set of output names if the factor depends only on Light Path,
+    constants and simple math nodes. Returns None when the factor depends on
+    dynamic nodes/textures we cannot reason about statically.
+    """
+    if depth > 8:
+        return None
+    if not socket or not socket.is_linked:
+        return set()
+
+    node = socket.links[0].from_node
+    out_name = socket.links[0].from_socket.name
+
+    if node.type == 'LIGHT_PATH':
+        return {out_name}
+
+    if node.type == 'REROUTE':
+        inp = node.inputs[0] if node.inputs else None
+        return _collect_light_path_outputs(inp, depth + 1)
+
+    if node.type in ('CLAMP', 'MAP_RANGE', 'MATH'):
+        outputs = set()
+        saw_link = False
+        for inp in node.inputs:
+            if inp.is_linked:
+                saw_link = True
+                sub = _collect_light_path_outputs(inp, depth + 1)
+                if sub is None:
+                    return None
+                outputs |= sub
+        return outputs if saw_link else set()
+
+    if node.type == 'VALUE':
+        return set()
+
+    return None
+
+
 def _resolve_mix_shader(mix_node, register_image_fn):
     """Resolve a Mix Shader node into blended PBR properties."""
     fac_inp = mix_node.inputs.get('Fac')
+    fac_light_path_outputs = _collect_light_path_outputs(fac_inp) if fac_inp else set()
     if fac_inp and fac_inp.is_linked:
         # Try to evaluate as compile-time constant (Light Path patterns)
         evaluated = _try_eval_light_path_factor(fac_inp)
@@ -4564,14 +4703,32 @@ def _resolve_mix_shader(mix_node, register_image_fn):
 
     p1 = _extract_shader_props(shader1_node, register_image_fn)
     p2 = _extract_shader_props(shader2_node, register_image_fn)
+    s1_type = shader1_node.type if shader1_node else None
+    s2_type = shader2_node.type if shader2_node else None
+
+    # Special-case common Cycles optimization pattern:
+    # Mix( Principled/Glass, Transparent, LightPath(Is Shadow Ray + Is Reflection Ray) )
+    # Camera rays see the transmissive shader, but shadow and reflection rays become
+    # fully transparent for cheaper and cleaner architectural glass.
+    lightpath_transparent = (
+        fac_light_path_outputs is not None
+        and ('Is Shadow Ray' in fac_light_path_outputs or 'Is Reflection Ray' in fac_light_path_outputs)
+        and (s1_type == 'BSDF_TRANSPARENT' or s2_type == 'BSDF_TRANSPARENT')
+    )
 
     # ---- Factor is 0 or 1: use dominant shader directly (like Cycles) ----
     # When Light Path or constant factor resolves to 0/1, skip all special
     # cases and use the winning shader's properties unchanged.
     if fac <= 0.001:
-        return dict(p1)  # 100% Shader 1
+        result = dict(p1)  # 100% Shader 1
+        if lightpath_transparent:
+            result['flags'] = result.get('flags', 0) | _MAT_FLAG_LIGHTPATH_TRANSPARENT
+        return result
     if fac >= 0.999:
-        return dict(p2)  # 100% Shader 2
+        result = dict(p2)  # 100% Shader 2
+        if lightpath_transparent:
+            result['flags'] = result.get('flags', 0) | _MAT_FLAG_LIGHTPATH_TRANSPARENT
+        return result
 
     # ---- Alpha cutout detection (fence, leaf, wireframe materials) ----
     # When Mix Shader Factor is linked to an Image Texture Alpha and one side
@@ -4618,8 +4775,6 @@ def _resolve_mix_shader(mix_node, register_image_fn):
 
     # If one side is fully transparent (direct Transparent BSDF), use the other side's
     # visual properties but set transparent_prob from the mix factor.
-    s1_type = shader1_node.type if shader1_node else None
-    s2_type = shader2_node.type if shader2_node else None
     if s1_type == 'BSDF_TRANSPARENT':
         result = dict(p2)
         if s2_type == 'BSDF_GLASS':
@@ -4632,6 +4787,8 @@ def _resolve_mix_shader(mix_node, register_image_fn):
         else:
             result['transparent_prob'] = (1.0 - fac)
         result['flags'] = result.get('flags', 0) | 2
+        if lightpath_transparent:
+            result['flags'] |= _MAT_FLAG_LIGHTPATH_TRANSPARENT
         return result
     if s2_type == 'BSDF_TRANSPARENT':
         result = dict(p1)
@@ -4642,6 +4799,8 @@ def _resolve_mix_shader(mix_node, register_image_fn):
         else:
             result['transparent_prob'] = fac
         result['flags'] = result.get('flags', 0) | 2
+        if lightpath_transparent:
+            result['flags'] |= _MAT_FLAG_LIGHTPATH_TRANSPARENT
         return result
 
     # General case: blend transparent_prob with mix factor, use non-transparent side's BRDF.
@@ -4683,6 +4842,8 @@ def _resolve_mix_shader(mix_node, register_image_fn):
     }
     if blended_tp > 0.0:
         blended['flags'] = p1.get('flags', 0) | p2.get('flags', 0) | 2
+    if lightpath_transparent:
+        blended['flags'] = blended.get('flags', 0) | _MAT_FLAG_LIGHTPATH_TRANSPARENT
 
     # If dominant texture is missing, fallback to the other
     if blended['diffuse_tex'] == _NO_TEX:
@@ -4695,8 +4856,8 @@ def extract_texture_bytes(tex_info):
     """Read pixel data for one deferred texture entry. Call once per frame for smooth loading.
 
     Modifies tex_info in place: fills 'data' with bytes, removes 'image_ref'.
-    If 'ramp_elements' is present, bakes the ColorRamp into raw RGBA8 pixels
-    and sets dxgi_format=28 to bypass stb_image decoding on the C++ side.
+    If 'ramp_elements' is present, bakes the ColorRamp into raw pixels and
+    bypasses stb_image decoding on the C++ side.
     Returns True if data was extracted, False on failure.
     """
     if tex_info.get("data") is not None:
@@ -4706,23 +4867,27 @@ def extract_texture_bytes(tex_info):
         return False
 
     ramp_elements = tex_info.get("ramp_elements")
+    export_mode = tex_info.get("export_mode", "file")
     if ramp_elements:
-        # Bake ColorRamp into raw RGBA8 pixels
         try:
-            data = _bake_ramp_into_pixels(image, ramp_elements)
+            as_half_float = export_mode == "scene_linear_f16"
+            data = _bake_ramp_into_pixels(image, ramp_elements, as_half_float=as_half_float)
             tex_info["data"] = data
-            tex_info["dxgi_format"] = 28  # RGBA8 raw — skip stb_image
+            tex_info["dxgi_format"] = 10 if as_half_float else 28
         except Exception:
-            # Fallback: use original image without ramp
-            data = _get_image_bytes(image)
+            data = _get_image_bytes(image, export_mode=export_mode)
             if data is None:
                 return False
             tex_info["data"] = data
+            if export_mode == "scene_linear_f16":
+                tex_info["dxgi_format"] = 10
     else:
-        data = _get_image_bytes(image)
+        data = _get_image_bytes(image, export_mode=export_mode)
         if data is None:
             return False
         tex_info["data"] = data
+        if export_mode == "scene_linear_f16":
+            tex_info["dxgi_format"] = 10
 
     tex_info["width"] = image.size[0]
     tex_info["height"] = image.size[1]
@@ -4804,13 +4969,23 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         """Register an image and return its texture index, or _NO_TEX if unavailable.
 
         If color_ramp_node is provided, the ramp will be baked into the texture
-        pixels during extraction (uploaded as raw RGBA8, bypassing stb_image).
+        pixels during extraction.
         """
         if image is None:
             return _NO_TEX
-        # Unique key: include ramp id to avoid sharing baked vs raw versions
+        cs = getattr(image, "colorspace_settings", None)
+        is_data = bool(getattr(cs, "is_data", False))
+        # Blender image textures are sampled in scene-linear unless the image is marked as
+        # "Non-Color". Export non-data images as raw RGBA16F so Ignis receives the same
+        # scene-linear values that Cycles/EEVEE use internally.
+        # Blender references:
+        # - source/blender/makesrna/intern/rna_image_api.cc `Image.gl_load()`
+        # - source/blender/draw/intern/shaders/draw_colormanagement_lib.glsl
+        scene_linear_export = (color_ramp_node is not None) or (not is_data)
+        export_mode = "scene_linear_f16" if scene_linear_export else "file"
+
         ramp_id = f"__ramp_{id(color_ramp_node)}" if color_ramp_node else ""
-        key = image.name + ramp_id
+        key = f"{image.name}{ramp_id}__{export_mode}"
         if key in texture_registry:
             return texture_registry[key]["index"]
         if image.size[0] == 0 or image.size[1] == 0:
@@ -4823,6 +4998,8 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
             "image_ref": image,
             "width": image.size[0],
             "height": image.size[1],
+            "export_mode": export_mode,
+            "scene_linear_export": scene_linear_export,
         }
         if color_ramp_node:
             ramp = color_ramp_node.color_ramp
@@ -5335,10 +5512,24 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                     flags |= 1   # bit0 = alpha_test
                 if transmission > 0.0:
                     flags |= 2   # bit1 = transmission
+                    # Cycles does not use material viewport/draw flags like blend_method or
+                    # backface culling to reinterpret Principled transmission as "thin glass".
+                    # The Principled closure stays transmissive, and Alpha separately mixes with
+                    # transparent() when needed:
+                    # - intern/cycles/kernel/osl/shaders/node_principled_bsdf.osl:128
+                    # - intern/cycles/kernel/osl/shaders/node_principled_bsdf.osl:151
+                    # - intern/cycles/kernel/osl/shaders/node_principled_bsdf.osl:198
+                    #
+                    # Keep the thin-sheet optimization only for materials that actually behave
+                    # like thin/transparency-mixed sheets in the shader graph.
+                    if alpha_test or alpha < 0.999 or transparent_prob > 0.0:
+                        flags |= _MAT_FLAG_THIN_TRANSMISSION
 
         # Ensure transmission flag is set for all code paths (Mix Shader, individual nodes)
         if transmission > 0.0:
             flags |= 2  # bit1 = transmission
+            if alpha_test or alpha < 0.999 or transparent_prob > 0.0:
+                flags |= _MAT_FLAG_THIN_TRANSMISSION
 
         # Compile VM bytecode — VM is the SINGLE AUTHORITY for material evaluation.
         # Legacy scalar path (ksAmbient, ksSpecularEXP, fresnelC) is DEPRECATED.
@@ -5447,6 +5638,10 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                 _mf.flush()
         except Exception:
             pass
+
+        if diffuse_tex != _NO_TEX and diffuse_tex < len(textures_list):
+            if textures_list[diffuse_tex].get("scene_linear_export", False):
+                flags |= _MAT_FLAG_DIFFUSE_SCENE_LINEAR
 
         all_bytes += _pack_gpu_material(
             base_color=base_color,

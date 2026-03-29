@@ -14,6 +14,7 @@
 #include "nrd_vulkan_integration.h"
 #include <vector>
 #include <fstream>
+#include <filesystem>
 #include <cstring>
 #include <chrono>
 #include <cmath>
@@ -38,6 +39,65 @@ namespace acpt { extern PathTracerConfig g_config; }
 
 namespace acpt {
 namespace vk {
+
+namespace {
+bool ResolveTonemapLutPath(std::string& outPath, uint64_t& outStamp)
+{
+    const char* lutCandidates[] = {
+        "shaders/Runtime_LUT.cube",
+        "shaders/AgX_Base_sRGB.cube",
+    };
+
+    std::error_code ec;
+    for (const char* candidate : lutCandidates) {
+        std::string resolved = IgnisResolvePath(candidate);
+        if (!std::filesystem::exists(resolved, ec) || ec) {
+            ec.clear();
+            continue;
+        }
+        outPath = resolved;
+        auto stamp = std::filesystem::last_write_time(resolved, ec);
+        outStamp = ec ? 0ull : static_cast<uint64_t>(stamp.time_since_epoch().count());
+        return true;
+    }
+
+    outPath.clear();
+    outStamp = 0;
+    return false;
+}
+
+float HalfBitsToFloat(uint16_t h)
+{
+    const uint32_t sign = (uint32_t(h & 0x8000u)) << 16;
+    uint32_t exp = (h >> 10) & 0x1Fu;
+    uint32_t mant = h & 0x03FFu;
+    uint32_t bits = 0;
+
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            exp = 1;
+            while ((mant & 0x0400u) == 0) {
+                mant <<= 1;
+                --exp;
+            }
+            mant &= 0x03FFu;
+            bits = sign | ((exp + 112u) << 23) | (mant << 13);
+        }
+    }
+    else if (exp == 31) {
+        bits = sign | 0x7F800000u | (mant << 13);
+    }
+    else {
+        bits = sign | ((exp + 112u) << 23) | (mant << 13);
+    }
+
+    float value = 0.0f;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+}  // namespace
 
 const char* Renderer::InitializeStep(HWND hwnd, uint32_t width, uint32_t height) {
     // Phased initialization — one step per call for smooth loading screen.
@@ -1114,6 +1174,13 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
         0, 1, &barrier, 0, nullptr, 0, nullptr);
 
+    // Record BLAS build into the same command buffer to avoid a second
+    // submit + queue idle per hair system during staged load.
+    int blasIdx = accelBuilder_->BuildBLASFromGPUBuffers(
+        posBuf.deviceAddress, totalVerts,
+        idxBuf.deviceAddress, totalIndices,
+        -1, cmd, opaqueHair);
+
     context_->EndSingleTimeCommands(cmd);
     // Safe to destroy staging now (GPU finished)
     accelBuilder_->DestroyAccelBuffer(stagingBuf);
@@ -1121,12 +1188,6 @@ int Renderer::GenerateHairGPU(const float* parentKeys, uint32_t nParents,
     if (emTStaging.buffer) accelBuilder_->DestroyAccelBuffer(emTStaging);
     if (emCStaging.buffer) accelBuilder_->DestroyAccelBuffer(emCStaging);
     if (frandStaging.buffer) accelBuilder_->DestroyAccelBuffer(frandStaging);
-
-    // Build BLAS directly from GPU-resident buffers
-    int blasIdx = accelBuilder_->BuildBLASFromGPUBuffers(
-        posBuf.deviceAddress, totalVerts,
-        idxBuf.deviceAddress, totalIndices,
-        -1, VK_NULL_HANDLE, opaqueHair);
 
     if (blasIdx >= 0) {
         // Store normal buffer address in BLAS entry for shader access
@@ -1202,6 +1263,9 @@ void Renderer::RenderFrameRT() {
     // Wait for previous frame
     vkWaitForFences(device, 1, &inFlightFences_[currentFrame_], VK_TRUE, UINT64_MAX);
     vkResetFences(device, 1, &inFlightFences_[currentFrame_]);
+    if (tonemapReady_) {
+        ReloadAgXLutIfChanged();
+    }
 
     // Single command buffer: RT → NRD → Composite → ImGui → Readback
     vkResetCommandBuffer(cmd, 0);
@@ -1806,6 +1870,130 @@ bool Renderer::ReadbackPixels(void* outData, uint32_t bufferSize) {
     // After vkQueueWaitIdle, just copy from persistent mapped memory
     VkDevice device = context_ ? context_->GetDevice() : VK_NULL_HANDLE;
     return interop_ ? interop_->CopyReadbackResult(outData, bufferSize, device) : false;
+}
+
+bool Renderer::ReadbackHDRPixelsFloat(float* outData, uint32_t pixelCount) {
+    if (!context_ || !outData || pixelCount == 0) return false;
+
+    VkImage srcImage = VK_NULL_HANDLE;
+    uint32_t srcWidth = 0;
+    uint32_t srcHeight = 0;
+
+    if (dlssHdrOutput_) {
+        srcImage = dlssHdrOutput_;
+        srcWidth = width_;
+        srcHeight = height_;
+    }
+    else if (dlssColorInput_) {
+        srcImage = dlssColorInput_;
+        srcWidth = renderWidth_;
+        srcHeight = renderHeight_;
+    }
+    else {
+        return false;
+    }
+
+    const uint32_t expectedPixels = srcWidth * srcHeight;
+    if (pixelCount < expectedPixels) {
+        Log(L"[VK Renderer] HDR readback buffer too small (%u < %u)\n", pixelCount, expectedPixels);
+        return false;
+    }
+
+    VkDevice device = context_->GetDevice();
+    VkQueue queue = context_->GetGraphicsQueue();
+    if (device == VK_NULL_HANDLE || queue == VK_NULL_HANDLE) return false;
+
+    // Exact viewport color path: wait for the submitted frame, then copy the linear HDR image.
+    vkQueueWaitIdle(queue);
+
+    const VkDeviceSize stagingSize = VkDeviceSize(expectedPixels) * 4u * sizeof(uint16_t);
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+
+    VkBufferCreateInfo bufInfo{};
+    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufInfo.size = stagingSize;
+    bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(device, &bufInfo, nullptr, &stagingBuffer) != VK_SUCCESS) {
+        return false;
+    }
+
+    VkMemoryRequirements memReqs{};
+    vkGetBufferMemoryRequirements(device, stagingBuffer, &memReqs);
+
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = context_->FindMemoryType(
+        memReqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &stagingMemory) != VK_SUCCESS) {
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        return false;
+    }
+    vkBindBufferMemory(device, stagingBuffer, stagingMemory, 0);
+
+    VkCommandBuffer cmd = context_->BeginSingleTimeCommands();
+
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = srcImage;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    VkBufferImageCopy region{};
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = { srcWidth, srcHeight, 1 };
+
+    vkCmdCopyImageToBuffer(
+        cmd, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stagingBuffer, 1, &region);
+
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    context_->EndSingleTimeCommands(cmd);
+
+    void* mapped = nullptr;
+    bool ok = false;
+    if (vkMapMemory(device, stagingMemory, 0, stagingSize, 0, &mapped) == VK_SUCCESS && mapped) {
+        const uint16_t* src = reinterpret_cast<const uint16_t*>(mapped);
+        const uint32_t totalFloats = expectedPixels * 4u;
+        for (uint32_t i = 0; i < totalFloats; ++i) {
+            outData[i] = HalfBitsToFloat(src[i]);
+        }
+        vkUnmapMemory(device, stagingMemory);
+        ok = true;
+    }
+
+    vkDestroyBuffer(device, stagingBuffer, nullptr);
+    vkFreeMemory(device, stagingMemory, nullptr);
+    return ok;
 }
 
 bool Renderer::ImportD3D11Texture(HANDLE ntHandle, uint32_t width, uint32_t height) {
@@ -2541,24 +2729,18 @@ bool Renderer::LoadAgXLut() {
     // The LUT is set via ignis_set_int("tonemap_lut", id) before create():
     //   0 = AgX (default), 1 = Filmic
     // Try runtime-baked LUT first (from Blender OCIO), fallback to AgX
-    const char* lutCandidates[] = {
-        "shaders/Runtime_LUT.cube",
-        "shaders/AgX_Base_sRGB.cube",
-    };
     std::string lutPath;
-    std::ifstream lutFile;
-    for (const char* candidate : lutCandidates) {
-        lutPath = IgnisResolvePath(candidate);
-        lutFile.open(lutPath);
-        if (lutFile.is_open()) {
-            Log(L"[VK Renderer] Loaded tonemap LUT: %S\n", lutPath.c_str());
-            break;
-        }
-    }
-    if (!lutFile.is_open()) {
+    uint64_t lutStamp = 0;
+    if (!ResolveTonemapLutPath(lutPath, lutStamp)) {
         Log(L"[VK Renderer] WARNING: No tonemap LUT found\n");
         return false;
     }
+    std::ifstream lutFile(lutPath);
+    if (!lutFile.is_open()) {
+        Log(L"[VK Renderer] WARNING: Failed to open tonemap LUT: %S\n", lutPath.c_str());
+        return false;
+    }
+    Log(L"[VK Renderer] Loaded tonemap LUT: %S\n", lutPath.c_str());
 
     int lutSize = 0;
     std::vector<float> lutData;
@@ -2589,6 +2771,7 @@ bool Renderer::LoadAgXLut() {
     }
 
     VkDevice device = context_->GetDevice();
+    DestroyAgXLut();
 
     // Create 3D image
     VkImageCreateInfo imgInfo{};
@@ -2686,6 +2869,45 @@ bool Renderer::LoadAgXLut() {
 
     Log(L"[VK Renderer] AgX 3D LUT loaded: %dx%dx%d (%zu KB)\n",
         lutSize, lutSize, lutSize, dataSize / 1024);
+    agxLutPath_ = lutPath;
+    agxLutStamp_ = lutStamp;
+    return true;
+}
+
+void Renderer::DestroyAgXLut() {
+    VkDevice device = context_ ? context_->GetDevice() : VK_NULL_HANDLE;
+    if (device == VK_NULL_HANDLE) return;
+
+    if (agxLutSampler_) { vkDestroySampler(device, agxLutSampler_, nullptr); agxLutSampler_ = VK_NULL_HANDLE; }
+    if (agxLutView_) { vkDestroyImageView(device, agxLutView_, nullptr); agxLutView_ = VK_NULL_HANDLE; }
+    if (agxLutImage_) { vkDestroyImage(device, agxLutImage_, nullptr); agxLutImage_ = VK_NULL_HANDLE; }
+    if (agxLutMemory_) { vkFreeMemory(device, agxLutMemory_, nullptr); agxLutMemory_ = VK_NULL_HANDLE; }
+    agxLutPath_.clear();
+    agxLutStamp_ = 0;
+}
+
+bool Renderer::ReloadAgXLutIfChanged() {
+    std::string nextPath;
+    uint64_t nextStamp = 0;
+    if (!ResolveTonemapLutPath(nextPath, nextStamp)) {
+        return false;
+    }
+    if (nextPath == agxLutPath_ && nextStamp == agxLutStamp_) {
+        return false;
+    }
+
+    VkDevice device = context_ ? context_->GetDevice() : VK_NULL_HANDLE;
+    if (device == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    Log(L"[VK Renderer] Tonemap LUT changed on disk, reloading: %S\n", nextPath.c_str());
+    vkDeviceWaitIdle(device);
+    if (!LoadAgXLut()) {
+        Log(L"[VK Renderer] WARNING: Failed to reload tonemap LUT\n");
+        return false;
+    }
+    UpdateTonemapDescriptors();
     return true;
 }
 
@@ -2876,6 +3098,7 @@ void Renderer::ShutdownTonemap() {
     if (tonemapDescPool_) { vkDestroyDescriptorPool(device, tonemapDescPool_, nullptr); tonemapDescPool_ = VK_NULL_HANDLE; }
     if (tonemapDescSetLayout_) { vkDestroyDescriptorSetLayout(device, tonemapDescSetLayout_, nullptr); tonemapDescSetLayout_ = VK_NULL_HANDLE; }
     if (tonemapSampler_) { vkDestroySampler(device, tonemapSampler_, nullptr); tonemapSampler_ = VK_NULL_HANDLE; }
+    DestroyAgXLut();
     tonemapReady_ = false;
 }
 

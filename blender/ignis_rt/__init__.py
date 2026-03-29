@@ -429,13 +429,10 @@ def register():
         'IGNIS_PT_sampling', 'IGNIS_PT_dlss', 'IGNIS_PT_color',
         'IGNIS_PT_performance', 'IGNIS_PT_advanced',
     }
-    _keep_panels = {
-        'RENDER_PT_color_management', 'RENDER_PT_color_management_curves',
-    }
     for panel in bpy.types.Panel.__subclasses__():
         if getattr(panel, 'bl_context', '') == 'render' and panel.__name__ not in _own_panels:
-            if panel.__name__ in _keep_panels:
-                continue  # keep Color Management visible
+            if panel.__name__.startswith('RENDER_PT_color_management'):
+                continue  # keep Blender's full Color Management stack visible
             compat = getattr(panel, 'COMPAT_ENGINES', None)
             if compat and 'IGNIS_RT' in compat:
                 compat.discard('IGNIS_RT')

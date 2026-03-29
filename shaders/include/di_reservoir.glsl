@@ -108,7 +108,7 @@ float diTargetPDF(vec3 N, vec3 V, vec3 lightDir, float NdotL,
     if (NdotL <= 0.0) return 0.0;
     // Use luminance of full BRDF contribution as target PDF
     vec3 diffC, specC;
-    evaluateCookTorrance(N, V, lightDir, baseColor, roughness, metallic, 0.5, 1.45,
+    evaluateCookTorrance(N, V, lightDir, baseColor, roughness, metallic, 0.5, 1.45, 0.0,
                          diffC, specC);
     vec3 contribution = (diffC + specC) * lightRadiance * NdotL;
     return dot(contribution, vec3(0.2126, 0.7152, 0.0722)); // luminance

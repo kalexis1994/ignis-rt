@@ -42,7 +42,7 @@ layout(binding = 6, set = 0, std430) buffer ExposureBuffer {
 
 layout(push_constant) uniform CompositeParams {
     uint mode;         // 0=skip, 1=NRD composite, 2-7=debug views
-    uint tonemapMode;  // 0=AgX, 1=ACES, 2=Reinhard, 3=Hable, 4=Neutral
+    uint tonemapMode;  // 0=AgX, 1=ACES, 2=Reinhard, 3=Hable, 4=Neutral, 7=Standard sRGB exact
     float exposure;    // from GUI ptExposure
     float saturation;  // from GUI ptSaturation
     float contrast;    // from GUI ptContrast
@@ -137,12 +137,21 @@ vec3 neutralTonemap(vec3 color) {
     return mix(color, vec3(newPeak), g);
 }
 
+vec3 linearToSRGB(vec3 color) {
+    color = max(color, vec3(0.0));
+    bvec3 cutoff = lessThanEqual(color, vec3(0.0031308));
+    vec3 lower = color * 12.92;
+    vec3 upper = 1.055 * pow(color, vec3(1.0 / 2.4)) - 0.055;
+    return mix(upper, lower, cutoff);
+}
+
 // Select tonemap curve by mode
 vec3 applyTonemap(vec3 hdr, uint mode) {
     if (mode == 1u) return acesTonemap(hdr);
     if (mode == 2u) return reinhardTonemap(hdr);
     if (mode == 3u) return hableTonemap(hdr);
     if (mode == 4u) return neutralTonemap(hdr);
+    if (mode == 7u) return linearToSRGB(clamp(hdr, 0.0, 1.0));
     return agxTonemap(hdr); // 0 = AgX (default)
 }
 
@@ -152,7 +161,10 @@ vec3 tonemapPipeline(vec3 hdr) {
     vec3 ldr = applyTonemap(hdr, push.tonemapMode);
     float luma = dot(ldr, vec3(0.2126, 0.7152, 0.0722));
     ldr = clamp(mix(vec3(luma), ldr, push.saturation), 0.0, 1.0);
-    return pow(ldr, vec3(1.0 / 2.2));
+    if (push.tonemapMode != 7u) {
+        ldr = pow(ldr, vec3(1.0 / 2.2));
+    }
+    return ldr;
 }
 
 // Shared memory for workgroup-level luminance reduction (8x8 = 64 threads)

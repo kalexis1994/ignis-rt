@@ -195,6 +195,9 @@ def load():
     _lib.ignis_readback_float.argtypes = [POINTER(c_float), c_uint32]
     _lib.ignis_readback_float.restype = c_bool
 
+    _lib.ignis_readback_hdr_float.argtypes = [POINTER(c_float), c_uint32]
+    _lib.ignis_readback_hdr_float.restype = c_bool
+
     _lib.ignis_draw_gl.argtypes = [c_uint32, c_uint32]
     _lib.ignis_draw_gl.restype = c_bool
 
@@ -419,6 +422,11 @@ def readback(out_buffer, buffer_size: int) -> bool:
 def readback_float(out_buffer, pixel_count: int) -> bool:
     """Readback as float32 RGBA (conversion done in C++). out_buffer = ctypes c_float array."""
     return _lib.ignis_readback_float(out_buffer, c_uint32(pixel_count))
+
+
+def readback_hdr_float(out_buffer, pixel_count: int) -> bool:
+    """Read back scene-linear HDR as float32 RGBA from the pre-tonemap buffer."""
+    return _lib.ignis_readback_hdr_float(out_buffer, c_uint32(pixel_count))
 
 
 def draw_gl(width: int, height: int) -> bool:

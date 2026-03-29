@@ -2,6 +2,8 @@
 
 #include <windows.h>
 #include <vector>
+#include <string>
+#include <cstdint>
 #include <vulkan/vulkan.h>
 #include "vk_accel_structure.h"
 #include "../../include/dlss_ngx.h"
@@ -82,6 +84,7 @@ public:
     // Interop
     HANDLE GetInteropNTHandle() const;
     bool ReadbackPixels(void* outData, uint32_t bufferSize);
+    bool ReadbackHDRPixelsFloat(float* outData, uint32_t pixelCount);
     void SetDirectInterop(bool enabled) { useDirectInterop_ = enabled; }
     bool ImportD3D11Texture(HANDLE ntHandle, uint32_t width, uint32_t height);
 
@@ -213,7 +216,11 @@ private:
     VkDeviceMemory agxLutMemory_ = VK_NULL_HANDLE;
     VkImageView agxLutView_ = VK_NULL_HANDLE;
     VkSampler agxLutSampler_ = VK_NULL_HANDLE;
+    std::string agxLutPath_;
+    uint64_t agxLutStamp_ = 0;
     bool LoadAgXLut();
+    void DestroyAgXLut();
+    bool ReloadAgXLutIfChanged();
 
     bool CreateTonemapPipeline();
     void UpdateTonemapDescriptors();

@@ -120,6 +120,18 @@ const uint OP_OUTPUT_BUMP     = 0xF8u;  // bump gradient output: gradient=R[srcA
 
 #include "noise.glsl"
 
+float srgbToLinearExact(float c) {
+    return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4);
+}
+
+vec3 srgbToLinearExact(vec3 c) {
+    return vec3(
+        srgbToLinearExact(c.r),
+        srgbToLinearExact(c.g),
+        srgbToLinearExact(c.b)
+    );
+}
+
 // ── ColorRamp evaluation ──
 vec4 nodeVmEvalColorRamp(uint matIdx, uint dataOffset, uint stopCount, float factor) {
     factor = clamp(factor, 0.0, 1.0);
@@ -227,8 +239,7 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, ve
             uint isSRGB = instr.y;  // 1 = sRGB color texture, 0 = linear data
             R[dst] = texture(textures[nonuniformEXT(texIdx)], R[srcA].xy);
             if (isSRGB != 0u) {
-                // sRGB → linear (matching Cycles texture decoding)
-                R[dst].rgb = pow(max(R[dst].rgb, vec3(0.0)), vec3(2.2));
+                R[dst].rgb = srgbToLinearExact(max(R[dst].rgb, vec3(0.0)));
             }
         }
 

@@ -647,6 +647,10 @@ IGNIS_API bool ignis_readback_float(float* outPixels, uint32_t pixelCount) {
     return true;
 }
 
+IGNIS_API bool ignis_readback_hdr_float(float* outPixels, uint32_t pixelCount) {
+    return g_renderer ? g_renderer->ReadbackHDRPixelsFloat(outPixels, pixelCount) : false;
+}
+
 IGNIS_API void ignis_set_float(const char* key, float value) {
     acpt::PathTracerConfig* cfg = &acpt::g_config;
     if (!key) return;
@@ -736,6 +740,8 @@ IGNIS_API int ignis_get_int(const char* key) {
     if (strcmp(key, "dlss_active") == 0)      return g_renderer && g_renderer->IsDLSSActive() ? 1 : 0;
     if (strcmp(key, "dlss_rr_active") == 0)    return g_renderer && g_renderer->IsDLSSRRActive() ? 1 : 0;
     if (strcmp(key, "nrd_active") == 0)        return g_renderer && g_renderer->IsDLSSActive() && !g_renderer->IsDLSSRRActive() ? 1 : 0;
+    if (strcmp(key, "display_width") == 0)     return g_renderer ? (int)g_renderer->GetRenderWidth() : 0;
+    if (strcmp(key, "display_height") == 0)    return g_renderer ? (int)g_renderer->GetRenderHeight() : 0;
 
     // Config queries
     acpt::PathTracerConfig* cfg = &acpt::g_config;

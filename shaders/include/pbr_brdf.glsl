@@ -66,7 +66,7 @@ float SmithG2(float NdotL, float NdotV, float alpha) {
 // Cook-Torrance BRDF Evaluation (for NEE / direct light)
 void evaluateCookTorrance(
     vec3 N, vec3 V, vec3 L, vec3 baseColor, float roughness, float metallic, float specularLevel,
-    float ior,
+    float ior, float transmission,
     out vec3 diffuseContrib, out vec3 specularContrib
 ) {
     float NdotL = max(dot(N, L), 0.0);
@@ -87,16 +87,48 @@ void evaluateCookTorrance(
     // F0 from IOR for dielectrics, baseColor for metals
     float f0_dielectric = (ior - 1.0) / (ior + 1.0);
     f0_dielectric = f0_dielectric * f0_dielectric;
-    vec3 F0 = mix(vec3(f0_dielectric * specularLevel * 2.0), baseColor, metallic);
-    vec3 F = fresnelSchlick(VdotH, F0);
-
-    // Specular: GGX Cook-Torrance
+    vec3 dielectricF0 = vec3(f0_dielectric * specularLevel * 2.0);
     float D = GGX_D(NdotH, alpha);
     float G = SmithG2(NdotL, NdotV, alpha);
-    vec3 spec = (D * G * F) / max(4.0 * NdotV * NdotL, 0.001);
+    float specDenom = max(4.0 * NdotV * NdotL, 0.001);
 
-    // Diffuse: Lambertian (energy-conserving with metallic)
-    vec3 kd = (1.0 - F) * (1.0 - metallic);
+    // Fast common case: opaque Principled without transmission.
+    // This keeps the pre-transmission cost profile on most surfaces.
+    if (transmission <= 0.001) {
+        vec3 F0 = mix(dielectricF0, baseColor, metallic);
+        vec3 F = fresnelSchlick(VdotH, F0);
+        vec3 spec = (D * G * F) / specDenom;
+        vec3 kd = (1.0 - F) * (1.0 - metallic);
+        vec3 diff = kd * baseColor * INV_PI;
+        diffuseContrib = diff * NdotL;
+        specularContrib = spec * NdotL;
+        return;
+    }
+
+    // Principled mixes the non-metal opaque lobes with transmission.
+    // Cycles reference:
+    // - intern/cycles/kernel/osl/shaders/node_principled_bsdf.osl
+    //   BSDF = mix(BSDF, TransmissionBSDF, transmission);
+    float dielectricWeight = (1.0 - metallic) * (1.0 - transmission);
+    vec3 dielectricF = fresnelSchlick(VdotH, dielectricF0);
+
+    vec3 spec;
+    if (metallic <= 0.001) {
+        // Common glass/plastic branch: skip the metallic Fresnel entirely.
+        spec = (D * G * dielectricF) / specDenom * dielectricWeight;
+    } else if (metallic >= 0.999) {
+        // Pure metal branch: transmission is irrelevant here.
+        vec3 metalF = fresnelSchlick(VdotH, baseColor);
+        spec = (D * G * metalF) / specDenom;
+    } else {
+        vec3 metalF = fresnelSchlick(VdotH, baseColor);
+        vec3 dielectricSpec = (D * G * dielectricF) / specDenom;
+        vec3 metalSpec = (D * G * metalF) / specDenom;
+        spec = dielectricSpec * dielectricWeight + metalSpec * metallic;
+    }
+
+    // Diffuse: Lambertian (energy-conserving with metallic and transmission)
+    vec3 kd = (1.0 - dielectricF) * dielectricWeight;
     vec3 diff = kd * baseColor * INV_PI;
 
     diffuseContrib = diff * NdotL;

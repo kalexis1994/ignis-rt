@@ -240,6 +240,13 @@ vec3 EnvBRDFApprox(vec3 F0, float roughness, float NdotV) {
 
 const uint INVALID_HAIR_STRAND = 0xFFFFFFFFu;
 const uint MAT_FLAG_HAIR = 32u;
+const uint MAT_FLAG_DIFFUSE_SCENE_LINEAR = 64u;
+const uint MAT_FLAG_THIN_TRANSMISSION = 128u;
+const uint MAT_FLAG_LIGHTPATH_TRANSPARENT = 256u;
+const uint VM_HEADER_FLAG_BASE_COLOR = 1u;
+const uint VM_HEADER_FLAG_ALPHA = 2u;
+const uint VM_HEADER_FLAG_TRANSMISSION = 4u;
+const uint VM_HEADER_FLAG_SHADOW_DYNAMIC = 8u;
 
 bool getHairRibbonLayout(GeometryMetadata geo,
                          out uint strandCount,
@@ -541,6 +548,16 @@ struct PBRHit {
     float hairRadialRoughness;
 };
 
+vec3 cyclesPrincipledTransmissionTint(vec3 baseColor)
+{
+    // Cycles Principled transmission tints the transmitted lobe with
+    // sqrt(clamped_base_color).
+    // Blender reference:
+    // - intern/cycles/kernel/osl/shaders/node_principled_bsdf.osl
+    //   TransmissionBSDF = generalized_schlick_bsdf(..., sqrt(clamped_base_color), ...)
+    return sqrt(clamp(baseColor, vec3(0.0), vec3(1.0)));
+}
+
 PBRHit evaluateBlenderMaterial(
     Material mat, uint matIdx,
     vec3 worldPos, vec3 geoNormal,
@@ -612,8 +629,10 @@ PBRHit evaluateBlenderMaterial(
         // No VM or VM didn't compile base color — legacy fallback
         if (mat.diffuseTexIndex != 0xFFFFFFFFu) {
             vec4 texColor = texture(textures[nonuniformEXT(mat.diffuseTexIndex)], uv);
-            // sRGB → linear for color textures (matching Cycles)
-            hit.baseColor = pow(max(texColor.rgb, vec3(0.0)), vec3(2.2));
+            bool diffuseIsSceneLinear = (mat.flags & MAT_FLAG_DIFFUSE_SCENE_LINEAR) != 0u;
+            hit.baseColor = diffuseIsSceneLinear ?
+                            texColor.rgb :
+                            srgbToLinearExact(max(texColor.rgb, vec3(0.0)));
             texAlpha = texColor.a;  // alpha stays linear
         } else {
             hit.baseColor = vec3(mat.ksAmbient, mat.ksDiffuse, mat.ksSpecular);
@@ -734,6 +753,100 @@ PBRHit evaluateBlenderMaterial(
     }
 
     return hit;
+}
+
+PBRHit evaluateShadowMaterial(
+    Material mat, uint matIdx,
+    GeometryMetadata geo, int primId,
+    vec3 bary, mat4x3 objToWorld,
+    vec3 rayDir, uint instanceId
+) {
+    Indices idx = Indices(geo.indexBufferAddress);
+    Vertices verts = Vertices(geo.vertexBufferAddress);
+    uint i0 = idx.i[primId * 3 + 0];
+    uint i1 = idx.i[primId * 3 + 1];
+    uint i2 = idx.i[primId * 3 + 2];
+
+    vec3 lp0 = vec3(verts.v[i0*3], verts.v[i0*3+1], verts.v[i0*3+2]);
+    vec3 lp1 = vec3(verts.v[i1*3], verts.v[i1*3+1], verts.v[i1*3+2]);
+    vec3 lp2 = vec3(verts.v[i2*3], verts.v[i2*3+1], verts.v[i2*3+2]);
+    vec3 localPos = lp0 * bary.x + lp1 * bary.y + lp2 * bary.z;
+
+    vec3 wp0 = objToWorld * vec4(lp0, 1.0);
+    vec3 wp1 = objToWorld * vec4(lp1, 1.0);
+    vec3 wp2 = objToWorld * vec4(lp2, 1.0);
+    vec3 worldPos = objToWorld * vec4(localPos, 1.0);
+    vec3 geoNormal = normalize(cross(wp1 - wp0, wp2 - wp0));
+
+    vec2 uv0 = vec2(0.0);
+    vec2 uv1 = vec2(0.0);
+    vec2 uv2 = vec2(0.0);
+    vec2 hitUV = vec2(0.0);
+    if (geo.uvBufferAddress != 0u) {
+        UVs uvData = UVs(geo.uvBufferAddress);
+        uv0 = vec2(uvData.uv[i0*2+0], 1.0 - uvData.uv[i0*2+1]);
+        uv1 = vec2(uvData.uv[i1*2+0], 1.0 - uvData.uv[i1*2+1]);
+        uv2 = vec2(uvData.uv[i2*2+0], 1.0 - uvData.uv[i2*2+1]);
+        hitUV = uv0 * bary.x + uv1 * bary.y + uv2 * bary.z;
+    }
+
+    vec4 hitVertexColor = vec4(1.0);
+    if (geo.colorBufferAddress != 0u) {
+        Colors colorData = Colors(geo.colorBufferAddress);
+        vec4 vc0 = vec4(colorData.c[i0*4+0], colorData.c[i0*4+1], colorData.c[i0*4+2], colorData.c[i0*4+3]);
+        vec4 vc1 = vec4(colorData.c[i1*4+0], colorData.c[i1*4+1], colorData.c[i1*4+2], colorData.c[i1*4+3]);
+        vec4 vc2 = vec4(colorData.c[i2*4+0], colorData.c[i2*4+1], colorData.c[i2*4+2], colorData.c[i2*4+3]);
+        hitVertexColor = vc0 * bary.x + vc1 * bary.y + vc2 * bary.z;
+    }
+
+    return evaluateBlenderMaterial(
+        mat, matIdx, worldPos, geoNormal,
+        wp0, wp1, wp2, uv0, uv1, uv2, hitUV, rayDir,
+        hitVertexColor, instanceId, localPos
+    );
+}
+
+vec3 evaluateShadowMaterialTransmittance(
+    Material mat, uint matIdx,
+    GeometryMetadata geo, int primId,
+    vec3 bary, mat4x3 objToWorld,
+    vec3 rayDir, uint instanceId
+) {
+    if ((mat.flags & MAT_FLAG_LIGHTPATH_TRANSPARENT) != 0u) {
+        return vec3(1.0);
+    }
+
+    if ((mat.flags & 4u) != 0u) {
+        return vec3(1.0); // Volumes remain non-blocking in shadow queries.
+    }
+
+    uint vmHeaderFlags = (mat.nodeVmHeader >> 8u) & 0xFFu;
+    bool vmShadowDynamic = (vmHeaderFlags & VM_HEADER_FLAG_SHADOW_DYNAMIC) != 0u;
+    bool alphaDynamic =
+        ((vmHeaderFlags & VM_HEADER_FLAG_ALPHA) != 0u && vmShadowDynamic) ||
+        ((mat.flags & 1u) != 0u && mat.diffuseTexIndex != 0xFFFFFFFFu);
+
+    // Cycles shadow transparency only follows actual transparent closures, not
+    // plain Principled transmission/glass closures:
+    // - intern/cycles/kernel/integrator/surface_shader.h:948
+    // - intern/cycles/scene/shader_nodes.cpp:2815
+    // That means solid glass should still block shadow rays unless Alpha or a
+    // Transparent closure makes the surface transparent to shadows.
+    float transparentProb = clamp(mat.multB, 0.0, 1.0);
+    if ((mat.flags & 1u) == 0u && transparentProb <= 0.0) {
+        return vec3(0.0);
+    }
+
+    if (!alphaDynamic) {
+        float alpha = clamp(mat.multG, 0.0, 1.0);
+        float passThrough = 1.0 - alpha * (1.0 - transparentProb);
+        return vec3(clamp(passThrough, 0.0, 1.0));
+    }
+
+    PBRHit hit = evaluateShadowMaterial(mat, matIdx, geo, primId, bary, objToWorld, rayDir, instanceId);
+    float alpha = clamp(hit.alpha, 0.0, 1.0);
+    float passThrough = 1.0 - alpha * (1.0 - transparentProb);
+    return vec3(clamp(passThrough, 0.0, 1.0));
 }
 
 // ============================================================
@@ -902,6 +1015,9 @@ void main() {
     const int MAX_ALPHA_SKIPS = 8;
     int glassBounces = 0;
     const int MAX_GLASS_BOUNCES = 16;
+    int thinTransmissionPasses = 0;
+    const int MAX_THIN_TRANSMISSION_PASSES = 4;
+    bool throughPrimarySpecularInterface = false;
 
     // ReSTIR GI reservoir for indirect lighting reuse
     // TODO: disabled for stability investigation on complex scenes
@@ -1598,6 +1714,108 @@ void main() {
             continue;
         }
 
+        // Artist-authored Cycles pattern:
+        // Mix transmissive shader with Transparent using Light Path
+        // (typically Is Shadow Ray and/or Is Reflection Ray).
+        // Camera rays still see the glass, but secondary specular/reflection rays
+        // and shadow rays should pass through cheaply.
+        if ((mat.flags & MAT_FLAG_LIGHTPATH_TRANSPARENT) != 0u && bounce > 0 && !isDiffusePath) {
+            rayOrigin = worldPos + rayDir * 0.002;
+            bounce--;
+            continue;
+        }
+
+        // ---- Thin transmission fast path ----
+        // Treat thin transmissive sheets before any NEE/shadow work.
+        // If the ray passes through the sheet, we should not pay direct-lighting
+        // costs on the sheet itself first.
+        float glassProb = (1.0 - pbrHit.metallic) * pbrHit.transmission;
+        bool thinTransmissionMaterial = (mat.flags & MAT_FLAG_THIN_TRANSMISSION) != 0u;
+        uint materialVmHeaderFlags = (mat.nodeVmHeader >> 8u) & 0xFFu;
+        bool mappedTransmissionMaterial = (materialVmHeaderFlags & VM_HEADER_FLAG_TRANSMISSION) != 0u;
+        bool partialTransmissionHit = (glassProb < 0.98) || (pbrHit.alpha < 0.999);
+        bool useThinTransmissionPath = thinTransmissionMaterial || (mappedTransmissionMaterial && partialTransmissionHit);
+        if (glassProb > 0.01 && useThinTransmissionPath) {
+            thinTransmissionPasses++;
+            if (thinTransmissionPasses > MAX_THIN_TRANSMISSION_PASSES) break;
+
+            vec3 Vthin = -rayDir;
+            float cosTheta = abs(dot(N, Vthin));
+            float etaThin = 1.0 / max(pbrHit.ior, 1.01);
+            float fresnelThin = fresnelDielectric(cosTheta, etaThin);
+            float thinPassProb = glassProb * (1.0 - fresnelThin);
+            float thinReflectProb = glassProb * fresnelThin;
+            float thinTotalProb = thinPassProb + thinReflectProb;
+            float thinRnd = rand01();
+            if (thinPassProb > 0.01 && thinRnd < thinPassProb) {
+                throughput *= cyclesPrincipledTransmissionTint(pbrHit.baseColor) / max(thinPassProb, 0.01);
+                rayOrigin = pbrHit.worldPos + rayDir * 0.002;
+                if (bounce == 0) throughPrimarySpecularInterface = true;
+                bounce--;  // thin sheet passthrough should not burn the main bounce budget
+                continue;
+            } else if (thinReflectProb > 0.001 && thinRnd < thinTotalProb) {
+                float alphaThin = pbrHit.roughness * pbrHit.roughness;
+                vec3 Hthin;
+                if (alphaThin > 0.0005) {
+                    alphaThin = max(alphaThin, 0.001);
+                    Hthin = sampleGGX_VNDF(rand2(), Vthin, N, alphaThin);
+                } else {
+                    Hthin = N;
+                }
+                rayDir = reflect(rayDir, Hthin);
+                rayOrigin = pbrHit.worldPos + N * 0.001;
+                throughput *= vec3(1.0) / max(thinReflectProb, 0.01);
+                if (bounce == 0) { isDiffusePath = false; captureSpecularMV = true; throughPrimarySpecularInterface = true; }
+                continue;
+            }
+        }
+
+        // ---- Early delta-glass fast path ----
+        // Smooth solid glass should refract/reflect immediately instead of paying
+        // all direct-light and shadow work first. This matches the practical
+        // behavior of a delta transmission closure much better and avoids the
+        // worst performance cliff when the camera looks through simple glass.
+        bool singularSolidGlass =
+            glassProb > 0.99 &&
+            !useThinTransmissionPath &&
+            transparentProb <= 0.0 &&
+            pbrHit.alpha >= 0.999 &&
+            pbrHit.metallic <= 0.001 &&
+            (pbrHit.roughness * pbrHit.roughness) < 0.0005;
+        if (singularSolidGlass) {
+            glassBounces++;
+            if (glassBounces >= MAX_GLASS_BOUNCES) break;
+
+            vec3 Vglass = -rayDir;
+            bool enteringGlass = dot(smoothN, -rayDir) >= 0.0;
+            vec3 refractN = enteringGlass ? smoothN : -smoothN;
+            float eta = enteringGlass ? (1.0 / pbrHit.ior) : pbrHit.ior;
+            vec3 Hglass = refractN;
+
+            float cosI = abs(dot(Vglass, Hglass));
+            float fresnel = fresnelDielectric(cosI, eta);
+            vec3 refracted = refract(-Vglass, Hglass, eta);
+            bool canRefract = dot(refracted, refracted) > 0.0001;
+
+            if (!canRefract || rand01() < fresnel) {
+                rayDir = reflect(rayDir, Hglass);
+                rayOrigin = pbrHit.worldPos + refractN * 0.001;
+            } else {
+                rayDir = refracted;
+                rayOrigin = pbrHit.worldPos - refractN * 0.001;
+            }
+
+            throughput *= cyclesPrincipledTransmissionTint(pbrHit.baseColor) / max(glassProb, 0.01);
+            if (bounce == 0) { isDiffusePath = false; captureSpecularMV = true; throughPrimarySpecularInterface = true; }
+            bounce--;
+            continue;
+        }
+
+        // PSR-lite: once the camera ray crossed a primary specular interface,
+        // treat the resolved surface as a replaced-primary hit and keep the
+        // remaining work on the cheapest path we can reasonably afford.
+        bool primaryThroughSpecularFast = (bounce == 0) && throughPrimarySpecularInterface;
+
         // ---- Bounce 0: capture primary hit info (first sample only) ----
         if (bounce == 0 && sampleIdx == 0) {
             primaryHit = true;
@@ -1611,7 +1829,7 @@ void main() {
             primaryInstanceId = instanceId;     // instance index
 
             // Insert surfel at primary hit position
-            if (surfelEnabled) {
+            if (surfelEnabled && !primaryThroughSpecularFast) {
                 uint64_t surfelKey = surfelHashKey(pbrHit.worldPos, N, surfelGrid);
                 surfelInsert(surfelKey, surfelCapacity);
             }
@@ -1662,7 +1880,7 @@ void main() {
         // ---- NEE throughput early-out (skip shadow rays when contribution is negligible) ----
         float maxThroughput = max(throughput.r, max(throughput.g, throughput.b));
         bool hairFastPrimary = isHairSurface;
-        bool hairFastSecondary = isHairSurface && bounce > 0;
+        bool hairFastSecondary = isHairSurface && (bounce > 0 || primaryThroughSpecularFast);
         // Full path before the dense-groom fast path:
         // bool skipSunNEE = (bounce >= 2 && maxThroughput < 0.01);
         // bool skipLocalNEE = false;  // NEE on all bounces (Cycles behavior)
@@ -1686,7 +1904,7 @@ void main() {
         uint neeStart = 0u;
         uint neeEnd = min(cam.lightCount, 32u);
         float neeScale = 1.0;
-        if ((bounce >= 2 || hairFastPrimary) && cam.lightCount > 1u && !skipLocalNEE) {
+        if ((bounce >= 2 || hairFastPrimary || primaryThroughSpecularFast) && cam.lightCount > 1u && !skipLocalNEE) {
             uint randIdx = min(uint(rand01() * float(cam.lightCount)), cam.lightCount - 1u);
             neeStart = randIdx;
             neeEnd = randIdx + 1u;
@@ -1728,6 +1946,7 @@ void main() {
                 }
                 vec3 shadowOrigin = pbrHit.worldPos + N * shadowBias;
                 bool inShadow = false;
+                vec3 shadowFilter = vec3(1.0);
                 float shadowHitDist = 65504.0;
                 for (int shadowSkip = 0; shadowSkip < sunShadowSkipMax; shadowSkip++) {
                     rayQueryEXT shadowRQ;
@@ -1765,43 +1984,37 @@ void main() {
                     }
                     Material sMat = materialBuffer.materials[sMatIdx];
 
-                    if ((sMat.flags & 3u) == 0u) {
-                        inShadow = true; // Opaque (no alpha test, no transmission)
+                    bool sNeedsShadowTransparency =
+                        (sMat.flags & (1u | MAT_FLAG_LIGHTPATH_TRANSPARENT)) != 0u || sMat.multB > 0.0;
+                    if (!sNeedsShadowTransparency) {
+                        inShadow = true; // Opaque for shadow rays (Cycles-like: transmission alone is not transparent shadow)
                         shadowHitDist = sHitT;
                         break;
                     }
 
-                    // Transmission (Glass): let shadow ray pass through
-                    if ((sMat.flags & 2u) != 0u || (sMat.flags & 4u) != 0u) {
-                        shadowOrigin = shadowOrigin + sunDir * (sHitT + 0.004);
-                        continue;
-                    }
-
-                    // Sample alpha at shadow hit
                     vec2 sBary2 = rayQueryGetIntersectionBarycentricsEXT(shadowRQ, true);
                     vec3 sBary = vec3(1.0 - sBary2.x - sBary2.y, sBary2.x, sBary2.y);
-                    Indices sIdx = Indices(sGeo.indexBufferAddress);
-                    UVs sUVs = UVs(sGeo.uvBufferAddress);
-                    uint si0 = sIdx.i[sPrimId * 3 + 0];
-                    uint si1 = sIdx.i[sPrimId * 3 + 1];
-                    uint si2 = sIdx.i[sPrimId * 3 + 2];
-                    vec2 sUV = vec2(sUVs.uv[si0*2], 1.0 - sUVs.uv[si0*2+1]) * sBary.x
-                             + vec2(sUVs.uv[si1*2], 1.0 - sUVs.uv[si1*2+1]) * sBary.y
-                             + vec2(sUVs.uv[si2*2], 1.0 - sUVs.uv[si2*2+1]) * sBary.z;
+                    mat4x3 sOTW = rayQueryGetIntersectionObjectToWorldEXT(shadowRQ, true);
+                    uint sInstanceId = uint(rayQueryGetIntersectionInstanceIdEXT(shadowRQ, true));
+                    vec3 sTrans = evaluateShadowMaterialTransmittance(
+                        sMat, sMatIdx, sGeo, sPrimId, sBary, sOTW, shadowDir, sInstanceId
+                    );
 
-                    float sAlpha = sMat.multG;
-                    if (sMat.diffuseTexIndex != 0xFFFFFFFFu) {
-                        sAlpha *= texture(textures[nonuniformEXT(sMat.diffuseTexIndex)], sUV).a;
-                    }
-
-                    if (sAlpha >= sMat.alphaRef) {
-                        inShadow = true; // Opaque enough
+                    if (max(max(sTrans.r, sTrans.g), sTrans.b) <= 0.001) {
+                        inShadow = true;
                         shadowHitDist = sHitT;
                         break;
                     }
 
-                    // Skip through — restart from behind this hit
-                    shadowOrigin += sunDir * (sHitT + 0.002);
+                    shadowFilter *= sTrans;
+                    if (max(max(shadowFilter.r, shadowFilter.g), shadowFilter.b) <= 0.001) {
+                        inShadow = true;
+                        shadowHitDist = sHitT;
+                        break;
+                    }
+
+                    // Skip through — restart from behind this hit with accumulated tint.
+                    shadowOrigin += shadowDir * (sHitT + 0.002);
                 }
 
                 // Compute direct light contribution (ALWAYS, regardless of shadow)
@@ -1831,14 +2044,14 @@ void main() {
                 } else {
                     evaluateCookTorrance(
                         N, V, sunDir, pbrHit.baseColor, pbrHit.roughness,
-                        pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior,
+                        pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior, pbrHit.transmission,
                         diffContrib, specContrib
                     );
                 }
 
                 if (bounce == 0) {
                     // Always apply shadow directly (works for both RR and NRD modes)
-                    float shadow = inShadow ? 0.0 : 1.0;
+                    vec3 shadow = inShadow ? vec3(0.0) : shadowFilter;
                     diffuseRadiance += clampRadiance(diffContrib * sunRadiance * throughput * shadow);
                     specularRadiance += clampRadiance(specContrib * sunRadiance * throughput * shadow);
 
@@ -1852,7 +2065,7 @@ void main() {
                     }
                 } else {
                     // Indirect bounces: apply shadow directly (SIGMA only handles primary)
-                    float shadow = inShadow ? 0.0 : 1.0;
+                    vec3 shadow = inShadow ? vec3(0.0) : shadowFilter;
                     vec3 directLight = clampRadiance((diffContrib + specContrib) * sunRadiance * shadow);
                     if (isDiffusePath) {
                         diffuseRadiance += directLight * throughput * giIntensity;
@@ -1871,7 +2084,7 @@ void main() {
         // ReSTIR DI: reservoir-based light sampling (opt-in via UI toggle)
         // Better for scenes with many lights (16+), may cause splotches with few lights
         bool restirEnabled = (cam.lightPad2 >> 1u) != 0u;  // bit 1 of lightPad2
-        if (restirEnabled && !skipLocalNEE && bounce == 0 && cam.lightCount > 0u && !isHairSurface) {
+        if (restirEnabled && !skipLocalNEE && bounce == 0 && cam.lightCount > 0u && !isHairSurface && !primaryThroughSpecularFast) {
             DIReservoir reservoir = emptyDIReservoir();
             vec3 V = -rayDir;
             uint localRng = rngState;
@@ -2020,6 +2233,7 @@ void main() {
                 // Shadow ray
                 vec3 fShadowOrigin = pbrHit.worldPos + N * shadowBias;
                 bool fInShadow = false;
+                vec3 fShadowFilter = vec3(1.0);
                 for (int fShadowSkip = 0; fShadowSkip < 4; fShadowSkip++) {
                     rayQueryEXT fShadowRQ;
                     rayQueryInitializeEXT(fShadowRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
@@ -2044,8 +2258,36 @@ void main() {
                         fShadowOrigin += fL * (fHitT + 0.01);
                         continue;
                     }
-                    fInShadow = true;
-                    break;
+                    uint fMatIdx = 0u;
+                    if (fGeo.primMaterialBufferAddress != 0u) {
+                        PrimMaterials fPM = PrimMaterials(fGeo.primMaterialBufferAddress);
+                        fMatIdx = fPM.m[fPrimId];
+                    }
+                    Material fMat = materialBuffer.materials[fMatIdx];
+                    bool fNeedsShadowTransparency =
+                        (fMat.flags & (1u | MAT_FLAG_LIGHTPATH_TRANSPARENT)) != 0u || fMat.multB > 0.0;
+                    if (!fNeedsShadowTransparency) {
+                        fInShadow = true;
+                        break;
+                    }
+
+                    vec2 fBary2 = rayQueryGetIntersectionBarycentricsEXT(fShadowRQ, true);
+                    vec3 fBary = vec3(1.0 - fBary2.x - fBary2.y, fBary2.x, fBary2.y);
+                    mat4x3 fOTW = rayQueryGetIntersectionObjectToWorldEXT(fShadowRQ, true);
+                    uint fInstanceId = uint(rayQueryGetIntersectionInstanceIdEXT(fShadowRQ, true));
+                    vec3 fTrans = evaluateShadowMaterialTransmittance(
+                        fMat, fMatIdx, fGeo, fPrimId, fBary, fOTW, fL, fInstanceId
+                    );
+                    if (max(max(fTrans.r, fTrans.g), fTrans.b) <= 0.001) {
+                        fInShadow = true;
+                        break;
+                    }
+                    fShadowFilter *= fTrans;
+                    if (max(max(fShadowFilter.r, fShadowFilter.g), fShadowFilter.b) <= 0.001) {
+                        fInShadow = true;
+                        break;
+                    }
+                    fShadowOrigin += fL * (fHitT + 0.002);
                 }
 
                 if (!fInShadow) {
@@ -2092,13 +2334,13 @@ void main() {
                             fSpecC = vec3(0.0);
                         }
                     } else {
-                        evaluateCookTorrance(N, V, fL, pbrHit.baseColor, pbrHit.roughness,
-                            pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior, fDiffC, fSpecC);
+                            evaluateCookTorrance(N, V, fL, pbrHit.baseColor, pbrHit.roughness,
+                            pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior, pbrHit.transmission, fDiffC, fSpecC);
                     }
 
-                    vec3 contribution = clampRadiance((fDiffC + fSpecC) * fRadiance * W);
-                    diffuseRadiance += clampRadiance(fDiffC * fRadiance * W * throughput);
-                    specularRadiance += clampRadiance(fSpecC * fRadiance * W * throughput);
+                    vec3 contribution = clampRadiance((fDiffC + fSpecC) * fRadiance * W * fShadowFilter);
+                    diffuseRadiance += clampRadiance(fDiffC * fRadiance * W * throughput * fShadowFilter);
+                    specularRadiance += clampRadiance(fSpecC * fRadiance * W * throughput * fShadowFilter);
                 }
             }
 
@@ -2219,6 +2461,7 @@ void main() {
             // Shadow ray to jittered target (skip glass surfaces)
             vec3 ptShadowOrigin = pbrHit.worldPos + N * shadowBias;
             bool inShadow = false;
+            vec3 shadowFilter = vec3(1.0);
             for (int ptShadowSkip = 0; ptShadowSkip < 16; ptShadowSkip++) {
                 rayQueryEXT shadowRQ;
                 rayQueryInitializeEXT(shadowRQ, topLevelAS,
@@ -2251,13 +2494,30 @@ void main() {
                     ptsMatIdx = ptsPM.m[ptsPrimId];
                 }
                 Material ptsMat = materialBuffer.materials[ptsMatIdx];
-                if ((ptsMat.flags & 2u) != 0u || (ptsMat.flags & 4u) != 0u) {
-                    // Glass or volume — skip and continue shadow ray
-                    ptShadowOrigin = ptShadowOrigin + shadowDir * (ptsHitT + 0.004);
-                    continue;
+                bool ptsNeedsShadowTransparency =
+                    (ptsMat.flags & (1u | MAT_FLAG_LIGHTPATH_TRANSPARENT)) != 0u || ptsMat.multB > 0.0;
+                if (!ptsNeedsShadowTransparency) {
+                    inShadow = true;
+                    break;
                 }
-                inShadow = true;
-                break;
+
+                vec2 ptsBary2 = rayQueryGetIntersectionBarycentricsEXT(shadowRQ, true);
+                vec3 ptsBary = vec3(1.0 - ptsBary2.x - ptsBary2.y, ptsBary2.x, ptsBary2.y);
+                mat4x3 ptsOTW = rayQueryGetIntersectionObjectToWorldEXT(shadowRQ, true);
+                uint ptsInstanceId = uint(rayQueryGetIntersectionInstanceIdEXT(shadowRQ, true));
+                vec3 ptsTrans = evaluateShadowMaterialTransmittance(
+                    ptsMat, ptsMatIdx, ptsGeo, ptsPrimId, ptsBary, ptsOTW, shadowDir, ptsInstanceId
+                );
+                if (max(max(ptsTrans.r, ptsTrans.g), ptsTrans.b) <= 0.001) {
+                    inShadow = true;
+                    break;
+                }
+                shadowFilter *= ptsTrans;
+                if (max(max(shadowFilter.r, shadowFilter.g), shadowFilter.b) <= 0.001) {
+                    inShadow = true;
+                    break;
+                }
+                ptShadowOrigin = ptShadowOrigin + shadowDir * (ptsHitT + 0.004);
             }
 
             // BRDF evaluation: area lights use direction to sampled point,
@@ -2284,12 +2544,12 @@ void main() {
                 }
             } else {
                 evaluateCookTorrance(N, V, brdfL, pbrHit.baseColor, pbrHit.roughness,
-                                     pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior,
+                                     pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior, pbrHit.transmission,
                                      diffC, specC);
             }
 
             vec3 lightRadiance = lightColor * lightInt * attenuation;
-            float shadow = inShadow ? 0.0 : 1.0;
+            vec3 shadow = inShadow ? vec3(0.0) : shadowFilter;
 
             if (bounce == 0) {
                 // Point lights: apply shadow directly (SIGMA only handles sun)
@@ -2307,7 +2567,7 @@ void main() {
 
         // ---- NEE: Emissive triangle lights (MIS, bounce 0-1 only) ----
         uint emissiveTriCount = cam.lightPad0;
-        if (!skipLocalNEE && emissiveTriCount > 0u) {
+        if (!skipLocalNEE && emissiveTriCount > 0u && !primaryThroughSpecularFast) {
             EmissiveSample eSample = sampleEmissiveTriangle(emissiveTriCount, rand01(), rand2());
             if (eSample.pdf > 0.0) {
                 vec3 toEmissive = eSample.position - pbrHit.worldPos;
@@ -2321,6 +2581,7 @@ void main() {
                     // Shadow ray to emissive surface (skip glass)
                     vec3 eShadowOrigin = pbrHit.worldPos + N * shadowBias;
                     bool eInShadow = false;
+                    vec3 eShadowFilter = vec3(1.0);
                     for (int eShadowSkip = 0; eShadowSkip < 16; eShadowSkip++) {
                         rayQueryEXT eShadowRQ;
                         rayQueryInitializeEXT(eShadowRQ, topLevelAS,
@@ -2352,12 +2613,29 @@ void main() {
                             eMatIdx = ePM.m[ePrimId];
                         }
                         Material eMat = materialBuffer.materials[eMatIdx];
-                        if ((eMat.flags & 2u) != 0u || (eMat.flags & 4u) != 0u) {
-                            eShadowOrigin = eShadowOrigin + eDir * (eHitT + 0.004);
-                            continue;
+                        bool eNeedsShadowTransparency =
+                            (eMat.flags & (1u | MAT_FLAG_LIGHTPATH_TRANSPARENT)) != 0u || eMat.multB > 0.0;
+                        if (!eNeedsShadowTransparency) {
+                            eInShadow = true;
+                            break;
                         }
-                        eInShadow = true;
-                        break;
+                        vec2 eBary2 = rayQueryGetIntersectionBarycentricsEXT(eShadowRQ, true);
+                        vec3 eBary = vec3(1.0 - eBary2.x - eBary2.y, eBary2.x, eBary2.y);
+                        mat4x3 eOTW = rayQueryGetIntersectionObjectToWorldEXT(eShadowRQ, true);
+                        uint eInstanceId = uint(rayQueryGetIntersectionInstanceIdEXT(eShadowRQ, true));
+                        vec3 eTrans = evaluateShadowMaterialTransmittance(
+                            eMat, eMatIdx, eGeo, ePrimId, eBary, eOTW, eDir, eInstanceId
+                        );
+                        if (max(max(eTrans.r, eTrans.g), eTrans.b) <= 0.001) {
+                            eInShadow = true;
+                            break;
+                        }
+                        eShadowFilter *= eTrans;
+                        if (max(max(eShadowFilter.r, eShadowFilter.g), eShadowFilter.b) <= 0.001) {
+                            eInShadow = true;
+                            break;
+                        }
+                        eShadowOrigin = eShadowOrigin + eDir * (eHitT + 0.004);
                     }
 
                     if (!eInShadow) {
@@ -2383,7 +2661,7 @@ void main() {
                             }
                         } else {
                             evaluateCookTorrance(N, V, eDir, pbrHit.baseColor, pbrHit.roughness,
-                                                 pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior,
+                                                 pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior, pbrHit.transmission,
                                                  eDiffC, eSpecC);
                         }
 
@@ -2396,8 +2674,8 @@ void main() {
                         float lightPdf = eSample.pdf * eDist * eDist / eCosTheta;
                         float misWeight = (lightPdf * lightPdf) / (lightPdf * lightPdf + bsdfPdf * bsdfPdf + 1e-8);
 
-                        vec3 eDiffContrib = clampRadiance(eDiffC * eRadiance * misWeight / max(eSample.pdf, 1e-6));
-                        vec3 eSpecContrib = clampRadiance(eSpecC * eRadiance * misWeight / max(eSample.pdf, 1e-6));
+                        vec3 eDiffContrib = clampRadiance(eDiffC * eRadiance * misWeight / max(eSample.pdf, 1e-6) * eShadowFilter);
+                        vec3 eSpecContrib = clampRadiance(eSpecC * eRadiance * misWeight / max(eSample.pdf, 1e-6) * eShadowFilter);
 
                         if (bounce == 0) {
                             diffuseRadiance += clampRadiance(eDiffContrib * throughput);
@@ -2435,7 +2713,7 @@ void main() {
         }
 
         // ── SHARC update + Path Guiding recording ──
-        if (sharcEnabled && sharcUpdatePixel) {
+        if (sharcEnabled && sharcUpdatePixel && !primaryThroughSpecularFast) {
             vec3 directLighting = (diffuseRadiance + specularRadiance) - preBounceRadiance;
             if (any(isnan(directLighting)) || any(isinf(directLighting)))
                 directLighting = vec3(0.0);
@@ -2460,7 +2738,7 @@ void main() {
         }
 
         // ---- Surfel update: trace 4 hemisphere rays for indirect irradiance ----
-        if (surfelEnabled && bounce == 0 && surfelIsUpdatePixel(pixel, frameIndex)) {
+        if (surfelEnabled && bounce == 0 && !primaryThroughSpecularFast && surfelIsUpdatePixel(pixel, frameIndex)) {
             uint64_t sKey = surfelHashKey(pbrHit.worldPos, N, surfelGrid);
             uint sSlot = surfelFind(sKey, surfelCapacity);
             if (sSlot != 0xFFFFFFFFu) {
@@ -2542,8 +2820,8 @@ void main() {
         //   P(glass refraction)    = (1 - metallic) * transmission
         //   P(diffuse)             = (1 - metallic) * (1 - transmission)
         // Stochastic lobe selection: if rand < metallic → skip glass, do metallic BRDF.
-        float glassProb = (1.0 - pbrHit.metallic) * pbrHit.transmission;
-        if (glassProb > 0.01 && rand01() < glassProb) {
+        vec3 V = -rayDir;
+        if (glassProb > 0.01 && !useThinTransmissionPath && rand01() < glassProb) {
             glassBounces++;
             if (glassBounces >= MAX_GLASS_BOUNCES) break;
 
@@ -2557,7 +2835,6 @@ void main() {
             float alpha = pbrHit.roughness * pbrHit.roughness;
 
             // Sample microfacet normal (GGX) for rough glass
-            vec3 V = -rayDir;
             vec3 H;
             bool singularGlass = (alpha < 0.0005);
             if (!singularGlass && alpha > 0.0) {
@@ -2591,14 +2868,13 @@ void main() {
                 rayDir = refracted;
                 rayOrigin = pbrHit.worldPos - refractN * 0.001;
             }
-            throughput *= pbrHit.baseColor / max(glassProb, 0.01);  // MIS weight for lobe selection
+            throughput *= cyclesPrincipledTransmissionTint(pbrHit.baseColor) / max(glassProb, 0.01);  // Cycles Principled transmission tint
             if (bounce == 0) { isDiffusePath = false; captureSpecularMV = true; }
             bounce--;  // glass doesn't count against main bounce budget
             continue;
         }
 
         // ---- Sample BRDF lobe ----
-        vec3 V = -rayDir;
         float NdotV = max(dot(N, V), 0.001);
 
         // F0 from IOR for lobe selection
@@ -2682,6 +2958,9 @@ void main() {
         }
 
         bool chooseDiffuse = (rand01() > specWeight);
+        float diffuseWeight = (1.0 - pbrHit.metallic) * (1.0 - pbrHit.transmission);
+        float dielectricSpecWeight = (1.0 - pbrHit.metallic) * (1.0 - pbrHit.transmission);
+        float metalSpecWeight = pbrHit.metallic;
 
         if (chooseDiffuse && pbrHit.metallic < 1.0) {
             // Diffuse lobe — with path guiding when available
@@ -2701,7 +2980,7 @@ void main() {
                         // MIS: weight the guided sample against cosine hemisphere
                         float cosinePdf = max(dot(newDir, N), 0.0) * INV_PI;
                         float misWeight = guideMISWeight(cosinePdf, guidePdf, 0.5);
-                        throughput *= pbrHit.baseColor * (1.0 - pbrHit.metallic) * misWeight;
+                        throughput *= pbrHit.baseColor * diffuseWeight * misWeight;
                         useGuide = true;
                     }
                 }
@@ -2710,7 +2989,7 @@ void main() {
             if (!useGuide) {
                 // Standard cosine hemisphere sampling
                 newDir = sampleCosineHemisphere(rand2(), N);
-                throughput *= pbrHit.baseColor * (1.0 - pbrHit.metallic);
+                throughput *= pbrHit.baseColor * diffuseWeight;
             }
 
             rayDir = newDir;
@@ -2732,10 +3011,12 @@ void main() {
             // We do NOT divide by lobe selection probability (specWeight) because
             // that cancels the Fresnel tint and creates overly bright specular
             // for dark materials (both metals and dielectrics).
-            vec3 Fw = fresnelSchlick(VdotH, F0);
+            vec3 dielectricF0 = vec3(f0_dielectric * pbrHit.specularLevel * 2.0);
+            vec3 dielectricFw = fresnelSchlick(VdotH, dielectricF0) * dielectricSpecWeight;
+            vec3 metalFw = fresnelSchlick(VdotH, pbrHit.baseColor) * metalSpecWeight;
             float G2 = SmithG2(NdotL, NdotV, alpha);
             float G1 = SmithG1(NdotV, alpha);
-            throughput *= Fw * (G2 / max(G1, 0.001));
+            throughput *= (dielectricFw + metalFw) * (G2 / max(G1, 0.001));
 
             rayDir = newDir;
             if (bounce == 0) { isDiffusePath = false; captureSpecularMV = true; }

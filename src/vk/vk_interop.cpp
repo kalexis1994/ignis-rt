@@ -488,6 +488,7 @@ typedef uint64_t GLuint64;
 #define GL_BLEND                 0x0BE2
 #define GL_DEPTH_TEST            0x0B71
 #define GL_SCISSOR_TEST          0x0C11
+#define GL_FRAMEBUFFER_SRGB      0x8DB9
 #define GL_TRIANGLES             0x0004
 #define GL_FRAGMENT_SHADER       0x8B30
 #define GL_VERTEX_SHADER         0x8B31
@@ -809,11 +810,16 @@ void Interop::DrawGL(uint32_t viewportW, uint32_t viewportH) {
     GLboolean prevBlend = gl.IsEnabled(GL_BLEND);
     GLboolean prevDepthTest = gl.IsEnabled(GL_DEPTH_TEST);
     GLboolean prevScissorTest = gl.IsEnabled(GL_SCISSOR_TEST);
+    GLboolean prevFramebufferSRGB = gl.IsEnabled(GL_FRAMEBUFFER_SRGB);
 
     // Set state for fullscreen draw
     gl.Disable(GL_BLEND);
     gl.Disable(GL_DEPTH_TEST);
     gl.Disable(GL_SCISSOR_TEST);
+    // The interop texture already contains display-ready SDR values. If Blender's
+    // viewport context keeps GL_FRAMEBUFFER_SRGB enabled, OpenGL encodes again on
+    // framebuffer write and the image looks washed out / overly white.
+    gl.Disable(GL_FRAMEBUFFER_SRGB);
 
     // Draw fullscreen triangle — read from the COMPLETED frame (readIdx)
     uint32_t readIdx = 1 - writeIdx_;
@@ -833,6 +839,7 @@ void Interop::DrawGL(uint32_t viewportW, uint32_t viewportH) {
     if (prevBlend) gl.Enable(GL_BLEND); else gl.Disable(GL_BLEND);
     if (prevDepthTest) gl.Enable(GL_DEPTH_TEST); else gl.Disable(GL_DEPTH_TEST);
     if (prevScissorTest) gl.Enable(GL_SCISSOR_TEST); else gl.Disable(GL_SCISSOR_TEST);
+    if (prevFramebufferSRGB) gl.Enable(GL_FRAMEBUFFER_SRGB); else gl.Disable(GL_FRAMEBUFFER_SRGB);
 }
 
 void Interop::ShutdownGL() {

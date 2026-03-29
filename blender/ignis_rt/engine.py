@@ -70,62 +70,279 @@ def _log_close():
         _log_file = None
 
 
-def _bake_view_transform_lut(view_transform_name):
-    """Bake ANY Blender view transform into a .cube LUT file using OCIO.
+_BRADFORD_M = np.array(
+    (
+        (0.8951, 0.2664, -0.1614),
+        (-0.7502, 1.7135, 0.0367),
+        (0.0389, -0.0685, 1.0296),
+    ),
+    dtype=np.float64,
+)
+_BRADFORD_M_INV = np.linalg.inv(_BRADFORD_M)
+def _curve_mapping_signature(curve_mapping):
+    """Hash Blender's RGB curves from evaluated samples instead of control points."""
+    curve_mapping.initialize()
+    probe_x = (-4.0, -2.0, -1.0, -0.5, 0.0, 0.125, 0.25, 0.5, 0.75, 1.0, 2.0, 4.0)
+    black = tuple(round(float(v), 7) for v in curve_mapping.black_level[:3])
+    white = tuple(round(float(v), 7) for v in curve_mapping.white_level[:3])
+    rgb_curves = curve_mapping.curves[:3]
+    curves = []
+    for curve in rgb_curves:
+        samples = []
+        for x in probe_x:
+            samples.append(round(float(curve_mapping.evaluate(curve, x)), 7))
+        curves.append(tuple(samples))
+    return (black, white, tuple(curves))
 
-    Reads the active display device (sRGB, Display P3, etc.) and view transform
-    (AgX, Filmic, Standard, etc.) from Blender's Color Management, and bakes
-    the full OCIO pipeline into a 33³ 3D LUT at a known path.
+
+def _apply_curve_mapping_rgb(curve_mapping, color):
+    """Match Blender's pre-display RGB curve evaluation.
+
+    Blender reference:
+    - source/blender/imbuf/opencolorio/shaders/gpu_shader_display_transform_frag.glsl
+      `curvemapping_evaluate_premulRGBF()`
+    """
+    curve_mapping.initialize()
+    black = np.array(curve_mapping.black_level[:3], dtype=np.float64)
+    white = np.array(curve_mapping.white_level[:3], dtype=np.float64)
+    bwmul = 1.0 / np.maximum(white - black, 1e-20)
+    premul = (np.asarray(color, dtype=np.float64) - black) * bwmul
+    rgb_curves = curve_mapping.curves[:3]
+    return np.array(
+        [float(curve_mapping.evaluate(rgb_curves[i], float(premul[i]))) for i in range(3)],
+        dtype=np.float64,
+    )
+
+
+def _ocio_matrix3x3(config, src_name, dst_name):
+    """Extract a linear 3x3 matrix from OCIO by transforming the RGB basis."""
+    cpu = config.getProcessor(src_name, dst_name).getDefaultCPUProcessor()
+    cols = []
+    for axis in ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]):
+        cols.append(np.array(cpu.applyRGB(axis), dtype=np.float64))
+    return np.column_stack(cols)
+
+
+def _chromatic_adaptation_matrix(source_xyz, target_xyz):
+    """Bradford chromatic adaptation.
+
+    Blender reference:
+    - source/blender/blenlib/intern/math_color.cc `chromatic_adaption_matrix()`
+    """
+    src_lms = _BRADFORD_M @ np.asarray(source_xyz, dtype=np.float64)
+    dst_lms = _BRADFORD_M @ np.asarray(target_xyz, dtype=np.float64)
+    scale = np.diag(dst_lms / np.maximum(src_lms, 1e-20))
+    return _BRADFORD_M_INV @ scale @ _BRADFORD_M
+
+
+def _build_scene_linear_matrix(config, view_settings):
+    """Match Blender's scene-linear exposure + white-balance stage.
+
+    Blender references:
+    - source/blender/imbuf/intern/colormanagement.cc
+      `display_parameters.scale = powf(2.0f, exposure)`
+    - source/blender/imbuf/opencolorio/intern/libocio/libocio_display_processor.cc
+      `create_ocio_display_processor()` applies exposure/white balance before display transform
+    - source/blender/imbuf/opencolorio/intern/white_point.cc
+      `calculate_white_point_matrix()`
+    """
+    scale = 2.0 ** float(view_settings.exposure)
+    matrix = np.identity(3, dtype=np.float64) * scale
+
+    if getattr(view_settings, "use_white_balance", False):
+        scene_to_xyz = _ocio_matrix3x3(config, "scene_linear", "XYZ")
+        xyz_to_scene = _ocio_matrix3x3(config, "XYZ", "scene_linear")
+        source_scene_wp = np.array(view_settings.white_balance_whitepoint[:3], dtype=np.float64)
+        source_xyz = scene_to_xyz @ source_scene_wp
+        target_xyz = scene_to_xyz @ np.array((1.0, 1.0, 1.0), dtype=np.float64)
+        matrix = matrix @ (xyz_to_scene @ _chromatic_adaptation_matrix(source_xyz, target_xyz) @ scene_to_xyz)
+
+    return matrix
+
+
+def _build_display_processor(config, display_name, view_settings, from_colorspace=None):
+    """Create the OCIO display processor for Ignis' viewport path.
+
+    Blender reference:
+    - source/blender/imbuf/opencolorio/intern/libocio/libocio_display_processor.cc
+      `create_ocio_display_transform()` and `create_ocio_display_processor()`
     """
     import PyOpenColorIO as ocio
-    import os
+
+    group = ocio.GroupTransform()
+    source_colorspace = from_colorspace or ocio.ROLE_SCENE_LINEAR
+    use_look = False
+    look_name = getattr(view_settings, "look", "")
+    if look_name and look_name != "None":
+        try:
+            look_output = None
+            if hasattr(ocio.LookTransform, "GetLooksResultColorSpace"):
+                look_output = ocio.LookTransform.GetLooksResultColorSpace(
+                    config, config.getCurrentContext(), look_name
+                )
+
+            view_colorspace_name = config.getDisplayViewColorSpaceName(
+                display_name, view_settings.view_transform
+            )
+            view_colorspace = config.getColorSpace(view_colorspace_name) if view_colorspace_name else None
+
+            lt = ocio.LookTransform()
+            lt.setSrc(source_colorspace)
+            # Match Blender's create_ocio_display_transform():
+            # - source/blender/imbuf/opencolorio/intern/libocio/libocio_display_processor.cc
+            #   `create_ocio_display_transform()`
+            # For data views, Blender skips the color-space conversion around the look.
+            if view_colorspace is not None and hasattr(view_colorspace, "isData") and view_colorspace.isData():
+                lt.setDst(source_colorspace)
+            elif look_output:
+                lt.setDst(look_output)
+                source_colorspace = look_output
+            else:
+                lt.setDst(source_colorspace)
+            lt.setLooks(look_name)
+            group.appendTransform(lt)
+            use_look = bool(look_output)
+        except Exception as exc:
+            _log(f"Skipping OCIO look '{look_name}': {exc}")
+
+    dvt = ocio.DisplayViewTransform()
+    dvt.setSrc(source_colorspace)
+    dvt.setDisplay(display_name)
+    dvt.setView(view_settings.view_transform)
+    if hasattr(dvt, "setLooksBypass"):
+        dvt.setLooksBypass(use_look)
+    group.appendTransform(dvt)
+
+    gamma = float(getattr(view_settings, "gamma", 1.0))
+    if abs(gamma - 1.0) > 1e-6:
+        exponent = ocio.ExponentTransform()
+        # Blender internally passes exponent = 1 / gamma to the display processor.
+        # Blender references:
+        # - source/blender/imbuf/intern/colormanagement.cc
+        #   IMB_colormanagement_setup_glsl_draw(): display_parameters.exponent = 1.0f / gamma
+        # - source/blender/imbuf/intern/colormanagement.cc
+        #   get_display_buffer_processor(): display_parameters.exponent = 1.0f / gamma
+        # - source/blender/imbuf/opencolorio/intern/libocio/libocio_display_processor.cc
+        #   create_ocio_display_processor(): et->setValue(display_parameters.exponent)
+        exp = 1.0 / max(gamma, 1e-6)
+        exponent.setValue((exp, exp, exp, 1.0))
+        group.appendTransform(exponent)
+
+    # Blender's display processor can optionally append display_as_extended_srgb()
+    # when writing to its own graphics buffer:
+    # - source/blender/imbuf/opencolorio/intern/libocio/libocio_display_processor.cc
+    #   `create_ocio_display_processor()`
+    # - source/blender/imbuf/opencolorio/intern/libocio/libocio_display_processor.cc
+    #   `display_as_extended_srgb()`
+    # Ignis already presents through its own Vulkan/OpenGL interop quad, so baking
+    # that extra graphics-buffer emulation here over-encodes the result.
+
+    return config.getProcessor(group).getDefaultCPUProcessor()
+
+
+def _bake_view_transform_lut(scene):
+    """Bake Blender's exact SDR display transform into Runtime_LUT.cube.
+
+    The LUT includes:
+    - RGB curves
+    - exposure
+    - white balance
+    - working-space-aware OCIO display/view/look
+    - gamma
+
+    Blender references:
+    - source/blender/editors/interface/templates/interface_template_color_management.cc
+      `template_colormanaged_view_settings()`
+    - source/blender/imbuf/opencolorio/shaders/gpu_shader_display_transform_frag.glsl
+      `OCIO_ProcessColor()`
+    - source/blender/imbuf/opencolorio/intern/libocio/libocio_display_processor.cc
+      `create_ocio_display_processor()`
+    - source/blender/makesrna/intern/rna_main.cc
+      `BlendFileColorspace.working_space[_interop_id]`
+    """
+    global _ignis_cm_lut_signature, _ignis_cm_lut_valid
+
+    import PyOpenColorIO as ocio
+
+    view_settings = scene.view_settings
+    display_name = scene.display_settings.display_device
+    blend_colorspace = getattr(bpy.data, "colorspace", None)
+    working_space = getattr(blend_colorspace, "working_space", "")
+    working_space_interop_id = getattr(blend_colorspace, "working_space_interop_id", "")
+    use_curves = bool(getattr(view_settings, "use_curve_mapping", False))
+    curve_sig = _curve_mapping_signature(view_settings.curve_mapping) if use_curves else None
+
+    signature = (
+        display_name,
+        view_settings.view_transform,
+        getattr(view_settings, "look", ""),
+        round(float(view_settings.exposure), 7),
+        round(float(getattr(view_settings, "gamma", 1.0)), 7),
+        bool(getattr(view_settings, "use_white_balance", False)),
+        tuple(round(float(v), 7) for v in getattr(view_settings, "white_balance_whitepoint", (1.0, 1.0, 1.0))),
+        use_curves,
+        curve_sig,
+        working_space,
+        working_space_interop_id,
+    )
+
+    if _ignis_cm_lut_valid and signature == _ignis_cm_lut_signature:
+        return True
+
     config = ocio.GetCurrentConfig()
-
-    display = bpy.context.scene.display_settings.display_device
-    _log(f"Baking LUT: view='{view_transform_name}' display='{display}'")
-
-    try:
-        transform = ocio.DisplayViewTransform()
-        transform.setSrc(ocio.ROLE_SCENE_LINEAR)
-        transform.setDisplay(display)
-        transform.setView(view_transform_name)
-        processor = config.getProcessor(transform)
-        cpu = processor.getDefaultCPUProcessor()
-    except Exception as e:
-        _log(f"OCIO processor failed: {e}")
-        raise
+    scene_linear_matrix = _build_scene_linear_matrix(config, view_settings)
+    cpu = _build_display_processor(config, display_name, view_settings)
 
     LUT_SIZE = 33
     LOG_MIN = -12.47393
     LOG_MAX = 12.52607
     LOG_RANGE = LOG_MAX - LOG_MIN
 
-    # Write to a known path that the C++ renderer will load
     from . import get_base_path
     lut_path = os.path.join(get_base_path(), "shaders", "Runtime_LUT.cube")
+    curve_mapping = view_settings.curve_mapping if use_curves else None
 
-    with open(lut_path, 'w') as f:
-        f.write(f'TITLE "{view_transform_name}_{display}"\n')
-        f.write(f'LUT_3D_SIZE {LUT_SIZE}\n')
-        f.write(f'DOMAIN_MIN 0.0 0.0 0.0\n')
-        f.write(f'DOMAIN_MAX 1.0 1.0 1.0\n\n')
-        for b in range(LUT_SIZE):
-            for g in range(LUT_SIZE):
-                for r in range(LUT_SIZE):
-                    rn = r / (LUT_SIZE - 1)
-                    gn = g / (LUT_SIZE - 1)
-                    bn = b / (LUT_SIZE - 1)
-                    r_lin = 2.0 ** (rn * LOG_RANGE + LOG_MIN)
-                    g_lin = 2.0 ** (gn * LOG_RANGE + LOG_MIN)
-                    b_lin = 2.0 ** (bn * LOG_RANGE + LOG_MIN)
-                    try:
-                        result = cpu.applyRGB([r_lin, g_lin, b_lin])
-                    except:
-                        result = [0.0, 0.0, 0.0]
-                    result = [max(0.0, min(1.0, v)) for v in result]
-                    f.write(f"{result[0]:.6f} {result[1]:.6f} {result[2]:.6f}\n")
+    _log(
+        "Baking Blender runtime LUT: "
+        f"display='{display_name}' view='{view_settings.view_transform}' look='{view_settings.look}' "
+        f"working='{working_space}' interop='{working_space_interop_id}'"
+    )
 
-    _log(f"LUT baked: {lut_path} ({LUT_SIZE}³)")
+    try:
+        with open(lut_path, "w", encoding="utf-8") as f:
+            f.write(f'TITLE "{view_settings.view_transform}_{display_name}"\n')
+            f.write(f"LUT_3D_SIZE {LUT_SIZE}\n")
+            f.write("DOMAIN_MIN 0.0 0.0 0.0\n")
+            f.write("DOMAIN_MAX 1.0 1.0 1.0\n\n")
+            for b in range(LUT_SIZE):
+                for g in range(LUT_SIZE):
+                    for r in range(LUT_SIZE):
+                        encoded = np.array(
+                            (
+                                2.0 ** ((r / (LUT_SIZE - 1)) * LOG_RANGE + LOG_MIN),
+                                2.0 ** ((g / (LUT_SIZE - 1)) * LOG_RANGE + LOG_MIN),
+                                2.0 ** ((b / (LUT_SIZE - 1)) * LOG_RANGE + LOG_MIN),
+                            ),
+                            dtype=np.float64,
+                        )
+                        if curve_mapping is not None:
+                            encoded = _apply_curve_mapping_rgb(curve_mapping, encoded)
+                        encoded = scene_linear_matrix @ encoded
+                        try:
+                            result = cpu.applyRGB(encoded.tolist())
+                        except Exception:
+                            result = (0.0, 0.0, 0.0)
+                        result = [max(0.0, min(1.0, float(v))) for v in result]
+                        f.write(f"{result[0]:.6f} {result[1]:.6f} {result[2]:.6f}\n")
+    except Exception:
+        _ignis_cm_lut_valid = False
+        _ignis_cm_lut_signature = None
+        raise
+
+    _ignis_cm_lut_signature = signature
+    _ignis_cm_lut_valid = True
+    _log(f"LUT baked: {lut_path} ({LUT_SIZE}^3)")
+    return True
 
 
 def _draw_texture_flipped(texture, w, h):
@@ -161,6 +378,42 @@ _ignis_gpu_texture = None      # Reusable GPUTexture (avoids alloc every frame)
 _ignis_frame_index = 0         # continuous frame counter
 _ignis_tex_manager = None      # Texture manager handle (opaque void*)
 _fps_times = []
+_ignis_hair_frand_tables = None
+_ignis_hair_frand_cache = {}
+_ignis_disable_tonemap_test = True
+
+
+def _get_hair_frand_scrambled(psys_seed):
+    """Cache Blender-exact particle RNG tables per particle-system seed."""
+    global _ignis_hair_frand_tables, _ignis_hair_frand_cache
+
+    psys_seed = int(psys_seed)
+    cached = _ignis_hair_frand_cache.get(psys_seed)
+    if cached is not None:
+        return cached
+
+    from . import blender_rng
+
+    if _ignis_hair_frand_tables is None:
+        _ignis_hair_frand_tables = blender_rng.generate_psys_frand_tables()
+
+    scrambled = blender_rng.generate_scrambled_table(_ignis_hair_frand_tables, psys_seed)
+    if len(_ignis_hair_frand_cache) >= 64:
+        _ignis_hair_frand_cache.clear()
+    _ignis_hair_frand_cache[psys_seed] = scrambled
+    return scrambled
+
+
+def _capture_restart_config(scene):
+    """Capture the subset of settings that require a renderer restart."""
+    try:
+        props = scene.ignis_rt
+        return {
+            "dlss_quality": int(props.dlss_quality),
+            "use_wavefront": bool(props.use_wavefront),
+        }
+    except Exception:
+        return {}
 _fps_display = 0.0
 
 # ── Incremental update flags (Cycles-style) ──
@@ -187,6 +440,8 @@ _ignis_hdri_sun = None         # sun extracted from HDRI (used as fallback when 
 _ignis_mat_name_to_index = {}  # persistent material name→index mapping for incremental uploads
 _ignis_last_draw_time = 0.0    # perf_counter of last view_draw (detect pause/resume)
 _ignis_init_config = {}        # settings snapshot at init time (detect restart-worthy changes)
+_ignis_cm_lut_signature = None # cached Blender color-management signature for Runtime_LUT.cube
+_ignis_cm_lut_valid = False    # exact OCIO LUT bake status for DLSS/DLAA path
 
 # ── Staged loading state machine ──
 LOAD_IDLE = 0          # no loading in progress
@@ -315,6 +570,7 @@ def _ignis_shutdown():
     global _ignis_last_full_upload, _ignis_instance_count
     global _fps_times, _fps_display
     global _load_stage, _ignis_last_draw_time
+    global _ignis_cm_lut_signature, _ignis_cm_lut_valid
     if _ignis_initialized:
         _log("ignis_destroy()")
         if _ignis_tex_manager is not None:
@@ -338,6 +594,8 @@ def _ignis_shutdown():
         _ignis_objkey_to_tlas = {}
         _ignis_last_full_upload = 0.0
         _ignis_instance_count = 0
+        _ignis_cm_lut_signature = None
+        _ignis_cm_lut_valid = False
         _fps_times = []
         _fps_display = 0.0
         _load_stage = LOAD_IDLE
@@ -445,15 +703,12 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         else:
             _log(" Denoiser: None")
 
-        # Snapshot settings that require full restart to change
         global _ignis_init_config
-        try:
-            _ignis_init_config = {
-                "dlss_quality": int(props.dlss_quality),
-                "use_wavefront": props.use_wavefront,
-            }
-        except Exception:
-            _ignis_init_config = {}
+        if not _ignis_init_config:
+            try:
+                _ignis_init_config = _capture_restart_config(bpy.context.scene)
+            except Exception:
+                _ignis_init_config = {}
 
         _ignis_initialized = True
         _ignis_width = width
@@ -482,7 +737,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         global _load_unique_meshes, _load_scene_instances, _load_mesh_keys, _load_mesh_idx
         global _load_materials_data, _load_mat_name_to_index, _load_textures_list, _load_obj_to_mesh_key, _load_hidden
         global _load_depsgraph
-        global _ignis_blas_handles
+        global _ignis_blas_handles, _ignis_init_config
 
         _load_stage = LOAD_EXPORT
         _load_start_time = time.perf_counter()
@@ -496,6 +751,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         _load_mat_name_to_index = None
         _load_textures_list = None
         _ignis_blas_handles = {}
+        _ignis_init_config = _capture_restart_config(depsgraph.scene_eval)
         # Destroy texture manager before clearing geometry (avoids dangling references)
         global _ignis_tex_manager
         if _ignis_tex_manager is not None:
@@ -521,7 +777,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         global _ignis_blas_handles, _ignis_frame_index
         global _ignis_full_dirty, _ignis_materials_dirty, _ignis_tlas_dirty, _ignis_objects_dirty
         global _ignis_changed_objects, _ignis_cached_tlas, _ignis_objkey_to_tlas
-        global _ignis_last_full_upload, _ignis_instance_count, _ignis_tex_manager
+        global _ignis_last_full_upload, _ignis_instance_count, _ignis_tex_manager, _ignis_last_draw_time
         global _ignis_last_tex_names
 
         # Yield frame: skip one frame of work to let the spinner animate
@@ -559,11 +815,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 dll_wrapper.set_int("dlss_enabled", 1)
                 dll_wrapper.set_int("dlss_rr_enabled", 1)
                 # Bake active view transform LUT using OCIO (supports ALL transforms + displays)
-                _vt = bpy.context.scene.view_settings.view_transform
                 try:
-                    _bake_view_transform_lut(_vt)
+                    _bake_view_transform_lut(bpy.context.scene)
                 except Exception as _e:
-                    _log(f"LUT bake failed for '{_vt}': {_e}")
+                    _log(f"Runtime LUT bake failed during init: {_e}")
                 try:
                     props = bpy.context.scene.ignis_rt
                     dll_wrapper.set_int("dlss_quality", int(props.dlss_quality))
@@ -653,50 +908,37 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
         elif _load_stage == LOAD_MESHES:
             # ── Stage 2: Upload meshes to GPU in batches ──
-            # Each batch: BLAS build + attribute upload (GPU-bound)
+            # Each batch: BLAS build + attribute upload (GPU-bound).
+            # Use a small time budget instead of a fixed 1-mesh batch so the
+            # staged load stays responsive without dragging total load time.
             total = len(_load_mesh_keys)
-            batch_size = 1  # 1 mesh per frame for smooth spinner
-            end = min(_load_mesh_idx + batch_size, total)
-            _load_status = f"Building BVH... {end}/{total}"
-            _load_progress = 0.1 + 0.4 * (end / max(total, 1))
+            batch_start = _load_mesh_idx
+            batch_budget_sec = 0.050 if total > 8 else 0.100
+            batch_max_items = 8
+            batch_t0 = time.perf_counter()
 
-            for i in range(_load_mesh_idx, end):
+            while _load_mesh_idx < total and (_load_mesh_idx - batch_start) < batch_max_items:
+                i = _load_mesh_idx
                 mesh_key = _load_mesh_keys[i]
                 m = _load_unique_meshes[mesh_key]
                 try:
                     if m.get("gpu_hair"):
                         # ── GPU hair generation ──
                         try:
-                            cam_pos = (0, 0, 5)
-                            try:
-                                rd = bpy.context.region_data
-                                if rd:
-                                    cam_pos = tuple(rd.view_matrix.inverted().translation)
-                            except Exception:
-                                pass
+                            hair_t0 = time.perf_counter()
                             child_nbr = max(int(m.get("child_nbr", 0)), 0)
                             render_parents = bool(m.get("use_parent_particles", False) or child_nbr == 0)
                             precomputed_strands = bool(m.get("precomputed_strands", False))
                             n_p = m["n_parents"]
-                            pk = m["parent_keys"].reshape(-1, 3)
-                            # Estimate spacing
-                            if n_p > 10:
-                                rng_sp = np.random.RandomState(99)
-                                si = rng_sp.choice(n_p, min(100, n_p), replace=False)
-                                sample = pk[si * m["n_keys"]]  # root positions only
-                                diffs = sample[:, None, :] - pk[::m["n_keys"]][:10][None, :, :]
-                                avg_sp = float(np.median(np.sqrt((diffs*diffs).sum(axis=2).min(axis=1))))
-                            else:
-                                avg_sp = 0.01
+                            avg_sp = float(m.get("avg_spacing", 0.01))
                             n_ev = m.get("n_emitter_verts", 0)
                             n_et = m.get("n_emitter_tris", 0)
                             _log(f"  GPU hair: {n_p} strands, {m['n_keys']} keys, {child_nbr} generated children, "
                                  f"render_parents={render_parents}, emitter={n_ev}v/{n_et}t")
-                            # Generate Blender-exact frand table for this particle system
-                            from . import blender_rng
-                            _frand_tables = blender_rng.generate_psys_frand_tables()
                             _psys_seed = m.get("blender_seed", 0)
-                            _frand_scrambled = blender_rng.generate_scrambled_table(_frand_tables, _psys_seed)
+                            _frand_scrambled = None
+                            if child_nbr > 0 and not precomputed_strands:
+                                _frand_scrambled = _get_hair_frand_scrambled(_psys_seed)
                             blas = dll_wrapper.generate_hair_gpu(
                                 m["parent_keys"], n_p, m["n_keys"], child_nbr,
                                 emitter_verts=m.get("emitter_verts"),
@@ -740,7 +982,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                                     subdiv_points = (m["n_keys"] - 1) * 16 + 1 + 4  # + TIP_EXTRA
                                 tris_per_child = (subdiv_points - 1) * 4
                                 m["_gpu_tri_count"] = total_children * tris_per_child
-                                _log(f"  GPU hair OK: '{mesh_key}' → BLAS {blas} ({m['_gpu_tri_count']} tris)")
+                                _log(f"  GPU hair OK: '{mesh_key}' → BLAS {blas} ({m['_gpu_tri_count']} tris) in {time.perf_counter() - hair_t0:.2f}s")
                             else:
                                 _log(f"  GPU hair FAILED: '{mesh_key}' returned {blas}")
                         except Exception:
@@ -752,16 +994,21 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                         )
                         if blas < 0:
                             _log(f"  FAILED upload_mesh: {mesh_key}")
-                            continue
-                        _ignis_blas_handles[mesh_key] = blas
-                        dll_wrapper.upload_mesh_attributes(
-                            blas, m["normals"], m["uvs"], m["vertex_count"],
-                            m.get("vcols"),
-                        )
+                        else:
+                            _ignis_blas_handles[mesh_key] = blas
+                            dll_wrapper.upload_mesh_attributes(
+                                blas, m["normals"], m["uvs"], m["vertex_count"],
+                                m.get("vcols"),
+                            )
                 except Exception:
                     _log_exception(f"LOAD_MESHES uploading '{mesh_key}'")
+                _load_mesh_idx += 1
+                if (_load_mesh_idx - batch_start) >= 1 and (time.perf_counter() - batch_t0) >= batch_budget_sec:
+                    break
 
-            _load_mesh_idx = end
+            end = _load_mesh_idx
+            _load_status = f"Building BVH... {end}/{total}"
+            _load_progress = 0.1 + 0.4 * (end / max(total, 1))
             if _load_mesh_idx >= total:
                 _log(f"Stage MESHES: {total} uploaded, {len(_ignis_blas_handles)} success")
                 # Dump BLAS mapping with vertex fingerprints for corruption detection
@@ -1192,6 +1439,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             _ignis_objkey_to_tlas = {}
             _ignis_last_full_upload = time.perf_counter()
             _ignis_frame_index = 0
+            _ignis_last_draw_time = time.perf_counter()
 
             dt = time.perf_counter() - _load_start_time
             _log(f" Staged load: COMPLETE ({dt:.2f}s total)")
@@ -1540,6 +1788,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         global _ignis_frame_index, _ignis_full_dirty, _ignis_materials_dirty, _ignis_tlas_dirty
         global _load_stage, _ignis_instance_count, _load_start_time
         global _ignis_last_draw_time, _ignis_init_config
+        global _ignis_float_buffer, _ignis_gpu_texture
 
         region = context.region
         w, h = region.width, region.height
@@ -1556,11 +1805,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 # Check if restart-worthy settings changed while paused
                 needs_restart = False
                 try:
-                    props = context.scene.ignis_rt
-                    cur = {
-                        "dlss_quality": int(props.dlss_quality),
-                        "use_wavefront": props.use_wavefront,
-                    }
+                    cur = _capture_restart_config(context.scene)
                     if cur != _ignis_init_config:
                         changed = [k for k in cur if cur[k] != _ignis_init_config.get(k)]
                         _log(f"  Config changed: {changed} — full restart")
@@ -1963,7 +2208,6 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         if props.vsync:
             # Detect monitor refresh rate (fallback 60Hz)
             try:
-                import ctypes
                 dm = ctypes.wintypes.DEVMODE()
                 dm.dmSize = ctypes.sizeof(dm)
                 ctypes.windll.user32.EnumDisplaySettingsW(None, -1, ctypes.byref(dm))
@@ -2004,29 +2248,92 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         except Exception:
             pass
 
-        # Read exposure and tonemap from Blender's Color Management settings
-        import math as _math
+        # Keep the DLSS/DLAA tonemap path aligned with Blender's active Color Management.
         _vs = context.scene.view_settings
-        _blender_exposure = 2.0 ** _vs.exposure  # Blender uses EV stops → multiplier
-        # Map Blender view_transform to our tonemap modes
-        _vt = _vs.view_transform
-        # ALL view transforms use the runtime-baked OCIO LUT (mode 5).
-        # Raw uses mode 6 (just clamp + gamma, no tone curve).
-        _tonemap_mode = 6 if _vt == 'Raw' else 5
-        # Read "look" for contrast
-        _look = _vs.look
-        _look_contrast = 0.0
-        if 'High Contrast' in _look: _look_contrast = 0.4
-        elif 'Medium High' in _look: _look_contrast = 0.3
-        elif 'Medium Contrast' in _look: _look_contrast = 0.2
-        elif 'Medium Low' in _look: _look_contrast = 0.1
-        elif 'Low Contrast' in _look: _look_contrast = 0.0
-        elif 'Very High' in _look: _look_contrast = 0.5
+        # Match Blender viewport color management exactly:
+        # Blender exposes user-controlled view exposure/gamma in Color Management, not an
+        # extra renderer-side auto exposure stage.
+        # Blender references:
+        # - source/blender/editors/interface/templates/interface_template_color_management.cc
+        #   `template_colormanaged_view_settings()`
+        # - source/blender/imbuf/intern/colormanagement.cc
+        #   `get_display_buffer_processor()`
+        dll_wrapper.set_int("auto_exposure", 0)
+        if _ignis_disable_tonemap_test:
+            # Perf isolation path:
+            # bypass Blender LUT/OCIO tonemap and use a minimal SDR transfer only.
+            # This keeps the image visible while removing the runtime LUT path as a suspect.
+            dll_wrapper.set_float("exposure", 1.0)
+            dll_wrapper.set_int("tonemap_mode", 7)
+            dll_wrapper.set_float("saturation", 1.0)
+            dll_wrapper.set_float("contrast", 0.0)
+            if _ignis_frame_index < 3:
+                _log("Color path: TONEMAP BYPASS TEST (mode 7, LUT disabled)")
+        else:
+            _lut_ok = False
+            try:
+                _lut_ok = _bake_view_transform_lut(context.scene)
+            except Exception as _e:
+                _log(f"Runtime LUT rebake failed: {_e}")
 
-        dll_wrapper.set_float("exposure", _blender_exposure)
-        dll_wrapper.set_int("tonemap_mode", _tonemap_mode)
-        dll_wrapper.set_float("saturation", props.saturation)
-        dll_wrapper.set_float("contrast", _look_contrast)
+            _display_name = context.scene.display_settings.display_device
+            _use_exact_standard_srgb = (
+                _display_name == "sRGB"
+                and _vs.view_transform == "Standard"
+                and getattr(_vs, "look", "") in ("", "None")
+                and abs(float(getattr(_vs, "gamma", 1.0)) - 1.0) <= 1e-6
+                and not bool(getattr(_vs, "use_white_balance", False))
+                and not bool(getattr(_vs, "use_curve_mapping", False))
+            )
+
+            if _use_exact_standard_srgb:
+            # Exact Standard+sRGB fast path.
+            # Blender reference:
+            # - source/blender/imbuf/opencolorio/intern/libocio/libocio_display_processor.cc
+            #   `create_ocio_display_processor()`
+            # For Standard on the sRGB display with neutral look/gamma/white-balance/curves,
+            # the correct SDR path is scene-linear exposure followed by the sRGB transfer
+            # function, without the log-domain runtime LUT indirection.
+                dll_wrapper.set_float("exposure", 2.0 ** _vs.exposure)
+                dll_wrapper.set_int("tonemap_mode", 7)
+                # Keep Blender-exact behavior when saturation stays at 1.0, but allow the
+                # Ignis saturation slider as an optional post-display tweak.
+                dll_wrapper.set_float("saturation", props.saturation)
+                dll_wrapper.set_float("contrast", 0.0)
+                if _ignis_frame_index < 3:
+                    _log("Color path: Standard+sRGB exact (mode 7)")
+            elif _lut_ok:
+            # Exact Blender color management path:
+            # Blender's display processor already contains the full display/view/look/gamma chain.
+            # We still allow Ignis saturation as an optional post-display tweak; exact Blender
+            # matching remains the neutral default at saturation=1.0.
+            # Blender reference:
+            # - source/blender/imbuf/opencolorio/intern/libocio/libocio_display_processor.cc
+            #   create_ocio_display_processor()
+                dll_wrapper.set_float("exposure", 1.0)
+                dll_wrapper.set_int("tonemap_mode", 5)
+                dll_wrapper.set_float("saturation", props.saturation)
+                dll_wrapper.set_float("contrast", 0.0)
+                if _ignis_frame_index < 3:
+                    _log("Color path: Runtime Blender LUT (mode 5)")
+            else:
+                _blender_exposure = 2.0 ** _vs.exposure
+                _vt = _vs.view_transform
+                _tonemap_mode = 6 if _vt == 'Raw' else 0
+                _look = _vs.look
+                _look_contrast = 0.0
+                if 'High Contrast' in _look: _look_contrast = 0.4
+                elif 'Medium High' in _look: _look_contrast = 0.3
+                elif 'Medium Contrast' in _look: _look_contrast = 0.2
+                elif 'Medium Low' in _look: _look_contrast = 0.1
+                elif 'Low Contrast' in _look: _look_contrast = 0.0
+                elif 'Very High' in _look: _look_contrast = 0.5
+                dll_wrapper.set_float("exposure", _blender_exposure)
+                dll_wrapper.set_int("tonemap_mode", _tonemap_mode)
+                dll_wrapper.set_float("contrast", _look_contrast)
+                dll_wrapper.set_float("saturation", props.saturation)
+                if _ignis_frame_index < 3:
+                    _log(f"Color path: fallback tonemap mode {_tonemap_mode}")
 
         # Camera
         try:
@@ -2041,25 +2348,29 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             dll_wrapper.render_frame()
 
             # Display
+            # Keep the zero-copy interop path as the main viewport route.
+            # The experimental HDR readback path was intentionally disabled here:
+            # it forced GPU->CPU->GPU traffic plus vkQueueWaitIdle() every frame,
+            # which is too slow for interactive viewport use and was not color-stable.
+            # Blender reference for the intended exact display path:
+            # - doc/python_api/examples/bpy.types.RenderEngine.1.py `bind_display_space_shader()`
+            # A correct version must wrap a shared HDR GPU texture directly instead of readback.
             gl_ok = dll_wrapper.draw_gl(w, h)
             if not gl_ok:
-                # Use actual Vulkan render size (may differ from viewport due to min-1920 enforcement)
+                # Final fallback: legacy LDR readback of the already tonemapped interop image
                 rw = dll_wrapper.get_int("render_width") or w
                 rh = dll_wrapper.get_int("render_height") or h
                 pixel_count = rw * rh
-                # Ensure float buffer matches render size
-                global _ignis_float_buffer
                 needed = pixel_count * 4
                 if _ignis_float_buffer is None or len(_ignis_float_buffer) < needed:
                     _ignis_float_buffer = (ctypes.c_float * needed)()
                 ok = dll_wrapper.readback_float(_ignis_float_buffer, pixel_count)
                 if ok:
-                    global _ignis_gpu_texture
                     gpu_buf = gpu.types.Buffer('FLOAT', [pixel_count * 4], _ignis_float_buffer)
                     _ignis_gpu_texture = gpu.types.GPUTexture((rw, rh), format='RGBA32F', data=gpu_buf)
                     _draw_texture_flipped(_ignis_gpu_texture, w, h)
                     if _ignis_frame_index < 3:
-                        _log(f"CPU readback OK ({rw}x{rh} -> {w}x{h})")
+                        _log(f"LDR fallback readback OK ({rw}x{rh} -> {w}x{h})")
                 elif _ignis_gpu_texture is not None:
                     _draw_texture_flipped(_ignis_gpu_texture, w, h)
 
