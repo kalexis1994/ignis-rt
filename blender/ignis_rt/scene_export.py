@@ -1338,9 +1338,10 @@ def export_lights(depsgraph):
         estimated_range = max(math.sqrt(energy / 0.01), 1.0) if energy > 0 else 10.0
         estimated_range = min(estimated_range, 100.0)
 
-        # Point/spot lights emit into the full sphere (4π steradians).
-        # Radiant intensity = power / (4π). Matches Cycles: strength / (4*PI) / r^2.
-        intensity = energy / (4.0 * math.pi)
+        # Point/spot lights: Cycles normalizes by 1/(4π²r²) — the extra 1/π comes from
+        # the eval_fac = M_1_PI * invarea in light.cpp. Our shader applies 1/r² attenuation,
+        # so we need to pass energy / (4π²) as intensity.
+        intensity = energy / (4.0 * math.pi * math.pi)
 
         # Direction and tangent (for area lights)
         # Area light emits along -Z local axis in Blender
