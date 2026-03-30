@@ -4284,10 +4284,11 @@ def _extract_shader_props(node, register_image_fn):
             tex_node = _find_image_texture_node(color_inp)
             if tex_node and tex_node.image:
                 props['diffuse_tex'] = register_image_fn(tex_node.image)
-        # Cycles: Diffuse BSDF is always Lambertian (roughness=0) or Oren-Nayar (roughness>0).
-        # In PBR terms, a Lambertian surface = fully rough (roughness=1.0).
+        # Cycles: Diffuse BSDF is purely Lambertian — no specular reflection at all.
+        # In PBR terms: roughness=1.0 (fully rough), metallic=0, specular_level=0 (no Fresnel).
         props['roughness'] = 1.0
         props['metallic'] = 0.0
+        props['specular_level'] = 0.0  # Critical: Diffuse has ZERO specular
     elif node.type == 'BSDF_GLOSSY':
         color_inp = node.inputs.get('Color')
         if color_inp:
