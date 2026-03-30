@@ -3351,9 +3351,9 @@ _GPU_MATERIAL_BASE = struct.Struct('<' + 'I' * 5 + 'f' * 3  # tex indices (4) + 
                                    + 'I' * 6                  # multilayer tex indices (6)
                                    + 'f' * 7                  # multilayer mults (7)
                                    + 'f' * 2)                 # sunSpecular + sunSpecularEXP
-# Node VM: header(1 uint) + pad(3 uints) + code(256 uints) = 260 uints = 1040 bytes
-_GPU_MATERIAL_VM = struct.Struct('<' + 'I' * 260)
-_GPU_MATERIAL_SIZE = _GPU_MATERIAL_BASE.size + _GPU_MATERIAL_VM.size  # 140 + 1040 = 1180
+# Node VM: header(1 uint) + pad(3 uints) + code(512 uints) = 516 uints = 2064 bytes
+_GPU_MATERIAL_VM = struct.Struct('<' + 'I' * 516)
+_GPU_MATERIAL_SIZE = _GPU_MATERIAL_BASE.size + _GPU_MATERIAL_VM.size  # 140 + 2064 = 2204
 
 _NO_TEX = 0xFFFFFFFF
 _MAT_FLAG_HAIR = 32
@@ -3461,11 +3461,11 @@ def _pack_gpu_material(
     )
 
     # Node VM bytecode
-    vm_uints = [0] * 260  # header(1) + pad(3) + code(256)
+    vm_uints = [0] * 516  # header(1) + pad(3) + code(512)
     if node_vm_code:
         instr_count = min(len(node_vm_code), 64)
         vm_flags = 0
-        for instr in node_vm_code[:64]:
+        for instr in node_vm_code[:128]:
             opcode = instr[0] & 0xFF
             if opcode == _OP_OUTPUT_COLOR:
                 vm_flags |= _VM_HEADER_FLAG_BASE_COLOR
@@ -3486,7 +3486,7 @@ def _pack_gpu_material(
                 vm_flags |= _VM_HEADER_FLAG_SHADOW_DYNAMIC
         vm_uints[0] = instr_count | (vm_flags << 8)  # nodeVmHeader: [7:0]=count, [15:8]=flags
         # Pack instructions: each is 4 uints (uvec4)
-        for i, instr in enumerate(node_vm_code[:64]):
+        for i, instr in enumerate(node_vm_code[:128]):
             for j in range(4):
                 vm_uints[4 + i * 4 + j] = instr[j] if j < len(instr) else 0
 

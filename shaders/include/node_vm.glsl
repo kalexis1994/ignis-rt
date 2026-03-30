@@ -224,7 +224,7 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, ve
     vec4 R[32];
     R[0] = vec4(uv, 0.0, 1.0);  // R0 = UV input
 
-    for (uint pc = 0u; pc < min(instrCount, 64u); pc++) {
+    for (uint pc = 0u; pc < min(instrCount, 128u); pc++) {
         uvec4 instr = materialBuffer.materials[matIdx].nodeVmCode[pc];
         uint opcode = instr.x & 0xFFu;
         uint dst    = (instr.x >> 8u)  & 0x1Fu;  // 5 bits = 0-31

@@ -112,7 +112,7 @@ struct Material {
     // Node VM bytecode
     uint nodeVmHeader;       // [7:0]=instrCount, [15:8]=flags
     uint nodeVmPad[3];
-    uvec4 nodeVmCode[64];    // 64 instructions
+    uvec4 nodeVmCode[128];   // 128 instructions (supports complex Mix Shader materials)
 };
 
 layout(binding = 4, set = 0, scalar) buffer MaterialBuffer {

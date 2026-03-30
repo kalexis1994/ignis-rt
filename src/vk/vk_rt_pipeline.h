@@ -87,8 +87,8 @@ struct GPUMaterial {
     // Node VM bytecode (per-pixel node tree evaluation)
     uint32_t nodeVmHeader;          // [7:0]=instrCount, [15:8]=flags
     uint32_t nodeVmPad[3];          // padding to 16-byte alignment
-    uint32_t nodeVmCode[256];       // 64 instructions x 4 uints (uvec4) each
-    // Total struct size: 140 + 4 + 12 + 1024 = 1180 bytes
+    uint32_t nodeVmCode[512];       // 128 instructions x 4 uints (uvec4) each
+    // Total struct size: 140 + 4 + 12 + 2048 = 2204 bytes
 };
 
 // Camera UBO matching raygen.rgen CameraProperties
