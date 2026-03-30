@@ -1849,19 +1849,21 @@ void main() {
             if (glassBounces >= MAX_GLASS_BOUNCES) break;
 
             vec3 Vglass = -rayDir;
-            // smoothN for inside/outside test (stable), perturbed N for refraction direction.
             bool enteringGlass = dot(smoothN, -rayDir) >= 0.0;
-            vec3 refractN = enteringGlass ? N : -N;
+            // Use bump-perturbed N for refraction only when bump/normal map is active.
+            // Without bump, use smoothN to avoid floating-point noise creating artifacts.
+            bool hasBumpMap = (mat.normalTexIndex != 0xFFFFFFFFu);
+            vec3 refractN = enteringGlass ? (hasBumpMap ? N : smoothN) : (hasBumpMap ? -N : -smoothN);
             float eta = enteringGlass ? (1.0 / pbrHit.ior) : pbrHit.ior;
             float alphaGlass = pbrHit.roughness * pbrHit.roughness;
 
-            // Bump-to-roughness: convert bump normal deviation to GGX roughness.
-            // At low SPP, per-pixel bump directions look like noise to the denoiser.
-            // GGX spread around the bump-perturbed center converges in 1 sample.
-            float bumpCos = dot(N, smoothN);
-            if (bumpCos < 0.9999) {
-                float bumpAlpha = max(1.0 - bumpCos * bumpCos, 0.0);  // sin²(angle)
-                alphaGlass = max(alphaGlass, bumpAlpha);
+            // Bump-to-roughness: only when bump map is active.
+            if (hasBumpMap) {
+                float bumpCos = dot(N, smoothN);
+                if (bumpCos < 0.9999) {
+                    float bumpAlpha = max(1.0 - bumpCos * bumpCos, 0.0);
+                    alphaGlass = max(alphaGlass, bumpAlpha);
+                }
             }
 
             vec3 Hglass;
@@ -2976,16 +2978,18 @@ void main() {
             glassBounces++;
             if (glassBounces >= MAX_GLASS_BOUNCES) break;
 
-            // smoothN for inside/outside test, perturbed N for refraction direction.
             bool enteringGlass = dot(smoothN, -rayDir) >= 0.0;
-            vec3 refractN = enteringGlass ? N : -N;
+            bool hasBumpMapG = (mat.normalTexIndex != 0xFFFFFFFFu);
+            vec3 refractN = enteringGlass ? (hasBumpMapG ? N : smoothN) : (hasBumpMapG ? -N : -smoothN);
             float eta = enteringGlass ? (1.0 / pbrHit.ior) : pbrHit.ior;
             float alpha = pbrHit.roughness * pbrHit.roughness;
 
-            // Bump-to-roughness for low-SPP convergence (same as earlyGlassExit)
-            float bumpCosG = dot(N, smoothN);
-            if (bumpCosG < 0.9999) {
-                alpha = max(alpha, max(1.0 - bumpCosG * bumpCosG, 0.0));
+            // Bump-to-roughness for low-SPP convergence — only with bump map
+            if (hasBumpMapG) {
+                float bumpCosG = dot(N, smoothN);
+                if (bumpCosG < 0.9999) {
+                    alpha = max(alpha, max(1.0 - bumpCosG * bumpCosG, 0.0));
+                }
             }
 
             // Sample microfacet normal (GGX) for rough glass
