@@ -118,6 +118,9 @@ struct PathTracerConfig {
     // Wavefront path tracing (experimental — compute-based multi-kernel pipeline)
     bool  useWavefront       = false;
 
+    // Hybrid rasterization: rasterize primary visibility, path trace secondary bounces
+    bool  hybridRasterization = true;
+
     // Backface culling
     bool  backfaceCulling    = false;
 

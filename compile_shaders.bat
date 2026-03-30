@@ -22,6 +22,10 @@ echo Compiling ray tracing shaders...
 %GLSLC% %ARGS% "%SHADER_DIR%\closesthit.rchit"      -o "%SHADER_DIR%\closesthit.rchit.spv"
 %GLSLC% %ARGS% "%SHADER_DIR%\miss.rmiss"            -o "%SHADER_DIR%\miss.rmiss.spv"
 
+echo Compiling hybrid G-buffer shaders...
+%GLSLC% %ARGS% "%SHADER_DIR%\gbuffer_hybrid.vert"   -o "%SHADER_DIR%\gbuffer_hybrid.vert.spv"
+%GLSLC% %ARGS% "%SHADER_DIR%\gbuffer_hybrid.frag"   -o "%SHADER_DIR%\gbuffer_hybrid.frag.spv"
+
 echo Compiling compute shaders...
 %GLSLC% %ARGS% "%SHADER_DIR%\nrd_composite.comp"    -o "%SHADER_DIR%\nrd_composite.spv"
 %GLSLC% %ARGS% "%SHADER_DIR%\tonemap.comp"          -o "%SHADER_DIR%\tonemap.comp.spv"

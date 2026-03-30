@@ -162,6 +162,14 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         default=True,
     )
 
+    # -- Performance --
+    hybrid_rasterization: BoolProperty(
+        name="Hybrid Rasterization",
+        description="Rasterize primary visibility for faster first bounce (uncheck for pure path tracing)",
+        default=True,
+        update=_tag_redraw,
+    )
+
     # -- Experimental --
     restir_di: BoolProperty(
         name="ReSTIR DI",
@@ -340,6 +348,7 @@ class IGNIS_PT_advanced(bpy.types.Panel):
         props = context.scene.ignis_rt
         layout.use_property_split = True
         layout.use_property_decorate = False
+        layout.prop(props, "hybrid_rasterization")
         layout.prop(props, "restir_di")
         # layout.prop(props, "use_wavefront")  # TODO: not ready yet
         layout.separator()

@@ -725,6 +725,7 @@ IGNIS_API void ignis_set_int(const char* key, int value) {
     else if (strcmp(key, "spp") == 0)              cfg->samplesPerPixel = (value < 1 ? 1 : (value > 128 ? 128 : value));
     else if (strcmp(key, "shader_mode") == 0)       cfg->shaderMode = value;
     else if (strcmp(key, "use_wavefront") == 0)    cfg->useWavefront = (value != 0);
+    else if (strcmp(key, "hybrid_rasterization") == 0) cfg->hybridRasterization = (value != 0);
     else if (strcmp(key, "backface_culling") == 0) cfg->backfaceCulling = (value != 0);
     else if (strcmp(key, "restir_di") == 0)      cfg->restirDI = (value != 0);
     else if (strcmp(key, "hdri_tex_index") == 0)  cfg->hdriTexIndex = value;
@@ -752,6 +753,7 @@ IGNIS_API int ignis_get_int(const char* key) {
     if (strcmp(key, "debug_view") == 0)        return cfg->debugView;
     if (strcmp(key, "shader_mode") == 0)       return cfg->shaderMode;
     if (strcmp(key, "use_wavefront") == 0)    return cfg->useWavefront ? 1 : 0;
+    if (strcmp(key, "hybrid_rasterization") == 0) return cfg->hybridRasterization ? 1 : 0;
 
     // Render size queries (actual Vulkan image size, may differ from viewport)
     if (strcmp(key, "render_width") == 0)  return g_renderer ? (int)g_renderer->GetRenderWidth() : 0;
