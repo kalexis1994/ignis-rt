@@ -1853,12 +1853,19 @@ void main() {
             // Use bump-perturbed N for refraction only when bump/normal map is active.
             // Without bump, use smoothN to avoid floating-point noise creating artifacts.
             bool hasBumpMap = (mat.normalTexIndex != 0xFFFFFFFFu);
-            vec3 refractN = enteringGlass ? (hasBumpMap ? N : smoothN) : (hasBumpMap ? -N : -smoothN);
+            // Bump maps (detailNormalBlend < 0) should affect refraction (frosted glass effect).
+            // Normal maps (detailNormalBlend >= 0) should NOT — they're surface detail that
+            // causes excessive distortion on curved glass.
+            bool isBumpNotNormalMap = hasBumpMap && (mat.detailNormalBlend < 0.0);
+            vec3 refractN = enteringGlass
+                ? (isBumpNotNormalMap ? N : smoothN)
+                : (isBumpNotNormalMap ? -N : -smoothN);
             float eta = enteringGlass ? (1.0 / pbrHit.ior) : pbrHit.ior;
             float alphaGlass = pbrHit.roughness * pbrHit.roughness;
 
-            // Bump-to-roughness: only when bump map is active.
-            if (hasBumpMap) {
+            // Bump-to-roughness: only for smooth glass (roughness≈0) with bump map.
+            // Glass with its own roughness (from texture/VM) doesn't need bump-derived roughness.
+            if (hasBumpMap && alphaGlass < 0.001) {
                 float bumpCos = dot(N, smoothN);
                 if (bumpCos < 0.9999) {
                     float bumpAlpha = max(1.0 - bumpCos * bumpCos, 0.0);
@@ -2980,12 +2987,15 @@ void main() {
 
             bool enteringGlass = dot(smoothN, -rayDir) >= 0.0;
             bool hasBumpMapG = (mat.normalTexIndex != 0xFFFFFFFFu);
-            vec3 refractN = enteringGlass ? (hasBumpMapG ? N : smoothN) : (hasBumpMapG ? -N : -smoothN);
+            bool isBumpNotNormalMapG = hasBumpMapG && (mat.detailNormalBlend < 0.0);
+            vec3 refractN = enteringGlass
+                ? (isBumpNotNormalMapG ? N : smoothN)
+                : (isBumpNotNormalMapG ? -N : -smoothN);
             float eta = enteringGlass ? (1.0 / pbrHit.ior) : pbrHit.ior;
             float alpha = pbrHit.roughness * pbrHit.roughness;
 
-            // Bump-to-roughness for low-SPP convergence — only with bump map
-            if (hasBumpMapG) {
+            // Bump-to-roughness for low-SPP convergence — only for smooth glass with bump
+            if (hasBumpMapG && alpha < 0.001) {
                 float bumpCosG = dot(N, smoothN);
                 if (bumpCosG < 0.9999) {
                     alpha = max(alpha, max(1.0 - bumpCosG * bumpCosG, 0.0));
