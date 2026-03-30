@@ -1644,8 +1644,8 @@ void main() {
                     }
                 }
 
-                // 3. Ambient + sky (isotropic: phase = 1/4π)
-                L_in += cam.ambientLight.rgb * 0.25 * INV_PI;
+                // 3. Sky environment (isotropic: phase = 1/4π)
+                // evaluateSky returns HDRI when available — no separate ambient needed.
                 L_in += evaluateSky(rayDir) * 0.25 * INV_PI;
 
                 // Accumulate: T(t) * sigma_s * L_in * dt
@@ -1808,8 +1808,10 @@ void main() {
             if (glassBounces >= MAX_GLASS_BOUNCES) break;
 
             vec3 Vglass = -rayDir;
+            // Use smoothN for inside/outside test (stable geometry normal),
+            // but perturbed N for refraction direction (bump/normal map effect).
             bool enteringGlass = dot(smoothN, -rayDir) >= 0.0;
-            vec3 refractN = enteringGlass ? smoothN : -smoothN;
+            vec3 refractN = enteringGlass ? N : -N;
             float eta = enteringGlass ? (1.0 / pbrHit.ior) : pbrHit.ior;
             float alphaGlass = pbrHit.roughness * pbrHit.roughness;
 
@@ -2890,8 +2892,8 @@ void main() {
                         float sNdotL = max(dot(sN, sunDir), 0.0);
                         surfelRadiance += albedo * sNdotL * cam.sunLight.w * cam.skyLight.rgb * INV_PI;
 
-                        // Ambient hemisphere
-                        surfelRadiance += albedo * cam.ambientLight.rgb * 0.25 * INV_PI;
+                        // Ambient hemisphere: use sky environment (includes HDRI when active)
+                        surfelRadiance += albedo * evaluateSky(sN) * 0.25 * INV_PI;
 
                         // Emission
                         surfelRadiance += vec3(sMat.emissiveR, sMat.emissiveG, sMat.emissiveB) * sMat.fresnelMaxLevel;
@@ -2925,12 +2927,10 @@ void main() {
             glassBounces++;
             if (glassBounces >= MAX_GLASS_BOUNCES) break;
 
-            // Use SMOOTH interpolated normal for refraction (no normal map).
-            // Smooth shading affects refraction (surface IS smooth), normal maps don't.
-            // Entry/exit from smooth vertex normals (always outward-facing from Blender,
-            // more reliable than geoNormalRaw which depends on triangle winding order).
+            // Use smoothN for inside/outside test (stable geometry normal),
+            // but perturbed N for refraction direction (bump/normal map effect).
             bool enteringGlass = dot(smoothN, -rayDir) >= 0.0;
-            vec3 refractN = enteringGlass ? smoothN : -smoothN;
+            vec3 refractN = enteringGlass ? N : -N;
             float eta = enteringGlass ? (1.0 / pbrHit.ior) : pbrHit.ior;
             float alpha = pbrHit.roughness * pbrHit.roughness;
 

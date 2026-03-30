@@ -63,7 +63,20 @@ float SmithG2(float NdotL, float NdotV, float alpha) {
     return SmithG1(NdotL, alpha) * SmithG1(NdotV, alpha);
 }
 
+// Approximate GGX single-scatter directional albedo E(mu, alpha).
+// Analytical fit avoiding LUT — Lazarov 2013 / Filament.
+// Returns how much energy single-scatter GGX reflects at a given angle.
+float approxGGXAlbedo(float NdotX, float alpha) {
+    // Curve-fit to the numerical integral of GGX BRDF over hemisphere.
+    // Smooth surfaces: E → 1 (all energy reflected in single bounce).
+    // Rough surfaces:  E → 0.5-0.7 (significant energy lost to multi-scatter).
+    vec4 r = alpha * vec4(-1.0, -0.0275, -0.572, 0.022) + vec4(1.0, 0.0425, 1.04, -0.04);
+    float a004 = min(r.x * r.x, exp2(-9.28 * NdotX)) * r.x + r.y;
+    return clamp(-1.04 * a004 + r.z, 0.0, 1.0);
+}
+
 // Cook-Torrance BRDF Evaluation (for NEE / direct light)
+// Includes Kulla-Conty multi-scatter energy compensation to match Cycles.
 void evaluateCookTorrance(
     vec3 N, vec3 V, vec3 L, vec3 baseColor, float roughness, float metallic, float specularLevel,
     float ior, float transmission,
@@ -92,42 +105,45 @@ void evaluateCookTorrance(
     float G = SmithG2(NdotL, NdotV, alpha);
     float specDenom = max(4.0 * NdotV * NdotL, 0.001);
 
+    // Multi-scatter GGX energy compensation (Kulla-Conty 2017, analytical approx).
+    // Single-scatter GGX loses energy on rough surfaces; this recovers it.
+    // Cycles ref: bsdf_microfacet.h microfacet_ggx_preserve_energy()
+    float Eo = approxGGXAlbedo(NdotV, alpha);  // outgoing directional albedo
+    float Ei = approxGGXAlbedo(NdotL, alpha);  // incoming directional albedo
+    float msScale = 1.0 + (1.0 - Eo) * (1.0 - Ei) / max(Eo + Ei - Eo * Ei, 0.01);
+
     // Fast common case: opaque Principled without transmission.
-    // This keeps the pre-transmission cost profile on most surfaces.
     if (transmission <= 0.001) {
         vec3 F0 = mix(dielectricF0, baseColor, metallic);
         vec3 F = fresnelSchlick(VdotH, F0);
-        vec3 spec = (D * G * F) / specDenom;
-        vec3 kd = (1.0 - F) * (1.0 - metallic);
+        vec3 spec = (D * G * F) / specDenom * msScale;
+        // Diffuse uses directional albedo for energy-conserving kd (not just Fresnel)
+        float specAlbedo = mix(Eo * f0_dielectric * specularLevel * 2.0,
+                               Eo * (F0.r + F0.g + F0.b) / 3.0, metallic);
+        vec3 kd = vec3(1.0 - specAlbedo) * (1.0 - metallic);
         vec3 diff = kd * baseColor * INV_PI;
         diffuseContrib = diff * NdotL;
         specularContrib = spec * NdotL;
         return;
     }
 
-    // Principled mixes the non-metal opaque lobes with transmission.
-    // Cycles reference:
-    // - intern/cycles/kernel/osl/shaders/node_principled_bsdf.osl
-    //   BSDF = mix(BSDF, TransmissionBSDF, transmission);
+    // With transmission: same approach, weighted by lobe contributions.
     float dielectricWeight = (1.0 - metallic) * (1.0 - transmission);
     vec3 dielectricF = fresnelSchlick(VdotH, dielectricF0);
 
     vec3 spec;
     if (metallic <= 0.001) {
-        // Common glass/plastic branch: skip the metallic Fresnel entirely.
-        spec = (D * G * dielectricF) / specDenom * dielectricWeight;
+        spec = (D * G * dielectricF) / specDenom * dielectricWeight * msScale;
     } else if (metallic >= 0.999) {
-        // Pure metal branch: transmission is irrelevant here.
         vec3 metalF = fresnelSchlick(VdotH, baseColor);
-        spec = (D * G * metalF) / specDenom;
+        spec = (D * G * metalF) / specDenom * msScale;
     } else {
         vec3 metalF = fresnelSchlick(VdotH, baseColor);
         vec3 dielectricSpec = (D * G * dielectricF) / specDenom;
         vec3 metalSpec = (D * G * metalF) / specDenom;
-        spec = dielectricSpec * dielectricWeight + metalSpec * metallic;
+        spec = (dielectricSpec * dielectricWeight + metalSpec * metallic) * msScale;
     }
 
-    // Diffuse: Lambertian (energy-conserving with metallic and transmission)
     vec3 kd = (1.0 - dielectricF) * dielectricWeight;
     vec3 diff = kd * baseColor * INV_PI;
 

@@ -4531,19 +4531,9 @@ def _extract_shader_props(node, register_image_fn):
         # Negative strength signals bump/height map to the shader
         props['normal_strength'] = -nstr if is_bump else nstr
 
-        # Glass + bump: convert bump intensity to GGX roughness.
-        # With low SPP, bump alone can't scatter refraction enough (needs 100+ samples
-        # to converge like Cycles). GGX roughness disperses rays analytically in 1 sample.
-        if node.type == 'BSDF_GLASS' and is_bump and props['roughness'] < 0.01:
-            # nstr is packed as: strength + distance * 100
-            # e.g. Strength=0.06, Distance=0.1 → nstr = 10.06
-            bump_strength = nstr - int(nstr)  # fractional part = strength
-            bump_distance = int(nstr) / 100.0
-            # Empirical mapping: roughness that produces similar scatter as
-            # Cycles' bump averaging over many samples.
-            equiv_roughness = min(bump_strength * bump_distance * 25.0, 0.4)
-            equiv_roughness = max(equiv_roughness, 0.05)
-            props['roughness'] = equiv_roughness
+        # Glass + bump: the shader handles bump maps per-pixel via normalTexIndex.
+        # No roughness override needed — bump perturbs the refraction normal directly,
+        # which is the correct behavior matching Cycles.
 
     return props
 
@@ -5066,6 +5056,7 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         color_value = 1.0
         color_saturation = 1.0
         flags = 0
+        alpha_test = False
         alpha_ref = 0.5
         hair_shift = 0.035
         hair_radial_roughness = 0.3
