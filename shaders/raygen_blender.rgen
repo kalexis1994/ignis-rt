@@ -1933,7 +1933,7 @@ void main() {
         uint neeStart = 0u;
         uint neeEnd = min(cam.lightCount, 32u);
         float neeScale = 1.0;
-        if ((bounce >= 2 || hairFastPrimary || primaryThroughSpecularFast) && cam.lightCount > 1u && !skipLocalNEE) {
+        if ((bounce >= 2 || hairFastPrimary) && cam.lightCount > 1u && !skipLocalNEE) {
             uint randIdx = min(uint(rand01() * float(cam.lightCount)), cam.lightCount - 1u);
             neeStart = randIdx;
             neeEnd = randIdx + 1u;
@@ -2193,26 +2193,50 @@ void main() {
             DIReservoir prevReservoir = diUnpack(
                 giReservoirPrev.data[prevBase + 0u],
                 giReservoirPrev.data[prevBase + 1u]);
+            bool prevFresh = diReservoirIsFresh(giReservoirPrev.data[prevBase + 2u], frameIndex);
 
-            if (prevReservoir.M > 0.0 && prevReservoir.lightIndex != 0xFFFFFFFFu
+            if (prevFresh && prevReservoir.M > 0.0 && prevReservoir.lightIndex != 0xFFFFFFFFu
                 && prevReservoir.age < 20.0) {
                 // Re-evaluate target PDF of previous sample at current pixel
                 uint prevLi = prevReservoir.lightIndex;
                 if (prevLi < cam.lightCount) {
                     vec4 pPosRange = cam.lights[prevLi * 4u];
                     vec4 pColInt   = cam.lights[prevLi * 4u + 1u];
+                    vec4 pDirSizeX = cam.lights[prevLi * 4u + 2u];
+                    vec4 pTanSizeY = cam.lights[prevLi * 4u + 3u];
                     vec3 pToLight = pPosRange.xyz - pbrHit.worldPos;
                     float pDist = length(pToLight);
                     vec3 pL = pToLight / max(pDist, 0.001);
                     float pNdotL = dot(N, pL);
                     float pFalloff = 1.0 / (pDist * pDist + 0.001);
-                    vec3 pRadiance = pColInt.rgb * pColInt.w * pFalloff;
+                    float pAtten = pFalloff;
+                    float pSpotAtten = 1.0;
+                    bool pIsSpecial = (pPosRange.w < 0.0);
+                    bool pIsSpot = pIsSpecial && pTanSizeY.w < 0.0;
+                    bool pIsArea = pIsSpecial && !pIsSpot;
+                    if (pIsSpot) {
+                        float pCosHalf = pDirSizeX.w;
+                        float pSm = abs(pTanSizeY.w);
+                        float pCosA = dot(-pL, pDirSizeX.xyz);
+                        float pSt = clamp((pCosA - pCosHalf) * pSm, 0.0, 1.0);
+                        pSpotAtten = pSt * pSt * (3.0 - 2.0 * pSt);
+                    }
+                    if (pIsArea) {
+                        float pFaceDot = max(dot(-pL, pDirSizeX.xyz), 0.0);
+                        pAtten *= pFaceDot * pDirSizeX.w * pTanSizeY.w;
+                    }
+                    vec3 pRadiance = pColInt.rgb * pColInt.w * pAtten * pSpotAtten;
                     float prevTargetPDF = diTargetPDF(N, V, pL, max(pNdotL, 0.0),
                         pbrHit.baseColor, pbrHit.roughness, pbrHit.metallic, pRadiance);
 
-                    // Clamp M to prevent bias buildup
+                    // Clamp M to prevent bias buildup — scale weightSum proportionally
+                    // so the weight/M ratio stays consistent (prevents W inflation)
                     DIReservoir clampedPrev = prevReservoir;
-                    clampedPrev.M = min(clampedPrev.M, 20.0);
+                    float prevMCap = min(clampedPrev.M, 20.0);
+                    if (prevMCap < clampedPrev.M) {
+                        clampedPrev.weightSum *= prevMCap / clampedPrev.M;
+                    }
+                    clampedPrev.M = prevMCap;
                     diReservoirMerge(reservoir, clampedPrev, prevTargetPDF, localRng);
                 }
             }
@@ -2230,6 +2254,7 @@ void main() {
 
                 uint nIdx = uint(neighbor.y) * uint(launchSize.x) + uint(neighbor.x);
                 uint nBase = nIdx * 3u;
+                if (!diReservoirIsFresh(giReservoirPrev.data[nBase + 2u], frameIndex)) continue;
                 DIReservoir nReservoir = diUnpack(
                     giReservoirPrev.data[nBase + 0u],
                     giReservoirPrev.data[nBase + 1u]);
@@ -2240,17 +2265,39 @@ void main() {
                 uint nLi = nReservoir.lightIndex;
                 vec4 nPosRange = cam.lights[nLi * 4u];
                 vec4 nColInt = cam.lights[nLi * 4u + 1u];
+                vec4 nDirSizeX = cam.lights[nLi * 4u + 2u];
+                vec4 nTanSizeY = cam.lights[nLi * 4u + 3u];
                 vec3 nToLight = nPosRange.xyz - pbrHit.worldPos;
                 float nDist = length(nToLight);
                 vec3 nL = nToLight / max(nDist, 0.001);
                 float nNdotL = dot(N, nL);
                 float nFalloff = 1.0 / (nDist * nDist + 0.001);
-                vec3 nRadiance = nColInt.rgb * nColInt.w * nFalloff;
+                float nAtten = nFalloff;
+                float nSpotAtten = 1.0;
+                bool nIsSpecial = (nPosRange.w < 0.0);
+                bool nIsSpot = nIsSpecial && nTanSizeY.w < 0.0;
+                bool nIsArea = nIsSpecial && !nIsSpot;
+                if (nIsSpot) {
+                    float nCosHalf = nDirSizeX.w;
+                    float nSm = abs(nTanSizeY.w);
+                    float nCosA = dot(-nL, nDirSizeX.xyz);
+                    float nSt = clamp((nCosA - nCosHalf) * nSm, 0.0, 1.0);
+                    nSpotAtten = nSt * nSt * (3.0 - 2.0 * nSt);
+                }
+                if (nIsArea) {
+                    float nFaceDot = max(dot(-nL, nDirSizeX.xyz), 0.0);
+                    nAtten *= nFaceDot * nDirSizeX.w * nTanSizeY.w;
+                }
+                vec3 nRadiance = nColInt.rgb * nColInt.w * nAtten * nSpotAtten;
                 float nTargetPDF = diTargetPDF(N, V, nL, max(nNdotL, 0.0),
                     pbrHit.baseColor, pbrHit.roughness, pbrHit.metallic, nRadiance);
 
                 DIReservoir clampedN = nReservoir;
-                clampedN.M = min(clampedN.M, 10.0);
+                float nMCap = min(clampedN.M, 10.0);
+                if (nMCap < clampedN.M) {
+                    clampedN.weightSum *= nMCap / clampedN.M;
+                }
+                clampedN.M = nMCap;
                 diReservoirMerge(reservoir, clampedN, nTargetPDF, localRng);
             }
 
@@ -2380,7 +2427,6 @@ void main() {
                             pbrHit.metallic, pbrHit.specularLevel, pbrHit.ior, pbrHit.transmission, fDiffC, fSpecC);
                     }
 
-                    vec3 contribution = clampRadiance((fDiffC + fSpecC) * fRadiance * W * fShadowFilter);
                     diffuseRadiance += clampRadiance(fDiffC * fRadiance * W * throughput * fShadowFilter);
                     specularRadiance += clampRadiance(fSpecC * fRadiance * W * throughput * fShadowFilter);
                 }
@@ -2391,7 +2437,7 @@ void main() {
             uint currBase = pixelLinearIdx * 3u;
             giReservoirCurr.data[currBase + 0u] = diPackV0(reservoir);
             giReservoirCurr.data[currBase + 1u] = diPackV1(reservoir);
-            giReservoirCurr.data[currBase + 2u] = vec4(0);
+            giReservoirCurr.data[currBase + 2u] = vec4(uintBitsToFloat(frameIndex), 0, 0, 0);
             rngState = localRng;
             restirDone = true;
         }
@@ -2615,7 +2661,7 @@ void main() {
 
         // ---- NEE: Emissive triangle lights (MIS, bounce 0-1 only) ----
         uint emissiveTriCount = cam.lightPad0;
-        if (!skipLocalNEE && emissiveTriCount > 0u && !primaryThroughSpecularFast) {
+        if (!skipLocalNEE && emissiveTriCount > 0u) {
             EmissiveSample eSample = sampleEmissiveTriangle(emissiveTriCount, rand01(), rand2());
             if (eSample.pdf > 0.0) {
                 vec3 toEmissive = eSample.position - pbrHit.worldPos;
@@ -3011,10 +3057,19 @@ void main() {
             continue;
         }
 
-        bool chooseDiffuse = (rand01() > specWeight);
         float diffuseWeight = (1.0 - pbrHit.metallic) * (1.0 - pbrHit.transmission);
         float dielectricSpecWeight = (1.0 - pbrHit.metallic) * (1.0 - pbrHit.transmission);
         float metalSpecWeight = pbrHit.metallic;
+
+        // Compensate for glass lobe selection probability.
+        // Glass path divides by glassProb; non-glass path must divide by (1-glassProb)
+        // so that E[throughput] = metallic*F*G2/G1 + diffuse*baseColor (correct weights).
+        // Cap at 2x to avoid excessive throughput that kills FPS on high-transmission materials.
+        float nonGlassCompensation = (glassProb > 0.01) ? 1.0 / max(1.0 - glassProb, 0.5) : 1.0;
+
+        // When diffuse lobe has no energy (metallic or full transmission),
+        // force specular to avoid wasting rays on zero-throughput paths.
+        bool chooseDiffuse = (diffuseWeight > 0.001) ? (rand01() > specWeight) : false;
 
         if (chooseDiffuse && pbrHit.metallic < 1.0) {
             // Diffuse lobe — with path guiding when available
@@ -3034,7 +3089,7 @@ void main() {
                         // MIS: weight the guided sample against cosine hemisphere
                         float cosinePdf = max(dot(newDir, N), 0.0) * INV_PI;
                         float misWeight = guideMISWeight(cosinePdf, guidePdf, 0.5);
-                        throughput *= pbrHit.baseColor * diffuseWeight * misWeight;
+                        throughput *= pbrHit.baseColor * diffuseWeight * misWeight * nonGlassCompensation;
                         useGuide = true;
                     }
                 }
@@ -3043,13 +3098,13 @@ void main() {
             if (!useGuide) {
                 // Standard cosine hemisphere sampling
                 newDir = sampleCosineHemisphere(rand2(), N);
-                throughput *= pbrHit.baseColor * diffuseWeight;
+                throughput *= pbrHit.baseColor * diffuseWeight * nonGlassCompensation;
             }
 
             rayDir = newDir;
             if (bounce == 0) isDiffusePath = true;
         } else {
-            // Specular lobe — chosen with probability specWeight
+            // Specular lobe
             float alpha = pbrHit.roughness * pbrHit.roughness;
             vec3 H = sampleGGX_VNDF(rand2(), V, N, alpha);
             vec3 newDir = reflect(-V, H);
@@ -3060,17 +3115,14 @@ void main() {
             float NdotH = max(dot(N, H), 0.0);
             float VdotH = max(dot(V, H), 0.0);
 
-            // VNDF sampling weight = F * G2 / G1
-            // This is the correct BRDF/PDF ratio for VNDF importance sampling.
-            // We do NOT divide by lobe selection probability (specWeight) because
-            // that cancels the Fresnel tint and creates overly bright specular
-            // for dark materials (both metals and dielectrics).
+            // VNDF sampling weight = F * lobeWeight * G2/G1
+            // Divided by nonGlassCompensation to account for stochastic glass selection.
             vec3 dielectricF0 = vec3(f0_dielectric * pbrHit.specularLevel * 2.0);
             vec3 dielectricFw = fresnelSchlick(VdotH, dielectricF0) * dielectricSpecWeight;
             vec3 metalFw = fresnelSchlick(VdotH, pbrHit.baseColor) * metalSpecWeight;
             float G2 = SmithG2(NdotL, NdotV, alpha);
             float G1 = SmithG1(NdotV, alpha);
-            throughput *= (dielectricFw + metalFw) * (G2 / max(G1, 0.001));
+            throughput *= (dielectricFw + metalFw) * (G2 / max(G1, 0.001)) * nonGlassCompensation;
 
             rayDir = newDir;
             if (bounce == 0) { isDiffusePath = false; captureSpecularMV = true; }

@@ -51,15 +51,9 @@ bool diReservoirUpdate(inout DIReservoir r, uint lightIdx, vec3 samplePos,
 // Merge another reservoir into this one (for temporal/spatial reuse)
 void diReservoirMerge(inout DIReservoir r, DIReservoir other, float otherTargetPDF,
                       inout uint rng) {
-    // Treat the other reservoir as M candidates with combined weight
-    float otherWeight = otherTargetPDF * other.weightSum * other.M;
-    if (other.targetPDF > 0.0) {
-        otherWeight = otherTargetPDF / other.targetPDF * other.weightSum;
-    } else {
-        otherWeight = 0.0;
-    }
-
-    float prevWeightSum = r.weightSum;
+    float otherWeight = (other.targetPDF > 0.0)
+        ? otherTargetPDF / other.targetPDF * other.weightSum
+        : 0.0;
     r.weightSum += otherWeight;
     r.M += other.M;
 
@@ -82,6 +76,9 @@ float diReservoirWeight(DIReservoir r) {
 }
 
 // Pack/unpack functions use raw vec4 values (caller handles SSBO access)
+// Layout: vec4[0] = (lightIndex, samplePos.xyz)
+//         vec4[1] = (targetPDF, weightSum, M, age)
+//         vec4[2] = (frameIndex, 0, 0, 0)  — for stale data detection
 vec4 diPackV0(DIReservoir r) {
     return vec4(uintBitsToFloat(r.lightIndex), r.lightSamplePos);
 }
@@ -100,6 +97,15 @@ DIReservoir diUnpack(vec4 d0, vec4 d1) {
     return r;
 }
 
+// Check if a stored reservoir is recent enough for reuse.
+// Uses absolute frame index stored in d2.x to detect truly stale data
+// (e.g. from when ReSTIR was disabled).
+bool diReservoirIsFresh(vec4 d2, uint currentFrameIndex) {
+    uint storedFrame = floatBitsToUint(d2.x);
+    // Reject data older than 4 frames (handles toggle on/off, buffer recycle)
+    return currentFrameIndex - storedFrame <= 4u;
+}
+
 // Compute target PDF (p-hat): luminance of unshadowed contribution
 // This is evaluated WITHOUT shadow ray — just BRDF * lightRadiance * geometric term
 float diTargetPDF(vec3 N, vec3 V, vec3 lightDir, float NdotL,
@@ -110,7 +116,8 @@ float diTargetPDF(vec3 N, vec3 V, vec3 lightDir, float NdotL,
     vec3 diffC, specC;
     evaluateCookTorrance(N, V, lightDir, baseColor, roughness, metallic, 0.5, 1.45, 0.0,
                          diffC, specC);
-    vec3 contribution = (diffC + specC) * lightRadiance * NdotL;
+    // evaluateCookTorrance output already includes NdotL — don't multiply again
+    vec3 contribution = (diffC + specC) * lightRadiance;
     return dot(contribution, vec3(0.2126, 0.7152, 0.0722)); // luminance
 }
 
