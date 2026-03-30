@@ -1095,8 +1095,31 @@ bool RTPipeline::CreateDescriptorSetLayout() {
     bindings[34].descriptorCount = 1;
     bindings[34].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
+    // bindings 35-37: Hybrid G-buffer (rasterized primary visibility)
+    bindings.resize(38);
+    // binding 35: primID (R32_UINT storage image)
+    bindings[35] = {};
+    bindings[35].binding = 35;
+    bindings[35].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bindings[35].descriptorCount = 1;
+    bindings[35].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
+
+    // binding 36: instanceInfo (RG32_UINT storage image)
+    bindings[36] = {};
+    bindings[36].binding = 36;
+    bindings[36].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bindings[36].descriptorCount = 1;
+    bindings[36].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
+
+    // binding 37: hybrid linear depth (R32_SFLOAT storage image)
+    bindings[37] = {};
+    bindings[37].binding = 37;
+    bindings[37].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bindings[37].descriptorCount = 1;
+    bindings[37].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
+
     // Binding flags for partially bound descriptors
-    std::vector<VkDescriptorBindingFlags> bindingFlags(35, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
+    std::vector<VkDescriptorBindingFlags> bindingFlags(38, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
 
     VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo{};
     flagsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
@@ -1326,7 +1349,7 @@ bool RTPipeline::CreateSBT() {
 bool RTPipeline::CreateDescriptorPool() {
     VkDescriptorPoolSize poolSizes[] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 22},   // 13 base + 1 reserved(27) + 3 masks(29-31) + 1 hairV(34) + padding
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 25},   // 13 base + 3 masks(29-31) + 1 hairV(34) + 3 hybrid(35-37) + padding
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 11},  // 3 base + 2 SHARC + 1 prevTransforms(28) + 2 GI reservoir(24-25) + 1 emissive(26) + 2 surfel(32-33)
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1034},  // 1024 textures + 10 other samplers
@@ -1812,6 +1835,33 @@ void RTPipeline::UpdateStorageImage(VkImageView imageView) {
 
     vkUpdateDescriptorSets(context_->GetDevice(), 1, &write, 0, nullptr);
     Log(L"[VK RTPipeline] Storage image descriptor updated (D3D11 interop)\n");
+}
+
+void RTPipeline::UpdateHybridGBufferDescriptors(VkImageView primIdView, VkImageView instanceInfoView,
+                                                 VkImageView depthView) {
+    if (descriptorSet_ == VK_NULL_HANDLE) return;
+    VkDevice device = context_->GetDevice();
+
+    // bindings 35-37: all storage images
+    VkDescriptorImageInfo storageInfos[3] = {};
+    storageInfos[0].imageView = primIdView;
+    storageInfos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    storageInfos[1].imageView = instanceInfoView;
+    storageInfos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    storageInfos[2].imageView = depthView;
+    storageInfos[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkWriteDescriptorSet writes[3] = {};
+    for (int i = 0; i < 3; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = descriptorSet_;
+        writes[i].dstBinding = 35 + i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[i].pImageInfo = &storageInfos[i];
+    }
+
+    vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
 }
 
 void RTPipeline::UpdateCloudShadowDescriptor(VkImageView view, VkSampler sampler) {

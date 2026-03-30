@@ -163,6 +163,10 @@ public:
     // Cloud shadow map (binding 23)
     void UpdateCloudShadowDescriptor(VkImageView view, VkSampler sampler);
 
+    // Hybrid G-buffer descriptors (bindings 35-37)
+    void UpdateHybridGBufferDescriptors(VkImageView primIdView, VkImageView instanceInfoView,
+                                         VkImageView depthView);
+
     // Per-instance previous transforms (binding 28)
     void UpdatePrevTransforms(const float* transforms, uint32_t instanceCount);
 

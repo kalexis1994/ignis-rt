@@ -97,6 +97,7 @@ public:
 
     bool IsDLSSActive() const { return dlssActive_; }
     bool IsDLSSRRActive() const { return dlssRRActive_; }
+    bool IsHybridGBufferReady() const { return hybridGBufferRendered_; }
     void GetRenderResolution(uint32_t* w, uint32_t* h) const { *w = renderWidth_; *h = renderHeight_; }
     void GetDisplayResolution(uint32_t* w, uint32_t* h) const { *w = width_; *h = height_; }
     uint32_t GetRenderWidth() const { return width_; }
@@ -233,6 +234,7 @@ private:
     float lastProj_[16] = {0};
     float lastViewPrev_[16] = {0};
     float lastProjPrev_[16] = {0};
+    float camWorldPos_[3] = {0};
 
     // Composite compute pipeline
     VkPipeline compositePipeline_ = VK_NULL_HANDLE;
@@ -247,6 +249,37 @@ private:
     bool CreateCompositePipeline();
     void UpdateCompositeDescriptors();
     void ShutdownNRD();
+
+    // Hybrid G-buffer rasterization pipeline
+    VkRenderPass hybridRenderPass_ = VK_NULL_HANDLE;
+    VkPipeline hybridPipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout hybridPipelineLayout_ = VK_NULL_HANDLE;
+    VkFramebuffer hybridFramebuffer_ = VK_NULL_HANDLE;
+    VkImage hybridPrimIdImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory hybridPrimIdMemory_ = VK_NULL_HANDLE;
+    VkImageView hybridPrimIdView_ = VK_NULL_HANDLE;
+    VkImage hybridInstanceInfoImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory hybridInstanceInfoMemory_ = VK_NULL_HANDLE;
+    VkImageView hybridInstanceInfoView_ = VK_NULL_HANDLE;
+    VkImage hybridDepthImage_ = VK_NULL_HANDLE;       // R32_SFLOAT linear depth output
+    VkDeviceMemory hybridDepthMemory_ = VK_NULL_HANDLE;
+    VkImageView hybridDepthView_ = VK_NULL_HANDLE;
+    VkImage hybridZBuffer_ = VK_NULL_HANDLE;           // D32_SFLOAT z-test only (not read by shader)
+    VkDeviceMemory hybridZBufferMemory_ = VK_NULL_HANDLE;
+    VkImageView hybridZBufferView_ = VK_NULL_HANDLE;
+    bool hybridGBufferReady_ = false;     // pipeline + images created
+    bool hybridGBufferRendered_ = false;  // raster pass has run at least once — safe for shader
+
+    struct HybridPushConstants {
+        float mvp[16];
+        float camPos[4];  // xyz = camera world position, w = pad
+        uint32_t instanceIndex;
+        uint32_t blasIndex;
+    };
+
+    bool CreateHybridGBufferPipeline();
+    void RecordHybridGBufferPass(VkCommandBuffer cmd);
+    void ShutdownHybridGBuffer();
 
     // Auto-exposure resolve pipeline
     VkPipeline exposureResolvePipeline_ = VK_NULL_HANDLE;

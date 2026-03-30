@@ -193,6 +193,11 @@ layout(binding = 31, set = 0, r8) uniform image2D specConfidenceImg;
 // Hair contour: per-pixel hairV for screen-space edge detection
 layout(binding = 34, set = 0, r16f) uniform image2D hairVImg;
 
+// Hybrid G-buffer (rasterized primary visibility)
+layout(binding = 35, set = 0, r32ui) uniform uimage2D hybridPrimIdImg;
+layout(binding = 36, set = 0, rg32ui) uniform uimage2D hybridInstanceInfoImg;
+layout(binding = 37, set = 0, r32f) uniform image2D hybridDepthImg;
+
 // Pick buffer
 layout(binding = 17, set = 0, scalar) buffer PickBuffer {
     uint pickCustomIndex;
@@ -957,6 +962,7 @@ void main() {
     int spp = clamp(int(cam.lightPad1), 1, 128);
     bool rrModeGlobal = (cam.parameters.w == 2u);
     bool backfaceCulling = (cam.lightPad2 & 1u) != 0u;  // bit 0 of lightPad2
+    bool hybridRasterMode = (cam.lightPad2 & 4u) != 0u; // bit 2 of lightPad2
 
     // Accumulators across SPP samples
     vec3 accumDiffuse = vec3(0.0);
@@ -1118,42 +1124,77 @@ void main() {
             skipTrace = (tEntry > tExit || tExit < MIN_HIT_DIST);
         }
 
+        // ---- Hybrid G-buffer: skip primary ray when rasterized hit is available ----
+        bool hybridHit = false;
+        uint customIndex;
+        int instanceId;
+        int primitiveId;
+        float hitT;
+        vec3 bary;
+        vec3 localPos;
+        vec3 worldPos;
+        vec3 wp0, wp1, wp2;
+        mat4x3 objToWorld;
         rayQueryEXT rq;
-        if (!skipTrace) {
-            // Trace ray — opaque mode for hardware BVH performance.
-            rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT,
-                                  0xFF, rayOrigin, MIN_HIT_DIST, rayDir, 10000.0);
-            while (rayQueryProceedEXT(rq)) {}
-        }
 
-        if (skipTrace || rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
-            // Sky miss — notify SHARC for backpropagation
-            vec3 skyColor = evaluateSky(rayDir);
-            if (sharcEnabled && sharcUpdatePixel) {
-                SharcUpdateMiss(sharcGrid, sharcState, skyColor, sharcCapacity);
-            }
-            if (bounce == 0) {
-                totalRadiance += skyColor * throughput;
-            } else {
-                // Indirect sky contribution
-                if (isDiffusePath) {
-                    diffuseRadiance += skyColor * throughput * giIntensity;
-                } else {
-                    specularRadiance += skyColor * throughput * giIntensity;
+        if (hybridRasterMode && bounce == 0) {
+            float hViewZ = imageLoad(hybridDepthImg, pixel).r;
+            if (hViewZ > 0.01 && hViewZ < 9990.0) {
+                // Convert view-space Z to ray distance and add margin
+                vec3 viewRayDir = mat3(cam.view) * rayDir;
+                float cosAngle = max(abs(viewRayDir.z), 0.01);
+                float depthHint = hViewZ / cosAngle + 0.1;
+
+                rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT,
+                                      0xFF, rayOrigin, MIN_HIT_DIST, rayDir, depthHint);
+                while (rayQueryProceedEXT(rq)) {}
+
+                if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+                    customIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+                    instanceId = rayQueryGetIntersectionInstanceIdEXT(rq, true);
+                    primitiveId = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+                    hitT = rayQueryGetIntersectionTEXT(rq, true);
+                    vec2 bary2 = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+                    bary = vec3(1.0 - bary2.x - bary2.y, bary2.x, bary2.y);
+                    hybridHit = true;
                 }
             }
-            break;
         }
 
-        // Get hit info
-        uint customIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);  // = BLAS index (geometry metadata)
-        int instanceId = rayQueryGetIntersectionInstanceIdEXT(rq, true);             // = instance index (prevTransforms)
-        int primitiveId = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-        float hitT = rayQueryGetIntersectionTEXT(rq, true);
-        vec2 bary2 = rayQueryGetIntersectionBarycentricsEXT(rq, true);
-        mat4x3 objToWorld = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
 
-        vec3 bary = vec3(1.0 - bary2.x - bary2.y, bary2.x, bary2.y);
+        // ---- Standard ray query (used for secondary bounces, or when hybrid miss/fallback) ----
+        if (!hybridHit) {
+            if (!skipTrace) {
+                rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT,
+                                      0xFF, rayOrigin, MIN_HIT_DIST, rayDir, 10000.0);
+                while (rayQueryProceedEXT(rq)) {}
+            }
+
+            if (skipTrace || rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+                vec3 skyColor = evaluateSky(rayDir);
+                if (sharcEnabled && sharcUpdatePixel) {
+                    SharcUpdateMiss(sharcGrid, sharcState, skyColor, sharcCapacity);
+                }
+                if (bounce == 0) {
+                    totalRadiance += skyColor * throughput;
+                } else {
+                    if (isDiffusePath) {
+                        diffuseRadiance += skyColor * throughput * giIntensity;
+                    } else {
+                        specularRadiance += skyColor * throughput * giIntensity;
+                    }
+                }
+                break;
+            }
+
+            // Get hit info from ray query
+            customIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+            instanceId = rayQueryGetIntersectionInstanceIdEXT(rq, true);
+            primitiveId = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+            hitT = rayQueryGetIntersectionTEXT(rq, true);
+            vec2 bary2 = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+            bary = vec3(1.0 - bary2.x - bary2.y, bary2.x, bary2.y);
+        }
 
         // Fetch geometry data (customIndex maps to geometryMetadata array)
         GeometryMetadata geo = geometryMetadata.geometries[customIndex];
@@ -1166,19 +1207,19 @@ void main() {
         uint i1 = indices.i[primitiveId * 3 + 1];
         uint i2 = indices.i[primitiveId * 3 + 2];
 
-        // Vertex positions (local space)
-        vec3 p0 = vec3(vertices.v[i0*3+0], vertices.v[i0*3+1], vertices.v[i0*3+2]);
-        vec3 p1 = vec3(vertices.v[i1*3+0], vertices.v[i1*3+1], vertices.v[i1*3+2]);
-        vec3 p2 = vec3(vertices.v[i2*3+0], vertices.v[i2*3+1], vertices.v[i2*3+2]);
-
-        // Interpolated local position
-        vec3 localPos = p0 * bary.x + p1 * bary.y + p2 * bary.z;
-        vec3 worldPos = (objToWorld * vec4(localPos, 1.0));
-
-        // World-space positions for TBN
-        vec3 wp0 = (objToWorld * vec4(p0, 1.0));
-        vec3 wp1 = (objToWorld * vec4(p1, 1.0));
-        vec3 wp2 = (objToWorld * vec4(p2, 1.0));
+        {
+            // Geometry reconstruction — runs for both hybrid and standard paths.
+            // In both cases, rq has valid intersection data.
+            vec3 p0 = vec3(vertices.v[i0*3+0], vertices.v[i0*3+1], vertices.v[i0*3+2]);
+            vec3 p1 = vec3(vertices.v[i1*3+0], vertices.v[i1*3+1], vertices.v[i1*3+2]);
+            vec3 p2 = vec3(vertices.v[i2*3+0], vertices.v[i2*3+1], vertices.v[i2*3+2]);
+            localPos = p0 * bary.x + p1 * bary.y + p2 * bary.z;
+            objToWorld = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+            worldPos = (objToWorld * vec4(localPos, 1.0));
+            wp0 = (objToWorld * vec4(p0, 1.0));
+            wp1 = (objToWorld * vec4(p1, 1.0));
+            wp2 = (objToWorld * vec4(p2, 1.0));
+        }
 
         // Normals
         vec3 n0 = vec3(normals.n[i0*3+0], normals.n[i0*3+1], normals.n[i0*3+2]);
@@ -2129,7 +2170,7 @@ void main() {
         bool restirDone = false;
         // ReSTIR DI: reservoir-based light sampling (opt-in via UI toggle)
         // Better for scenes with many lights (16+), may cause splotches with few lights
-        bool restirEnabled = (cam.lightPad2 >> 1u) != 0u;  // bit 1 of lightPad2
+        bool restirEnabled = (cam.lightPad2 & 2u) != 0u;  // bit 1 of lightPad2
         if (restirEnabled && !skipLocalNEE && bounce == 0 && cam.lightCount > 0u && !isHairSurface && !primaryThroughSpecularFast) {
             DIReservoir reservoir = emptyDIReservoir();
             vec3 V = -rayDir;

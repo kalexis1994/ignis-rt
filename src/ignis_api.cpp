@@ -512,7 +512,8 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
     cam.lightCount = s_lightCount;
     cam.lightPad[0] = s_emissiveTriCount;
     cam.lightPad[1] = static_cast<uint32_t>(acpt::g_config.samplesPerPixel);
-    cam.lightPad[2] = (cfg->backfaceCulling ? 1u : 0u) | (cfg->restirDI ? 2u : 0u);
+    bool hybridActive = cfg->hybridRasterization && g_renderer && g_renderer->IsHybridGBufferReady();
+    cam.lightPad[2] = (cfg->backfaceCulling ? 1u : 0u) | (cfg->restirDI ? 2u : 0u) | (hybridActive ? 4u : 0u);
     // HDRI environment map: pack index and strength into windParams
     cam.windParams[0] = static_cast<float>(cfg->hdriTexIndex);  // -1 = no HDRI
     cam.windParams[1] = cfg->hdriStrength;
