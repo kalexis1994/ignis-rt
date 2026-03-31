@@ -86,18 +86,33 @@ vec3 hair_eval(vec3 wi, vec3 wo, vec3 tangent,
     F0 = F0 * F0;
     float F = hair_fresnel_schlick(cos_theta_o * cos_gamma_o, F0);
 
-    // ── Attenuation per lobe ──
-    // For standard Principled BSDF materials: use color as direct tint (not absorption).
-    // Beer-Lambert absorption is too aggressive for non-Principled-Hair materials.
-    vec3 A_R   = vec3(F);                          // R: white specular highlight
-    vec3 A_TT  = (1.0 - F) * (1.0 - F) * hairColor;  // TT: colored transmission
-    vec3 A_TRT = A_TT * hairColor * F;                 // TRT: colored secondary highlight
-
     // ── Azimuthal shifts (Snell's law at fiber surface) ──
     float gamma_o = asin(clamp(h, -1.0, 1.0));
     float eta_sq_sin2 = ior * ior - sin_theta_o * sin_theta_o;
     float sin_gamma_t = (eta_sq_sin2 > 0.0) ? h * cos_theta_o / sqrt(eta_sq_sin2) : 0.0;
     float gamma_t = asin(clamp(sin_gamma_t, -1.0, 1.0));
+    float cos_gamma_t = cos(gamma_t);
+
+    // ── Attenuation per lobe (Beer-Lambert absorption, matching Cycles) ──
+    // Convert base color to absorption coefficient sigma using Cycles' formula:
+    //   sigma = (ln(color) / roughness_factor)^2
+    // Then apply Beer-Lambert: T = exp(-sigma * path_length)
+    // Ref: intern/cycles/kernel/closure/bsdf_principled_hair_chiang.h
+    float roughness_fac = (((((0.245 * betaPhi) + 5.574) * betaPhi - 10.73) * betaPhi + 2.532) * betaPhi - 0.215) * betaPhi + 5.969;
+    vec3 sigma = vec3(0.0);
+    for (int ch = 0; ch < 3; ch++) {
+        float c = max(hairColor[ch], 1e-5);
+        float ls = log(c) / max(roughness_fac, 1e-5);
+        sigma[ch] = ls * ls;
+    }
+
+    // Beer-Lambert transmittance through the fiber
+    float path_len = 2.0 * cos_gamma_t / max(cos_theta_o, 0.01);
+    vec3 T_fiber = exp(-sigma * path_len);
+
+    vec3 A_R   = vec3(F);                                  // R: surface reflection (white)
+    vec3 A_TT  = (1.0 - F) * (1.0 - F) * T_fiber;         // TT: one pass through fiber
+    vec3 A_TRT = (1.0 - F) * (1.0 - F) * T_fiber * T_fiber * F;  // TRT: two passes through fiber
     float dphi_R   = -2.0 * gamma_o;
     float dphi_TT  =  2.0 * gamma_t - 2.0 * gamma_o + HAIR_PI;
     float dphi_TRT =  4.0 * gamma_t - 2.0 * gamma_o;
@@ -119,8 +134,11 @@ vec3 hair_eval(vec3 wi, vec3 wo, vec3 tangent,
     float N_TRT = hair_azimuthal_N(phi, dphi_TRT, mix(28.0, 2.0, betaPhi));
     F_total += A_TRT * M_TRT * N_TRT;
 
-    // Energy conservation: clamp to physically plausible range
-    F_total = min(F_total, vec3(1.0));
+    // Normalization: Cycles' Chiang model includes 1/(2*cos_theta) in the longitudinal
+    // scattering which our Gaussian M doesn't have. Scale by cos_theta to match energy.
+    // Also divide by PI for hemisphere normalization (M*N integrates over the fiber
+    // coordinate system, not the rendering hemisphere).
+    F_total *= cos_theta_o * HAIR_INV_PI;
 
     // Clamp cos_theta_i to prevent blackout at grazing angles
     return max(F_total, vec3(0.0)) * max(abs(cos_theta_i), 0.15);

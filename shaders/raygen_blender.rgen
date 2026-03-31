@@ -375,15 +375,17 @@ void evaluateHairCylinderBSDF(
     float ior, float hairShift, float hairV,
     out vec3 diffuseContrib, out vec3 specularContrib)
 {
-    diffuseContrib = baseColor * evalHairCylinderFalloff(cylN, lightDir) * 0.35;
-
+    // Cycles hair: all energy via R+TT+TRT with Beer-Lambert absorption.
     float hairIor = max(ior, 1.01);
     float hairRoughness = max(roughness, 0.05);
     float hairRadialRoughness = max(radialRoughness, 0.05);
-    float specularWeight = max(specularLevel, 0.0);
-    specularContrib = hair_eval(viewDir, lightDir, hairT,
-                                baseColor, hairRoughness, hairRadialRoughness, hairShift, hairIor, hairV)
-                    * specularWeight;
+    vec3 hairBSDF = hair_eval(viewDir, lightDir, hairT,
+                              baseColor, hairRoughness, hairRadialRoughness, hairShift, hairIor, hairV);
+
+    // hair_eval already includes geometric terms (M, N gaussians).
+    // No extra sinTL or specularWeight — those would double-count.
+    diffuseContrib = hairBSDF;
+    specularContrib = vec3(0.0);
 }
 
 // ============================================================
@@ -2125,17 +2127,12 @@ void main() {
                             pbrHit.specularLevel, pbrHit.ior, pbrHit.hairShift, hairV,
                             diffContrib, specContrib);
                     } else {
-                        // Hair: Kajiya-Kay diffuse + Karis specular
-                        // Diffuse: sin(T, L) — bright when light perpendicular to strand
-                        float sinTL = length(cross(hairSmoothT, sunDir));
-                        vec3 hairDiffuse = pbrHit.baseColor * INV_PI * sinTL;
-                        vec3 hairSpec = hair_eval(V, sunDir, hairSmoothT,
-                                                 pbrHit.baseColor, max(pbrHit.roughness, 0.05),
-                                                 max(pbrHit.hairRadialRoughness, 0.05),
-                                                 pbrHit.hairShift, max(pbrHit.ior, 1.01), hairV)
-                                      * max(pbrHit.specularLevel, 0.0);
-                        diffContrib = hairDiffuse + hairSpec;
-                        specContrib = vec3(0.0); // already included in hairDirect
+                        // Hair: R+TT+TRT via Beer-Lambert (no separate diffuse)
+                        diffContrib = hair_eval(V, sunDir, hairSmoothT,
+                                               pbrHit.baseColor, max(pbrHit.roughness, 0.05),
+                                               max(pbrHit.hairRadialRoughness, 0.05),
+                                               pbrHit.hairShift, max(pbrHit.ior, 1.01), hairV);
+                        specContrib = vec3(0.0);
                     }
                 } else {
                     evaluateCookTorrance(
@@ -2473,13 +2470,10 @@ void main() {
                                 pbrHit.specularLevel, pbrHit.ior, pbrHit.hairShift, hairV,
                                 fDiffC, fSpecC);
                         } else {
-                            float sinTfL = length(cross(hairSmoothT, fL));
-                            fDiffC = pbrHit.baseColor * INV_PI * sinTfL
-                                   + hair_eval(V, fL, hairSmoothT, pbrHit.baseColor,
+                            fDiffC = hair_eval(V, fL, hairSmoothT, pbrHit.baseColor,
                                               max(pbrHit.roughness, 0.05),
                                               max(pbrHit.hairRadialRoughness, 0.05),
-                                              pbrHit.hairShift, max(pbrHit.ior, 1.01), hairV)
-                                   * max(pbrHit.specularLevel, 0.0);
+                                              pbrHit.hairShift, max(pbrHit.ior, 1.01), hairV);
                             fSpecC = vec3(0.0);
                         }
                     } else {
@@ -2687,13 +2681,10 @@ void main() {
                         pbrHit.specularLevel, pbrHit.ior, pbrHit.hairShift, hairV,
                         diffC, specC);
                 } else {
-                    float sinTbrdf = length(cross(hairSmoothT, brdfL));
-                    diffC = pbrHit.baseColor * INV_PI * sinTbrdf
-                          + hair_eval(V, brdfL, hairSmoothT, pbrHit.baseColor,
+                    diffC = hair_eval(V, brdfL, hairSmoothT, pbrHit.baseColor,
                                       max(pbrHit.roughness, 0.05),
                                       max(pbrHit.hairRadialRoughness, 0.05),
-                                      pbrHit.hairShift, max(pbrHit.ior, 1.01), hairV)
-                          * max(pbrHit.specularLevel, 0.0);
+                                      pbrHit.hairShift, max(pbrHit.ior, 1.01), hairV);
                     specC = vec3(0.0);
                 }
             } else {
@@ -2810,13 +2801,10 @@ void main() {
                                     pbrHit.specularLevel, pbrHit.ior, pbrHit.hairShift, hairV,
                                     eDiffC, eSpecC);
                             } else {
-                                float sinTeDir = length(cross(hairSmoothT, eDir));
-                                eDiffC = pbrHit.baseColor * INV_PI * sinTeDir
-                                       + hair_eval(V, eDir, hairSmoothT, pbrHit.baseColor,
+                                eDiffC = hair_eval(V, eDir, hairSmoothT, pbrHit.baseColor,
                                                   max(pbrHit.roughness, 0.05),
                                                   max(pbrHit.hairRadialRoughness, 0.05),
-                                                  pbrHit.hairShift, max(pbrHit.ior, 1.01), hairV)
-                                       * max(pbrHit.specularLevel, 0.0);
+                                                  pbrHit.hairShift, max(pbrHit.ior, 1.01), hairV);
                                 eSpecC = vec3(0.0);
                             }
                         } else {
@@ -3055,10 +3043,10 @@ void main() {
 
         // ── Hair BSDF: Karis simplified Marschner (R + TT + TRT) ──
         if (isHairSurface) {
-            if (bounce > 0) {
-                // Dense-groom fast path: secondary hair hits stop here.
-                // Full path before this optimization:
-                // keep tracing glossy/diffuse hair transport on every bounce.
+            if (bounce > 1) {
+                // Allow 1 secondary hair bounce for inter-strand scattering (fills shadows).
+                // Cycles traces multiple hair bounces; stopping at bounce 0 creates
+                // harsh contrast between lit and shadowed areas.
                 break;
             }
 
@@ -3097,17 +3085,17 @@ void main() {
                               / max(4.0 * NdotVHair * VdotH, 1e-6);
                 vec3 hairSpec = hair_eval(V, newDir, hairT,
                                           hairColor, hairRoughness, max(pbrHit.hairRadialRoughness, 0.05),
-                                          pbrHit.hairShift, hairIor, hairV)
-                              * hairSpecularWeight;
+                                          pbrHit.hairShift, hairIor, hairV);
                 float branchPdf = specProb * max(specPdf, 1e-6);
                 throughput *= hairSpec / branchPdf;
                 if (bounce == 0) { isDiffusePath = false; captureSpecularMV = true; }
             } else {
                 newDir = sampleCosineHemisphere(rand2(), bounceN);
 
-                // Hair diffuse stays tangent-driven so the cylinder keeps its strand look.
-                float sinTBounce = length(cross(hairT, newDir));
-                vec3 hairDiffuse = hairColor * INV_PI * sinTBounce;
+                // Use hair_eval for diffuse bounce (Beer-Lambert absorption)
+                vec3 hairDiffuse = hair_eval(V, newDir, hairT,
+                                             hairColor, hairRoughness, max(pbrHit.hairRadialRoughness, 0.05),
+                                             pbrHit.hairShift, hairIor, hairV);
                 float cosPdf = max(dot(newDir, bounceN), 0.0) * INV_PI;
                 float branchPdf = max((1.0 - specProb) * cosPdf, 1e-6);
                 if (branchPdf <= 1e-6)
