@@ -139,10 +139,102 @@ def _particle_hair_step_count(settings, use_render_steps: bool):
 
 
 def _sample_particle_strands_exact(eval_obj, ps, total_strands: int, step_count: int):
-    """Sample strands exactly like Blender/Cycles using co_hair()."""
+    """Sample strands via direct pathcache access (ctypes) or co_hair() fallback.
+
+    The fast path reads Blender's internal ParticleCacheKey pathcache directly via
+    ctypes, matching how Cycles accesses it in C++ (intern/cycles/blender/curves.cpp).
+    This avoids thousands of Python→C++ RNA calls from co_hair().
+    """
+    import time as _t
+    import ctypes
+    _t0 = _t.perf_counter()
+
+    # ── Fast path: direct pathcache access via ctypes ──
+    try:
+        # ParticleCacheKey struct: { float co[3], vel[3], rot[4], col[3], time; int segments; } = 60 bytes
+        CACHE_KEY_SIZE = 60
+        CO_OFFSET = 0       # co[3] at byte 0
+        SEGMENTS_OFFSET = 56  # segments at byte 56
+
+        # Get raw pointer to ParticleSystem struct via Blender's as_pointer()
+        ps_ptr = ps.as_pointer()
+
+        # ParticleSystem layout (64-bit): pathcache at offset 56, childcache at 64
+        # totcached at offset 332, totchildcache at offset 336
+        PATHCACHE_OFFSET = 56
+        CHILDCACHE_OFFSET = 64
+        TOTCACHED_OFFSET = 332
+        TOTCHILDCACHE_OFFSET = 336
+
+        # Read pathcache pointer (ParticleCacheKey**)
+        pathcache_pp = ctypes.c_void_p.from_address(ps_ptr + PATHCACHE_OFFSET).value
+        childcache_pp = ctypes.c_void_p.from_address(ps_ptr + CHILDCACHE_OFFSET).value
+        totcached = ctypes.c_int.from_address(ps_ptr + TOTCACHED_OFFSET).value
+        totchildcache = ctypes.c_int.from_address(ps_ptr + TOTCHILDCACHE_OFFSET).value
+
+        if pathcache_pp is None or pathcache_pp == 0 or totcached <= 0:
+            raise RuntimeError("pathcache not available")
+
+        # World → local transform
+        eval_world_inv = np.linalg.inv(np.array(eval_obj.matrix_world, dtype=np.float64))
+
+        all_keys = np.empty((total_strands, step_count, 3), dtype=np.float32)
+
+        # Read parent strands from pathcache
+        ptr_size = ctypes.sizeof(ctypes.c_void_p)
+        for strand_idx in range(min(totcached, total_strands)):
+            # pathcache[strand_idx] = pointer to ParticleCacheKey array
+            cache_ptr = ctypes.c_void_p.from_address(pathcache_pp + strand_idx * ptr_size).value
+            if cache_ptr is None or cache_ptr == 0:
+                all_keys[strand_idx] = 0
+                continue
+
+            # Read segments count from first key
+            max_k = ctypes.c_int.from_address(cache_ptr + SEGMENTS_OFFSET).value
+
+            for step_idx in range(step_count):
+                if step_idx <= max_k:
+                    key_addr = cache_ptr + step_idx * CACHE_KEY_SIZE
+                    co = (ctypes.c_float * 3).from_address(key_addr + CO_OFFSET)
+                    co_world = eval_world_inv @ np.array([co[0], co[1], co[2], 1.0], dtype=np.float64)
+                    all_keys[strand_idx, step_idx] = co_world[:3]
+                elif step_idx > 0:
+                    all_keys[strand_idx, step_idx] = all_keys[strand_idx, step_idx - 1]
+
+        # Read child strands from childcache
+        if childcache_pp and childcache_pp != 0 and totchildcache > 0:
+            child_start = totcached
+            for ci in range(min(totchildcache, total_strands - child_start)):
+                strand_idx = child_start + ci
+                if strand_idx >= total_strands:
+                    break
+                cache_ptr = ctypes.c_void_p.from_address(childcache_pp + ci * ptr_size).value
+                if cache_ptr is None or cache_ptr == 0:
+                    all_keys[strand_idx] = 0
+                    continue
+
+                max_k = ctypes.c_int.from_address(cache_ptr + SEGMENTS_OFFSET).value
+
+                for step_idx in range(step_count):
+                    if step_idx <= max_k:
+                        key_addr = cache_ptr + step_idx * CACHE_KEY_SIZE
+                        co = (ctypes.c_float * 3).from_address(key_addr + CO_OFFSET)
+                        co_world = eval_world_inv @ np.array([co[0], co[1], co[2], 1.0], dtype=np.float64)
+                        all_keys[strand_idx, step_idx] = co_world[:3]
+                    elif step_idx > 0:
+                        all_keys[strand_idx, step_idx] = all_keys[strand_idx, step_idx - 1]
+
+        _dt = _t.perf_counter() - _t0
+        print(f"[ignis-hair] FAST ctypes: {total_strands} strands x {step_count} keys in {_dt:.3f}s"
+              f" ({totcached}p + {totchildcache}ch)")
+        return all_keys
+
+    except Exception as e:
+        print(f"[ignis-hair] ctypes pathcache failed: {e}, falling back to co_hair()")
+
+    # ── Fallback: per-strand co_hair() (slow but always works) ──
     all_keys = np.empty((total_strands, step_count, 3), dtype=np.float32)
-    eval_world = np.array(eval_obj.matrix_world, dtype=np.float64)
-    eval_world_inv = np.linalg.inv(eval_world)
+    eval_world_inv = np.linalg.inv(np.array(eval_obj.matrix_world, dtype=np.float64))
     zero_world = np.zeros(3, dtype=np.float64)
 
     for strand_idx in range(total_strands):
@@ -151,10 +243,6 @@ def _sample_particle_strands_exact(eval_obj, ps, total_strands: int, step_count:
             co = ps.co_hair(eval_obj, particle_no=strand_idx, step=step_idx)
             co_world3 = np.array((co[0], co[1], co[2]), dtype=np.float64)
 
-            # RNA exposes BKE_particle_co_hair() as an output vector initialized to zero.
-            # When Blender has fewer cached keys for a shortened child strand, out-of-range
-            # steps leave that output untouched. Cycles seeds the call with prev_co_world,
-            # so invalid tail samples collapse to the previous valid key instead of (0,0,0).
             if step_idx > 0 and prev_co_world is not None:
                 if not np.isfinite(co_world3).all():
                     co_world3 = prev_co_world.copy()
@@ -168,6 +256,8 @@ def _sample_particle_strands_exact(eval_obj, ps, total_strands: int, step_count:
             all_keys[strand_idx, step_idx] = co_local[:3]
             prev_co_world = co_world3
 
+    _dt = _t.perf_counter() - _t0
+    print(f"[ignis-hair] SLOW co_hair: {total_strands} strands x {step_count} keys in {_dt:.3f}s")
     return all_keys
 
 
