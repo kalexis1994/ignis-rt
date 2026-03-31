@@ -691,6 +691,17 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
         _log("ignis_create OK")
 
+        # Report GPU backend
+        try:
+            import gpu.platform
+            _gpu_backend = gpu.platform.backend_type_get()
+            _log(f" GPU backend: {_gpu_backend}")
+            if _gpu_backend == "VULKAN":
+                dll_wrapper.set_int("blender_vulkan_backend", 1)
+                _log(" Vulkan backend detected — native interop available")
+        except Exception:
+            _log(" GPU backend: unknown")
+
         # Report denoiser status
         dlss_on = dll_wrapper.get_int("dlss_active")
         rr_on = dll_wrapper.get_int("dlss_rr_active")

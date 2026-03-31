@@ -128,6 +128,9 @@ struct PathTracerConfig {
     float dofRotation        = 0.0f;   // blade rotation (radians)
     float dofRatio           = 1.0f;   // anamorphic ratio
 
+    // Blender GPU backend (true = Vulkan, false = OpenGL — affects interop sync)
+    bool  blenderVulkanBackend = false;
+
     // Backface culling
     bool  backfaceCulling    = false;
 

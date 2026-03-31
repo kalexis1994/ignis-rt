@@ -741,6 +741,7 @@ IGNIS_API void ignis_set_int(const char* key, int value) {
     else if (strcmp(key, "use_wavefront") == 0)    cfg->useWavefront = (value != 0);
     else if (strcmp(key, "hybrid_rasterization") == 0) cfg->hybridRasterization = (value != 0);
     else if (strcmp(key, "dof_blades") == 0)        cfg->dofBlades = value;
+    else if (strcmp(key, "blender_vulkan_backend") == 0) cfg->blenderVulkanBackend = (value != 0);
     else if (strcmp(key, "backface_culling") == 0) cfg->backfaceCulling = (value != 0);
     else if (strcmp(key, "restir_di") == 0)      cfg->restirDI = (value != 0);
     else if (strcmp(key, "hdri_tex_index") == 0)  cfg->hdriTexIndex = value;
@@ -835,10 +836,13 @@ IGNIS_API void ignis_update_texture_descriptors(void* mgr) {
 IGNIS_API bool ignis_draw_gl(uint32_t viewportWidth, uint32_t viewportHeight) {
     if (!g_renderer) return false;
     if (!g_renderer->InitGLInterop()) return false;
-    // Ensure ALL Vulkan GPU work is complete before OpenGL reads the shared texture.
-    // Cross-API (Vulkan→OpenGL) memory sharing has no implicit synchronization.
-    auto* ctx = g_renderer->GetContext();
-    if (ctx) vkQueueWaitIdle(ctx->GetGraphicsQueue());
+    // Cross-API sync: Vulkan→OpenGL has no implicit synchronization.
+    // With GL backend: must wait for Vulkan to finish before GL reads shared texture.
+    // With Vulkan backend: Blender shares the same GPU queue — implicit ordering.
+    if (!acpt::g_config.blenderVulkanBackend) {
+        auto* ctx = g_renderer->GetContext();
+        if (ctx) vkQueueWaitIdle(ctx->GetGraphicsQueue());
+    }
     g_renderer->DrawGL(viewportWidth, viewportHeight);
     return true;
 }
