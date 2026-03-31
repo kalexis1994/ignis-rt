@@ -415,7 +415,6 @@ def _capture_restart_config(scene):
         }
     except Exception:
         return {}
-_fps_display = 0.0
 
 # ── Incremental update flags (Cycles-style) ──
 _ignis_full_dirty = True       # need full scene upload (meshes + materials + TLAS)
@@ -478,36 +477,15 @@ MESH_BATCH_SIZE = 4    # meshes per frame during loading
 
 
 def _update_fps():
-    """Track frame times and compute rolling average FPS."""
-    global _fps_times, _fps_display
-    now = time.perf_counter()
-    _fps_times.append(now)
-    if len(_fps_times) > 30:
-        _fps_times = _fps_times[-30:]
-    if len(_fps_times) >= 2:
-        elapsed = _fps_times[-1] - _fps_times[0]
-        if elapsed > 0:
-            _fps_display = (len(_fps_times) - 1) / elapsed
+    """Track frame times — delegates to perf_overlay."""
+    from . import perf_overlay
+    perf_overlay.update()
 
 
 def _draw_fps_overlay(w, h):
-    """Draw FPS counter at top-right of viewport."""
-    text = f"{_fps_display:.0f} FPS"
-    gpu.state.blend_set('ALPHA')
-    gpu.state.depth_test_set('NONE')
-    gpu.state.depth_mask_set(False)
-    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
-    verts = ((w - 130, h - 46), (w - 14, h - 46), (w - 14, h - 74), (w - 130, h - 74))
-    batch = batch_for_shader(shader, 'TRI_FAN', {"pos": verts})
-    shader.bind()
-    shader.uniform_float("color", (0.0, 0.0, 0.0, 0.6))
-    batch.draw(shader)
-    font_id = 0
-    blf.size(font_id, 18)
-    blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
-    blf.position(font_id, w - 122, h - 68, 0)
-    blf.draw(font_id, text)
-    gpu.state.blend_set('NONE')
+    """Draw performance overlay — delegates to perf_overlay."""
+    from . import perf_overlay
+    perf_overlay.draw(w, h)
 
 
 from . import loading_screen
@@ -569,7 +547,7 @@ def _ignis_shutdown():
     global _ignis_frame_index, _ignis_full_dirty, _ignis_materials_dirty, _ignis_tlas_dirty, _ignis_objects_dirty
     global _ignis_changed_objects, _ignis_cached_tlas, _ignis_objkey_to_tlas
     global _ignis_last_full_upload, _ignis_instance_count
-    global _fps_times, _fps_display
+    global _fps_times
     global _load_stage, _ignis_last_draw_time
     global _ignis_cm_lut_signature, _ignis_cm_lut_valid
     if _ignis_initialized:
@@ -598,7 +576,8 @@ def _ignis_shutdown():
         _ignis_cm_lut_signature = None
         _ignis_cm_lut_valid = False
         _fps_times = []
-        _fps_display = 0.0
+        from . import perf_overlay
+        perf_overlay.reset()
         _load_stage = LOAD_IDLE
         _ignis_last_draw_time = 0.0
 
