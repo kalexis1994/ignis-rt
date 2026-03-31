@@ -32,6 +32,8 @@ layout(binding = 2, set = 0) uniform CameraProperties {
     vec4 ptParams1;  // x=skyReflIntensity, y=ambientMax, z=sunMinIntensity, w=skyBounceIntensity
     vec4 windParams;
     vec4 rainParams;
+    vec4 dofParams;    // x=aperture, y=focusDist, z=blades, w=rotation
+    vec4 dofParams2;   // x=ratio
     ivec4 jitterPattern[8];
     // Point/spot lights
     uint lightCount;
@@ -1020,6 +1022,67 @@ void main() {
 
     vec3 rayOrigin = origin4.xyz;
     vec3 rayDir = normalize(dir4.xyz);
+
+    // ── Depth of Field ──
+    float dofAperture = cam.dofParams.x;
+    if (dofAperture > 0.0) {
+        float dofFocusDist = cam.dofParams.y;
+        float dofBlades = cam.dofParams.z;
+        float dofRotation = cam.dofParams.w;
+        float dofRatio = cam.dofParams2.x;
+
+        // Sample lens aperture (circular or polygonal)
+        vec2 lensRand = rand2();
+        vec2 lensUV;
+        if (dofBlades < 3.0) {
+            // Circular disk: concentric mapping (Shirley)
+            float a = 2.0 * lensRand.x - 1.0;
+            float b = 2.0 * lensRand.y - 1.0;
+            float r, phi;
+            if (abs(a) > abs(b)) {
+                r = a;
+                phi = (PI / 4.0) * (b / max(abs(a), 1e-8));
+            } else {
+                r = b;
+                phi = (PI / 2.0) - (PI / 4.0) * (a / max(abs(b), 1e-8));
+            }
+            lensUV = vec2(r * cos(phi), r * sin(phi));
+        } else {
+            // Polygonal bokeh (regular polygon sampling, matching Cycles)
+            float corners = dofBlades;
+            float u = lensRand.x, v = lensRand.y;
+            float corner = floor(u * corners);
+            u = u * corners - corner;
+            u = sqrt(u);
+            v = v * u;
+            u = 1.0 - u;
+            float angle = PI / corners;
+            vec2 p = vec2((u + v) * cos(angle), (u - v) * sin(angle));
+            float rot = dofRotation + corner * 2.0 * angle;
+            float cr = cos(rot), sr = sin(rot);
+            lensUV = vec2(cr * p.x - sr * p.y, sr * p.x + cr * p.y);
+        }
+
+        // Anamorphic distortion
+        lensUV.x *= (dofRatio > 0.01 ? 1.0 / dofRatio : 1.0);
+
+        // Scale by aperture size
+        lensUV *= dofAperture;
+
+        // Compute focal plane intersection
+        // target4.xyz is the camera-space direction (before world transform)
+        float ft = dofFocusDist / max(abs(target4.z), 1e-6);
+        vec3 focusPoint = target4.xyz * ft;  // Camera-space focus point
+
+        // New camera-space ray: from lens offset to focus point
+        vec3 camOriginOffset = vec3(lensUV, 0.0);
+        vec3 camDirDOF = normalize(focusPoint - camOriginOffset);
+
+        // Transform to world space
+        rayOrigin = (cam.viewInverse * vec4(camOriginOffset, 1.0)).xyz;
+        rayDir = normalize((cam.viewInverse * vec4(camDirDOF, 0.0)).xyz);
+    }
+
     if (sampleIdx == 0) savedRayDir = rayDir;
 
     // Per-sample state

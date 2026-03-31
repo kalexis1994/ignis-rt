@@ -2372,6 +2372,13 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 _ignis_frame_index,
             )
 
+            # DOF settings
+            dll_wrapper.set_float("dof_aperture", cam.get("dof_aperture", 0.0))
+            dll_wrapper.set_float("dof_focus_dist", cam.get("dof_focus_dist", 10.0))
+            dll_wrapper.set_int("dof_blades", cam.get("dof_blades", 0))
+            dll_wrapper.set_float("dof_rotation", cam.get("dof_rotation", 0.0))
+            dll_wrapper.set_float("dof_ratio", cam.get("dof_ratio", 1.0))
+
             # Render
             dll_wrapper.render_frame()
 

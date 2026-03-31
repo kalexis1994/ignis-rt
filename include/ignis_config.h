@@ -121,6 +121,13 @@ struct PathTracerConfig {
     // Hybrid rasterization: rasterize primary visibility, path trace secondary bounces
     bool  hybridRasterization = true;
 
+    // Depth of Field
+    float dofAperture        = 0.0f;   // lens radius in world units (0 = no DOF)
+    float dofFocusDist       = 10.0f;  // focus plane distance
+    int   dofBlades          = 0;      // 0=circular, 3-16=polygonal bokeh
+    float dofRotation        = 0.0f;   // blade rotation (radians)
+    float dofRatio           = 1.0f;   // anamorphic ratio
+
     // Backface culling
     bool  backfaceCulling    = false;
 

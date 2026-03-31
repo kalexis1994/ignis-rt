@@ -1003,6 +1003,36 @@ def export_camera(context):
                 result.append(mat[row][col])
         return result
 
+    # DOF settings from active scene camera (if any)
+    import bpy
+    dof_aperture = 0.0  # 0 = no DOF
+    dof_focus_dist = 10.0
+    dof_blades = 0
+    dof_rotation = 0.0
+    dof_ratio = 1.0
+
+    scene_camera = context.scene.camera
+    if scene_camera and scene_camera.type == 'CAMERA':
+        cam_data = scene_camera.data
+        dof = cam_data.dof
+        if dof.use_dof:
+            fstop = max(dof.aperture_fstop, 1e-5)
+            lens_mm = cam_data.lens  # focal length in mm
+            # Cycles formula: aperture_radius = (lens_mm / 1000) / (2 * fstop)
+            dof_aperture = (lens_mm * 1e-3) / (2.0 * fstop)
+            dof_blades = int(dof.aperture_blades)
+            dof_rotation = float(dof.aperture_rotation)
+            dof_ratio = float(dof.aperture_ratio)
+
+            # Focus distance: use focus_object distance if set, else explicit value
+            if dof.focus_object:
+                # Distance from camera to focus object
+                cam_loc = scene_camera.matrix_world.translation
+                obj_loc = dof.focus_object.matrix_world.translation
+                dof_focus_dist = (cam_loc - obj_loc).length
+            else:
+                dof_focus_dist = max(dof.focus_distance, 0.01)
+
     return {
         "view": flatten(view_matrix),
         "view_inv": flatten(view_inv),
@@ -1010,6 +1040,11 @@ def export_camera(context):
         "proj_inv": flatten(proj_inv),
         "width": region.width,
         "height": region.height,
+        "dof_aperture": dof_aperture,
+        "dof_focus_dist": dof_focus_dist,
+        "dof_blades": dof_blades,
+        "dof_rotation": dof_rotation,
+        "dof_ratio": dof_ratio,
     }
 
 

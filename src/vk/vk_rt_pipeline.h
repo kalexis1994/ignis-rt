@@ -106,8 +106,10 @@ struct CameraUBO {
     float skyLight[4];
     float ptParams[8];         // Path tracing tuning: [0]=exposure, [1]=giIntensity, [2]=saturation,
                                // [3]=contrast, [4]=skyReflIntensity, [5]=ambientMax, [6]=sunMinIntensity, [7]=skyBounceIntensity
-    float windParams[4];       // [0]=windDirX, [1]=windDirZ, [2]=windSpeed(m/s), [3]=time(seconds)
-    float rainParams[4];       // [0]=wetness, [1]=waterLevel, [2]=rainIntensity, [3]=reserved
+    float windParams[4];       // [0]=hdri_tex_index, [1]=hdri_strength, [2]=world_bg_r, [3]=world_bg_g
+    float rainParams[4];       // [0]=wetness, [1]=waterLevel, [2]=rainIntensity, [3]=world_bg_b
+    float dofParams[4];        // [0]=aperture, [1]=focusDist, [2]=blades(float), [3]=rotation
+    float dofParams2[4];       // [0]=ratio, [1-3]=reserved
     int32_t jitterPattern[32]; // 8 x ivec4
     // Point/spot lights (NEE direct sampling)
     uint32_t lightCount;       // number of active lights (0-32)

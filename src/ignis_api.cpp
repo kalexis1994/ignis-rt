@@ -523,6 +523,14 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
     cam.windParams[2] = cfg->worldBgR;
     cam.windParams[3] = cfg->worldBgG;
     cam.rainParams[3] = cfg->worldBgB;
+
+    // DOF parameters
+    cam.dofParams[0] = cfg->dofAperture;
+    cam.dofParams[1] = cfg->dofFocusDist;
+    cam.dofParams[2] = static_cast<float>(cfg->dofBlades);
+    cam.dofParams[3] = cfg->dofRotation;
+    cam.dofParams2[0] = cfg->dofRatio;
+
     if (s_lightCount > 0) {
         uint32_t uboLights = (s_lightCount > 32) ? 32 : s_lightCount;
         cam.lightCount = uboLights;
@@ -705,6 +713,10 @@ IGNIS_API void ignis_set_float(const char* key, float value) {
     else if (strcmp(key, "nrd_roughness_fraction") == 0)    cfg->nrdRoughnessFraction = value;
     else if (strcmp(key, "nrd_min_hit_dist_weight") == 0)   cfg->nrdMinHitDistanceWeight = value;
     else if (strcmp(key, "hdri_strength") == 0)             cfg->hdriStrength = value;
+    else if (strcmp(key, "dof_aperture") == 0)              cfg->dofAperture = value;
+    else if (strcmp(key, "dof_focus_dist") == 0)            cfg->dofFocusDist = value;
+    else if (strcmp(key, "dof_rotation") == 0)              cfg->dofRotation = value;
+    else if (strcmp(key, "dof_ratio") == 0)                 cfg->dofRatio = value;
 }
 
 IGNIS_API void ignis_set_int(const char* key, int value) {
@@ -728,6 +740,7 @@ IGNIS_API void ignis_set_int(const char* key, int value) {
     else if (strcmp(key, "shader_mode") == 0)       cfg->shaderMode = value;
     else if (strcmp(key, "use_wavefront") == 0)    cfg->useWavefront = (value != 0);
     else if (strcmp(key, "hybrid_rasterization") == 0) cfg->hybridRasterization = (value != 0);
+    else if (strcmp(key, "dof_blades") == 0)        cfg->dofBlades = value;
     else if (strcmp(key, "backface_culling") == 0) cfg->backfaceCulling = (value != 0);
     else if (strcmp(key, "restir_di") == 0)      cfg->restirDI = (value != 0);
     else if (strcmp(key, "hdri_tex_index") == 0)  cfg->hdriTexIndex = value;
