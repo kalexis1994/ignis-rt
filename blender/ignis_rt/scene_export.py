@@ -1003,7 +1003,7 @@ def export_camera(context):
                 result.append(mat[row][col])
         return result
 
-    # DOF settings from active scene camera (if any)
+    # DOF settings — only when viewing through a scene camera (Numpad 0)
     import bpy
     dof_aperture = 0.0  # 0 = no DOF
     dof_focus_dist = 10.0
@@ -1011,8 +1011,9 @@ def export_camera(context):
     dof_rotation = 0.0
     dof_ratio = 1.0
 
+    is_camera_view = (rv3d.view_perspective == 'CAMERA')
     scene_camera = context.scene.camera
-    if scene_camera and scene_camera.type == 'CAMERA':
+    if is_camera_view and scene_camera and scene_camera.type == 'CAMERA':
         cam_data = scene_camera.data
         dof = cam_data.dof
         if dof.use_dof:
