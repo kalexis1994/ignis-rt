@@ -250,6 +250,7 @@ const uint MAT_FLAG_HAIR = 32u;
 const uint MAT_FLAG_DIFFUSE_SCENE_LINEAR = 64u;
 const uint MAT_FLAG_THIN_TRANSMISSION = 128u;
 const uint MAT_FLAG_LIGHTPATH_TRANSPARENT = 256u;
+const uint MAT_FLAG_BACKFACE_EMIT = 512u;
 const uint VM_HEADER_FLAG_BASE_COLOR = 1u;
 const uint VM_HEADER_FLAG_ALPHA = 2u;
 const uint VM_HEADER_FLAG_TRANSMISSION = 4u;
@@ -1819,12 +1820,30 @@ void main() {
             }
         }
 
+        // ---- Backface emit (light portal) ----
+        // Blender Backfacing=0 (front) = Transparent, Backfacing=1 (back) = Emission.
+        // Our frontFace is computed BEFORE normal flip (line 1786), so it reflects
+        // the raw geometric facing. But after the flip (1787-1789), normals always
+        // face the camera. Use the PRE-FLIP frontFace to match Blender's Backfacing.
+        // Note: frontFace here means "geometric normal faces the ray" = Blender front face.
+        if ((mat.flags & MAT_FLAG_BACKFACE_EMIT) != 0u) {
+            if (!frontFace) {
+                // Back face in Blender = frontFace=false here → this is the EMISSIVE side
+                // Emission is accumulated below, skip transparent passthrough
+            } else {
+                // Front face in Blender = Transparent, pass ray through
+                rayOrigin = worldPos + rayDir * 0.002;
+                bounce--;
+                continue;
+            }
+        }
+
         // ---- Stochastic transparent passthrough (Cycles-style) ----
         // For materials with Transparent BSDF (tp > 0), use Fresnel to determine
         // pass-through vs reflection probability. At normal incidence most light
         // passes through; at grazing angles reflection dominates.
         // This matches Cycles' behavior for architectural glass (Transparent + Glossy).
-        float transparentProb = mat.multB;
+        float transparentProb = ((mat.flags & MAT_FLAG_BACKFACE_EMIT) != 0u) ? 0.0 : mat.multB;
         // For glass+transparent materials: use Fresnel to split pass-through vs reflection.
         // At normal incidence ~96% passes, ~4% reflects (matches Glass BSDF Fresnel).
         if (transparentProb > 0.0) {

@@ -3612,7 +3612,7 @@ class _NodeVmCompiler:
             r = self._compile_principled(p2)
             self._group_context = old
             # Compile Mix Shader factor as alpha (factor=1 → fully Shader 2 → opaque)
-            fac_inp = mix_node.inputs.get('Fac') or mix_node.inputs[0]
+            fac_inp = mix_node.inputs.get('Fac') or mix_node.inputs.get('Factor') or mix_node.inputs[0] or mix_node.inputs[0]
             if fac_inp and fac_inp.is_linked:
                 fac_reg = self._compile_node(fac_inp)
                 self._emit(_OP_OUTPUT_ALPHA, srcA=fac_reg)
@@ -3628,7 +3628,7 @@ class _NodeVmCompiler:
             r = self._compile_principled(p1)
             self._group_context = old
             # Compile Mix Shader factor as inverse alpha (factor=0 → fully Shader 1 → opaque)
-            fac_inp = mix_node.inputs.get('Fac') or mix_node.inputs[0]
+            fac_inp = mix_node.inputs.get('Fac') or mix_node.inputs.get('Factor') or mix_node.inputs[0] or mix_node.inputs[0]
             if fac_inp and fac_inp.is_linked:
                 fac_reg = self._compile_node(fac_inp)
                 inv_reg = self._alloc_reg()
@@ -3683,7 +3683,7 @@ class _NodeVmCompiler:
                 break
 
         # Compile factor
-        fac_inp = mix_node.inputs.get('Fac') or mix_node.inputs[0]
+        fac_inp = mix_node.inputs.get('Fac') or mix_node.inputs.get('Factor') or mix_node.inputs[0] or mix_node.inputs[0]
         if fac_inp and fac_inp.is_linked:
             fac_reg = self._compile_node(fac_inp)
         else:
@@ -3929,6 +3929,7 @@ _MAT_FLAG_HAIR = 32
 _MAT_FLAG_DIFFUSE_SCENE_LINEAR = 64
 _MAT_FLAG_THIN_TRANSMISSION = 128
 _MAT_FLAG_LIGHTPATH_TRANSPARENT = 256
+_MAT_FLAG_BACKFACE_EMIT = 512  # front=transparent, back=emissive (light portal)
 _VM_HEADER_FLAG_BASE_COLOR = 1
 _VM_HEADER_FLAG_ALPHA = 2
 _VM_HEADER_FLAG_TRANSMISSION = 4
@@ -5239,7 +5240,7 @@ def _collect_light_path_outputs(socket, depth=0):
 
 def _resolve_mix_shader(mix_node, register_image_fn):
     """Resolve a Mix Shader node into blended PBR properties."""
-    fac_inp = mix_node.inputs.get('Fac')
+    fac_inp = mix_node.inputs.get('Fac') or mix_node.inputs.get('Factor') or mix_node.inputs[0]
     fac_light_path_outputs = _collect_light_path_outputs(fac_inp) if fac_inp else set()
     if fac_inp and fac_inp.is_linked:
         # Try to evaluate as compile-time constant (Light Path patterns)
@@ -5276,6 +5277,28 @@ def _resolve_mix_shader(mix_node, register_image_fn):
         and ('Is Shadow Ray' in fac_light_path_outputs or 'Is Reflection Ray' in fac_light_path_outputs)
         and (s1_type == 'BSDF_TRANSPARENT' or s2_type == 'BSDF_TRANSPARENT')
     )
+
+    # Special-case: Mix(Transparent, Emission, Geometry.Backfacing)
+    # This is a light portal: front face = transparent, back face = emissive.
+    # Detect by checking if the factor comes from Geometry.Backfacing.
+    backface_emit = False
+    if fac_inp and fac_inp.is_linked:
+        fac_src = fac_inp.links[0].from_node
+        if fac_src.type == 'NEW_GEOMETRY' and fac_inp.links[0].from_socket.name == 'Backfacing':
+            if s1_type == 'BSDF_TRANSPARENT' and s2_type == 'EMISSION':
+                # Front face (backfacing=0) = Shader 1 (Transparent)
+                # Back face (backfacing=1) = Shader 2 (Emission)
+                result = dict(p2)  # Use emission properties
+                result['transparent_prob'] = 1.0  # Front face passes through
+                result['flags'] = result.get('flags', 0) | 2 | _MAT_FLAG_BACKFACE_EMIT
+                backface_emit = True
+            elif s2_type == 'BSDF_TRANSPARENT' and s1_type == 'EMISSION':
+                result = dict(p1)
+                result['transparent_prob'] = 1.0
+                result['flags'] = result.get('flags', 0) | 2 | _MAT_FLAG_BACKFACE_EMIT
+                backface_emit = True
+            if backface_emit:
+                return result
 
     # ---- Factor is 0 or 1: use dominant shader directly (like Cycles) ----
     # When Light Path or constant factor resolves to 0/1, skip all special
