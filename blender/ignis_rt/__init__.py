@@ -130,10 +130,18 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         description="Cull back-facing triangles (skip geometry facing away from camera)",
         update=_tag_redraw,
     )
-    debug_view: IntProperty(
-        name="Debug View",
-        default=0, min=0, max=99,
-        description="Debug visualization (0=off, 99=material index)",
+    debug_view: bpy.props.EnumProperty(
+        name="View Mode",
+        items=[
+            ('0', "Final", "Full rendered output"),
+            ('1', "Lighting", "White surfaces — shows lighting, shadows, GI only"),
+            ('2', "Unlit", "Albedo textures only — no lighting"),
+            ('3', "Normals", "World-space normals as RGB"),
+            ('4', "Depth", "Linear depth as grayscale gradient"),
+            ('5', "UV", "UV coordinates as RG color"),
+        ],
+        default='0',
+        description="Viewport visualization mode",
         update=_tag_redraw,
     )
 

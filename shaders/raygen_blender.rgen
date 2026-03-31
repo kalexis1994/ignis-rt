@@ -985,6 +985,8 @@ void main() {
     float secondaryHitDist = 0.0;  // bounce 1 hit distance (for denoiser)
     bool primaryHit = false;
     vec3 primaryLocalPos = vec3(0.0);
+    vec2 primaryUV = vec2(0.0);
+    vec3 primaryBaseColor = vec3(0.0);
     uint primaryCustomIndex = 0u;
     int  primaryInstanceId = 0;
     float primaryPenumbra = 65504.0;
@@ -1008,8 +1010,9 @@ void main() {
     rngState += uint(blueNoise * 4294967295.0);
 
     // Sub-pixel jitter (NRD mode only — DLSS RR uses Halton from projInverse)
+    // Skip jitter when debug view active (no denoiser to resolve it)
     vec2 pixelCenter = vec2(pixel) + 0.5;
-    if (!rrModeGlobal) {
+    if (!rrModeGlobal && cam.parameters.y == 0u) {
         pixelCenter += vec2(rand01() - 0.5, rand01() - 0.5);
     }
     vec2 uv = pixelCenter / vec2(launchSize);
@@ -1981,6 +1984,8 @@ void main() {
             primaryLocalPos = localPos;
             primaryCustomIndex = customIndex;   // BLAS index
             primaryInstanceId = instanceId;     // instance index
+            primaryUV = hitUV;
+            primaryBaseColor = pbrHit.baseColor;
 
             // Insert surfel at primary hit position
             if (surfelEnabled && !primaryThroughSpecularFast) {
@@ -1991,6 +1996,11 @@ void main() {
             // View-space Z (negative in RH convention)
             vec4 viewPos = cam.view * vec4(pbrHit.worldPos, 1.0);
             primaryViewZ = viewPos.z;
+        }
+
+        // ---- Debug: Lighting mode overrides baseColor to white on all samples ----
+        if (cam.parameters.y == 1u && bounce == 0) {
+            pbrHit.baseColor = vec3(1.0);
         }
 
         // ---- Capture secondary hit distance (bounce 1, for denoiser) ----
@@ -3321,6 +3331,24 @@ void main() {
     vec3 ambientDiffuse = accumAmbientDiffuse * invSPP;
     vec3 color = accumTotalRadiance * invSPP;
 
+    // ---- Debug view override (after SPP averaging) ----
+    uint debugView = cam.parameters.y;
+    if (debugView >= 2u && debugView <= 5u) {
+        if (debugView == 2u) {
+            // Unlit: albedo only
+            color = primaryHit ? primaryBaseColor : vec3(0.0);
+        } else if (debugView == 3u) {
+            // Normals: world-space N as RGB
+            color = primaryHit ? primaryNormal * 0.5 + 0.5 : vec3(0.5);
+        } else if (debugView == 4u) {
+            // Depth: linear distance normalized over 100m
+            color = primaryHit ? vec3(clamp(primaryHitDist / 100.0, 0.0, 1.0)) : vec3(1.0);
+        } else if (debugView == 5u) {
+            // UV coordinates as RG
+            color = primaryHit ? vec3(fract(primaryUV), 0.0) : vec3(0.0);
+        }
+    }
+
     // ---- Write outputs ----
 
     // NRD G-buffers
@@ -3465,46 +3493,18 @@ void main() {
         imageStore(specConfidenceImg, pixel, vec4(1.0));
     }
 
-    // Debug visualization modes (debug_view = cam.parameters.y)
-    uint debugView = cam.parameters.y;
-    if (debugView >= 2u) {
-        // Recompute MV for visualization (same as above, avoids imageLoad issues)
-        vec2 dbgMV = vec2(0.0);
-        if (primaryHit) {
-            uint dBase = uint(primaryInstanceId) * 3u;
-            vec4 dRow0 = prevTransforms.data[dBase + 0u];
-            vec4 dRow1 = prevTransforms.data[dBase + 1u];
-            vec4 dRow2 = prevTransforms.data[dBase + 2u];
-            vec4 dLp = vec4(primaryLocalPos, 1.0);
-            vec3 dbgPrevWorldPos = vec3(dot(dRow0, dLp), dot(dRow1, dLp), dot(dRow2, dLp));
-
-            vec4 dc = cam.proj * cam.view * vec4(primaryWorldPos, 1.0);
-            vec2 dn = dc.xy / dc.w;
-            vec2 du = vec2(dn.x * 0.5 + 0.5, 0.5 - dn.y * 0.5);
-            vec4 dp = cam.projPrev * cam.viewPrev * vec4(dbgPrevWorldPos, 1.0);
-            vec2 dpn = dp.xy / dp.w;
-            vec2 dpu = vec2(dpn.x * 0.5 + 0.5, 0.5 - dpn.y * 0.5);
-            dbgMV = dpu - du;
-        }
-
-        if (debugView == 2u) {
-            // Motion vector vis: R=MV.x*50+0.5, G=MV.y*50+0.5, B=magnitude*100
-            color = vec3(dbgMV.x * 50.0 + 0.5, dbgMV.y * 50.0 + 0.5, length(dbgMV) * 100.0);
-        } else if (debugView == 3u) {
-            // ViewZ vis: grayscale, scale for typical Blender distances
-            float vz = primaryHit ? -primaryViewZ : 0.0;
-            color = vec3(clamp(vz / 20.0, 0.0, 1.0));
-        } else if (debugView == 4u) {
-            // World normal vis
-            color = primaryHit ? primaryNormal * 0.5 + 0.5 : vec3(0.5);
-        }
-    }
+    // Debug views: all modes bypass DLSS/HDR pipeline (C++ routes output to interop).
+    // Mode 1 (Lighting) keeps tonemap (HDR white-albedo shading).
+    // Modes 2-5 skip tonemap (already LDR).
+    bool isDebugView = (debugView >= 1u && debugView <= 5u);
+    bool isDebugLDR = (debugView >= 2u && debugView <= 5u);
 
     // HDR output flag: when DLSS SR or RR is active, skip tonemap in raygen
     // (DLSS/RR processes HDR; a dedicated tonemap pass converts to LDR)
-    bool hdrOutput = (cam.parameters.w != 0u);
+    // All debug views bypass HDR pipeline since DLSS is not running on debug output.
+    bool hdrOutput = (cam.parameters.w != 0u) && !isDebugView;
 
-    if (!hdrOutput) {
+    if (!hdrOutput && !isDebugLDR) {
         // Tonemap + gamma (composite overwrites geometry pixels; this survives for sky)
         float ptSaturation = cam.ptParams0.z;
         float ptContrast   = cam.ptParams0.w;
@@ -3520,11 +3520,15 @@ void main() {
         }
         color = clamp(color, 0.0, 1.0);
         color = pow(color, vec3(1.0 / 2.2));
+    } else if (isDebugLDR) {
+        // LDR debug modes: clamp to [0,1] and apply gamma for display
+        color = clamp(color, 0.0, 1.0);
+        color = pow(color, vec3(1.0 / 2.2));
     }
     // else: write raw linear HDR (no exposure, no tonemap, no gamma)
 
     // Triangular dithering (±0.5/255) to eliminate 8-bit banding
-    if (!hdrOutput) {
+    if (!hdrOutput && !isDebugLDR) {
         uint dh = uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + frameIndex * 26699u;
         dh = (dh ^ (dh >> 16u)) * 0x45d9f3bu;
         dh = (dh ^ (dh >> 16u)) * 0x45d9f3bu;

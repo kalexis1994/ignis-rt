@@ -1334,10 +1334,14 @@ void Renderer::RenderFrameRT() {
             Log(L"[WF] frame %u: dispatch %ux%u dlssActive=%d dlssRR=%d tonemapReady=%d\n",
                 frameIndex_, renderWidth_, renderHeight_, (int)dlssActive_, (int)dlssRRActive_, (int)tonemapReady_);
         }
-        wavefrontPipeline_->RecordDispatch(cmd, renderWidth_, renderHeight_,
+        uint32_t dispW = (dlssDebugBypass_ && debugViewActive) ? width_ : renderWidth_;
+        uint32_t dispH = (dlssDebugBypass_ && debugViewActive) ? height_ : renderHeight_;
+        wavefrontPipeline_->RecordDispatch(cmd, dispW, dispH,
             rtPipeline_->GetDescriptorSet(), wfCfg ? wfCfg->maxBounces : 2);
     } else {
-        rtPipeline_->RecordDispatch(cmd, renderWidth_, renderHeight_);
+        uint32_t dispW = (dlssDebugBypass_ && debugViewActive) ? width_ : renderWidth_;
+        uint32_t dispH = (dlssDebugBypass_ && debugViewActive) ? height_ : renderHeight_;
+        rtPipeline_->RecordDispatch(cmd, dispW, dispH);
     }
 
     if (diagFlush) {
@@ -1445,7 +1449,7 @@ void Renderer::RenderFrameRT() {
     // But DLSS SR + tonemap still need to run if DLSS is active
     bool wavefrontActive = wavefrontPipeline_ && wavefrontPipeline_->IsReady();
 
-    if (wavefrontActive && dlssActive_ && dlss_ && dlss_->IsInitialized() && dlss_->IsSupported() && !dlssRRActive_) {
+    if (wavefrontActive && dlssActive_ && dlss_ && dlss_->IsInitialized() && dlss_->IsSupported() && !dlssRRActive_ && !debugViewActive) {
         if (frameIndex_ < 3) Log(L"[WF] frame %u: running DLSS SR + tonemap path\n", frameIndex_);
         // Barrier: K5 compute writes → DLSS reads
         VkMemoryBarrier wfBarrier{};
@@ -1503,7 +1507,8 @@ void Renderer::RenderFrameRT() {
 
     // 2. Ray Reconstruction path (replaces NRD + composite + DLSS SR)
     // RR still runs with wavefront — it denoises + upscales K5's noisy output
-    if (dlssRRActive_ && dlss_ && dlss_->IsRRActive()) {
+    // Skip when debug view active — raygen wrote final LDR directly to interop
+    if (dlssRRActive_ && dlss_ && dlss_->IsRRActive() && !debugViewActive) {
         // Barrier: RT/compute writes → RR reads (G-buffers and noisy color)
         VkMemoryBarrier rtToRR{};
         rtToRR.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -1592,7 +1597,8 @@ void Renderer::RenderFrameRT() {
         }
     }
     // 2b. NRD denoise path (traditional pipeline)
-    else if (!wavefrontActive && nrdInitialized_) {
+    // Skip when debug view active — raygen wrote final LDR directly to interop
+    else if (!wavefrontActive && nrdInitialized_ && !debugViewActive) {
         // Barrier: RT writes → NRD reads (G-buffers and output image)
         VkMemoryBarrier rtToNrd{};
         rtToNrd.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -1872,7 +1878,7 @@ void Renderer::RenderFrameRT() {
     if (interop_) {
         interop_->SwapBuffers();
         // Update all descriptors that reference the interop image to point to new write slot
-        if (rtPipeline_ && !dlssActive_ && !dlssDebugBypass_) {
+        if (rtPipeline_ && (!dlssActive_ || dlssDebugBypass_)) {
             rtPipeline_->UpdateStorageImage(interop_->GetSharedImageView());
         }
         if (tonemapReady_) {
