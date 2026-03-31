@@ -1714,7 +1714,7 @@ def export_sun(depsgraph):
         return {
             "sun_elevation": elevation,
             "sun_azimuth": azimuth,
-            "sun_intensity": light.energy * math.pi,
+            "sun_intensity": light.energy,  # Cycles uses energy directly (W/m² irradiance)
             "sun_color": (light.color[0], light.color[1], light.color[2]),
             "sun_size": sun_angle,
             "sun_disc_intensity": 1.0,
@@ -1767,8 +1767,8 @@ def export_sun(depsgraph):
             sky_ozone_density = getattr(sky_node, 'ozone_density', 1.0)
             sky_altitude = getattr(sky_node, 'altitude', 0.0)           # meters
 
-            # Sun radiance: base × node intensity × background strength × PI (BRDF parity)
-            sun_intensity = 5.0 * sky_sun_intensity * bg_strength * math.pi
+            # Sun radiance: base × node intensity × background strength
+            sun_intensity = 5.0 * sky_sun_intensity * bg_strength
 
             return {
                 "sun_elevation": elevation,

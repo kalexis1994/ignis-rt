@@ -381,7 +381,7 @@ _ignis_tex_manager = None      # Texture manager handle (opaque void*)
 _fps_times = []
 _ignis_hair_frand_tables = None
 _ignis_hair_frand_cache = {}
-_ignis_disable_tonemap_test = True
+_ignis_disable_tonemap_test = False
 
 
 def _get_hair_frand_scrambled(psys_seed):
@@ -1341,9 +1341,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 if sun["sun_intensity"] <= 0.0 and hdri_sun:
                     sun = hdri_sun
                     hdri_str = hdri["strength"] if hdri else 1.0
-                    # Scale by PI to compensate for hemisphere sampling deficit
-                    # (Cycles importance-samples the sun disc efficiently; we use NEE)
-                    sun["sun_intensity"] = sun["sun_intensity"] * hdri_str * math.pi
+                    sun["sun_intensity"] = sun["sun_intensity"] * hdri_str
                     _log(f"Stage FINALIZE: Sun from HDRI — elev={sun['sun_elevation']:.1f}° "
                          f"azim={sun['sun_azimuth']:.1f}° intensity={sun['sun_intensity']:.1f} "
                          f"color=({sun['sun_color'][0]:.3f},{sun['sun_color'][1]:.3f},{sun['sun_color'][2]:.3f})")
