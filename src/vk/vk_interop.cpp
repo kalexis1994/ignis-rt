@@ -512,6 +512,11 @@ typedef void     (APIENTRY* PFN_glDisable)(GLenum);
 typedef GLboolean(APIENTRY* PFN_glIsEnabled)(GLenum);
 typedef void     (APIENTRY* PFN_glDrawArrays)(GLenum, GLint, GLsizei);
 typedef GLenum   (APIENTRY* PFN_glGetError)();
+typedef void     (APIENTRY* PFN_glFlush)();
+typedef void     (APIENTRY* PFN_glFinish)();
+typedef void     (APIENTRY* PFN_glMemoryBarrier)(GLuint);
+
+#define GL_ALL_BARRIER_BITS 0x7FFFFFFF
 
 typedef GLuint   (APIENTRY* PFN_glCreateShader)(GLenum);
 typedef void     (APIENTRY* PFN_glShaderSource)(GLuint, GLsizei, const GLchar**, const GLint*);
@@ -550,6 +555,9 @@ static struct {
     PFN_glIsEnabled IsEnabled;
     PFN_glDrawArrays DrawArrays;
     PFN_glGetError GetError;
+    PFN_glFlush Flush;
+    PFN_glFinish Finish;
+    PFN_glMemoryBarrier MemoryBarrier;
 
     PFN_glCreateShader CreateShader;
     PFN_glShaderSource ShaderSource;
@@ -607,6 +615,9 @@ static bool LoadGLFunctions() {
     LOAD_GL(IsEnabled);
     LOAD_GL(DrawArrays);
     LOAD_GL(GetError);
+    LOAD_GL(Flush);
+    LOAD_GL(Finish);
+    LOAD_GL(MemoryBarrier);
     #undef LOAD_GL
 
     // GL 2.0+ and extensions (via wglGetProcAddress)
@@ -822,6 +833,7 @@ void Interop::DrawGL(uint32_t viewportW, uint32_t viewportH) {
     gl.Disable(GL_FRAMEBUFFER_SRGB);
 
     // Draw fullscreen triangle — read from the COMPLETED frame (readIdx)
+    // vkQueueWaitIdle in ignis_draw_gl ensures Vulkan finished writing before we read.
     uint32_t readIdx = 1 - writeIdx_;
     GLuint readTex = glTexture_[readIdx] ? glTexture_[readIdx] : glTexture_[0];
     gl.UseProgram(glShaderProgram_);

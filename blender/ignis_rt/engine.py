@@ -2339,6 +2339,19 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         # Camera
         try:
             cam = scene_export.export_camera(context)
+
+            # Detect large camera jumps (viewport navigation without scene camera)
+            # and reset denoiser history to prevent frame mixing/ghosting.
+            global _ignis_prev_view_hash
+            _view_hash = sum(cam["view"][i] for i in (0, 5, 10, 12, 13, 14))
+            if '_ignis_prev_view_hash' not in dir():
+                _ignis_prev_view_hash = _view_hash
+            if abs(_view_hash - _ignis_prev_view_hash) > 0.001:
+                # Camera moved — reset prev frame to prevent stale motion vectors
+                dll_wrapper.set_int("reset_history", 1)
+                _ignis_frame_index = 0
+            _ignis_prev_view_hash = _view_hash
+
             dll_wrapper.set_camera(
                 cam["view_inv"], cam["proj_inv"],
                 cam["view"], cam["proj"],

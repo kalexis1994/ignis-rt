@@ -1264,7 +1264,7 @@ void Renderer::RenderFrameRT() {
     VkDevice device = context_->GetDevice();
     VkCommandBuffer cmd = commandBuffers_[currentFrame_];
 
-    // Wait for previous frame
+    // Wait for previous frame using this slot's fence
     vkWaitForFences(device, 1, &inFlightFences_[currentFrame_], VK_TRUE, UINT64_MAX);
     vkResetFences(device, 1, &inFlightFences_[currentFrame_]);
     if (tonemapReady_) {
@@ -1866,7 +1866,9 @@ void Renderer::RenderFrameRT() {
     }
 
     // Double-buffer swap: flip write/read indices so GL displays the completed frame
-    // while RT writes to the other buffer next frame
+    // while RT writes to the other buffer next frame.
+    // Note: the fence wait at the START of the next RenderFrameRT() guarantees the
+    // read buffer's GPU work is complete before DrawGL() reads it.
     if (interop_) {
         interop_->SwapBuffers();
         // Update all descriptors that reference the interop image to point to new write slot

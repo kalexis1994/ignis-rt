@@ -6,6 +6,7 @@
 #include "vk/vk_rt_pipeline.h"
 #include "vk/vk_accel_structure.h"
 #include "vk/vk_texture_manager.h"
+#include "vk/vk_context.h"
 
 #include <cstring>
 #include <cstdio>
@@ -821,6 +822,10 @@ IGNIS_API void ignis_update_texture_descriptors(void* mgr) {
 IGNIS_API bool ignis_draw_gl(uint32_t viewportWidth, uint32_t viewportHeight) {
     if (!g_renderer) return false;
     if (!g_renderer->InitGLInterop()) return false;
+    // Ensure ALL Vulkan GPU work is complete before OpenGL reads the shared texture.
+    // Cross-API (Vulkan→OpenGL) memory sharing has no implicit synchronization.
+    auto* ctx = g_renderer->GetContext();
+    if (ctx) vkQueueWaitIdle(ctx->GetGraphicsQueue());
     g_renderer->DrawGL(viewportWidth, viewportHeight);
     return true;
 }
