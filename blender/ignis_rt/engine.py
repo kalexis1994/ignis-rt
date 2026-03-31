@@ -47,7 +47,8 @@ def _log(msg):
         try:
             _log_file.write(line + "\n")
             _log_file.flush()
-            os.fsync(_log_file.fileno())
+            # Removed os.fsync() — caused periodic micro-stutters during rendering.
+            # flush() alone ensures data reaches the OS write buffer.
         except Exception:
             pass
 
@@ -2342,14 +2343,27 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
             # Detect large camera jumps (viewport navigation without scene camera)
             # and reset denoiser history to prevent frame mixing/ghosting.
-            global _ignis_prev_view_hash
+            global _ignis_prev_view_hash, _ignis_gc_disabled
             _view_hash = sum(cam["view"][i] for i in (0, 5, 10, 12, 13, 14))
             if '_ignis_prev_view_hash' not in dir():
                 _ignis_prev_view_hash = _view_hash
-            if abs(_view_hash - _ignis_prev_view_hash) > 0.001:
-                # Camera moved — reset prev frame to prevent stale motion vectors
+                _ignis_gc_disabled = False
+            _camera_moved = abs(_view_hash - _ignis_prev_view_hash) > 0.001
+            if _camera_moved:
                 dll_wrapper.set_int("reset_history", 1)
                 _ignis_frame_index = 0
+                # Disable Python GC during active camera movement to prevent stutters.
+                # GC pauses (~5-50ms) cause visible micro-hitches at 30+ fps.
+                if not _ignis_gc_disabled:
+                    import gc
+                    gc.disable()
+                    _ignis_gc_disabled = True
+            elif _ignis_gc_disabled:
+                # Camera stopped — run GC now (safe, no visual impact)
+                import gc
+                gc.collect()
+                gc.enable()
+                _ignis_gc_disabled = False
             _ignis_prev_view_hash = _view_hash
 
             dll_wrapper.set_camera(

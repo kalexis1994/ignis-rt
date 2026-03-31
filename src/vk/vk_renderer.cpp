@@ -1267,8 +1267,8 @@ void Renderer::RenderFrameRT() {
     // Wait for previous frame using this slot's fence
     vkWaitForFences(device, 1, &inFlightFences_[currentFrame_], VK_TRUE, UINT64_MAX);
     vkResetFences(device, 1, &inFlightFences_[currentFrame_]);
-    if (tonemapReady_) {
-        ReloadAgXLutIfChanged();
+    if (tonemapReady_ && (frameIndex_ % 60) == 0) {
+        ReloadAgXLutIfChanged();  // Check filesystem once per ~60 frames, not every frame
     }
 
     // Single command buffer: RT → NRD → Composite → ImGui → Readback
