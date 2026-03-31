@@ -228,6 +228,23 @@ bool Context::CreateLogicalDevice() {
         Log(L"[VK Context] RT + NGX extensions enabled\n");
     }
 
+    // Shader clock (VK_KHR_shader_clock) — per-pixel GPU timing for complexity heatmap
+    bool shaderClockEnabled = false;
+    {
+        uint32_t extCount = 0;
+        vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &extCount, nullptr);
+        std::vector<VkExtensionProperties> exts(extCount);
+        vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr, &extCount, exts.data());
+        for (const auto& ext : exts) {
+            if (strcmp(ext.extensionName, VK_KHR_SHADER_CLOCK_EXTENSION_NAME) == 0) {
+                deviceExtensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
+                shaderClockEnabled = true;
+                Log(L"[VK Context] Shader clock enabled (per-pixel GPU timing)\n");
+                break;
+            }
+        }
+    }
+
     // Shader Execution Reordering (SER) — reduces thread divergence
     // when rays hit different materials. RTX 40+ hardware, software fallback on 30.
     bool serEnabled = false;
@@ -279,12 +296,23 @@ bool Context::CreateLogicalDevice() {
     atomicInt64Features.shaderBufferInt64Atomics = VK_TRUE;
     rtpFeatures.pNext = &atomicInt64Features;
 
+    // Shader clock feature (per-pixel timing)
+    VkPhysicalDeviceShaderClockFeaturesKHR clockFeatures{};
+    clockFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR;
+    clockFeatures.shaderSubgroupClock = VK_TRUE;
+    clockFeatures.shaderDeviceClock = VK_TRUE;
+    if (shaderClockEnabled) {
+        atomicInt64Features.pNext = &clockFeatures;
+    }
+
     // SER feature struct (must be in chain before device creation)
     VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV serFeatures{};
     serFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_NV;
     serFeatures.rayTracingInvocationReorder = VK_TRUE;
     if (serEnabled) {
-        atomicInt64Features.pNext = &serFeatures;
+        // Chain after clock if both enabled
+        if (shaderClockEnabled) clockFeatures.pNext = &serFeatures;
+        else atomicInt64Features.pNext = &serFeatures;
     }
 
     // Device features

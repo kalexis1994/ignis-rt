@@ -91,6 +91,7 @@ public:
     // GL interop (Vulkan → OpenGL zero-copy)
     bool InitGLInterop();
     void DrawGL(uint32_t w, uint32_t h);
+    void WaitForReadBuffer();  // wait for the frame that wrote the GL read buffer
     bool IsRTReady() const { return rtReady_; }
     bool IsRTSupported() const;
     bool HasInterop() const { return interop_ != nullptr; }
@@ -322,6 +323,26 @@ private:
     bool hairContourReady_ = false;
     bool CreateHairContourPipeline();
     void ShutdownHairContour();
+
+    // GPU timestamp profiling
+    // Slots: 0=start, 1=after hybrid raster, 2=after RT dispatch, 3=after hair contour,
+    //        4=after denoise, 5=after composite, 6=after tonemap, 7=frame end
+    VkQueryPool timestampQueryPool_ = VK_NULL_HANDLE;
+    static constexpr uint32_t TS_COUNT = 8;
+    enum TSSlot { TS_START=0, TS_HYBRID=1, TS_RT=2, TS_HAIR=3, TS_DENOISE=4, TS_COMPOSITE=5, TS_TONEMAP=6, TS_END=7 };
+    float gpuStageMs_[8] = {};  // per-stage durations (computed from consecutive timestamps)
+    float timestampPeriod_ = 0.0f;
+    bool timestampReady_ = false;
+    uint8_t tsWritten_ = 0;    // bitmask of slots written this frame
+    void InitTimestampQueries();
+    void ShutdownTimestampQueries();
+    void ReadbackTimestamps();
+    void WriteTimestamp(VkCommandBuffer cmd, uint32_t slot);
+    void FillMissingTimestamps(VkCommandBuffer cmd);
+public:
+    // stage: 0=HybridRaster, 1=RTTrace, 2=HairContour, 3=Denoise, 4=Composite, 5=Tonemap, 6=Total
+    float GetGpuStageMs(int stage) const { return (stage >= 0 && stage < 7) ? gpuStageMs_[stage] : 0.0f; }
+private:
 
     // ImGui overlay
     VkRenderPass imguiRenderPass_ = VK_NULL_HANDLE;

@@ -8,6 +8,25 @@ from gpu_extras.batch import batch_for_shader
 
 WINDOW_SEC = 5.0  # show last N seconds of frame history
 
+# ── CPU section timing ───────────────────────────────────────────────
+_cpu_marks = {}    # name → perf_counter (begin marks)
+_cpu_times = {}    # name → ms (latest completed section)
+
+def begin(name):
+    """Mark the start of a CPU section."""
+    _cpu_marks[name] = time.perf_counter()
+
+def end(name):
+    """Mark the end of a CPU section, compute elapsed ms."""
+    t0 = _cpu_marks.get(name)
+    if t0 is not None:
+        _cpu_times[name] = (time.perf_counter() - t0) * 1000.0
+
+def cpu_time(name):
+    """Get the last recorded time for a CPU section (ms)."""
+    return _cpu_times.get(name, 0.0)
+
+
 # Rolling history — (timestamp, frame_time_ms) pairs
 _samples = []      # list of (perf_counter, dt_ms)
 _prev_time = 0.0
@@ -198,5 +217,101 @@ def draw(w, h):
 
     # Text
     _draw_text(x0 + _PAD, gy + _GRAPH_H + _PAD + 4)
+
+    gpu.state.blend_set('NONE')
+
+
+# ── GPU Profiler Overlay ─────────────────────────────────────────────
+
+_GPU_BAR_W = 200
+_GPU_ROW_H = 18
+_GPU_PAD = 8
+_GPU_LABEL_W = 100
+
+def draw_gpu_profiler(w, h, fps_visible):
+    """Draw GPU + CPU timing breakdown at top-right, below FPS overlay if visible."""
+    from . import dll_wrapper
+
+    hybrid_ms = dll_wrapper.get_float("gpu_time_hybrid")
+    rt_ms = dll_wrapper.get_float("gpu_time_rt")
+    hair_ms = dll_wrapper.get_float("gpu_time_hair")
+    denoise_ms = dll_wrapper.get_float("gpu_time_denoise")
+    composite_ms = dll_wrapper.get_float("gpu_time_composite")
+    tonemap_ms = dll_wrapper.get_float("gpu_time_tonemap")
+    total_gpu = dll_wrapper.get_float("gpu_time_total")
+
+    sync_ms = cpu_time("sync")
+    render_ms = cpu_time("render")
+    gpu_call_ms = cpu_time("gpu")
+    interop_ms = cpu_time("interop")
+
+    sections = [
+        # (label, ms, color, is_header)
+        ("GPU", None, None, True),
+        ("Hybrid Raster", hybrid_ms, (0.6, 0.9, 0.3, 0.9), False),
+        ("RT Trace", rt_ms, (0.3, 0.7, 1.0, 0.9), False),
+        ("Hair+Resolve", hair_ms, (0.8, 0.6, 0.3, 0.9), False),
+        ("Denoise", denoise_ms, (0.9, 0.4, 0.7, 0.9), False),
+        ("Composite", composite_ms, (0.9, 0.6, 0.2, 0.9), False),
+        ("Tonemap", tonemap_ms, (0.7, 0.7, 0.3, 0.9), False),
+        ("GPU Total", total_gpu, (0.8, 0.8, 0.8, 0.9), False),
+        ("CPU", None, None, True),
+        ("Scene Sync", sync_ms, (0.4, 0.9, 0.5, 0.9), False),
+        ("Camera+Prep", render_ms, (0.5, 0.8, 0.9, 0.9), False),
+        ("Render Call", gpu_call_ms, (0.3, 0.7, 1.0, 0.9), False),
+        ("GL Interop", interop_ms, (0.9, 0.5, 0.8, 0.9), False),
+        ("Blender Gap", cpu_time("blender"), (0.6, 0.4, 0.4, 0.9), False),
+    ]
+
+    rows = len(sections)
+    panel_w = _GPU_LABEL_W + _GPU_BAR_W + 70 + _GPU_PAD * 2
+    panel_h = rows * _GPU_ROW_H + _GPU_PAD * 2 + 8
+
+    x0 = w - panel_w - 6
+    y_offset = (_TOTAL_H + 10) if fps_visible else 0
+    y0 = h - panel_h - 6 - y_offset
+
+    gpu.state.blend_set('ALPHA')
+    gpu.state.depth_test_set('NONE')
+    gpu.state.depth_mask_set(False)
+
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    _draw_rect(shader, x0, y0, panel_w, panel_h, _COLOR_BG)
+
+    fid = 0
+    tx = x0 + _GPU_PAD
+    ty = y0 + panel_h - _GPU_PAD - 4
+
+    # Scale: max of total GPU or 33ms
+    max_ms = max(total_gpu, gpu_call_ms, 16.67, 1.0)
+
+    for label, ms, color, is_header in sections:
+        if is_header:
+            blf.size(fid, 13)
+            blf.color(fid, 0.8, 0.8, 0.8, 1.0)
+            blf.position(fid, tx, ty, 0)
+            blf.draw(fid, label)
+            ty -= _GPU_ROW_H
+            continue
+
+        blf.size(fid, 12)
+        # Label
+        blf.color(fid, *color)
+        blf.position(fid, tx + 8, ty, 0)
+        blf.draw(fid, label)
+
+        # Bar
+        bar_x = tx + _GPU_LABEL_W
+        bar_frac = min(ms / max_ms, 1.0) if max_ms > 0 else 0
+        bar_px = max(bar_frac * _GPU_BAR_W, 1.0)
+        _draw_rect(shader, bar_x, ty - 2, bar_px, 12, color)
+        _draw_rect(shader, bar_x + bar_px, ty - 2, _GPU_BAR_W - bar_px, 12, (0.15, 0.15, 0.15, 0.6))
+
+        # Value
+        blf.color(fid, 1.0, 1.0, 1.0, 1.0)
+        blf.position(fid, bar_x + _GPU_BAR_W + 6, ty, 0)
+        blf.draw(fid, f"{ms:.1f} ms")
+
+        ty -= _GPU_ROW_H
 
     gpu.state.blend_set('NONE')

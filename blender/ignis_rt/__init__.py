@@ -139,6 +139,7 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
             ('3', "Normals", "World-space normals as RGB"),
             ('4', "Depth", "Linear depth as grayscale gradient"),
             ('5', "UV", "UV coordinates as RG color"),
+            ('6', "Complexity", "Shader cost heatmap (green=cheap, red=expensive)"),
         ],
         default='0',
         description="Viewport visualization mode",
@@ -215,6 +216,11 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
     show_fps: BoolProperty(
         name="Show FPS",
         description="Display frames per second in the viewport",
+        default=False, update=_tag_redraw,
+    )
+    show_gpu_profiler: BoolProperty(
+        name="GPU Profiler",
+        description="Display GPU timing breakdown (RT, PostProcess, Total)",
         default=False, update=_tag_redraw,
     )
 
@@ -336,6 +342,7 @@ class IGNIS_PT_performance(bpy.types.Panel):
         layout.prop(props, "vsync")
         layout.prop(props, "fps_limit")
         layout.prop(props, "show_fps")
+        layout.prop(props, "show_gpu_profiler")
 
 
 class IGNIS_PT_advanced(bpy.types.Panel):

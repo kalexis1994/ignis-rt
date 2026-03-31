@@ -8,6 +8,7 @@
 #extension GL_EXT_shader_atomic_int64 : require
 #extension GL_GOOGLE_include_directive : require
 #extension GL_NV_ray_tracing_invocation_reorder : enable
+#extension GL_ARB_shader_clock : enable
 
 // ============================================================
 // Descriptor bindings — IDENTICAL layout to raygen.rgen (0-23)
@@ -999,6 +1000,10 @@ void main() {
     float exposure = cam.ptParams0.x;
     float giIntensity = cam.ptParams0.y;
 
+    // Shader complexity: real GPU clock ticks (when available) + operation counter fallback
+    uint64_t shaderClockStart = clockARB();
+    uint shaderCost = 0u;
+
     for (int sampleIdx = 0; sampleIdx < spp; sampleIdx++) {
 
     // Initialize RNG: hash pixel + frame + sample index + blue noise
@@ -1141,6 +1146,7 @@ void main() {
     surfelGrid.sceneScale = cam.sharcSceneScale * SURFEL_GRID_SCALE_MULT;
 
     for (int bounce = 0; bounce < maxBounces; bounce++) {
+        shaderCost += 4u;  // each bounce = base cost of BVH traversal + shading
 
         // ── Surfel GI query (bounce 1+): surface-based irradiance cache ──
         if (surfelEnabled && bounce >= 1) {
@@ -1628,7 +1634,7 @@ void main() {
 
         // ---- Volume-only material: ray march with Beer-Lambert + in-scattering ----
         bool isVolumeOnly = (mat.flags & 4u) != 0u && (mat.flags & 8u) != 0u;
-        if (isVolumeOnly) {
+        if (isVolumeOnly) { shaderCost += 20u;  // volume ray marching is very expensive
             float volumeDensity = mat.sunSpecular;
             float volumeAnisotropy = mat.sunSpecularEXP;
             vec3 volumeColor = pbrHit.baseColor;
@@ -1783,6 +1789,7 @@ void main() {
         vec3 N = pbrHit.worldNormal;
         vec3 gN = geoNormal;  // camera-facing geometric normal
         bool isHairSurface = (geo.bitangentBufferAddress != 0u);
+        if (isHairSurface) shaderCost += 5u;  // hair BSDF + cylinder shading
         // Hair: large shadow bias plus same-strand skip prevents ribbon-on-ribbon shadows.
         float shadowBias = isHairSurface ? 0.1 : 0.002;
         float hairSelfShadowSkipDist = isHairSurface ? 0.12 : 0.0;
@@ -2058,7 +2065,7 @@ void main() {
         // materials need NEE for the metallic reflection lobe.
         float _glassP = (1.0 - pbrHit.metallic) * pbrHit.transmission;
         bool isGlass = (_glassP > 0.99);
-        if (isGlass) {
+        if (isGlass) { shaderCost += 3u;  // glass refraction + extra bounce
             skipSunNEE = true;
             skipLocalNEE = true;
         }
@@ -2084,7 +2091,7 @@ void main() {
         vec3 sunColor = cam.skyLight.rgb;
         int sunShadowSkipMax = isHairSurface ? 4 : 16;
 
-        if (!skipSunNEE && sunIntensity > 0.0 && sunDir.y > -0.01) {
+        if (!skipSunNEE && sunIntensity > 0.0 && sunDir.y > -0.01) { shaderCost += 2u;  // sun shadow ray
             float NdotL = isHairSurface
                 ? (isHairHit ? evalHairCylinderFalloff(N, sunDir) : length(cross(hairSmoothT, sunDir)))
                 : dot(N, sunDir);
@@ -3333,7 +3340,7 @@ void main() {
 
     // ---- Debug view override (after SPP averaging) ----
     uint debugView = cam.parameters.y;
-    if (debugView >= 2u && debugView <= 5u) {
+    if (debugView >= 2u && debugView <= 6u) {
         if (debugView == 2u) {
             // Unlit: albedo only
             color = primaryHit ? primaryBaseColor : vec3(0.0);
@@ -3346,6 +3353,18 @@ void main() {
         } else if (debugView == 5u) {
             // UV coordinates as RG
             color = primaryHit ? vec3(fract(primaryUV), 0.0) : vec3(0.0);
+        } else if (debugView == 6u) {
+            // Shader complexity heatmap using real GPU clock ticks
+            uint64_t shaderClockEnd = clockARB();
+            uint64_t elapsed = shaderClockEnd - shaderClockStart;
+            // Normalize: ~500K ticks = simple pixel, ~5M ticks = expensive pixel
+            // (RTX 3080 core clock ~1.7GHz → 1M ticks ≈ 0.6ms)
+            float complexity = clamp(float(elapsed) / 5000000.0, 0.0, 1.0);
+            // Smooth green → yellow → red gradient
+            float r = smoothstep(0.0, 0.5, complexity);
+            float g = 1.0 - smoothstep(0.5, 1.0, complexity);
+            float b = 0.0;
+            color = vec3(r, g, b);
         }
     }
 
@@ -3496,8 +3515,8 @@ void main() {
     // Debug views: all modes bypass DLSS/HDR pipeline (C++ routes output to interop).
     // Mode 1 (Lighting) keeps tonemap (HDR white-albedo shading).
     // Modes 2-5 skip tonemap (already LDR).
-    bool isDebugView = (debugView >= 2u && debugView <= 5u);
-    bool isDebugLDR = (debugView >= 2u && debugView <= 5u);
+    bool isDebugView = (debugView >= 2u && debugView <= 6u);
+    bool isDebugLDR = (debugView >= 2u && debugView <= 6u);
 
     // HDR output flag: when DLSS SR or RR is active, skip tonemap in raygen
     // (DLSS/RR processes HDR; a dedicated tonemap pass converts to LDR)

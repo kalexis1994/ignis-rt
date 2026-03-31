@@ -1264,11 +1264,19 @@ void Renderer::RenderFrameRT() {
     VkDevice device = context_->GetDevice();
     VkCommandBuffer cmd = commandBuffers_[currentFrame_];
 
-    // Wait for previous frame using this slot's fence
-    vkWaitForFences(device, 1, &inFlightFences_[currentFrame_], VK_TRUE, UINT64_MAX);
+    // Wait for ALL in-flight frames to complete.  With double-buffered interop,
+    // GL reads the buffer from the most recent submit (prevSlot), so we must
+    // ensure it's done before draw_gl runs after this call returns.
+    // Waiting for both fences here keeps draw_gl non-blocking (~0ms).
+    vkWaitForFences(device, MAX_FRAMES_IN_FLIGHT, inFlightFences_.data(), VK_TRUE, UINT64_MAX);
     vkResetFences(device, 1, &inFlightFences_[currentFrame_]);
+
+    // GPU profiling: readback AFTER fence wait (all GPU work done, no blocking)
+    if (!timestampReady_) InitTimestampQueries();
+    if (timestampReady_ && frameIndex_ > 0) ReadbackTimestamps();
+
     if (tonemapReady_ && (frameIndex_ % 60) == 0) {
-        ReloadAgXLutIfChanged();  // Check filesystem once per ~60 frames, not every frame
+        ReloadAgXLutIfChanged();
     }
 
     // Single command buffer: RT → NRD → Composite → ImGui → Readback
@@ -1277,6 +1285,11 @@ void Renderer::RenderFrameRT() {
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     if (!VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo))) return;
+
+    // Reset timestamp queries for this frame
+    if (timestampReady_)
+        vkCmdResetQueryPool(cmd, timestampQueryPool_, 0, TS_COUNT);
+        tsWritten_ = 0;
 
     // Check debug view mode early (needed for DLSS bypass)
     PathTracerConfig* rtCfgEarly = VK_GetConfig();
@@ -1306,6 +1319,8 @@ void Renderer::RenderFrameRT() {
 
     bool diagFlush = false;  // Set true to flush GPU between stages for crash isolation
 
+    WriteTimestamp(cmd, TS_START);
+
     // 0. Hybrid G-buffer rasterization pass (before RT dispatch)
     PathTracerConfig* hybridCfg = VK_GetConfig();
     bool hybridEnabled = hybridCfg && hybridCfg->hybridRasterization;
@@ -1325,6 +1340,7 @@ void Renderer::RenderFrameRT() {
             0, 1, &rasterToRT, 0, nullptr, 0, nullptr);
         hybridGBufferRendered_ = true;
     }
+    WriteTimestamp(cmd, TS_HYBRID);
 
     // 1. Path tracing dispatch (wavefront or monolithic)
     interop_->TransitionForRTWrite(cmd);
@@ -1359,6 +1375,8 @@ void Renderer::RenderFrameRT() {
         VkCommandBufferBeginInfo bi2{}; bi2.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         vkBeginCommandBuffer(cmd, &bi2);
     }
+
+    WriteTimestamp(cmd, TS_RT);
 
     // SHARC resolve: merge accumulation → resolved (EMA + aging + eviction)
     if (sharcResolveReady_ && rtPipeline_->HasSHARCBuffers()) {
@@ -1444,6 +1462,8 @@ void Renderer::RenderFrameRT() {
         uint32_t gy = (renderHeight_ + 7) / 8;
         vkCmdDispatch(cmd, gx, gy, 1);
     }
+
+    WriteTimestamp(cmd, TS_HAIR);
 
     // Wavefront path: skip NRD denoise + composite — K5 wrote G-buffers + output
     // But DLSS SR + tonemap still need to run if DLSS is active
@@ -1557,6 +1577,9 @@ void Renderer::RenderFrameRT() {
             rtPipeline_->GetReactiveMaskImage(),             // reactive mask (dynamic objects)
             rtPipeline_->GetReactiveMaskView());
 
+        WriteTimestamp(cmd, TS_DENOISE);
+        WriteTimestamp(cmd, TS_COMPOSITE);  // RR path has no separate composite
+
         // Barrier: RR writes → tonemap reads
         VkMemoryBarrier rrBarrier{};
         rrBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -1652,6 +1675,8 @@ void Renderer::RenderFrameRT() {
             VkCommandBufferBeginInfo bi2{}; bi2.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             vkBeginCommandBuffer(cmd, &bi2);
         }
+
+        WriteTimestamp(cmd, TS_DENOISE);
 
         // 3. Composite dispatch (reads NRD outputs, writes to interop image)
         // Skip when debug view is active — raygen already wrote final output directly
@@ -1761,6 +1786,8 @@ void Renderer::RenderFrameRT() {
                 vkBeginCommandBuffer(cmd, &bi2);
             }
 
+            WriteTimestamp(cmd, TS_COMPOSITE);
+
             // 3b. DLSS upscaling (render res → display res)
             if (dlssActive_ && dlss_ && dlss_->IsInitialized() && dlss_->IsSupported()) {
                 // Measure real frame delta for DLSS
@@ -1828,6 +1855,9 @@ void Renderer::RenderFrameRT() {
             }
         }
     }
+
+    // Fill any unwritten timestamp slots (skipped stages → current time → 0ms delta).
+    FillMissingTimestamps(cmd);
 
     // 4. ImGui overlay (renders on top of final output)
     if (imguiReady_) {
@@ -3926,8 +3956,92 @@ void Renderer::ShutdownImGui() {
     Log(L"[VK Renderer] ImGui overlay shutdown\n");
 }
 
+void Renderer::WaitForReadBuffer() {
+    // GL reads the buffer from the PREVIOUS submit.  Wait on that fence
+    // (the "other" slot) to guarantee the read buffer is complete.
+    // Much cheaper than vkQueueWaitIdle: only waits for one specific frame.
+    if (!context_) return;
+    uint32_t prevSlot = (currentFrame_ + MAX_FRAMES_IN_FLIGHT - 1) % MAX_FRAMES_IN_FLIGHT;
+    if (inFlightFences_[prevSlot] != VK_NULL_HANDLE) {
+        vkWaitForFences(context_->GetDevice(), 1, &inFlightFences_[prevSlot], VK_TRUE, UINT64_MAX);
+    }
+}
+
+// ── GPU Timestamp Profiling ──────────────────────────────────────────
+
+void Renderer::InitTimestampQueries() {
+    if (timestampReady_ || !context_) return;
+    VkDevice device = context_->GetDevice();
+
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(context_->GetPhysicalDevice(), &props);
+    timestampPeriod_ = props.limits.timestampPeriod;
+    if (timestampPeriod_ == 0.0f) {
+        Log(L"[GPU Prof] Timestamps not supported on this device\n");
+        return;
+    }
+
+    VkQueryPoolCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    ci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    ci.queryCount = TS_COUNT;
+    if (vkCreateQueryPool(device, &ci, nullptr, &timestampQueryPool_) != VK_SUCCESS) {
+        Log(L"[GPU Prof] Failed to create timestamp query pool\n");
+        return;
+    }
+    timestampReady_ = true;
+    Log(L"[GPU Prof] Timestamp queries ready (period=%.2f ns)\n", timestampPeriod_);
+}
+
+void Renderer::ShutdownTimestampQueries() {
+    if (timestampQueryPool_ && context_) {
+        vkDestroyQueryPool(context_->GetDevice(), timestampQueryPool_, nullptr);
+        timestampQueryPool_ = VK_NULL_HANDLE;
+    }
+    timestampReady_ = false;
+}
+
+void Renderer::WriteTimestamp(VkCommandBuffer cmd, uint32_t slot) {
+    if (timestampReady_ && slot < TS_COUNT && !(tsWritten_ & (1u << slot))) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestampQueryPool_, slot);
+        tsWritten_ |= (1u << slot);
+    }
+}
+
+void Renderer::FillMissingTimestamps(VkCommandBuffer cmd) {
+    if (!timestampReady_) return;
+    for (uint32_t i = 0; i < TS_COUNT; i++) {
+        if (!(tsWritten_ & (1u << i)))
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestampQueryPool_, i);
+    }
+}
+
+void Renderer::ReadbackTimestamps() {
+    if (!timestampReady_ || !timestampQueryPool_) return;
+    uint64_t ts[TS_COUNT] = {};
+    // WAIT_BIT is safe here — fence wait already completed, so results are ready.
+    VkResult r = vkGetQueryPoolResults(context_->GetDevice(), timestampQueryPool_,
+        0, TS_COUNT, sizeof(ts), ts, sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (r != VK_SUCCESS) return;
+
+    float nsToMs = timestampPeriod_ / 1e6f;
+    auto delta = [&](int a, int b) -> float {
+        return (ts[b] >= ts[a]) ? (float)(ts[b] - ts[a]) * nsToMs : 0.0f;
+    };
+    // 0=HybridRaster, 1=RTTrace, 2=HairContour, 3=Denoise, 4=Composite, 5=Tonemap, 6=Total
+    gpuStageMs_[0] = delta(TS_START, TS_HYBRID);     // Hybrid Raster
+    gpuStageMs_[1] = delta(TS_HYBRID, TS_RT);         // RT Trace
+    gpuStageMs_[2] = delta(TS_RT, TS_HAIR);           // Hair Contour
+    gpuStageMs_[3] = delta(TS_HAIR, TS_DENOISE);      // Denoise (NRD/DLSS RR)
+    gpuStageMs_[4] = delta(TS_DENOISE, TS_COMPOSITE); // Composite
+    gpuStageMs_[5] = delta(TS_COMPOSITE, TS_TONEMAP);  // Tonemap/DLSS SR
+    gpuStageMs_[6] = delta(TS_START, TS_TONEMAP);      // Total
+}
+
 void Renderer::Shutdown() {
     ShutdownImGui();
+    ShutdownTimestampQueries();
     if (context_ && context_->GetDevice() != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(context_->GetDevice());
 

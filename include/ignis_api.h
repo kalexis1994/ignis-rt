@@ -91,6 +91,7 @@ IGNIS_API bool   ignis_draw_gl(uint32_t viewportWidth, uint32_t viewportHeight);
 IGNIS_API void   ignis_set_float(const char* key, float value);
 IGNIS_API void   ignis_set_int(const char* key, int value);
 IGNIS_API int    ignis_get_int(const char* key);
+IGNIS_API float  ignis_get_float(const char* key);
 
 // Pick buffer (GPU raycast selection)
 IGNIS_API bool   ignis_read_pick_result(uint32_t* outCustomIndex,

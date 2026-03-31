@@ -2180,6 +2180,11 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 if _ignis_frame_index < 2:
                     _log(f"  sync: {_sync_obj_count} mesh objects, {len(cur_instances)} known, {len(new_objects)} new")
 
+        # Measure Blender overhead (time between view_draw calls)
+        from . import perf_overlay as _prf
+        _prf.end("blender")    # end of gap since last view_draw
+        _prf.begin("blender")  # start measuring gap for next frame
+
         # FPS limiter / V-Sync
         props = context.scene.ignis_rt
         fps_limit = props.fps_limit
@@ -2199,6 +2204,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 elapsed = now - _fps_times[-1]
                 if elapsed < min_frame_time:
                     time.sleep(min_frame_time - elapsed)
+
+        # CPU profiling
+        from . import perf_overlay as _prf
+        _prf.begin("sync")
 
         # Sync scene properties
         props = context.scene.ignis_rt
@@ -2314,7 +2323,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 if _ignis_frame_index < 3:
                     _log(f"Color path: fallback tonemap mode {_tonemap_mode}")
 
+        _prf.end("sync")
+
         # Camera
+        _prf.begin("render")
         try:
             cam = scene_export.export_camera(context)
 
@@ -2357,9 +2369,13 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             dll_wrapper.set_float("dof_ratio", cam.get("dof_ratio", 1.0))
 
             # Render
+            _prf.end("render")
+            _prf.begin("gpu")
             dll_wrapper.render_frame()
+            _prf.end("gpu")
 
             # Display
+            _prf.begin("interop")
             # Keep the zero-copy interop path as the main viewport route.
             # The experimental HDR readback path was intentionally disabled here:
             # it forced GPU->CPU->GPU traffic plus vkQueueWaitIdle() every frame,
@@ -2386,6 +2402,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 elif _ignis_gpu_texture is not None:
                     _draw_texture_flipped(_ignis_gpu_texture, w, h)
 
+            _prf.end("interop")
             _ignis_frame_index += 1
         except Exception:
             _log_exception(f"view_draw render/display (frame {_ignis_frame_index})")
@@ -2398,6 +2415,11 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         if props.show_fps:
             _update_fps()
             _draw_fps_overlay(w, h)
+
+        # GPU profiler overlay
+        if props.show_gpu_profiler:
+            from . import perf_overlay
+            perf_overlay.draw_gpu_profiler(w, h, props.show_fps)
 
         # Always request next frame — NRD needs continuous accumulation to converge
         self.tag_redraw()

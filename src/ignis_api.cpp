@@ -781,6 +781,19 @@ IGNIS_API int ignis_get_int(const char* key) {
     return 0;
 }
 
+IGNIS_API float ignis_get_float(const char* key) {
+    if (!key || !g_renderer) return 0.0f;
+    // GPU stage timings: 0=HybridRaster, 1=RTTrace, 2=HairContour, 3=Denoise, 4=Composite, 5=Tonemap, 6=Total
+    if (strcmp(key, "gpu_time_hybrid") == 0)       return g_renderer->GetGpuStageMs(0);
+    if (strcmp(key, "gpu_time_rt") == 0)           return g_renderer->GetGpuStageMs(1);
+    if (strcmp(key, "gpu_time_hair") == 0)         return g_renderer->GetGpuStageMs(2);
+    if (strcmp(key, "gpu_time_denoise") == 0)      return g_renderer->GetGpuStageMs(3);
+    if (strcmp(key, "gpu_time_composite") == 0)    return g_renderer->GetGpuStageMs(4);
+    if (strcmp(key, "gpu_time_tonemap") == 0)      return g_renderer->GetGpuStageMs(5);
+    if (strcmp(key, "gpu_time_total") == 0)        return g_renderer->GetGpuStageMs(6);
+    return 0.0f;
+}
+
 IGNIS_API void* ignis_create_texture_manager(void) {
     if (!g_renderer || !g_renderer->GetContext()) return nullptr;
     auto* mgr = new acpt::vk::TextureManager();
@@ -836,10 +849,8 @@ IGNIS_API void ignis_update_texture_descriptors(void* mgr) {
 IGNIS_API bool ignis_draw_gl(uint32_t viewportWidth, uint32_t viewportHeight) {
     if (!g_renderer) return false;
     if (!g_renderer->InitGLInterop()) return false;
-    // Ensure ALL Vulkan GPU work is complete before OpenGL reads the shared texture.
-    // Cross-API (Vulkan→OpenGL) memory sharing has no implicit synchronization.
-    auto* ctx = g_renderer->GetContext();
-    if (ctx) vkQueueWaitIdle(ctx->GetGraphicsQueue());
+    // No sync needed here — RenderFrameRT waits for both in-flight fences
+    // at the start, guaranteeing the GL read buffer is complete before we get here.
     g_renderer->DrawGL(viewportWidth, viewportHeight);
     return true;
 }
