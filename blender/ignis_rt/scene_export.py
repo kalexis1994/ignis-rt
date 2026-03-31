@@ -1102,8 +1102,427 @@ def _extract_sun_from_hdri(rgb, w, h):
     }
 
 
+def _world_needs_baking(world):
+    """Check if the World node tree is complex (Mix Shader, multiple textures, etc.)
+    and needs to be baked to an HDRI instead of direct texture extraction."""
+    if not world or not world.node_tree:
+        return False
+    nodes = world.node_tree.nodes
+    has_mix = any(n.type == 'MIX_SHADER' for n in nodes)
+    has_sky = any(n.type == 'TEX_SKY' for n in nodes)
+    has_image = any(n.type == 'TEX_IMAGE' for n in nodes)
+    has_env = any(n.type == 'TEX_ENVIRONMENT' for n in nodes)
+    # Complex: Mix Shader, or Sky+Image without Environment Texture
+    if has_mix:
+        return True
+    if has_sky and has_image and not has_env:
+        return True
+    return False
+
+
+def _bake_world_to_hdri(world, resolution=512):
+    """Bake the World node tree to an equirectangular HDRI by evaluating nodes.
+
+    Evaluates the node tree structure manually (Sky Texture + Image Texture +
+    Mix Shader + Background strength).
+
+    Returns dict with HDRI data or None on failure.
+    """
+    import bpy
+    import mathutils
+
+    if not world or not world.node_tree:
+        return None
+
+    nodes = world.node_tree.nodes
+
+    # Auto-detect resolution from image textures in the World
+    for n in nodes:
+        if n.type in ('TEX_IMAGE', 'TEX_ENVIRONMENT') and n.image:
+            iw, ih = n.image.size
+            if iw > 0 and ih > 0:
+                resolution = max(min(iw, 2048), resolution)
+                break
+    w, h = resolution * 2, resolution
+    _bake_pixel_cache = {}  # image id → numpy pixels array
+
+    # Find the World Output → trace to get the full chain
+    output_node = None
+    for n in nodes:
+        if n.type == 'OUTPUT_WORLD':
+            output_node = n
+            break
+    if not output_node:
+        return None
+
+    surface_inp = output_node.inputs.get('Surface')
+    if not surface_inp or not surface_inp.is_linked:
+        return None
+
+    root_node = surface_inp.links[0].from_node
+
+    # Build evaluation function for the node tree
+    def _eval_background(bg_node, direction):
+        """Evaluate a Background node: color × strength."""
+        strength = float(bg_node.inputs['Strength'].default_value) if bg_node.inputs.get('Strength') else 1.0
+        color_inp = bg_node.inputs.get('Color')
+        if color_inp and color_inp.is_linked:
+            color = _eval_color_node(color_inp.links[0].from_node, direction)
+        else:
+            c = color_inp.default_value if color_inp else (0.05, 0.05, 0.05, 1)
+            color = np.array([c[0], c[1], c[2]], dtype=np.float32)
+        return color * strength
+
+    def _eval_color_node(node, direction):
+        """Evaluate a color-producing node at a given world direction."""
+        if node.type == 'TEX_SKY':
+            return _eval_sky(node, direction)
+        elif node.type == 'TEX_IMAGE':
+            return _eval_tex_image(node, direction)
+        elif node.type == 'TEX_ENVIRONMENT':
+            return _eval_tex_environment(node, direction)
+        elif node.type == 'MIX_RGB' or node.type == 'MIX':
+            return _eval_mix_rgb(node, direction)
+        else:
+            # Unknown node — return default
+            out = node.outputs.get('Color')
+            if out:
+                try:
+                    c = out.default_value
+                    return np.array([c[0], c[1], c[2]], dtype=np.float32)
+                except Exception:
+                    pass
+            return np.array([0.5, 0.5, 0.5], dtype=np.float32)
+
+    def _eval_sky(node, direction):
+        """Evaluate Preetham/Hosek/Nishita sky at a direction (simplified)."""
+        # Blender sky uses Z-up; convert our direction to Blender coords
+        # direction is in Blender world space (Z-up)
+        x, y, z = direction
+        # Simple sky model approximation — warm horizon, blue zenith
+        elevation = math.asin(max(-1, min(1, z)))  # Z is up in Blender
+        t = max(elevation / (math.pi / 2), 0.0)  # 0 at horizon, 1 at zenith
+
+        sun_dir = np.array(node.sun_direction[:3], dtype=np.float64)
+        sun_dot = max(np.dot(direction, sun_dir), 0.0)
+
+        if node.sky_type == 'PREETHAM':
+            # Preetham approximation
+            sky_blue = np.array([0.3, 0.5, 0.9], dtype=np.float32)
+            horizon = np.array([0.8, 0.6, 0.4], dtype=np.float32)
+            sky = sky_blue * t + horizon * (1 - t)
+            # Sun glow
+            sun_glow = sun_dot ** 128 * 5.0
+            sky += np.array([1.0, 0.9, 0.7], dtype=np.float32) * sun_glow
+        else:
+            # Generic fallback
+            sky = np.array([0.4, 0.5, 0.7], dtype=np.float32) * max(t, 0.1)
+
+        return sky * getattr(node, 'sun_intensity', 1.0)
+
+    def _eval_tex_image(node, direction):
+        """Evaluate an Image Texture node using its Mapping chain."""
+        if not node.image:
+            return np.array([0.5, 0.5, 0.5], dtype=np.float32)
+
+        # Get mapped coordinates
+        vec_inp = node.inputs.get('Vector')
+        if vec_inp and vec_inp.is_linked:
+            coord = _eval_vector_node(vec_inp.links[0].from_node, direction)
+        else:
+            # Default: use direction as coords
+            coord = direction
+
+        # Sample image at UV
+        img = node.image
+        iw, ih = img.size
+        if iw == 0 or ih == 0:
+            return np.array([0.5, 0.5, 0.5], dtype=np.float32)
+
+        # TEX_IMAGE projection: default is Flat (XY of input vector → UV)
+        projection = getattr(node, 'projection', 'FLAT')
+        if projection == 'FLAT':
+            u = coord[0] % 1.0
+            v = coord[1] % 1.0
+        elif projection == 'SPHERE':
+            u = (math.atan2(coord[1], coord[0]) / (2 * math.pi) + 0.5) % 1.0
+            v = (math.asin(max(-1, min(1, coord[2]))) / math.pi + 0.5) % 1.0
+        else:
+            # BOX or other — use XY as fallback
+            u = coord[0] % 1.0
+            v = coord[1] % 1.0
+
+        px = int(u * (iw - 1)) % iw
+        py = int(v * (ih - 1)) % ih
+
+        # Read pixel from image (cached)
+        _cache_key = id(img)
+        if _cache_key not in _bake_pixel_cache:
+            pxdata = np.empty(iw * ih * 4, dtype=np.float32)
+            img.pixels.foreach_get(pxdata)
+            _bake_pixel_cache[_cache_key] = pxdata.reshape(ih, iw, 4)
+        pixels = _bake_pixel_cache[_cache_key]
+        return pixels[py, px, :3].copy()
+
+    def _eval_tex_environment(node, direction):
+        """Evaluate Environment Texture at direction."""
+        if not node.image:
+            return np.array([0.5, 0.5, 0.5], dtype=np.float32)
+
+        img = node.image
+        iw, ih = img.size
+        if iw == 0 or ih == 0:
+            return np.array([0.5, 0.5, 0.5], dtype=np.float32)
+
+        # Equirectangular: phi=atan2(y,x), theta=asin(z)
+        x, y, z = direction
+        u = (math.atan2(y, x) / (2 * math.pi) + 0.5) % 1.0
+        v = (math.asin(max(-1, min(1, z))) / math.pi + 0.5) % 1.0
+
+        _cache_key = id(img)
+        if _cache_key not in _bake_pixel_cache:
+            pxdata = np.empty(iw * ih * 4, dtype=np.float32)
+            img.pixels.foreach_get(pxdata)
+            _bake_pixel_cache[_cache_key] = pxdata.reshape(ih, iw, 4)
+        pixels = _bake_pixel_cache[_cache_key]
+        px = int(u * (iw - 1)) % iw
+        py = int(v * (ih - 1)) % ih
+        return pixels[py, px, :3].copy()
+
+    def _eval_vector_node(node, direction):
+        """Evaluate a vector-producing node (Mapping, Texture Coordinate, etc.)."""
+        if node.type == 'MAPPING':
+            vec_inp = node.inputs.get('Vector')
+            if vec_inp and vec_inp.is_linked:
+                v = _eval_vector_node(vec_inp.links[0].from_node, direction)
+            else:
+                v = direction
+            # Apply mapping: location, rotation, scale
+            loc = mathutils.Vector(node.inputs['Location'].default_value[:3])
+            rot = mathutils.Euler(node.inputs['Rotation'].default_value[:3])
+            scl = mathutils.Vector(node.inputs['Scale'].default_value[:3])
+            mv = mathutils.Vector(v)
+            mat = mathutils.Matrix.LocRotScale(loc, rot, scl)
+            result = mat @ mv
+            return np.array(result[:3], dtype=np.float64)
+        elif node.type == 'TEX_COORD':
+            # Object/Generated/Normal coords — use direction as approximation
+            return direction
+        else:
+            return direction
+
+    def _eval_mix_rgb(node, direction):
+        """Evaluate Mix RGB/Mix node."""
+        fac = float(node.inputs[0].default_value) if node.inputs[0] else 0.5
+        c1 = np.array(node.inputs[1].default_value[:3], dtype=np.float32) if not node.inputs[1].is_linked else _eval_color_node(node.inputs[1].links[0].from_node, direction)
+        c2 = np.array(node.inputs[2].default_value[:3], dtype=np.float32) if not node.inputs[2].is_linked else _eval_color_node(node.inputs[2].links[0].from_node, direction)
+        return c1 * (1 - fac) + c2 * fac
+
+    # Evaluate root node
+    def _eval_root(node, direction):
+        if node.type == 'MIX_SHADER':
+            fac_inp = node.inputs.get('Fac') or node.inputs[0]
+            fac = float(fac_inp.default_value) if not fac_inp.is_linked else 0.5
+            s1 = node.inputs[1]
+            s2 = node.inputs[2]
+            c1 = _eval_background(s1.links[0].from_node, direction) if s1.is_linked else np.zeros(3, dtype=np.float32)
+            c2 = _eval_background(s2.links[0].from_node, direction) if s2.is_linked else np.zeros(3, dtype=np.float32)
+            return c1 * (1 - fac) + c2 * fac
+        elif node.type == 'BACKGROUND':
+            return _eval_background(node, direction)
+        else:
+            return np.array([0.05, 0.05, 0.05], dtype=np.float32)
+
+    # ── Vectorized bake: generate ALL directions with numpy, then evaluate in batch ──
+    import time as _t
+    _t0 = _t.perf_counter()
+
+    # Generate all (u,v) coordinates
+    vs = (np.arange(h, dtype=np.float32) + 0.5) / h
+    us = (np.arange(w, dtype=np.float32) + 0.5) / w
+    uu, vv = np.meshgrid(us, vs)  # (h, w)
+
+    theta = (vv - 0.5) * np.float32(math.pi)   # elevation
+    phi = (uu - 0.5) * np.float32(2.0 * math.pi)  # azimuth
+
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+    cos_p = np.cos(phi)
+    sin_p = np.sin(phi)
+
+    # Vulkan Y-up directions → Blender Z-up: (vk.x, -vk.z, vk.y)
+    dirs_bl = np.stack([cos_t * cos_p, -(cos_t * sin_p), sin_t], axis=-1)  # (h, w, 3)
+
+    # Evaluate each node type in batch
+    pixels = np.zeros((h, w, 3), dtype=np.float32)
+
+    # ── Vectorized node evaluation ──
+    def _batch_eval_sky(node, dirs):
+        """Evaluate TEX_SKY for all directions at once."""
+        z = dirs[..., 2]  # Blender Z = up
+        elevation = np.arcsin(np.clip(z, -1, 1))
+        t = np.clip(elevation / (math.pi / 2), 0, 1)
+
+        sun_dir = np.array(node.sun_direction[:3], dtype=np.float32)
+        sun_dot = np.clip(np.sum(dirs * sun_dir, axis=-1), 0, 1)
+
+        sky_blue = np.array([0.3, 0.5, 0.9], dtype=np.float32)
+        horizon = np.array([0.8, 0.6, 0.4], dtype=np.float32)
+        sky = t[..., None] * sky_blue + (1 - t[..., None]) * horizon
+        sun_glow = np.power(sun_dot, 128) * 5.0
+        sky += sun_glow[..., None] * np.array([1.0, 0.9, 0.7], dtype=np.float32)
+        return sky * getattr(node, 'sun_intensity', 1.0)
+
+    def _batch_eval_tex_image(node, dirs):
+        """Evaluate TEX_IMAGE for all directions at once."""
+        if not node.image:
+            return np.full(dirs.shape[:-1] + (3,), 0.5, dtype=np.float32)
+
+        # Apply Mapping if connected
+        vec_inp = node.inputs.get('Vector')
+        if vec_inp and vec_inp.is_linked:
+            src = vec_inp.links[0].from_node
+            coords = _batch_apply_mapping(src, dirs)
+        else:
+            coords = dirs
+
+        img = node.image
+        iw, ih = img.size
+        if iw == 0 or ih == 0:
+            return np.full(dirs.shape[:-1] + (3,), 0.5, dtype=np.float32)
+
+        # Cache image pixels
+        _cache_key = id(img)
+        if _cache_key not in _bake_pixel_cache:
+            pxdata = np.empty(iw * ih * 4, dtype=np.float32)
+            img.pixels.foreach_get(pxdata)
+            _bake_pixel_cache[_cache_key] = pxdata.reshape(ih, iw, 4)
+        img_pixels = _bake_pixel_cache[_cache_key]
+
+        # Projection
+        projection = getattr(node, 'projection', 'FLAT')
+        if projection == 'FLAT':
+            u_coords = coords[..., 0] % 1.0
+            v_coords = coords[..., 1] % 1.0
+        else:
+            u_coords = (np.arctan2(coords[..., 1], coords[..., 0]) / (2 * math.pi) + 0.5) % 1.0
+            v_coords = (np.arcsin(np.clip(coords[..., 2], -1, 1)) / math.pi + 0.5) % 1.0
+
+        # Sample with nearest-neighbor (vectorized integer indexing)
+        px_x = (u_coords * (iw - 1)).astype(np.int32) % iw
+        px_y = (v_coords * (ih - 1)).astype(np.int32) % ih
+        return img_pixels[px_y, px_x, :3]
+
+    def _batch_eval_tex_environment(node, dirs):
+        """Evaluate TEX_ENVIRONMENT for all directions at once."""
+        if not node.image:
+            return np.full(dirs.shape[:-1] + (3,), 0.5, dtype=np.float32)
+
+        img = node.image
+        iw, ih = img.size
+        if iw == 0 or ih == 0:
+            return np.full(dirs.shape[:-1] + (3,), 0.5, dtype=np.float32)
+
+        _cache_key = id(img)
+        if _cache_key not in _bake_pixel_cache:
+            pxdata = np.empty(iw * ih * 4, dtype=np.float32)
+            img.pixels.foreach_get(pxdata)
+            _bake_pixel_cache[_cache_key] = pxdata.reshape(ih, iw, 4)
+        img_pixels = _bake_pixel_cache[_cache_key]
+
+        u_coords = (np.arctan2(dirs[..., 1], dirs[..., 0]) / (2 * math.pi) + 0.5) % 1.0
+        v_coords = (np.arcsin(np.clip(dirs[..., 2], -1, 1)) / math.pi + 0.5) % 1.0
+        px_x = (u_coords * (iw - 1)).astype(np.int32) % iw
+        px_y = (v_coords * (ih - 1)).astype(np.int32) % ih
+        return img_pixels[px_y, px_x, :3]
+
+    def _batch_apply_mapping(node, dirs):
+        """Apply Mapping/TexCoord transforms to all directions at once."""
+        if node.type == 'MAPPING':
+            vec_inp = node.inputs.get('Vector')
+            if vec_inp and vec_inp.is_linked:
+                v = _batch_apply_mapping(vec_inp.links[0].from_node, dirs)
+            else:
+                v = dirs
+            loc = np.array(node.inputs['Location'].default_value[:3], dtype=np.float64)
+            rot_euler = node.inputs['Rotation'].default_value[:3]
+            scl = np.array(node.inputs['Scale'].default_value[:3], dtype=np.float64)
+            mat = np.array(mathutils.Matrix.LocRotScale(
+                mathutils.Vector(loc),
+                mathutils.Euler(rot_euler),
+                mathutils.Vector(scl)
+            ), dtype=np.float64)[:3, :3]  # 3x3 rotation+scale
+            # Batch transform: (h,w,3) @ (3,3).T + translation
+            result = np.einsum('...i,ji->...j', v, mat) + loc
+            return result
+        else:
+            return dirs
+
+    def _batch_eval_color(node, dirs):
+        """Evaluate any color-producing node in batch."""
+        if node.type == 'TEX_SKY':
+            return _batch_eval_sky(node, dirs)
+        elif node.type == 'TEX_IMAGE':
+            return _batch_eval_tex_image(node, dirs)
+        elif node.type == 'TEX_ENVIRONMENT':
+            return _batch_eval_tex_environment(node, dirs)
+        else:
+            c = getattr(node.outputs.get('Color'), 'default_value', (0.5, 0.5, 0.5, 1))
+            return np.full(dirs.shape[:-1] + (3,), [c[0], c[1], c[2]], dtype=np.float32)
+
+    def _batch_eval_background(bg_node, dirs):
+        """Evaluate Background node in batch."""
+        strength = float(bg_node.inputs['Strength'].default_value) if bg_node.inputs.get('Strength') else 1.0
+        color_inp = bg_node.inputs.get('Color')
+        if color_inp and color_inp.is_linked:
+            color = _batch_eval_color(color_inp.links[0].from_node, dirs)
+        else:
+            c = color_inp.default_value if color_inp else (0.05, 0.05, 0.05, 1)
+            color = np.full(dirs.shape[:-1] + (3,), [c[0], c[1], c[2]], dtype=np.float32)
+        return color * strength
+
+    # ── Evaluate root node (Mix Shader or Background) ──
+    if root_node.type == 'MIX_SHADER':
+        fac_inp = root_node.inputs.get('Fac') or root_node.inputs[0]
+        fac = float(fac_inp.default_value) if not fac_inp.is_linked else 0.5
+        s1 = root_node.inputs[1]
+        s2 = root_node.inputs[2]
+        c1 = _batch_eval_background(s1.links[0].from_node, dirs_bl) if s1.is_linked else np.zeros((h, w, 3), dtype=np.float32)
+        c2 = _batch_eval_background(s2.links[0].from_node, dirs_bl) if s2.is_linked else np.zeros((h, w, 3), dtype=np.float32)
+        pixels = c1 * (1 - fac) + c2 * fac
+    elif root_node.type == 'BACKGROUND':
+        pixels = _batch_eval_background(root_node, dirs_bl)
+    else:
+        pixels = np.full((h, w, 3), 0.05, dtype=np.float32)
+
+    pixels = np.clip(pixels, 0, 500)
+
+    _dt = _t.perf_counter() - _t0
+    print(f"[ignis-world] Baked World to {w}x{h} HDRI in {_dt:.3f}s (vectorized)")
+
+    # Add alpha channel and flip vertically (Blender bottom-up → Vulkan top-down)
+    pixels_rgba = np.ones((h, w, 4), dtype=np.float32)
+    pixels_rgba[:, :, :3] = pixels
+    pixels_flipped = pixels_rgba[::-1].copy()
+    pixels_f16 = pixels_flipped.astype(np.float16)
+
+    return {
+        "name": "__world_baked__",
+        "data": pixels_f16.tobytes(),
+        "width": w,
+        "height": h,
+        "strength": 1.0,  # strength already baked into pixel values
+        "dxgi_format": 10,  # DXGI_FORMAT_R16G16B16A16_FLOAT
+        "extracted_sun": _extract_sun_from_hdri(pixels.reshape(-1, 3), w, h),
+    }
+
+
 def export_world_hdri(depsgraph):
     """Extract HDRI environment texture from Blender's World node tree.
+
+    For complex World node trees (Mix Shader, Sky+Image, etc.), bakes
+    the full tree to an equirectangular HDRI. For simple setups with
+    TEX_ENVIRONMENT, extracts the image directly (faster).
 
     Returns dict with image data or None if no HDRI found:
         {"name": str, "data": bytes, "width": int, "height": int, "strength": float}
@@ -1112,10 +1531,34 @@ def export_world_hdri(depsgraph):
 
     scene = depsgraph.scene
     world = scene.world
-    if not world or not world.use_nodes or not world.node_tree:
+    _use_nodes = getattr(world, 'use_nodes', True) if world else False
+    if not world or not _use_nodes or not world.node_tree:
         return None
 
-    # Find Background node and its color input
+    # Check if we need to bake the World node tree
+    _needs_bake = _world_needs_baking(world)
+    import os as _wos
+    try:
+        with open(_wos.path.join(_wos.path.expanduser("~"), "ignis-rt.log"), "a") as _wf:
+            _node_types = [n.type for n in world.node_tree.nodes] if world.node_tree else []
+            _wf.write(f"[ignis-world] World='{world.name}' needs_bake={_needs_bake} nodes={_node_types}\n")
+    except Exception:
+        pass
+
+    if _needs_bake:
+        try:
+            result = _bake_world_to_hdri(world, resolution=1024)
+            if result:
+                return result
+        except Exception as e:
+            try:
+                with open(_wos.path.join(_wos.path.expanduser("~"), "ignis-rt.log"), "a") as _wf:
+                    import traceback
+                    _wf.write(f"[ignis-world] Bake FAILED: {e}\n{traceback.format_exc()}\n")
+            except Exception:
+                pass
+
+    # ── Simple path: find TEX_ENVIRONMENT directly ──
     bg_node = None
     env_tex_node = None
     strength = 1.0
