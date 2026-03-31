@@ -1280,7 +1280,7 @@ void Renderer::RenderFrameRT() {
 
     // Check debug view mode early (needed for DLSS bypass)
     PathTracerConfig* rtCfgEarly = VK_GetConfig();
-    bool debugViewActive = rtCfgEarly && rtCfgEarly->debugView > 0;
+    bool debugViewActive = rtCfgEarly && rtCfgEarly->debugView >= 2;
 
     // DLSS debug bypass: when debug views are active, route RT output directly
     // to the interop image instead of through DLSS (which would show stale frames)

@@ -422,7 +422,7 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
     }
 
     // DLSS jitter — skip when debug view active (no denoiser to resolve it)
-    bool debugViewActive = acpt::g_config.debugView > 0;
+    bool debugViewActive = acpt::g_config.debugView >= 2;
     if (g_renderer->IsDLSSActive() && !debugViewActive) {
         uint32_t rw, rh;
         g_renderer->GetRenderResolution(&rw, &rh);

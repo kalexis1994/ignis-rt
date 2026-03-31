@@ -1012,7 +1012,7 @@ void main() {
     // Sub-pixel jitter (NRD mode only — DLSS RR uses Halton from projInverse)
     // Skip jitter when debug view active (no denoiser to resolve it)
     vec2 pixelCenter = vec2(pixel) + 0.5;
-    if (!rrModeGlobal && cam.parameters.y == 0u) {
+    if (!rrModeGlobal && cam.parameters.y < 2u) {
         pixelCenter += vec2(rand01() - 0.5, rand01() - 0.5);
     }
     vec2 uv = pixelCenter / vec2(launchSize);
@@ -1973,6 +1973,11 @@ void main() {
         // remaining work on the cheapest path we can reasonably afford.
         bool primaryThroughSpecularFast = (bounce == 0) && throughPrimarySpecularInterface;
 
+        // ---- Debug: Lighting mode overrides baseColor to white on all samples ----
+        if (cam.parameters.y == 1u && bounce == 0) {
+            pbrHit.baseColor = vec3(1.0);
+        }
+
         // ---- Bounce 0: capture primary hit info (first sample only) ----
         if (bounce == 0 && sampleIdx == 0) {
             primaryHit = true;
@@ -1996,11 +2001,6 @@ void main() {
             // View-space Z (negative in RH convention)
             vec4 viewPos = cam.view * vec4(pbrHit.worldPos, 1.0);
             primaryViewZ = viewPos.z;
-        }
-
-        // ---- Debug: Lighting mode overrides baseColor to white on all samples ----
-        if (cam.parameters.y == 1u && bounce == 0) {
-            pbrHit.baseColor = vec3(1.0);
         }
 
         // ---- Capture secondary hit distance (bounce 1, for denoiser) ----
@@ -3496,7 +3496,7 @@ void main() {
     // Debug views: all modes bypass DLSS/HDR pipeline (C++ routes output to interop).
     // Mode 1 (Lighting) keeps tonemap (HDR white-albedo shading).
     // Modes 2-5 skip tonemap (already LDR).
-    bool isDebugView = (debugView >= 1u && debugView <= 5u);
+    bool isDebugView = (debugView >= 2u && debugView <= 5u);
     bool isDebugLDR = (debugView >= 2u && debugView <= 5u);
 
     // HDR output flag: when DLSS SR or RR is active, skip tonemap in raygen
