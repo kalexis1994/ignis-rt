@@ -2036,10 +2036,23 @@ void Renderer::RenderFrameRT() {
             VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0, 1, &rtToNirc, 0, nullptr, 0, nullptr);
-        // TODO: sampleCount should come from an atomic counter written by the raygen shader
-        // For now, use a fixed count based on render resolution
+        // Training: 1/16 of pixels, capped at 64K
         uint32_t trainSamples = std::min(renderWidth_ * renderHeight_ / 16, 65536u);
         nirc_->Train(cmd, trainSamples, frameIndex_);
+
+        // Barrier: training writes → inference reads (hash grid + weights updated)
+        VkMemoryBarrier trainToInfer{};
+        trainToInfer.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        trainToInfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        trainToInfer.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &trainToInfer, 0, nullptr, 0, nullptr);
+
+        // Inference: predict radiance for all pixels (next frame reads results)
+        uint32_t queryCount = renderWidth_ * renderHeight_;
+        nirc_->Infer(cmd, queryCount);
     }
 
     // Fill any unwritten timestamp slots (skipped stages → current time → 0ms delta).

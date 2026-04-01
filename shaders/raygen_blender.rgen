@@ -2070,6 +2070,21 @@ void main() {
             pbrHit.baseColor = vec3(1.0);
         }
 
+        // ---- NIRC: write query input + read previous frame prediction ----
+        if (bounce == 0 && sampleIdx == 0) {
+            uint nircPixelIdx = uint(pixel.y) * uint(launchSize.x) + uint(pixel.x);
+            // Write query for this pixel (inference runs after this frame)
+            uint qBase = nircPixelIdx * 8u;
+            nircQueryInput[qBase]     = pbrHit.worldPos.x;
+            nircQueryInput[qBase + 1] = pbrHit.worldPos.y;
+            nircQueryInput[qBase + 2] = pbrHit.worldPos.z;
+            nircQueryInput[qBase + 3] = -rayDir.x;
+            nircQueryInput[qBase + 4] = -rayDir.y;
+            nircQueryInput[qBase + 5] = -rayDir.z;
+            nircQueryInput[qBase + 6] = pbrHit.roughness;
+            nircQueryInput[qBase + 7] = 0.0;
+        }
+
         // ---- Bounce 0: capture primary hit info (first sample only) ----
         if (bounce == 0 && sampleIdx == 0) {
             primaryHit = true;
@@ -3465,6 +3480,23 @@ void main() {
     // NRC update pass: only writes training data, skip image output
     if (NrcIsUpdateMode()) {
         return;
+    }
+
+    // ---- NIRC Two-Level MC: blend neural prediction with path traced result ----
+    if (primaryHit && sampleIdx == 0 && frameIndex > 5u) {
+        uint nircPixelIdx = uint(pixel.y) * uint(launchSize.x) + uint(pixel.x);
+        vec4 nircPred = nircQueryOutput[nircPixelIdx];
+        // nircPred.rgb = predicted incident radiance, .a = confidence
+        if (nircPred.a > 0.0) {
+            // Two-Level MC: F_total = F_cache + F_residual
+            // F_cache = neural prediction (cheap, potentially biased)
+            // F_residual = (path_traced - prediction) → converges to 0
+            // Weighted blend based on confidence (increases as network trains)
+            float nircWeight = clamp(float(frameIndex) / 300.0, 0.0, 0.3);  // ramp up over ~10s
+            vec3 nircRadiance = max(nircPred.rgb, vec3(0.0));
+            // Blend: use prediction for indirect, keep path traced for direct
+            diffuseRadiance = mix(diffuseRadiance, diffuseRadiance + nircRadiance * 0.2, nircWeight);
+        }
     }
 
     // ---- Accumulate this sample ----

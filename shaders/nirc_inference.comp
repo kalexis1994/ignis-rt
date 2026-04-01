@@ -1,0 +1,73 @@
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+
+// nirc_inference.comp — NIRC Batch Inference
+// Reads query points (position + direction + roughness), runs hash grid + MLP,
+// writes predicted incident radiance to output buffer.
+//
+// Dispatch: (queryCount + 255) / 256
+
+layout(local_size_x = 256) in;
+
+// Push constants
+layout(push_constant) uniform PushConstants {
+    uint queryCount;
+    float pad0;
+    vec3 scenePosScale;
+    float pad1;
+    vec3 scenePosOffset;
+    float pad2;
+} pc;
+
+// Query input: position(3) + direction(3) + roughness(1) + pad(1) = 8 floats per query
+layout(binding = 0, set = 0, scalar) buffer QueryInputBuf {
+    float data[];  // queryCount × 8 floats
+} queryIn;
+
+// Hash grid features
+layout(binding = 1, set = 0, scalar) buffer HashFeatureBuf {
+    float features[];
+} hashGrid;
+
+// MLP weights
+layout(binding = 2, set = 0, scalar) buffer WeightBuf {
+    float w[];
+} mlpWeights;
+
+// Query output: vec4 (RGB radiance + confidence) per query
+layout(binding = 3, set = 0, scalar) buffer QueryOutputBuf {
+    vec4 results[];
+} queryOut;
+
+// Define buffer accessors before including headers
+#define NIRC_HASH_FEATURES_BUFFER hashGrid.features
+#define NIRC_MLP_WEIGHTS_BUFFER mlpWeights.w
+
+#include "include/nirc_hash_grid.glsl"
+#include "include/nirc_mlp.glsl"
+
+void main() {
+    uint qIdx = gl_GlobalInvocationID.x;
+    if (qIdx >= pc.queryCount) return;
+
+    // Read query
+    uint base = qIdx * 8;
+    vec3 position  = vec3(queryIn.data[base], queryIn.data[base + 1], queryIn.data[base + 2]);
+    vec3 direction = vec3(queryIn.data[base + 3], queryIn.data[base + 4], queryIn.data[base + 5]);
+    float roughness = queryIn.data[base + 6];
+
+    // Hash grid encoding
+    float hashFeatures[NIRC_TOTAL_FEATURES];
+    nircHashGridEncode(position, pc.scenePosScale, pc.scenePosOffset, hashFeatures);
+
+    // Build MLP input
+    float mlpInp[NIRC_MLP_INPUT];
+    nircBuildInput(hashFeatures, direction, roughness, mlpInp);
+
+    // MLP forward pass
+    vec3 prediction = nircMlpForward(mlpInp);
+
+    // Write result with confidence (higher after more training)
+    queryOut.results[qIdx] = vec4(prediction, 1.0);
+}

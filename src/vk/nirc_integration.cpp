@@ -172,6 +172,11 @@ bool NircIntegration::Initialize(Context* ctx, uint32_t renderWidth, uint32_t re
         return false;
     }
 
+    if (!CreateInferPipeline()) {
+        Log(L"[NIRC] Failed to create inference pipeline\n");
+        return false;
+    }
+
     ready_ = true;
     Log(L"[NIRC] Ready: hashGrid=%.1fMB weights=%uB queries=%ux%u\n",
         hashFeatureBufSize_ / 1048576.0f, TOTAL_WEIGHTS * 4, renderWidth, renderHeight);
@@ -287,7 +292,107 @@ bool NircIntegration::CreateTrainPipeline() {
 }
 
 bool NircIntegration::CreateInferPipeline() {
-    // TODO: Phase 2 — inference compute shader pipeline
+    VkDevice device = ctx_->GetDevice();
+
+    // Descriptor set layout: 4 SSBOs (query input, hash features, weights, query output)
+    VkDescriptorSetLayoutBinding bindings[4] = {};
+    for (int i = 0; i < 4; i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+
+    VkDescriptorSetLayoutCreateInfo layoutCI{};
+    layoutCI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutCI.bindingCount = 4;
+    layoutCI.pBindings = bindings;
+    if (vkCreateDescriptorSetLayout(device, &layoutCI, nullptr, &inferDescSetLayout_) != VK_SUCCESS)
+        return false;
+
+    VkPushConstantRange pushRange{};
+    pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushRange.offset = 0;
+    pushRange.size = 48;
+
+    VkPipelineLayoutCreateInfo plCI{};
+    plCI.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plCI.setLayoutCount = 1;
+    plCI.pSetLayouts = &inferDescSetLayout_;
+    plCI.pushConstantRangeCount = 1;
+    plCI.pPushConstantRanges = &pushRange;
+    if (vkCreatePipelineLayout(device, &plCI, nullptr, &inferPipelineLayout_) != VK_SUCCESS)
+        return false;
+
+    // Load shader
+    std::string shaderPath = IgnisResolvePath("shaders/nirc_inference.comp.spv");
+    std::ifstream file(shaderPath, std::ios::ate | std::ios::binary);
+    if (!file.is_open()) {
+        Log(L"[NIRC] Cannot open inference shader %hs\n", shaderPath.c_str());
+        return false;
+    }
+    size_t fileSize = (size_t)file.tellg();
+    std::vector<char> codeBytes(fileSize);
+    file.seekg(0);
+    file.read(codeBytes.data(), fileSize);
+    file.close();
+
+    VkShaderModule shaderModule = VK_NULL_HANDLE;
+    VkShaderModuleCreateInfo smCI{};
+    smCI.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smCI.codeSize = fileSize;
+    smCI.pCode = reinterpret_cast<const uint32_t*>(codeBytes.data());
+    if (vkCreateShaderModule(device, &smCI, nullptr, &shaderModule) != VK_SUCCESS)
+        return false;
+
+    VkComputePipelineCreateInfo pipelineCI{};
+    pipelineCI.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipelineCI.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipelineCI.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipelineCI.stage.module = shaderModule;
+    pipelineCI.stage.pName = "main";
+    pipelineCI.layout = inferPipelineLayout_;
+
+    VkResult r = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineCI, nullptr, &inferPipeline_);
+    vkDestroyShaderModule(device, shaderModule, nullptr);
+    if (r != VK_SUCCESS) return false;
+
+    // Descriptor pool + set
+    VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 };
+    VkDescriptorPoolCreateInfo poolCI{};
+    poolCI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolCI.maxSets = 1;
+    poolCI.poolSizeCount = 1;
+    poolCI.pPoolSizes = &poolSize;
+    if (vkCreateDescriptorPool(device, &poolCI, nullptr, &inferDescPool_) != VK_SUCCESS)
+        return false;
+
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = inferDescPool_;
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &inferDescSetLayout_;
+    if (vkAllocateDescriptorSets(device, &allocInfo, &inferDescSet_) != VK_SUCCESS)
+        return false;
+
+    // Update descriptors: 0=queryInput, 1=hashFeatures, 2=weights, 3=queryOutput
+    VkBuffer bufs[4] = { queryInputBuf_, hashFeatureBuf_, weightBuf_, queryOutputBuf_ };
+    VkDeviceSize sizes[4] = { queryInputBufSize_, hashFeatureBufSize_, weightBufSize_, queryOutputBufSize_ };
+
+    VkDescriptorBufferInfo bufInfos[4] = {};
+    VkWriteDescriptorSet writes[4] = {};
+    for (int i = 0; i < 4; i++) {
+        bufInfos[i] = { bufs[i], 0, sizes[i] };
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = inferDescSet_;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+    vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
+
+    Log(L"[NIRC] Inference pipeline created\n");
     return true;
 }
 
@@ -322,7 +427,29 @@ void NircIntegration::Train(VkCommandBuffer cmd, uint32_t sampleCount, uint32_t 
 }
 
 void NircIntegration::Infer(VkCommandBuffer cmd, uint32_t queryCount) {
-    // TODO: Phase 2 — dispatch inference compute shader
+    if (!ready_ || queryCount == 0 || !inferPipeline_) return;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, inferPipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        inferPipelineLayout_, 0, 1, &inferDescSet_, 0, nullptr);
+
+    struct {
+        uint32_t queryCount;
+        float pad0;
+        float scenePosScale[3];
+        float pad1;
+        float scenePosOffset[3];
+        float pad2;
+    } pc;
+    pc.queryCount = queryCount;
+    pc.pad0 = 0;
+    memcpy(pc.scenePosScale, scenePosScale, 12);
+    pc.pad1 = 0;
+    memcpy(pc.scenePosOffset, scenePosOffset, 12);
+    pc.pad2 = 0;
+
+    vkCmdPushConstants(cmd, inferPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(cmd, (queryCount + 255) / 256, 1, 1);
 }
 
 void NircIntegration::Reconfigure(const float sceneMin[3], const float sceneMax[3]) {
