@@ -235,15 +235,11 @@ layout(binding = 43, set = 0) uniform NrcConstantsUBO {
     NrcConstants nrcConstants;
 };
 
-// NRC mode: 0=disabled, query mode for neural cache early termination.
-// Update pass (training) would be a separate dispatch at lower resolution.
-// For now, we run query-only mode — the SDK trains from query data.
-#ifndef ENABLE_NRC
+// NRC mode: controlled at runtime via nrcConstants.enableTerminationHeuristic > 0.
+// Compiled with ENABLE_NRC=1 but all NRC functions check NrcIsEnabled() which
+// tests g_nrcMode. We set g_nrcMode based on a runtime flag in the constants UBO.
 #define ENABLE_NRC 1
-#endif
-#if ENABLE_NRC
-#define NRC_QUERY 1
-#endif
+// Don't define NRC_QUERY or NRC_UPDATE — let g_nrcMode be set at runtime
 #include "include/nrc.glsl"
 
 // Buffer references

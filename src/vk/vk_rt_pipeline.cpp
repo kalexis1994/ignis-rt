@@ -1141,9 +1141,8 @@ bool RTPipeline::CreateDescriptorSetLayout() {
     bindings[37].descriptorCount = 1;
     bindings[37].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
-    // bindings 38-42: NRC (Neural Radiance Cache) SSBOs
-    // binding 43: NRC constants UBO
-#ifdef IGNIS_HAVE_NRC
+    // bindings 38-42: NRC SSBOs + binding 43: NRC constants UBO
+    // Always declared (shader references them unconditionally with PARTIALLY_BOUND)
     bindings.resize(44);
     for (uint32_t i = 38; i <= 42; i++) {
         bindings[i] = {};
@@ -1157,7 +1156,6 @@ bool RTPipeline::CreateDescriptorSetLayout() {
     bindings[43].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[43].descriptorCount = 1;
     bindings[43].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
-#endif
 
     // Binding flags for partially bound descriptors
     std::vector<VkDescriptorBindingFlags> bindingFlags(bindings.size(), VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
