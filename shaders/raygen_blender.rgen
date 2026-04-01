@@ -218,6 +218,47 @@ layout(buffer_reference, scalar) buffer Colors { float c[]; };  // float4 RGBA p
 layout(buffer_reference, scalar) buffer PrimMaterials { uint m[]; };
 layout(buffer_reference, scalar) readonly buffer CurveKeys { vec4 k[]; };
 
+// ── NIRC (custom Neural Incident Radiance Cache) buffers ──
+// 44: training samples (written by raygen), 45: hash features (read for inference)
+// 46: MLP weights (read for inference), 47: query input, 48: query output
+struct NircTrainingSample {
+    vec3 position; float roughness;
+    vec3 direction; float _pad0;
+    vec3 radiance;  float _pad1;
+};
+layout(binding = 44, set = 0, scalar) buffer NircTrainBuf  { NircTrainingSample nircSamples[]; };
+layout(binding = 45, set = 0, scalar) buffer NircHashBuf   { float nircHashFeatures[]; };
+layout(binding = 46, set = 0, scalar) buffer NircWeightBuf { float nircWeights[]; };
+layout(binding = 47, set = 0, scalar) buffer NircQueryIn   { float nircQueryInput[]; };
+layout(binding = 48, set = 0, scalar) buffer NircQueryOut  { vec4  nircQueryOutput[]; };
+
+// NIRC inline inference macros (for hash grid + MLP in raygen)
+#define NIRC_HASH_FEATURES_BUFFER nircHashFeatures
+#define NIRC_MLP_WEIGHTS_BUFFER nircWeights
+#include "include/nirc_hash_grid.glsl"
+#include "include/nirc_mlp.glsl"
+
+// Inline NIRC query: hash grid encode → MLP → predicted incident radiance
+// Scene bounds from camera UBO: jitterPattern[0..2]=min, jitterPattern[4..6]=max
+vec3 nircInlineQuery(vec3 worldPos, vec3 direction, float roughness) {
+    // Compute scene bounds normalization from AABB
+    vec3 sceneMin = vec3(intBitsToFloat(cam.jitterPattern[0].x),
+                         intBitsToFloat(cam.jitterPattern[0].y),
+                         intBitsToFloat(cam.jitterPattern[0].z));
+    vec3 sceneMax = vec3(intBitsToFloat(cam.jitterPattern[1].x),
+                         intBitsToFloat(cam.jitterPattern[1].y),
+                         intBitsToFloat(cam.jitterPattern[1].z));
+    vec3 range = max(sceneMax - sceneMin, vec3(0.01));
+    vec3 posScale = vec3(1.0) / range;
+    vec3 posOffset = -sceneMin / range;
+
+    float hashFeats[NIRC_TOTAL_FEATURES];
+    nircHashGridEncode(worldPos, posScale, posOffset, hashFeats);
+    float inp[NIRC_MLP_INPUT];
+    nircBuildInput(hashFeats, direction, roughness, inp);
+    return nircMlpForward(inp);
+}
+
 // ============================================================
 // Shared includes (extracted for reuse across shaders)
 // ============================================================
@@ -975,6 +1016,7 @@ void main() {
     bool rrModeGlobal = (cam.parameters.w == 2u);
     bool backfaceCulling = (cam.lightPad2 & 1u) != 0u;  // bit 0 of lightPad2
     bool hybridRasterMode = (cam.lightPad2 & 4u) != 0u; // bit 2 of lightPad2
+    bool nircReady = (cam.lightPad2 & 16u) != 0u;       // bit 4 of lightPad2
 
     // Accumulators across SPP samples
     vec3 accumDiffuse = vec3(0.0);
@@ -2001,6 +2043,22 @@ void main() {
             pbrHit.baseColor = vec3(1.0);
         }
 
+        // ---- NIRC: write query input + read previous frame prediction ----
+        // nircQueryOutput[0].a > 0 signals that NIRC buffers are valid
+        bool nircActive = (nircReady);
+        if (nircActive && bounce == 0 && sampleIdx == 0) {
+            uint nircPixelIdx = uint(pixel.y) * uint(launchSize.x) + uint(pixel.x);
+            uint qBase = nircPixelIdx * 8u;
+            nircQueryInput[qBase]     = pbrHit.worldPos.x;
+            nircQueryInput[qBase + 1] = pbrHit.worldPos.y;
+            nircQueryInput[qBase + 2] = pbrHit.worldPos.z;
+            nircQueryInput[qBase + 3] = -rayDir.x;
+            nircQueryInput[qBase + 4] = -rayDir.y;
+            nircQueryInput[qBase + 5] = -rayDir.z;
+            nircQueryInput[qBase + 6] = pbrHit.roughness;
+            nircQueryInput[qBase + 7] = 0.0;
+        }
+
         // ---- Bounce 0: capture primary hit info (first sample only) ----
         if (bounce == 0 && sampleIdx == 0) {
             primaryHit = true;
@@ -2049,6 +2107,19 @@ void main() {
             vec2 rpNDC = rpClip.xy / rpClip.w;
             vec2 rpUV = vec2(rpNDC.x * 0.5 + 0.5, 0.5 - rpNDC.y * 0.5);
             specularMV = rpUV - rcUV;
+        }
+
+
+        // ---- NIRC: write training sample (stochastic subset, 1/16 pixels) ----
+        if (nircActive && bounce >= 1 && sampleIdx == 0) {
+            uint nircPixelHash = uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + frameIndex * 26699u;
+            if ((nircPixelHash & 15u) == 0u) {
+                uint nircIdx = (uint(pixel.y) * uint(launchSize.x) + uint(pixel.x) + uint(bounce) * 65536u) % 65536u;
+                nircSamples[nircIdx].position = pbrHit.worldPos;
+                nircSamples[nircIdx].roughness = pbrHit.roughness;
+                nircSamples[nircIdx].direction = -rayDir;
+                nircSamples[nircIdx].radiance = totalRadiance * throughput;
+            }
         }
 
         // ---- Accumulate emission ----
@@ -3049,6 +3120,21 @@ void main() {
             }
         }
 
+
+        // ---- NIRC: early path termination using neural cache prediction ----
+        // Only at bounce 3+ (let bounce 0-2 trace normally for quality)
+        // Only for diffuse paths (specular needs full tracing)
+        // After 60 frames warmup (~2s for network to learn)
+        if (nircReady && bounce >= 3 && isDiffusePath && frameIndex > 60u) {
+            // Terminate 70% of diffuse paths at bounce 3+ and inject neural prediction
+            if (rand01() > 0.3) {
+                vec3 nircPred = nircInlineQuery(pbrHit.worldPos, -rayDir, pbrHit.roughness);
+                vec3 cachedContrib = nircPred * throughput;
+                diffuseRadiance += clampRadiance(cachedContrib);
+                break;
+            }
+        }
+
         // ---- Early termination: throughput too low to contribute visibly ----
         float tpMax = max(throughput.r, max(throughput.g, throughput.b));
         if (tpMax < 0.01) break;
@@ -3292,6 +3378,9 @@ void main() {
         float rayOffset = (geo.bitangentBufferAddress != 0u) ? 0.02 : 0.002;
         rayOrigin = pbrHit.worldPos + N * rayOffset;
         prevBounceNormal = N;  // store for SHARC query on next bounce
+
+        // NRC: report BRDF PDF for termination heuristic
+        float nrcBrdfPdf = max(dot(rayDir, N), 0.0) * INV_PI;  // cosine-weighted approximation
     }
 
     // ---- ReSTIR GI: temporal reuse from previous frame ----

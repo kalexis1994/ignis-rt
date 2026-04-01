@@ -169,6 +169,13 @@ public:
     void UpdateHybridGBufferDescriptors(VkImageView primIdView, VkImageView instanceInfoView,
                                          VkImageView depthView);
 
+    // NRC buffer descriptors (bindings 38-42)
+    void UpdateNrcBufferDescriptors(VkBuffer counter, VkDeviceSize counterSize,
+                                     VkBuffer queryPathInfo, VkDeviceSize queryPathInfoSize,
+                                     VkBuffer trainingPathInfo, VkDeviceSize trainingPathInfoSize,
+                                     VkBuffer trainingPathVertices, VkDeviceSize trainingPathVerticesSize,
+                                     VkBuffer queryRadianceParams, VkDeviceSize queryRadianceParamsSize);
+
     // Per-instance previous transforms (binding 28)
     void UpdatePrevTransforms(const float* transforms, uint32_t instanceCount);
 
@@ -265,6 +272,16 @@ private:
     VkStridedDeviceAddressRegionKHR missRegion_{};
     VkStridedDeviceAddressRegionKHR hitRegion_{};
     VkStridedDeviceAddressRegionKHR callableRegion_{};
+
+    // NRC constants UBO (binding 43)
+#ifdef IGNIS_HAVE_NRC
+    VkBuffer nrcConstantsBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory nrcConstantsMemory_ = VK_NULL_HANDLE;
+    void* nrcConstantsMapped_ = nullptr;
+public:
+    void UpdateNrcConstants(const void* constants, size_t size);
+private:
+#endif
 
     // NRD G-buffer images (full-resolution, written by raygen shader)
     struct GBufferImage {

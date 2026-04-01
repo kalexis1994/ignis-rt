@@ -12,6 +12,7 @@
 #include "ignis_config.h"
 #include "vk_check.h"
 #include "nrd_vulkan_integration.h"
+#include "nirc_integration.h"
 #include <vector>
 #include <fstream>
 #include <filesystem>
@@ -538,6 +539,8 @@ bool Renderer::InitRT() {
         Log(L"[VK Renderer] RT modules initialized with NRD denoiser\n");
     }
 
+    // Initialize NRC (Neural Radiance Cache)
+
     // Initialize wavefront pipeline (experimental)
     if (cfg && cfg->useWavefront) {
         wavefrontPipeline_ = new WavefrontPipeline();
@@ -666,6 +669,44 @@ void Renderer::InitRT_Remaining() {
     // NRD denoiser
     if (!InitNRD()) {
         rtPipeline_->CreateGBuffers(renderWidth_, renderHeight_);
+    }
+
+    // NRC (Neural Radiance Cache)
+
+    // NIRC (custom Neural Incident Radiance Cache)
+    if (cfg && !nirc_) {
+        nirc_ = new NircIntegration();
+        float sMin[3] = { cfg->sceneAABBMin[0], cfg->sceneAABBMin[1], cfg->sceneAABBMin[2] };
+        float sMax[3] = { cfg->sceneAABBMax[0], cfg->sceneAABBMax[1], cfg->sceneAABBMax[2] };
+        if (sMin[0] == sMax[0]) { sMin[0] = -50; sMax[0] = 50; sMin[1] = -50; sMax[1] = 50; sMin[2] = -50; sMax[2] = 50; }
+        if (!nirc_->Initialize(context_, renderWidth_, renderHeight_, sMin, sMax)) {
+            Log(L"[VK Renderer] NIRC init failed\n");
+            delete nirc_;
+            nirc_ = nullptr;
+        } else if (rtPipeline_) {
+            // Bind NIRC buffers to RT pipeline descriptors (44-48)
+            VkBuffer bufs[5] = {
+                nirc_->GetTrainingSampleBuffer(), nirc_->GetHashFeatureBuffer(),
+                nirc_->GetWeightBuffer(), nirc_->GetQueryInputBuffer(), nirc_->GetQueryOutputBuffer()
+            };
+            VkDeviceSize sizes[5] = {
+                nirc_->GetTrainingSampleBufferSize(), nirc_->GetHashFeatureBufferSize(),
+                nirc_->GetWeightBufferSize(), nirc_->GetQueryInputBufferSize(), nirc_->GetQueryOutputBufferSize()
+            };
+            VkDescriptorBufferInfo bufInfos[5] = {};
+            VkWriteDescriptorSet writes[5] = {};
+            for (int i = 0; i < 5; i++) {
+                bufInfos[i] = { bufs[i], 0, sizes[i] };
+                writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[i].dstSet = rtPipeline_->GetDescriptorSet();
+                writes[i].dstBinding = 44 + i;
+                writes[i].descriptorCount = 1;
+                writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                writes[i].pBufferInfo = &bufInfos[i];
+            }
+            vkUpdateDescriptorSets(context_->GetDevice(), 5, writes, 0, nullptr);
+            Log(L"[VK Renderer] NIRC buffers bound to descriptors 44-48\n");
+        }
     }
 
     // Wavefront (experimental)
@@ -1319,6 +1360,8 @@ void Renderer::RenderFrameRT() {
 
     bool diagFlush = false;  // Set true to flush GPU between stages for crash isolation
 
+    // NRC: populate constants + begin frame (only when user enabled)
+
     WriteTimestamp(cmd, TS_START);
 
     // 0. Hybrid G-buffer rasterization pass (before RT dispatch)
@@ -1342,7 +1385,9 @@ void Renderer::RenderFrameRT() {
     }
     WriteTimestamp(cmd, TS_HYBRID);
 
-    // 1. Path tracing dispatch (wavefront or monolithic)
+    // 0.5 NRC update pass: trace at training resolution to generate training data
+
+    // 1. Path tracing dispatch (wavefront or monolithic) — NRC query mode
     interop_->TransitionForRTWrite(cmd);
     if (wavefrontPipeline_ && wavefrontPipeline_->IsReady()) {
         PathTracerConfig* wfCfg = VK_GetConfig();
@@ -1856,6 +1901,37 @@ void Renderer::RenderFrameRT() {
         }
     }
 
+    // NRC: query neural cache + train network
+
+    // NIRC: train neural incident radiance cache from path tracer samples
+    if (nirc_ && nirc_->IsReady()) {
+        VkMemoryBarrier rtToNirc{};
+        rtToNirc.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        rtToNirc.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        rtToNirc.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &rtToNirc, 0, nullptr, 0, nullptr);
+        // Training: 1/16 of pixels, capped at 64K
+        uint32_t trainSamples = std::min(renderWidth_ * renderHeight_ / 16, 65536u);
+        nirc_->Train(cmd, trainSamples, frameIndex_);
+
+        // Barrier: training writes → inference reads (hash grid + weights updated)
+        VkMemoryBarrier trainToInfer{};
+        trainToInfer.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        trainToInfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        trainToInfer.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &trainToInfer, 0, nullptr, 0, nullptr);
+
+        // Inference: predict radiance for all pixels (next frame reads results)
+        uint32_t queryCount = renderWidth_ * renderHeight_;
+        nirc_->Infer(cmd, queryCount);
+    }
+
     // Fill any unwritten timestamp slots (skipped stages → current time → 0ms delta).
     FillMissingTimestamps(cmd);
 
@@ -1886,6 +1962,8 @@ void Renderer::RenderFrameRT() {
         }
         return;
     }
+
+    // NRC: end frame (must be called after queue submit)
 
     // No WaitIdle — double-buffered readback with per-buffer fence sync
 
@@ -4065,6 +4143,7 @@ void Renderer::Shutdown() {
     ShutdownHybridGBuffer();
     ShutdownNRD();
     ShutdownDLSS();
+    if (nirc_) { nirc_->Shutdown(); delete nirc_; nirc_ = nullptr; }
 
     // Shutdown wavefront + RT modules
     if (wavefrontPipeline_) { wavefrontPipeline_->Shutdown(); delete wavefrontPipeline_; wavefrontPipeline_ = nullptr; }

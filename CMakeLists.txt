@@ -71,6 +71,11 @@ set(IGNIS_CORE_SOURCES
 list(APPEND IGNIS_CORE_SOURCES src/nrd_vulkan_integration.cpp)
 
 # ============================================================================
+# NIRC (always compiled — custom implementation, no external dependency)
+# ============================================================================
+list(APPEND IGNIS_CORE_SOURCES src/vk/nirc_integration.cpp)
+
+# ============================================================================
 # Optional: DLSS
 # ============================================================================
 if(IGNIS_USE_DLSS)

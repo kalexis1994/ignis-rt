@@ -93,6 +93,7 @@ public:
     void DrawGL(uint32_t w, uint32_t h);
     void WaitForReadBuffer();  // wait for the frame that wrote the GL read buffer
     bool IsRTReady() const { return rtReady_; }
+    bool IsNircReady() const { return nirc_ != nullptr; }
     bool IsRTSupported() const;
     bool HasInterop() const { return interop_ != nullptr; }
 
@@ -138,6 +139,7 @@ private:
     RTPipeline* rtPipeline_ = nullptr;
     WavefrontPipeline* wavefrontPipeline_ = nullptr;
     Interop* interop_ = nullptr;
+    class NircIntegration* nirc_ = nullptr;
     bool rtReady_ = false;
     bool useDirectInterop_ = false;
     int initStep_ = 0;          // phased init progress

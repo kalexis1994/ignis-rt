@@ -1,0 +1,151 @@
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_atomic_float : enable
+
+// nirc_train.comp — NIRC Training (2-layer MLP + hash grid backprop)
+// Dispatch: (sampleCount + 255) / 256
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint sampleCount;
+    uint frameIndex;
+    float learningRate;
+    float pad0;
+    vec3 scenePosScale;
+    float pad1;
+    vec3 scenePosOffset;
+    float pad2;
+} pc;
+
+struct TrainingSample {
+    vec3 position; float roughness;
+    vec3 direction; float _pad0;
+    vec3 radiance; float _pad1;
+};
+
+layout(binding = 0, set = 0, scalar) buffer TrainingSampleBuf { TrainingSample samples[]; } trainData;
+layout(binding = 1, set = 0, scalar) buffer HashFeatureBuf { float features[]; } hashGrid;
+layout(binding = 2, set = 0, scalar) buffer WeightBuf { float w[]; } mlpWeights;
+layout(binding = 3, set = 0, scalar) buffer AdamMomentBuf { float m[]; } adamM;
+layout(binding = 4, set = 0, scalar) buffer AdamVarianceBuf { float v[]; } adamV;
+
+#define NIRC_HASH_FEATURES_BUFFER hashGrid.features
+#define NIRC_MLP_WEIGHTS_BUFFER mlpWeights.w
+#include "include/nirc_hash_grid.glsl"
+#include "include/nirc_mlp.glsl"
+
+#define ADAM_BETA1 0.9
+#define ADAM_BETA2 0.999
+#define ADAM_EPSILON 1e-8
+
+void adamUpdate(uint idx, float grad, float lr) {
+    float mo = ADAM_BETA1 * adamM.m[idx] + (1.0 - ADAM_BETA1) * grad;
+    float va = ADAM_BETA2 * adamV.v[idx] + (1.0 - ADAM_BETA2) * grad * grad;
+    adamM.m[idx] = mo;
+    adamV.v[idx] = va;
+    float mHat = mo / (1.0 - pow(ADAM_BETA1, float(pc.frameIndex + 1)));
+    float vHat = va / (1.0 - pow(ADAM_BETA2, float(pc.frameIndex + 1)));
+    mlpWeights.w[idx] -= lr * mHat / (sqrt(vHat) + ADAM_EPSILON);
+}
+
+void main() {
+    uint sampleIdx = gl_GlobalInvocationID.x;
+    if (sampleIdx >= pc.sampleCount) return;
+
+    TrainingSample ts = trainData.samples[sampleIdx];
+
+    // Forward: hash grid encode
+    float hashFeatures[NIRC_TOTAL_FEATURES];
+    nircHashGridEncode(ts.position, pc.scenePosScale, pc.scenePosOffset, hashFeatures);
+
+    float mlpInp[NIRC_MLP_INPUT];
+    nircBuildInput(hashFeatures, ts.direction, ts.roughness, mlpInp);
+
+    // Forward: Layer 1 (32 → 16, ReLU)
+    float h1[NIRC_MLP_HIDDEN];
+    float z1[NIRC_MLP_HIDDEN];
+    for (int j = 0; j < NIRC_MLP_HIDDEN; j++) {
+        float sum = mlpWeights.w[NIRC_B1_OFFSET + j];
+        for (int i = 0; i < NIRC_MLP_INPUT; i++)
+            sum += mlpInp[i] * mlpWeights.w[NIRC_W1_OFFSET + i * NIRC_MLP_HIDDEN + j];
+        z1[j] = sum;
+        h1[j] = nircRelu(sum);
+    }
+
+    // Forward: Layer 2 (16 → 3, softplus)
+    vec3 prediction;
+    float z2[3];
+    for (int c = 0; c < 3; c++) {
+        float sum = mlpWeights.w[NIRC_B2_OFFSET + c];
+        for (int i = 0; i < NIRC_MLP_HIDDEN; i++)
+            sum += h1[i] * mlpWeights.w[NIRC_W2_OFFSET + i * NIRC_MLP_OUTPUT + c];
+        z2[c] = sum;
+        prediction[c] = log(1.0 + exp(sum));
+    }
+
+    // Loss: relative L2
+    vec3 diff = prediction - ts.radiance;
+    float denom = max(dot(prediction, vec3(0.2126, 0.7152, 0.0722)), 0.01);
+    vec3 lossGrad = 2.0 * diff / denom;
+
+    // Backward: Layer 2 (softplus derivative = sigmoid)
+    float dOut[3];
+    for (int c = 0; c < 3; c++)
+        dOut[c] = lossGrad[c] * (1.0 / (1.0 + exp(-z2[c])));
+
+    float dH1[NIRC_MLP_HIDDEN];
+    for (int i = 0; i < NIRC_MLP_HIDDEN; i++) dH1[i] = 0.0;
+    for (int c = 0; c < 3; c++) {
+        adamUpdate(NIRC_B2_OFFSET + c, dOut[c], pc.learningRate);
+        for (int i = 0; i < NIRC_MLP_HIDDEN; i++) {
+            uint wIdx = NIRC_W2_OFFSET + i * NIRC_MLP_OUTPUT + c;
+            adamUpdate(wIdx, h1[i] * dOut[c], pc.learningRate);
+            dH1[i] += mlpWeights.w[wIdx] * dOut[c];
+        }
+    }
+
+    // ReLU backward
+    for (int i = 0; i < NIRC_MLP_HIDDEN; i++)
+        if (z1[i] <= 0.0) dH1[i] = 0.0;
+
+    // Backward: Layer 1
+    float dInput[NIRC_MLP_INPUT];
+    for (int i = 0; i < NIRC_MLP_INPUT; i++) dInput[i] = 0.0;
+    for (int j = 0; j < NIRC_MLP_HIDDEN; j++) {
+        adamUpdate(NIRC_B1_OFFSET + j, dH1[j], pc.learningRate);
+        for (int i = 0; i < NIRC_MLP_INPUT; i++) {
+            uint wIdx = NIRC_W1_OFFSET + i * NIRC_MLP_HIDDEN + j;
+            adamUpdate(wIdx, mlpInp[i] * dH1[j], pc.learningRate);
+            dInput[i] += mlpWeights.w[wIdx] * dH1[j];
+        }
+    }
+
+    // Hash grid gradient backprop
+    vec3 pos = ts.position * pc.scenePosScale + pc.scenePosOffset;
+    pos = clamp(pos, vec3(0.0), vec3(1.0));
+    for (uint level = 0u; level < uint(NIRC_HASH_LEVELS); level++) {
+        float res = nircLevelResolution(level);
+        vec3 gridPos = pos * res;
+        ivec3 p0 = ivec3(floor(gridPos));
+        ivec3 p1 = p0 + ivec3(1);
+        vec3 w = fract(gridPos);
+
+        uint baseIdx = level * uint(NIRC_FEATURES_PER_LEVEL);
+        float dF0 = dInput[baseIdx];
+        float dF1 = dInput[baseIdx + 1];
+
+        for (int dz = 0; dz < 2; dz++)
+        for (int dy = 0; dy < 2; dy++)
+        for (int dx = 0; dx < 2; dx++) {
+            ivec3 corner = ivec3(dx == 0 ? p0.x : p1.x, dy == 0 ? p0.y : p1.y, dz == 0 ? p0.z : p1.z);
+            float wt = (dx == 0 ? (1.0 - w.x) : w.x) *
+                        (dy == 0 ? (1.0 - w.y) : w.y) *
+                        (dz == 0 ? (1.0 - w.z) : w.z);
+            uint idx = nircSpatialHash(corner, level);
+            atomicAdd(hashGrid.features[idx * 2],     wt * dF0 * pc.learningRate);
+            atomicAdd(hashGrid.features[idx * 2 + 1], wt * dF1 * pc.learningRate);
+        }
+    }
+}
