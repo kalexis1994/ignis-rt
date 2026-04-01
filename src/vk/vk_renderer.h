@@ -141,6 +141,7 @@ private:
 #ifdef IGNIS_HAVE_NRC
     class NrcIntegration* nrc_ = nullptr;
 #endif
+    class NircIntegration* nirc_ = nullptr;
     bool rtReady_ = false;
     bool useDirectInterop_ = false;
     int initStep_ = 0;          // phased init progress

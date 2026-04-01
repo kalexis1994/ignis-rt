@@ -1157,6 +1157,17 @@ bool RTPipeline::CreateDescriptorSetLayout() {
     bindings[43].descriptorCount = 1;
     bindings[43].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
+    // bindings 44-48: NIRC (custom Neural Incident Radiance Cache) SSBOs
+    // 44: training samples, 45: hash features, 46: weights, 47: query input, 48: query output
+    bindings.resize(49);
+    for (uint32_t i = 44; i <= 48; i++) {
+        bindings[i] = {};
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+
     // Binding flags for partially bound descriptors
     std::vector<VkDescriptorBindingFlags> bindingFlags(bindings.size(), VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
 
@@ -1388,7 +1399,7 @@ bool RTPipeline::CreateDescriptorPool() {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 25},   // 13 base + 3 masks(29-31) + 1 hairV(34) + 3 hybrid(35-37) + padding
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},  // camera + NRC constants
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16},  // 11 base + 5 NRC(38-42)
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 21},  // 11 base + 5 NRC(38-42) + 5 NIRC(44-48)
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1034},  // 1024 textures + 10 other samplers
     };
 

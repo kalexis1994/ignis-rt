@@ -16,6 +16,7 @@
 #include "nrc_integration.h"
 #include <NrcStructures.h>
 #endif
+#include "nirc_integration.h"
 #include <vector>
 #include <fstream>
 #include <filesystem>
@@ -733,6 +734,42 @@ void Renderer::InitRT_Remaining() {
         }
     }
 #endif
+
+    // NIRC (custom Neural Incident Radiance Cache)
+    if (cfg && !nirc_) {
+        nirc_ = new NircIntegration();
+        float sMin[3] = { cfg->sceneAABBMin[0], cfg->sceneAABBMin[1], cfg->sceneAABBMin[2] };
+        float sMax[3] = { cfg->sceneAABBMax[0], cfg->sceneAABBMax[1], cfg->sceneAABBMax[2] };
+        if (sMin[0] == sMax[0]) { sMin[0] = -50; sMax[0] = 50; sMin[1] = -50; sMax[1] = 50; sMin[2] = -50; sMax[2] = 50; }
+        if (!nirc_->Initialize(context_, renderWidth_, renderHeight_, sMin, sMax)) {
+            Log(L"[VK Renderer] NIRC init failed\n");
+            delete nirc_;
+            nirc_ = nullptr;
+        } else if (rtPipeline_) {
+            // Bind NIRC buffers to RT pipeline descriptors (44-48)
+            VkBuffer bufs[5] = {
+                nirc_->GetTrainingSampleBuffer(), nirc_->GetHashFeatureBuffer(),
+                nirc_->GetWeightBuffer(), nirc_->GetQueryInputBuffer(), nirc_->GetQueryOutputBuffer()
+            };
+            VkDeviceSize sizes[5] = {
+                nirc_->GetTrainingSampleBufferSize(), nirc_->GetHashFeatureBufferSize(),
+                nirc_->GetWeightBufferSize(), nirc_->GetQueryInputBufferSize(), nirc_->GetQueryOutputBufferSize()
+            };
+            VkDescriptorBufferInfo bufInfos[5] = {};
+            VkWriteDescriptorSet writes[5] = {};
+            for (int i = 0; i < 5; i++) {
+                bufInfos[i] = { bufs[i], 0, sizes[i] };
+                writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[i].dstSet = rtPipeline_->GetDescriptorSet();
+                writes[i].dstBinding = 44 + i;
+                writes[i].descriptorCount = 1;
+                writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                writes[i].pBufferInfo = &bufInfos[i];
+            }
+            vkUpdateDescriptorSets(context_->GetDevice(), 5, writes, 0, nullptr);
+            Log(L"[VK Renderer] NIRC buffers bound to descriptors 44-48\n");
+        }
+    }
 
     // Wavefront (experimental)
     if (cfg && cfg->useWavefront) {
@@ -1988,6 +2025,22 @@ void Renderer::RenderFrameRT() {
         nrc_->QueryAndTrain(cmd);
     }
 #endif
+
+    // NIRC: train neural incident radiance cache from path tracer samples
+    if (nirc_ && nirc_->IsReady()) {
+        VkMemoryBarrier rtToNirc{};
+        rtToNirc.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        rtToNirc.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        rtToNirc.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &rtToNirc, 0, nullptr, 0, nullptr);
+        // TODO: sampleCount should come from an atomic counter written by the raygen shader
+        // For now, use a fixed count based on render resolution
+        uint32_t trainSamples = std::min(renderWidth_ * renderHeight_ / 16, 65536u);
+        nirc_->Train(cmd, trainSamples, frameIndex_);
+    }
 
     // Fill any unwritten timestamp slots (skipped stages → current time → 0ms delta).
     FillMissingTimestamps(cmd);
@@ -4208,6 +4261,7 @@ void Renderer::Shutdown() {
 #ifdef IGNIS_HAVE_NRC
     if (nrc_) { nrc_->Shutdown(); delete nrc_; nrc_ = nullptr; }
 #endif
+    if (nirc_) { nirc_->Shutdown(); delete nirc_; nirc_ = nullptr; }
 
     // Shutdown wavefront + RT modules
     if (wavefrontPipeline_) { wavefrontPipeline_->Shutdown(); delete wavefrontPipeline_; wavefrontPipeline_ = nullptr; }
