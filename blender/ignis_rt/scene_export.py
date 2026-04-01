@@ -4001,6 +4001,12 @@ def _pack_gpu_material(
     volume_emission_color=(1.0, 1.0, 1.0),
     volume_blackbody=0.0,
     volume_temperature=1000.0,
+    volume_bbox_min=(0.0, 0.0, 0.0),
+    volume_bbox_max=(1.0, 1.0, 1.0),
+    volume_noise_type=1,
+    volume_noise_normalize=1,
+    volume_noise_offset=0.0,
+    volume_noise_gain=1.0,
     hair_shift=0.035,
     hair_radial_roughness=0.3,
 ):
@@ -4093,8 +4099,21 @@ def _pack_gpu_material(
         vm_uints[17] = _pf(volume_emission_color[1])
         vm_uints[18] = _pf(volume_emission_color[2])
         vm_uints[19] = _pf(volume_temperature)
-        # nodeVmCode[4].x = blackbody intensity
+        # nodeVmCode[4] = uvec4(blackbody, noiseType|normalize<<16, noiseOffset, noiseGain)
         vm_uints[20] = _pf(volume_blackbody)
+        vm_uints[21] = (volume_noise_type & 0xFFFF) | ((volume_noise_normalize & 0xFFFF) << 16)
+        vm_uints[22] = _pf(volume_noise_offset)
+        vm_uints[23] = _pf(volume_noise_gain)
+        # nodeVmCode[5] = uvec4(bbox_min.x, bbox_min.y, bbox_min.z, 0)
+        vm_uints[24] = _pf(volume_bbox_min[0])
+        vm_uints[25] = _pf(volume_bbox_min[1])
+        vm_uints[26] = _pf(volume_bbox_min[2])
+        vm_uints[27] = 0
+        # nodeVmCode[6] = uvec4(bbox_max.x, bbox_max.y, bbox_max.z, 0)
+        vm_uints[28] = _pf(volume_bbox_max[0])
+        vm_uints[29] = _pf(volume_bbox_max[1])
+        vm_uints[30] = _pf(volume_bbox_max[2])
+        vm_uints[31] = 0
 
     return base + _GPU_MATERIAL_VM.pack(*vm_uints)
 
@@ -5648,6 +5667,12 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         alpha_ref = 0.5
         hair_shift = 0.035
         hair_radial_roughness = 0.3
+        volume_bbox_min = (0.0, 0.0, 0.0)
+        volume_bbox_max = (1.0, 1.0, 1.0)
+        volume_noise_type = 1   # 0=multifractal, 1=fBM, 2=hybrid, 3=ridged, 4=hetero
+        volume_noise_normalize = 1  # 1=true, 0=false
+        volume_noise_offset = 0.0
+        volume_noise_gain = 1.0
 
         # Volume material properties
         volume_density = 0.0
@@ -5727,6 +5752,19 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                             if _r: volume_noise_roughness = float(_r.default_value)
                             _l = _trace.inputs.get('Lacunarity')
                             if _l: volume_noise_lacunarity = float(_l.default_value)
+                            # Musgrave/Noise type, offset, gain, normalize
+                            _noise_type_map = {
+                                'MULTIFRACTAL': 0, 'FBM': 1,
+                                'HYBRID_MULTIFRACTAL': 2, 'RIDGED_MULTIFRACTAL': 3,
+                                'HETERO_TERRAIN': 4,
+                            }
+                            _nt = getattr(_trace, 'noise_type', 'FBM')
+                            volume_noise_type = _noise_type_map.get(_nt, 1)
+                            volume_noise_normalize = 1 if getattr(_trace, 'normalize', True) else 0
+                            _off = _trace.inputs.get('Offset')
+                            if _off: volume_noise_offset = float(_off.default_value)
+                            _ga = _trace.inputs.get('Gain')
+                            if _ga: volume_noise_gain = float(_ga.default_value)
                             # Follow Vector input for Mapping node
                             _vi = _trace.inputs.get('Vector')
                             if _vi and _vi.is_linked:
@@ -5775,6 +5813,19 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
             # Volume-only: Surface input empty but Volume input connected
             if surface_node is None and (flags & 4) != 0:
                 flags |= 8  # MAT_FLAG_VOLUME_ONLY
+                # Get bounding box from first object using this material (for Generated coords)
+                import bpy as _bpy_vol
+                for _vobj in _bpy_vol.data.objects:
+                    if _vobj.type == 'MESH' and mat.name in [s.material.name for s in _vobj.material_slots if s.material]:
+                        bb = _vobj.bound_box
+                        _bb_verts = [bb[i] for i in range(8)]
+                        volume_bbox_min = (min(v[0] for v in _bb_verts),
+                                           min(v[1] for v in _bb_verts),
+                                           min(v[2] for v in _bb_verts))
+                        volume_bbox_max = (max(v[0] for v in _bb_verts),
+                                           max(v[1] for v in _bb_verts),
+                                           max(v[2] for v in _bb_verts))
+                        break
             if surface_node and surface_node.type == 'MIX_SHADER':
                 _original_surface_node = surface_node
             # Debug: log what Material Output points to
@@ -6288,6 +6339,12 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
             volume_emission_color=volume_emission_color,
             volume_blackbody=volume_blackbody,
             volume_temperature=volume_temperature,
+            volume_bbox_min=volume_bbox_min,
+            volume_bbox_max=volume_bbox_max,
+            volume_noise_type=volume_noise_type,
+            volume_noise_normalize=volume_noise_normalize,
+            volume_noise_offset=volume_noise_offset,
+            volume_noise_gain=volume_noise_gain,
             hair_shift=hair_shift,
             hair_radial_roughness=hair_radial_roughness,
         )

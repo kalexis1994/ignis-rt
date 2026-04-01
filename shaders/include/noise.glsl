@@ -82,35 +82,142 @@ float perlinNoise3D(vec3 p) {
 // detail:     number of octaves (fractional allowed)
 // roughness:  amplitude decay per octave (typically 0.5)
 // lacunarity: frequency multiplier per octave (typically 2.0)
-// Returns [0, 1]
+// Cycles-matching fractal noise functions (from kernel/svm/fractal_noise.h)
 // ============================================================
 
-float fbm3D(vec3 p, float detail, float roughness, float lacunarity) {
-    float value = 0.0;
-    float amplitude = 1.0;
-    float maxAmplitude = 0.0;
-    float frequency = 1.0;
+// Noise types (match Cycles NodeNoiseType enum)
+#define NOISE_TYPE_MULTIFRACTAL          0
+#define NOISE_TYPE_FBM                   1
+#define NOISE_TYPE_HYBRID_MULTIFRACTAL   2
+#define NOISE_TYPE_RIDGED_MULTIFRACTAL   3
+#define NOISE_TYPE_HETERO_TERRAIN        4
 
+// fBM (Cycles-exact: fractal_noise.h:63)
+float noise_fbm_3d(vec3 p, float detail, float roughness, float lacunarity, bool normalize) {
+    float fscale = 1.0;
+    float amp = 1.0;
+    float maxamp = 0.0;
+    float sum = 0.0;
     int nOctaves = int(detail);
-    for (int i = 0; i < nOctaves; i++) {
-        value += amplitude * perlinNoise3D(p * frequency);
-        maxAmplitude += amplitude;
-        amplitude *= roughness;
-        frequency *= lacunarity;
+    for (int i = 0; i <= nOctaves; i++) {
+        float t = perlinNoise3D(fscale * p);
+        sum += t * amp;
+        maxamp += amp;
+        amp *= roughness;
+        fscale *= lacunarity;
     }
+    float rmd = detail - floor(detail);
+    if (rmd != 0.0) {
+        float t = perlinNoise3D(fscale * p);
+        float sum2 = sum + t * amp;
+        return normalize ? mix(0.5 * sum / maxamp + 0.5, 0.5 * sum2 / (maxamp + amp) + 0.5, rmd) :
+                           mix(sum, sum2, rmd);
+    }
+    return normalize ? 0.5 * sum / maxamp + 0.5 : sum;
+}
 
-    // Fractional octave blend
-    float remainder = detail - float(nOctaves);
-    if (remainder > 0.0) {
-        value += remainder * amplitude * perlinNoise3D(p * frequency);
-        maxAmplitude += remainder * amplitude;
+// Multifractal (Cycles-exact: fractal_noise.h:159)
+float noise_multi_fractal_3d(vec3 p, float detail, float roughness, float lacunarity) {
+    float value = 1.0;
+    float pwr = 1.0;
+    int nOctaves = int(detail);
+    for (int i = 0; i <= nOctaves; i++) {
+        value *= (pwr * perlinNoise3D(p) + 1.0);
+        pwr *= roughness;
+        p *= lacunarity;
     }
+    float rmd = detail - floor(detail);
+    if (rmd != 0.0) {
+        value *= (rmd * pwr * perlinNoise3D(p) + 1.0);
+    }
+    return value;
+}
 
-    // Normalize from [-1,1] to [0,1]
-    if (maxAmplitude > 0.0) {
-        value /= maxAmplitude;
+// Heterogeneous Terrain (Cycles-exact: fractal_noise.h:258)
+float noise_hetero_terrain_3d(vec3 p, float detail, float roughness, float lacunarity, float offset) {
+    float pwr = roughness;
+    float value = offset + perlinNoise3D(p);
+    p *= lacunarity;
+    int nOctaves = int(detail);
+    for (int i = 1; i <= nOctaves; i++) {
+        float increment = (perlinNoise3D(p) + offset) * pwr * value;
+        value += increment;
+        pwr *= roughness;
+        p *= lacunarity;
     }
-    return value * 0.5 + 0.5;
+    float rmd = detail - floor(detail);
+    if (rmd != 0.0) {
+        float increment = (perlinNoise3D(p) + offset) * pwr * value;
+        value += rmd * increment;
+    }
+    return value;
+}
+
+// Hybrid Multifractal (Cycles-exact: fractal_noise.h:377)
+float noise_hybrid_multi_fractal_3d(vec3 p, float detail, float roughness, float lacunarity, float offset, float gain) {
+    float pwr = 1.0;
+    float value = 0.0;
+    float weight = 1.0;
+    int nOctaves = int(detail);
+    for (int i = 0; (weight > 0.001) && (i <= nOctaves); i++) {
+        weight = min(weight, 1.0);
+        float signal = (perlinNoise3D(p) + offset) * pwr;
+        pwr *= roughness;
+        value += weight * signal;
+        weight *= gain * signal;
+        p *= lacunarity;
+    }
+    float rmd = detail - floor(detail);
+    if ((rmd != 0.0) && (weight > 0.001)) {
+        weight = min(weight, 1.0);
+        float signal = (perlinNoise3D(p) + offset) * pwr;
+        value += rmd * weight * signal;
+    }
+    return value;
+}
+
+// Ridged Multifractal (Cycles-exact: fractal_noise.h:496)
+float noise_ridged_multi_fractal_3d(vec3 p, float detail, float roughness, float lacunarity, float offset, float gain) {
+    float pwr = roughness;
+    float signal = offset - abs(perlinNoise3D(p));
+    signal *= signal;
+    float value = signal;
+    float weight = 1.0;
+    int nOctaves = int(detail);
+    for (int i = 1; i <= nOctaves; i++) {
+        p *= lacunarity;
+        weight = clamp(signal * gain, 0.0, 1.0);
+        signal = offset - abs(perlinNoise3D(p));
+        signal *= signal;
+        signal *= weight;
+        value += signal * pwr;
+        pwr *= roughness;
+    }
+    return value;
+}
+
+// Dispatch by type (matches Cycles noisetex.h:56 noise_select)
+float noiseSelect3D(vec3 p, float detail, float roughness, float lacunarity,
+                     float offset, float gain, int noiseType, bool normalize) {
+    switch (noiseType) {
+        case NOISE_TYPE_FBM:
+            return noise_fbm_3d(p, detail, roughness, lacunarity, normalize);
+        case NOISE_TYPE_MULTIFRACTAL:
+            return noise_multi_fractal_3d(p, detail, roughness, lacunarity);
+        case NOISE_TYPE_HYBRID_MULTIFRACTAL:
+            return noise_hybrid_multi_fractal_3d(p, detail, roughness, lacunarity, offset, gain);
+        case NOISE_TYPE_RIDGED_MULTIFRACTAL:
+            return noise_ridged_multi_fractal_3d(p, detail, roughness, lacunarity, offset, gain);
+        case NOISE_TYPE_HETERO_TERRAIN:
+            return noise_hetero_terrain_3d(p, detail, roughness, lacunarity, offset);
+        default:
+            return noise_fbm_3d(p, detail, roughness, lacunarity, normalize);
+    }
+}
+
+// Legacy wrapper (normalized fBM)
+float fbm3D(vec3 p, float detail, float roughness, float lacunarity) {
+    return noise_fbm_3d(p, detail, roughness, lacunarity, true);
 }
 
 // ============================================================
