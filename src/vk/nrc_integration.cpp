@@ -41,6 +41,21 @@ bool NrcIntegration::Initialize(Context* ctx, uint32_t renderWidth, uint32_t ren
     globalSettings.enableGPUMemoryAllocation = true;
     globalSettings.maxNumFramesInFlight = 2;
 
+    // Tell NRC where CUDA runtime DLLs are (same dir as ignis_rt.dll)
+    static wchar_t nrcDepsPath[512] = {};
+    {
+        HMODULE hm = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)&NrcLogCallback, &hm);
+        if (hm) {
+            GetModuleFileNameW(hm, nrcDepsPath, 511);
+            wchar_t* lastSlash = wcsrchr(nrcDepsPath, L'\\');
+            if (lastSlash) *(lastSlash + 1) = 0;
+            globalSettings.depsDirectoryPath = nrcDepsPath;
+            Log(L"[NRC] Deps path: %s\n", nrcDepsPath);
+        }
+    }
+
     nrc::Status status = nrc::vulkan::Initialize(globalSettings);
     if (status != nrc::Status::OK) {
         Log(L"[NRC] Initialize failed: %d\n", (int)status);

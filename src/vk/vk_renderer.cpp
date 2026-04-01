@@ -704,6 +704,36 @@ void Renderer::InitRT_Remaining() {
         rtPipeline_->CreateGBuffers(renderWidth_, renderHeight_);
     }
 
+    // NRC (Neural Radiance Cache)
+#ifdef IGNIS_HAVE_NRC
+    if (cfg && !nrc_) {
+        nrc_ = new NrcIntegration();
+        float sceneMin[3] = { cfg->sceneAABBMin[0], cfg->sceneAABBMin[1], cfg->sceneAABBMin[2] };
+        float sceneMax[3] = { cfg->sceneAABBMax[0], cfg->sceneAABBMax[1], cfg->sceneAABBMax[2] };
+        if (sceneMin[0] == sceneMax[0]) { sceneMin[0] = -50; sceneMax[0] = 50; sceneMin[1] = -50; sceneMax[1] = 50; sceneMin[2] = -50; sceneMax[2] = 50; }
+        if (!nrc_->Initialize(context_, renderWidth_, renderHeight_,
+                              cfg->samplesPerPixel, cfg->maxBounces, sceneMin, sceneMax)) {
+            Log(L"[VK Renderer] NRC init failed — continuing without neural cache\n");
+            delete nrc_;
+            nrc_ = nullptr;
+        } else if (rtPipeline_ && nrc_->GetBuffers()) {
+            auto* bufs = nrc_->GetBuffers();
+            rtPipeline_->UpdateNrcBufferDescriptors(
+                (*bufs)[nrc::BufferIdx::Counter].resource,
+                (*bufs)[nrc::BufferIdx::Counter].allocatedSize,
+                (*bufs)[nrc::BufferIdx::QueryPathInfo].resource,
+                (*bufs)[nrc::BufferIdx::QueryPathInfo].allocatedSize,
+                (*bufs)[nrc::BufferIdx::TrainingPathInfo].resource,
+                (*bufs)[nrc::BufferIdx::TrainingPathInfo].allocatedSize,
+                (*bufs)[nrc::BufferIdx::TrainingPathVertices].resource,
+                (*bufs)[nrc::BufferIdx::TrainingPathVertices].allocatedSize,
+                (*bufs)[nrc::BufferIdx::QueryRadianceParams].resource,
+                (*bufs)[nrc::BufferIdx::QueryRadianceParams].allocatedSize);
+            Log(L"[VK Renderer] NRC buffers bound to RT pipeline\n");
+        }
+    }
+#endif
+
     // Wavefront (experimental)
     if (cfg && cfg->useWavefront) {
         wavefrontPipeline_ = new WavefrontPipeline();

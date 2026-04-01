@@ -1195,6 +1195,11 @@ void main() {
     vec3 sunBitangent = cross(sunDir, sunTangent);
 
     // NRC: create context and path state for this sample
+    // NRC: activate query mode if SDK configured (maxPathVertices > 0 means NRC is ready)
+    if (nrcConstants.maxPathVertices > 0u) {
+        g_nrcMode = NRC_MODE_QUERY;
+    }
+
     NrcBuffers nrcBufs;  // empty struct (buffers accessed via custom macros)
     NrcContext nrcCtx = NrcCreateContext(nrcConstants, nrcBufs, uvec2(pixel));
     NrcSetSampleIndex(nrcCtx, uint(sampleIdx));
