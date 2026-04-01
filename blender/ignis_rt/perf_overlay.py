@@ -70,8 +70,12 @@ def update():
 
     n = len(_samples)
     if n >= 2:
-        elapsed = _samples[-1][0] - _samples[0][0]
-        _fps = (n - 1) / elapsed if elapsed > 0 else 0
+        # EMA-smoothed FPS: fast response to drops, stable readout
+        # alpha ~0.1 = smooth over ~10 frames (~0.3s at 30fps)
+        last_dt = _samples[-1][1]
+        instant_fps = 1000.0 / last_dt if last_dt > 0 else 0
+        alpha = 0.1
+        _fps = _fps + alpha * (instant_fps - _fps) if _fps > 0 else instant_fps
 
         times = [s[1] for s in _samples]
         _stats['avg'] = sum(times) / n
