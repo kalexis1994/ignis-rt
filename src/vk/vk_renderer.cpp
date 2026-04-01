@@ -1419,7 +1419,33 @@ void Renderer::RenderFrameRT() {
     }
     WriteTimestamp(cmd, TS_HYBRID);
 
-    // 1. Path tracing dispatch (wavefront or monolithic)
+    // 0.5 NRC update pass: trace at training resolution to generate training data
+#ifdef IGNIS_HAVE_NRC
+    if (nrc_ && nrc_->IsReady()) {
+        // Dispatch at training resolution — shader detects NRC_MODE_UPDATE from launch size
+        NrcConstants nrcConst = {};
+        if (nrc_->PopulateShaderConstants(nrcConst)) {
+            rtPipeline_->UpdateNrcConstants(&nrcConst, sizeof(nrcConst));
+        }
+        uint32_t trainW = nrcConst.trainingDimensions.x;
+        uint32_t trainH = nrcConst.trainingDimensions.y;
+        if (trainW > 0 && trainH > 0) {
+            rtPipeline_->RecordDispatch(cmd, trainW, trainH);
+
+            // Barrier: update pass writes → query pass reads + SDK reads
+            VkMemoryBarrier updateBarrier{};
+            updateBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            updateBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            updateBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &updateBarrier, 0, nullptr, 0, nullptr);
+        }
+    }
+#endif
+
+    // 1. Path tracing dispatch (wavefront or monolithic) — NRC query mode
     interop_->TransitionForRTWrite(cmd);
     if (wavefrontPipeline_ && wavefrontPipeline_->IsReady()) {
         PathTracerConfig* wfCfg = VK_GetConfig();

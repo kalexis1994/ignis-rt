@@ -1195,9 +1195,15 @@ void main() {
     vec3 sunBitangent = cross(sunDir, sunTangent);
 
     // NRC: create context and path state for this sample
-    // NRC: activate query mode if SDK configured (maxPathVertices > 0 means NRC is ready)
+    // NRC: detect mode from dispatch resolution
+    // Update pass dispatches at trainingDimensions, query pass at frameDimensions
     if (nrcConstants.maxPathVertices > 0u) {
-        g_nrcMode = NRC_MODE_QUERY;
+        if (launchSize.x == int(nrcConstants.trainingDimensions.x) &&
+            launchSize.y == int(nrcConstants.trainingDimensions.y)) {
+            g_nrcMode = NRC_MODE_UPDATE;
+        } else {
+            g_nrcMode = NRC_MODE_QUERY;
+        }
     }
 
     NrcBuffers nrcBufs;  // empty struct (buffers accessed via custom macros)
@@ -3426,6 +3432,11 @@ void main() {
 
     // ---- NRC: finalize path info ----
     NrcWriteFinalPathInfo(nrcCtx, nrcPath, throughput, totalRadiance);
+
+    // NRC update pass: only writes training data, skip image output
+    if (NrcIsUpdateMode()) {
+        return;
+    }
 
     // ---- Accumulate this sample ----
     totalRadiance += diffuseRadiance + specularRadiance;
