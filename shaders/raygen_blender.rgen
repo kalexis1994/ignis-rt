@@ -1729,11 +1729,11 @@ void main() {
                 continue;
             }
 
-            // Find exit distance
-            vec3 entryPos = worldPos + rayDir * 0.001;
+            // Find exit distance — trace from entry to back face of volume mesh
+            vec3 entryPos = worldPos + rayDir * 0.0005;
             float marchDist = 0.0;
             vec3 probeOrigin = entryPos;
-            for (int attempt = 0; attempt < 2; attempt++) {
+            for (int attempt = 0; attempt < 4; attempt++) {
                 rayQueryEXT exitRQ;
                 rayQueryInitializeEXT(exitRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
                                       0xFF, probeOrigin, 0.0, rayDir, 100000.0);
@@ -1743,11 +1743,11 @@ void main() {
                     break;
                 }
                 float t = rayQueryGetIntersectionTEXT(exitRQ, true);
-                marchDist += t + 0.01;
-                if (t > 0.05) break;
-                probeOrigin += rayDir * (t + 0.01);
+                marchDist += t + 0.001;
+                if (t > 0.01) break;  // found real back face
+                probeOrigin += rayDir * (t + 0.001);
             }
-            marchDist = max(marchDist, 0.1);
+            marchDist = max(marchDist, 0.005);
 
             // Noise parameters
             float noiseScale = uintBitsToFloat(mat.nodeVmPad[0]);
