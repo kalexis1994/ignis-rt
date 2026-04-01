@@ -273,6 +273,16 @@ private:
     VkStridedDeviceAddressRegionKHR hitRegion_{};
     VkStridedDeviceAddressRegionKHR callableRegion_{};
 
+    // NRC constants UBO (binding 43)
+#ifdef IGNIS_HAVE_NRC
+    VkBuffer nrcConstantsBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory nrcConstantsMemory_ = VK_NULL_HANDLE;
+    void* nrcConstantsMapped_ = nullptr;
+public:
+    void UpdateNrcConstants(const void* constants, size_t size);
+private:
+#endif
+
     // NRD G-buffer images (full-resolution, written by raygen shader)
     struct GBufferImage {
         VkImage image = VK_NULL_HANDLE;

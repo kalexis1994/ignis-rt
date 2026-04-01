@@ -14,6 +14,7 @@
 #include "nrd_vulkan_integration.h"
 #ifdef IGNIS_HAVE_NRC
 #include "nrc_integration.h"
+#include <NrcStructures.h>
 #endif
 #include <vector>
 #include <fstream>
@@ -1354,9 +1355,13 @@ void Renderer::RenderFrameRT() {
 
     bool diagFlush = false;  // Set true to flush GPU between stages for crash isolation
 
-    // NRC: begin frame (housekeeping before path tracing)
+    // NRC: populate constants + begin frame
 #ifdef IGNIS_HAVE_NRC
     if (nrc_ && nrc_->IsReady()) {
+        NrcConstants nrcConst = {};
+        if (nrc_->PopulateShaderConstants(nrcConst)) {
+            rtPipeline_->UpdateNrcConstants(&nrcConst, sizeof(nrcConst));
+        }
         nrc_->BeginFrame(cmd);
     }
 #endif

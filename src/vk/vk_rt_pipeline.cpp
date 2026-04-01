@@ -1,5 +1,6 @@
 #include "vk_rt_pipeline.h"
 #include "vk_context.h"
+#include <algorithm>
 #include "vk_accel_structure.h"
 #include "vk_interop.h"
 #include "vk_texture_manager.h"
@@ -56,6 +57,28 @@ bool RTPipeline::Initialize(Context* context, AccelStructureBuilder* accelBuilde
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     vkAllocateMemory(device, &allocInfo, nullptr, &cameraMemory_);
     vkBindBufferMemory(device, cameraBuffer_, cameraMemory_, 0);
+
+    // Create NRC constants UBO (binding 43)
+#ifdef IGNIS_HAVE_NRC
+    {
+        VkBufferCreateInfo nrcBufInfo{};
+        nrcBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        nrcBufInfo.size = 128;  // NrcConstants is ~96 bytes, pad to 128
+        nrcBufInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+        nrcBufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        vkCreateBuffer(device, &nrcBufInfo, nullptr, &nrcConstantsBuffer_);
+        VkMemoryRequirements nrcReqs;
+        vkGetBufferMemoryRequirements(device, nrcConstantsBuffer_, &nrcReqs);
+        VkMemoryAllocateInfo nrcAlloc{};
+        nrcAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        nrcAlloc.allocationSize = nrcReqs.size;
+        nrcAlloc.memoryTypeIndex = context_->FindMemoryType(nrcReqs.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        vkAllocateMemory(device, &nrcAlloc, nullptr, &nrcConstantsMemory_);
+        vkBindBufferMemory(device, nrcConstantsBuffer_, nrcConstantsMemory_, 0);
+        vkMapMemory(device, nrcConstantsMemory_, 0, 128, 0, &nrcConstantsMapped_);
+    }
+#endif
 
     // Create pick buffer (16 bytes, HOST_VISIBLE + HOST_COHERENT, persistently mapped)
     {
@@ -1118,10 +1141,10 @@ bool RTPipeline::CreateDescriptorSetLayout() {
     bindings[37].descriptorCount = 1;
     bindings[37].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
-    // bindings 38-42: NRC (Neural Radiance Cache) buffers
+    // bindings 38-42: NRC (Neural Radiance Cache) SSBOs
+    // binding 43: NRC constants UBO
 #ifdef IGNIS_HAVE_NRC
-    bindings.resize(43);
-    // 38: Counter, 39: QueryPathInfo, 40: TrainingPathInfo, 41: TrainingPathVertices, 42: QueryRadianceParams
+    bindings.resize(44);
     for (uint32_t i = 38; i <= 42; i++) {
         bindings[i] = {};
         bindings[i].binding = i;
@@ -1129,6 +1152,11 @@ bool RTPipeline::CreateDescriptorSetLayout() {
         bindings[i].descriptorCount = 1;
         bindings[i].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
     }
+    bindings[43] = {};
+    bindings[43].binding = 43;
+    bindings[43].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    bindings[43].descriptorCount = 1;
+    bindings[43].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 #endif
 
     // Binding flags for partially bound descriptors
@@ -1361,7 +1389,7 @@ bool RTPipeline::CreateDescriptorPool() {
     VkDescriptorPoolSize poolSizes[] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 25},   // 13 base + 3 masks(29-31) + 1 hairV(34) + 3 hybrid(35-37) + padding
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},  // camera + NRC constants
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16},  // 11 base + 5 NRC(38-42)
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1034},  // 1024 textures + 10 other samplers
     };
@@ -1941,6 +1969,28 @@ void RTPipeline::UpdateCamera(const CameraUBO& camera) {
     memcpy(mapped, &camera, sizeof(CameraUBO));
     vkUnmapMemory(context_->GetDevice(), cameraMemory_);
 }
+
+#ifdef IGNIS_HAVE_NRC
+void RTPipeline::UpdateNrcConstants(const void* constants, size_t size) {
+    if (!nrcConstantsMapped_ || !constants) return;
+    memcpy(nrcConstantsMapped_, constants, std::min(size, (size_t)128));
+
+    // Update descriptor binding 43
+    VkDescriptorBufferInfo bufInfo{};
+    bufInfo.buffer = nrcConstantsBuffer_;
+    bufInfo.offset = 0;
+    bufInfo.range = 128;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = descriptorSet_;
+    write.dstBinding = 43;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    write.pBufferInfo = &bufInfo;
+    vkUpdateDescriptorSets(context_->GetDevice(), 1, &write, 0, nullptr);
+}
+#endif
 
 void RTPipeline::UpdateMaterialBuffer(const GPUMaterial* materials, uint32_t count) {
     if (!materials || count == 0) return;
