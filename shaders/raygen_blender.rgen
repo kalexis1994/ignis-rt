@@ -1201,6 +1201,9 @@ void main() {
         if (launchSize.x == int(nrcConstants.trainingDimensions.x) &&
             launchSize.y == int(nrcConstants.trainingDimensions.y)) {
             g_nrcMode = NRC_MODE_UPDATE;
+            // Update pass: use deeper paths for better training data
+            maxBounces = int(nrcConstants.maxPathVertices);
+            spp = 1;  // single sample for training
         } else {
             g_nrcMode = NRC_MODE_QUERY;
         }

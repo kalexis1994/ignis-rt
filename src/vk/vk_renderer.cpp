@@ -1385,9 +1385,11 @@ void Renderer::RenderFrameRT() {
 
     bool diagFlush = false;  // Set true to flush GPU between stages for crash isolation
 
-    // NRC: populate constants + begin frame
+    // NRC: populate constants + begin frame (only when user enabled)
 #ifdef IGNIS_HAVE_NRC
-    if (nrc_ && nrc_->IsReady()) {
+    PathTracerConfig* nrcCfg = VK_GetConfig();
+    bool nrcActive = nrc_ && nrc_->IsReady() && nrcCfg && nrcCfg->nrcEnabled;
+    if (nrcActive) {
         NrcConstants nrcConst = {};
         if (nrc_->PopulateShaderConstants(nrcConst)) {
             rtPipeline_->UpdateNrcConstants(&nrcConst, sizeof(nrcConst));
@@ -1421,7 +1423,7 @@ void Renderer::RenderFrameRT() {
 
     // 0.5 NRC update pass: trace at training resolution to generate training data
 #ifdef IGNIS_HAVE_NRC
-    if (nrc_ && nrc_->IsReady()) {
+    if (nrcActive) {
         // Dispatch at training resolution — shader detects NRC_MODE_UPDATE from launch size
         NrcConstants nrcConst = {};
         if (nrc_->PopulateShaderConstants(nrcConst)) {
@@ -1961,7 +1963,7 @@ void Renderer::RenderFrameRT() {
 
     // NRC: query neural cache + train network
 #ifdef IGNIS_HAVE_NRC
-    if (nrc_ && nrc_->IsReady()) {
+    if (nrcActive) {
         VkMemoryBarrier rtToNrc{};
         rtToNrc.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         rtToNrc.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -2007,7 +2009,7 @@ void Renderer::RenderFrameRT() {
 
     // NRC: end frame (must be called after queue submit)
 #ifdef IGNIS_HAVE_NRC
-    if (nrc_ && nrc_->IsReady()) {
+    if (nrcActive) {
         nrc_->EndFrame(context_->GetGraphicsQueue());
     }
 #endif

@@ -187,6 +187,12 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         default=False,
         update=_tag_redraw,
     )
+    nrc_enabled: BoolProperty(
+        name="Neural Radiance Cache",
+        description="AI-accelerated GI: neural network predicts indirect lighting for early path termination (requires Tensor Cores)",
+        default=False,
+        update=_tag_redraw,
+    )
     use_wavefront: BoolProperty(
         name="Wavefront Path Tracing",
         description="Experimental: compute-based multi-kernel path tracing for better GPU occupancy",
@@ -422,6 +428,7 @@ class IGNIS_PT_advanced(bpy.types.Panel):
         layout.use_property_decorate = False
         layout.prop(props, "hybrid_rasterization")
         layout.prop(props, "restir_di")
+        layout.prop(props, "nrc_enabled")
         # layout.prop(props, "use_wavefront")  # TODO: not ready yet
         layout.separator()
         layout.prop(props, "debug_view")

@@ -8,6 +8,7 @@
 
 #include <NrcVk.h>
 #include <NrcCommon.h>
+#include <algorithm>
 
 namespace acpt {
 namespace vk {
@@ -78,13 +79,14 @@ bool NrcIntegration::Initialize(Context* ctx, uint32_t renderWidth, uint32_t ren
 
     // 3. Configure
     contextSettings_ = {};
-    contextSettings_.learnIrradiance = false;
-    contextSettings_.includeDirectLighting = false;
+    contextSettings_.learnIrradiance = true;   // demodulate albedo → better detail retention
+    contextSettings_.includeDirectLighting = false;  // cache only indirect → direct comes from NEE
     contextSettings_.frameDimensions = { renderWidth, renderHeight };
+    // Training resolution: keep small to minimize update pass cost
     contextSettings_.trainingDimensions = nrc::ComputeIdealTrainingDimensions(
-        { renderWidth, renderHeight }, 0);
+        { renderWidth, renderHeight }, 2);  // 2 training iterations — cheap
     contextSettings_.samplesPerPixel = spp;
-    contextSettings_.maxPathVertices = maxBounces;
+    contextSettings_.maxPathVertices = std::max(maxBounces, 4u);  // 4 bounces for training
     contextSettings_.sceneBoundsMin = { sceneMin[0], sceneMin[1], sceneMin[2] };
     contextSettings_.sceneBoundsMax = { sceneMax[0], sceneMax[1], sceneMax[2] };
     contextSettings_.smallestResolvableFeatureSize = 0.05f;
@@ -98,13 +100,15 @@ bool NrcIntegration::Initialize(Context* ctx, uint32_t renderWidth, uint32_t ren
         return false;
     }
 
-    // 4. Default frame settings
+    // 4. Frame settings — tuned for interactive viewport
     frameSettings_ = {};
     frameSettings_.maxExpectedAverageRadianceValue = 1.0f;
-    frameSettings_.terminationHeuristicThreshold = 0.1f;
+    frameSettings_.terminationHeuristicThreshold = 0.15f;  // conservative — only terminate very spread paths
     frameSettings_.trainingTerminationHeuristicThreshold = 0.1f;
     frameSettings_.trainTheCache = true;
     frameSettings_.learningRate = 1e-2f;
+    frameSettings_.numTrainingIterations = 2;  // keep training cheap
+    frameSettings_.skipDeltaVertices = true;   // don't terminate on mirrors/glass
 
     nrcReady_ = true;
     Log(L"[NRC] Ready: render=%ux%u training=%ux%u spp=%u bounces=%u\n",
