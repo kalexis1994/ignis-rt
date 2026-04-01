@@ -5,6 +5,9 @@ import os
 import struct
 import numpy as np
 
+# Object types that can be converted to mesh via to_mesh() — includes Geometry Nodes outputs
+RENDERABLE_TYPES = {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META', 'CURVES', 'POINTCLOUD'}
+
 # Blender Z-up → Vulkan Y-up conversion (applied to positions, normals, transforms)
 # Swaps Y↔Z, negates new Z:  x' = x,  y' = z,  z' = -y
 def _bake_sky_texture(sky_node, width=256, height=128):
@@ -635,7 +638,7 @@ def export_meshes(depsgraph):
     # Build set of objects used as Boolean modifier cutters (should not be rendered)
     boolean_cutters = set()
     for obj in depsgraph.objects:
-        if obj.type != 'MESH':
+        if obj.type not in RENDERABLE_TYPES:
             continue
         for mod in obj.modifiers:
             if mod.type == 'BOOLEAN' and hasattr(mod, 'object') and mod.object:
@@ -671,7 +674,7 @@ def export_meshes(depsgraph):
 
     for instance in depsgraph.object_instances:
         obj = instance.object
-        if obj.type != 'MESH':
+        if obj.type not in RENDERABLE_TYPES:
             continue
 
         # Skip Boolean modifier cutters
@@ -870,7 +873,7 @@ def export_meshes(depsgraph):
     # Export particle hair as ribbon meshes
     for instance in depsgraph.object_instances:
         obj = instance.object
-        if obj.type != 'MESH':
+        if obj.type not in RENDERABLE_TYPES:
             continue
         if not instance.show_self or obj.name in hidden_by_collection:
             continue
@@ -1994,7 +1997,7 @@ def export_emissive_triangles_fast(depsgraph, unique_meshes, scene_instances, ma
     mat_emission = {}  # mat_name → (emission_rgb, strength)
     for inst in depsgraph.object_instances:
         obj = inst.object
-        if obj.type != 'MESH':
+        if obj.type not in RENDERABLE_TYPES:
             continue
         for slot in obj.material_slots:
             mat = slot.material
@@ -2142,7 +2145,7 @@ def export_emissive_triangles(depsgraph):
 
     for instance in depsgraph.object_instances:
         obj = instance.object
-        if obj.type != 'MESH':
+        if obj.type not in RENDERABLE_TYPES:
             continue
 
         # Check if any material slot has emission
@@ -5486,7 +5489,7 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
 
     for inst in depsgraph.object_instances:
         obj = inst.object
-        if obj.type != 'MESH':
+        if obj.type not in RENDERABLE_TYPES:
             continue
         if not inst.show_self:
             continue

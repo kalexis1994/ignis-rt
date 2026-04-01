@@ -3,6 +3,7 @@
 import ctypes
 import math
 import os
+from .scene_export import RENDERABLE_TYPES
 import time
 import traceback
 
@@ -1691,7 +1692,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         instances = []
         for inst in depsgraph.object_instances:
             obj = inst.object
-            if obj.type != 'MESH':
+            if obj.type not in RENDERABLE_TYPES:
                 continue
             mesh_key = _ignis_obj_to_mesh.get(obj.name)
             if not mesh_key or mesh_key not in _ignis_blas_handles:
@@ -2054,7 +2055,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 _parent_children_sync = {}  # parent_name → [(tlas_idx, parent_vk_4x4, child_vk_4x4)]
                 for inst in depsgraph.object_instances:
                     obj = inst.object
-                    if obj.type != 'MESH':
+                    if obj.type not in RENDERABLE_TYPES:
                         continue
                     if not inst.show_self:
                         continue
@@ -2102,7 +2103,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                     _parent_children_sync = {}
                     for inst in depsgraph.object_instances:
                         obj = inst.object
-                        if obj.type != 'MESH':
+                        if obj.type not in RENDERABLE_TYPES:
                             continue
                         mesh_key = _ignis_obj_to_mesh.get(obj.name)
                         if mesh_key and mesh_key in _ignis_blas_handles:
