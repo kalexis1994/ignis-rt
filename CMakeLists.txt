@@ -9,10 +9,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ============================================================================
 option(IGNIS_USE_NRD   "Enable NRD denoiser"       OFF)
 option(IGNIS_USE_DLSS  "Enable NVIDIA DLSS"         OFF)
+option(IGNIS_USE_NRC   "Enable NVIDIA NRC (Neural Radiance Cache)" OFF)
 option(IGNIS_ENABLE_VALIDATION "Enable Vulkan validation layers in debug builds" OFF)
 
 set(IGNIS_NRD_ROOT "" CACHE PATH "Path to NVIDIA NRD root directory")
 set(IGNIS_NGX_ROOT "" CACHE PATH "Path to NVIDIA NGX SDK (headers + lib)")
+set(IGNIS_NRC_ROOT "" CACHE PATH "Path to NVIDIA NRC root directory")
 
 # ============================================================================
 # Find Vulkan
@@ -69,6 +71,13 @@ set(IGNIS_CORE_SOURCES
 # NRD integration (always compiled — has built-in stubs when ACPT_HAVE_NRD is not defined)
 # ============================================================================
 list(APPEND IGNIS_CORE_SOURCES src/nrd_vulkan_integration.cpp)
+
+# ============================================================================
+# Optional: NRC (Neural Radiance Cache)
+# ============================================================================
+if(IGNIS_USE_NRC)
+    list(APPEND IGNIS_CORE_SOURCES src/vk/nrc_integration.cpp)
+endif()
 
 # ============================================================================
 # Optional: DLSS
@@ -138,6 +147,20 @@ if(IGNIS_USE_DLSS)
         message(WARNING "NGX SDK not found — set IGNIS_NGX_ROOT")
     endif()
 endif()
+if(IGNIS_USE_NRC)
+    target_compile_definitions(ignis_rt PRIVATE IGNIS_HAVE_NRC)
+    if(IGNIS_NRC_ROOT STREQUAL "")
+        # Auto-detect: check sibling directory
+        set(IGNIS_NRC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../NRC")
+    endif()
+    if(EXISTS "${IGNIS_NRC_ROOT}/Include/NrcVk.h")
+        message(STATUS "Using NRC at ${IGNIS_NRC_ROOT}")
+        target_include_directories(ignis_rt PRIVATE "${IGNIS_NRC_ROOT}/Include")
+        target_link_libraries(ignis_rt PRIVATE "${IGNIS_NRC_ROOT}/Lib/NRC_Vulkan.lib")
+    else()
+        message(WARNING "NRC not found at '${IGNIS_NRC_ROOT}' — set IGNIS_NRC_ROOT")
+    endif()
+endif()
 if(IGNIS_ENABLE_VALIDATION)
     target_compile_definitions(ignis_rt PRIVATE IGNIS_ENABLE_VALIDATION)
 endif()
@@ -154,7 +177,6 @@ if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     set(IGNIS_SHADER_SOURCES
         basic.vert:basic.vert.spv
         basic.frag:basic.frag.spv
-        raygen.rgen:raygen.rgen.spv
         closesthit.rchit:closesthit.rchit.spv
         miss.rmiss:miss.rmiss.spv
         nrd_composite.comp:nrd_composite.spv
