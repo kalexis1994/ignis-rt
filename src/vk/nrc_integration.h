@@ -30,6 +30,9 @@ public:
     void Reconfigure(uint32_t renderWidth, uint32_t renderHeight,
                      const float sceneMin[3], const float sceneMax[3]);
 
+    // Sync settings if user changed bounces/SPP/scene bounds (cheap if unchanged)
+    void SyncSettings(int maxBounces, int spp, const float sceneMin[3], const float sceneMax[3]);
+
     // Populate shader constants (call before path tracing dispatch)
     bool PopulateShaderConstants(NrcConstants& outConstants) const;
 
@@ -44,6 +47,7 @@ private:
     nrc::ContextSettings contextSettings_ = {};
     nrc::FrameSettings frameSettings_ = {};
     bool nrcReady_ = false;
+    uint32_t warmupFrames_ = 0;
 };
 
 } // namespace vk

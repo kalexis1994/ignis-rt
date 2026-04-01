@@ -103,7 +103,7 @@ bool NrcIntegration::Initialize(Context* ctx, uint32_t renderWidth, uint32_t ren
     // 4. Frame settings — tuned for interactive viewport
     frameSettings_ = {};
     frameSettings_.maxExpectedAverageRadianceValue = 1.0f;
-    frameSettings_.terminationHeuristicThreshold = 0.15f;  // conservative — only terminate very spread paths
+    frameSettings_.terminationHeuristicThreshold = 1000.0f;  // start disabled, ramp down after warmup
     frameSettings_.trainingTerminationHeuristicThreshold = 0.1f;
     frameSettings_.trainTheCache = true;
     frameSettings_.learningRate = 1e-2f;
@@ -111,10 +111,10 @@ bool NrcIntegration::Initialize(Context* ctx, uint32_t renderWidth, uint32_t ren
     frameSettings_.skipDeltaVertices = true;   // don't terminate on mirrors/glass
 
     nrcReady_ = true;
-    Log(L"[NRC] Ready: render=%ux%u training=%ux%u spp=%u bounces=%u\n",
+    Log(L"[NRC] Ready: render=%ux%u training=%ux%u spp=%u maxPathVerts=%u (input bounces=%u)\n",
         renderWidth, renderHeight,
         contextSettings_.trainingDimensions.x, contextSettings_.trainingDimensions.y,
-        spp, maxBounces);
+        spp, contextSettings_.maxPathVertices, maxBounces);
     return true;
 }
 
@@ -130,6 +130,22 @@ void NrcIntegration::Shutdown() {
 
 void NrcIntegration::BeginFrame(VkCommandBuffer cmd) {
     if (!nrcReady_) return;
+
+    // Warmup: let the network train for ~90 frames (~3s at 30fps) before
+    // enabling early path termination. Ramp threshold from 1000 → 0.15.
+    warmupFrames_++;
+    const uint32_t WARMUP_FRAMES = 90;
+    const float TARGET_THRESHOLD = 0.5f;  // very conservative — only terminate extremely spread paths
+    if (warmupFrames_ < WARMUP_FRAMES) {
+        frameSettings_.terminationHeuristicThreshold = 1000.0f;  // no termination
+    } else if (warmupFrames_ < WARMUP_FRAMES + 30) {
+        // Ramp over 30 frames (1s)
+        float t = float(warmupFrames_ - WARMUP_FRAMES) / 30.0f;
+        frameSettings_.terminationHeuristicThreshold = 1000.0f * (1.0f - t) + TARGET_THRESHOLD * t;
+    } else {
+        frameSettings_.terminationHeuristicThreshold = TARGET_THRESHOLD;
+    }
+
     nrc::Status s = nrcContext_->BeginFrame(cmd, frameSettings_);
     if (s != nrc::Status::OK) {
         Log(L"[NRC] BeginFrame failed: %d\n", (int)s);
@@ -176,6 +192,42 @@ void NrcIntegration::Reconfigure(uint32_t renderWidth, uint32_t renderHeight,
     }
     contextSettings_.requestReset = false;
     Log(L"[NRC] Reconfigured: %ux%u\n", renderWidth, renderHeight);
+}
+
+void NrcIntegration::SyncSettings(int maxBounces, int spp, const float sceneMin[3], const float sceneMax[3]) {
+    if (!nrcReady_) return;
+
+    uint32_t newMaxVerts = std::max((uint32_t)maxBounces, 2u);
+    uint32_t newSpp = std::max((uint32_t)spp, 1u);
+    nrc_float3 newMin = { sceneMin[0], sceneMin[1], sceneMin[2] };
+    nrc_float3 newMax = { sceneMax[0], sceneMax[1], sceneMax[2] };
+
+    // Only reconfigure if something actually changed
+    if (newMaxVerts == contextSettings_.maxPathVertices &&
+        newSpp == contextSettings_.samplesPerPixel &&
+        newMin.x == contextSettings_.sceneBoundsMin.x &&
+        newMin.y == contextSettings_.sceneBoundsMin.y &&
+        newMin.z == contextSettings_.sceneBoundsMin.z &&
+        newMax.x == contextSettings_.sceneBoundsMax.x &&
+        newMax.y == contextSettings_.sceneBoundsMax.y &&
+        newMax.z == contextSettings_.sceneBoundsMax.z) {
+        return;  // no change
+    }
+
+    contextSettings_.maxPathVertices = newMaxVerts;
+    contextSettings_.samplesPerPixel = newSpp;
+    contextSettings_.sceneBoundsMin = newMin;
+    contextSettings_.sceneBoundsMax = newMax;
+    contextSettings_.requestReset = true;
+
+    nrc::Status s = nrcContext_->Configure(contextSettings_);
+    if (s != nrc::Status::OK) {
+        Log(L"[NRC] SyncSettings reconfigure failed: %d\n", (int)s);
+    } else {
+        Log(L"[NRC] Reconfigured: bounces=%u spp=%u\n", newMaxVerts, newSpp);
+        warmupFrames_ = 0;  // reset warmup — network needs to relearn
+    }
+    contextSettings_.requestReset = false;
 }
 
 bool NrcIntegration::PopulateShaderConstants(NrcConstants& outConstants) const {

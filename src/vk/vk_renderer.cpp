@@ -1390,11 +1390,24 @@ void Renderer::RenderFrameRT() {
     PathTracerConfig* nrcCfg = VK_GetConfig();
     bool nrcActive = nrc_ && nrc_->IsReady() && nrcCfg && nrcCfg->nrcEnabled;
     if (nrcActive) {
+        // Reconfigure NRC if user changed bounces/SPP/scene
+        nrc_->SyncSettings(nrcCfg->maxBounces, nrcCfg->samplesPerPixel,
+                           nrcCfg->sceneAABBMin, nrcCfg->sceneAABBMax);
         NrcConstants nrcConst = {};
         if (nrc_->PopulateShaderConstants(nrcConst)) {
+            if (frameIndex_ < 3) {
+                Log(L"[NRC] Constants: maxPathVerts=%u trainDim=%ux%u frameDim=%ux%u threshold=%.3f\n",
+                    nrcConst.maxPathVertices, nrcConst.trainingDimensions.x, nrcConst.trainingDimensions.y,
+                    nrcConst.frameDimensions.x, nrcConst.frameDimensions.y,
+                    nrcConst.terminationHeuristicThreshold);
+            }
             rtPipeline_->UpdateNrcConstants(&nrcConst, sizeof(nrcConst));
         }
         nrc_->BeginFrame(cmd);
+    } else if (rtPipeline_) {
+        // Clear NRC constants so shader sees maxPathVertices=0 → NRC disabled
+        NrcConstants nrcZero = {};
+        rtPipeline_->UpdateNrcConstants(&nrcZero, sizeof(nrcZero));
     }
 #endif
 
