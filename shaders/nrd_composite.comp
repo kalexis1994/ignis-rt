@@ -320,18 +320,10 @@ void main() {
         }
     }
 
-    // Triangular dithering to eliminate 8-bit banding in smooth gradients.
-    // Adds ±0.5/255 noise shaped as a triangular PDF (two uniform samples
-    // subtracted) which is visually superior to uniform dithering.
-    // The hash is spatial+temporal so the noise pattern changes every frame.
+    // IGN dithering (spatial-only, low amplitude — denoiser-friendly)
     if (push.hdrOutput == 0u) {
-        uint dh = uint(pixelCoord.x) * 1973u + uint(pixelCoord.y) * 9277u + uint(push.mode) * 26699u;
-        dh = (dh ^ (dh >> 16u)) * 0x45d9f3bu;
-        dh = (dh ^ (dh >> 16u)) * 0x45d9f3bu;
-        float d1 = float(dh & 0xFFFFu) / 65535.0;
-        float d2 = float((dh >> 16u) & 0xFFFFu) / 65535.0;
-        float dither = (d1 - d2) * 0.6 / 255.0;
-        finalColor += dither;
+        float ign = fract(52.9829189 * fract(0.06711056 * float(pixelCoord.x) + 0.00583715 * float(pixelCoord.y)));
+        finalColor += (ign - 0.5) * 0.4 / 255.0;
     }
 
     imageStore(finalOutput, pixelCoord, vec4(finalColor, 1.0));

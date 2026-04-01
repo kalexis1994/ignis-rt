@@ -152,13 +152,11 @@ void main() {
         ldr = mix(ldr, curved, push.contrast);
     }
 
-    // Triangular dithering (±0.5/255) to eliminate 8-bit banding
-    uint dh = uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + push.tonemapMode * 26699u;
-    dh = (dh ^ (dh >> 16u)) * 0x45d9f3bu;
-    dh = (dh ^ (dh >> 16u)) * 0x45d9f3bu;
-    float d1 = float(dh & 0xFFFFu) / 65535.0;
-    float d2 = float((dh >> 16u) & 0xFFFFu) / 65535.0;
-    ldr += (d1 - d2) * 0.6 / 255.0;
+    // IGN dithering (spatial-only, low amplitude — denoiser-friendly)
+    {
+        float ign = fract(52.9829189 * fract(0.06711056 * float(pixel.x) + 0.00583715 * float(pixel.y)));
+        ldr += (ign - 0.5) * 0.4 / 255.0;
+    }
 
     imageStore(ldrOutput, pixel, vec4(ldr, 1.0));
 }

@@ -3559,14 +3559,11 @@ void main() {
     }
     // else: write raw linear HDR (no exposure, no tonemap, no gamma)
 
-    // Triangular dithering (±0.5/255) to eliminate 8-bit banding
+    // Blue noise dithering (spatial-only — same pattern each frame so denoiser averages it out)
     if (!hdrOutput && !isDebugLDR) {
-        uint dh = uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + frameIndex * 26699u;
-        dh = (dh ^ (dh >> 16u)) * 0x45d9f3bu;
-        dh = (dh ^ (dh >> 16u)) * 0x45d9f3bu;
-        float d1 = float(dh & 0xFFFFu) / 65535.0;
-        float d2 = float((dh >> 16u) & 0xFFFFu) / 65535.0;
-        color += (d1 - d2) * 0.6 / 255.0;
+        ivec2 dnCoord = ivec2(pixel.x & 63, pixel.y & 63);
+        float bn = texelFetch(blueNoiseTexture, dnCoord, 0).r;
+        color += (bn - 0.5) * 0.8 / 255.0;
     }
 
     // Final output to display image
