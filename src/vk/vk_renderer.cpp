@@ -12,6 +12,9 @@
 #include "ignis_config.h"
 #include "vk_check.h"
 #include "nrd_vulkan_integration.h"
+#ifdef IGNIS_HAVE_NRC
+#include "nrc_integration.h"
+#endif
 #include <vector>
 #include <fstream>
 #include <filesystem>
@@ -537,6 +540,23 @@ bool Renderer::InitRT() {
     } else {
         Log(L"[VK Renderer] RT modules initialized with NRD denoiser\n");
     }
+
+    // Initialize NRC (Neural Radiance Cache)
+#ifdef IGNIS_HAVE_NRC
+    if (cfg) {
+        nrc_ = new NrcIntegration();
+        float sceneMin[3] = { cfg->sceneAABBMin[0], cfg->sceneAABBMin[1], cfg->sceneAABBMin[2] };
+        float sceneMax[3] = { cfg->sceneAABBMax[0], cfg->sceneAABBMax[1], cfg->sceneAABBMax[2] };
+        // Ensure valid AABB (non-zero)
+        if (sceneMin[0] == sceneMax[0]) { sceneMin[0] = -50; sceneMax[0] = 50; sceneMin[1] = -50; sceneMax[1] = 50; sceneMin[2] = -50; sceneMax[2] = 50; }
+        if (!nrc_->Initialize(context_, renderWidth_, renderHeight_,
+                              cfg->samplesPerPixel, cfg->maxBounces, sceneMin, sceneMax)) {
+            Log(L"[VK Renderer] NRC init failed — continuing without neural cache\n");
+            delete nrc_;
+            nrc_ = nullptr;
+        }
+    }
+#endif
 
     // Initialize wavefront pipeline (experimental)
     if (cfg && cfg->useWavefront) {
@@ -1319,6 +1339,13 @@ void Renderer::RenderFrameRT() {
 
     bool diagFlush = false;  // Set true to flush GPU between stages for crash isolation
 
+    // NRC: begin frame (housekeeping before path tracing)
+#ifdef IGNIS_HAVE_NRC
+    if (nrc_ && nrc_->IsReady()) {
+        nrc_->BeginFrame(cmd);
+    }
+#endif
+
     WriteTimestamp(cmd, TS_START);
 
     // 0. Hybrid G-buffer rasterization pass (before RT dispatch)
@@ -1856,6 +1883,21 @@ void Renderer::RenderFrameRT() {
         }
     }
 
+    // NRC: query neural cache + train network
+#ifdef IGNIS_HAVE_NRC
+    if (nrc_ && nrc_->IsReady()) {
+        VkMemoryBarrier rtToNrc{};
+        rtToNrc.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        rtToNrc.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        rtToNrc.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &rtToNrc, 0, nullptr, 0, nullptr);
+        nrc_->QueryAndTrain(cmd);
+    }
+#endif
+
     // Fill any unwritten timestamp slots (skipped stages → current time → 0ms delta).
     FillMissingTimestamps(cmd);
 
@@ -1886,6 +1928,13 @@ void Renderer::RenderFrameRT() {
         }
         return;
     }
+
+    // NRC: end frame (must be called after queue submit)
+#ifdef IGNIS_HAVE_NRC
+    if (nrc_ && nrc_->IsReady()) {
+        nrc_->EndFrame(context_->GetGraphicsQueue());
+    }
+#endif
 
     // No WaitIdle — double-buffered readback with per-buffer fence sync
 
@@ -4065,6 +4114,9 @@ void Renderer::Shutdown() {
     ShutdownHybridGBuffer();
     ShutdownNRD();
     ShutdownDLSS();
+#ifdef IGNIS_HAVE_NRC
+    if (nrc_) { nrc_->Shutdown(); delete nrc_; nrc_ = nullptr; }
+#endif
 
     // Shutdown wavefront + RT modules
     if (wavefrontPipeline_) { wavefrontPipeline_->Shutdown(); delete wavefrontPipeline_; wavefrontPipeline_ = nullptr; }
