@@ -183,6 +183,9 @@ def load():
     _lib.ignis_upload_emissive_triangles.argtypes = [POINTER(c_float), c_uint32]
     _lib.ignis_upload_emissive_triangles.restype = None
 
+    _lib.ignis_upload_lut.argtypes = [POINTER(c_float), c_uint32]
+    _lib.ignis_upload_lut.restype = c_bool
+
     # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
@@ -469,6 +472,12 @@ def upload_lights(light_data_floats, count: int):
         return
     arr = (c_float * len(light_data_floats))(*light_data_floats)
     _lib.ignis_upload_lights(arr, c_uint32(count))
+
+
+def upload_lut(rgb_floats, lut_size: int):
+    """Upload tonemap 3D LUT in-memory. rgb_floats = flat float array (3 per entry, lut_size^3 entries)."""
+    arr = (c_float * len(rgb_floats))(*rgb_floats)
+    return _lib.ignis_upload_lut(arr, c_uint32(lut_size))
 
 
 def set_float(key: str, value: float):

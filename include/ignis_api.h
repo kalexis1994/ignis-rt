@@ -102,6 +102,9 @@ IGNIS_API bool   ignis_read_pick_result(uint32_t* outCustomIndex,
 IGNIS_API bool   ignis_save_config(const char* path);
 IGNIS_API bool   ignis_load_config(const char* path);
 
+// Tonemap LUT (in-memory upload, no disk I/O)
+IGNIS_API bool   ignis_upload_lut(const float* rgbData, uint32_t lutSize);
+
 // Texture management
 IGNIS_API void*  ignis_create_texture_manager(void);
 IGNIS_API void   ignis_destroy_texture_manager(void* mgr);

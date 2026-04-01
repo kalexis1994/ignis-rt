@@ -124,6 +124,10 @@ public:
     void RenderImGuiOverlay(VkCommandBuffer cmd);
     void ShutdownImGui();
 
+    // Tonemap LUT (in-memory upload)
+    bool UploadLutData(const float* rgbData, uint32_t lutSize);
+    void UpdateTonemapDescriptors();
+
 private:
     bool CreateCommandBuffers();
     bool CreateSyncObjects();
@@ -227,7 +231,6 @@ private:
     bool ReloadAgXLutIfChanged();
 
     bool CreateTonemapPipeline();
-    void UpdateTonemapDescriptors();
     void ShutdownTonemap();
 
     // NRD denoiser

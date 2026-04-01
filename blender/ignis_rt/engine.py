@@ -299,42 +299,44 @@ def _bake_view_transform_lut(scene):
     LOG_MAX = 12.52607
     LOG_RANGE = LOG_MAX - LOG_MIN
 
-    from . import get_base_path
-    lut_path = os.path.join(get_base_path(), "shaders", "Runtime_LUT.cube")
     curve_mapping = view_settings.curve_mapping if use_curves else None
 
     _log(
-        "Baking Blender runtime LUT: "
+        "Baking Blender runtime LUT (in-memory): "
         f"display='{display_name}' view='{view_settings.view_transform}' look='{view_settings.look}' "
         f"working='{working_space}' interop='{working_space_interop_id}'"
     )
 
     try:
-        with open(lut_path, "w", encoding="utf-8") as f:
-            f.write(f'TITLE "{view_settings.view_transform}_{display_name}"\n')
-            f.write(f"LUT_3D_SIZE {LUT_SIZE}\n")
-            f.write("DOMAIN_MIN 0.0 0.0 0.0\n")
-            f.write("DOMAIN_MAX 1.0 1.0 1.0\n\n")
-            for b in range(LUT_SIZE):
-                for g in range(LUT_SIZE):
-                    for r in range(LUT_SIZE):
-                        encoded = np.array(
-                            (
-                                2.0 ** ((r / (LUT_SIZE - 1)) * LOG_RANGE + LOG_MIN),
-                                2.0 ** ((g / (LUT_SIZE - 1)) * LOG_RANGE + LOG_MIN),
-                                2.0 ** ((b / (LUT_SIZE - 1)) * LOG_RANGE + LOG_MIN),
-                            ),
-                            dtype=np.float64,
-                        )
-                        if curve_mapping is not None:
-                            encoded = _apply_curve_mapping_rgb(curve_mapping, encoded)
-                        encoded = scene_linear_matrix @ encoded
-                        try:
-                            result = cpu.applyRGB(encoded.tolist())
-                        except Exception:
-                            result = (0.0, 0.0, 0.0)
-                        result = [max(0.0, min(1.0, float(v))) for v in result]
-                        f.write(f"{result[0]:.6f} {result[1]:.6f} {result[2]:.6f}\n")
+        lut_rgb = []
+        for b in range(LUT_SIZE):
+            for g in range(LUT_SIZE):
+                for r in range(LUT_SIZE):
+                    encoded = np.array(
+                        (
+                            2.0 ** ((r / (LUT_SIZE - 1)) * LOG_RANGE + LOG_MIN),
+                            2.0 ** ((g / (LUT_SIZE - 1)) * LOG_RANGE + LOG_MIN),
+                            2.0 ** ((b / (LUT_SIZE - 1)) * LOG_RANGE + LOG_MIN),
+                        ),
+                        dtype=np.float64,
+                    )
+                    if curve_mapping is not None:
+                        encoded = _apply_curve_mapping_rgb(curve_mapping, encoded)
+                    encoded = scene_linear_matrix @ encoded
+                    try:
+                        result = cpu.applyRGB(encoded.tolist())
+                    except Exception:
+                        result = (0.0, 0.0, 0.0)
+                    lut_rgb.append(max(0.0, min(1.0, float(result[0]))))
+                    lut_rgb.append(max(0.0, min(1.0, float(result[1]))))
+                    lut_rgb.append(max(0.0, min(1.0, float(result[2]))))
+
+        from . import dll_wrapper
+        if not dll_wrapper.upload_lut(lut_rgb, LUT_SIZE):
+            _ignis_cm_lut_valid = False
+            _ignis_cm_lut_signature = None
+            _log("WARNING: ignis_upload_lut failed")
+            return False
     except Exception:
         _ignis_cm_lut_valid = False
         _ignis_cm_lut_signature = None
@@ -342,7 +344,7 @@ def _bake_view_transform_lut(scene):
 
     _ignis_cm_lut_signature = signature
     _ignis_cm_lut_valid = True
-    _log(f"LUT baked: {lut_path} ({LUT_SIZE}^3)")
+    _log(f"LUT baked in-memory ({LUT_SIZE}^3)")
     return True
 
 

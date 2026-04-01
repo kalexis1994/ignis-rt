@@ -374,6 +374,14 @@ IGNIS_API int ignis_generate_hair_gpu(const float* parentKeys, uint32_t nParents
                                         frandTable, frandCount);
 }
 
+IGNIS_API bool ignis_upload_lut(const float* rgbData, uint32_t lutSize) {
+    if (!g_renderer || !rgbData || lutSize == 0) return false;
+    vkDeviceWaitIdle(g_renderer->GetContext()->GetDevice());
+    if (!g_renderer->UploadLutData(rgbData, lutSize)) return false;
+    g_renderer->UpdateTonemapDescriptors();
+    return true;
+}
+
 IGNIS_API bool ignis_reload_shaders() {
     if (!g_renderer) return false;
     auto* pipeline = g_renderer->GetRTPipeline();

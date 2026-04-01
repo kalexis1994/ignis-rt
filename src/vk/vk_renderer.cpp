@@ -3014,6 +3014,123 @@ bool Renderer::LoadAgXLut() {
     return true;
 }
 
+bool Renderer::UploadLutData(const float* rgbData, uint32_t lutSize) {
+    if (!rgbData || lutSize == 0 || !context_) return false;
+
+    // Convert RGB → RGBA
+    size_t totalEntries = (size_t)lutSize * lutSize * lutSize;
+    std::vector<float> lutData(totalEntries * 4);
+    for (size_t i = 0; i < totalEntries; i++) {
+        lutData[i * 4 + 0] = rgbData[i * 3 + 0];
+        lutData[i * 4 + 1] = rgbData[i * 3 + 1];
+        lutData[i * 4 + 2] = rgbData[i * 3 + 2];
+        lutData[i * 4 + 3] = 1.0f;
+    }
+
+    VkDevice device = context_->GetDevice();
+    DestroyAgXLut();
+
+    // Create 3D image
+    VkImageCreateInfo imgInfo{};
+    imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imgInfo.imageType = VK_IMAGE_TYPE_3D;
+    imgInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    imgInfo.extent = {lutSize, lutSize, lutSize};
+    imgInfo.mipLevels = 1;
+    imgInfo.arrayLayers = 1;
+    imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imgInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateImage(device, &imgInfo, nullptr, &agxLutImage_) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements memReqs;
+    vkGetImageMemoryRequirements(device, agxLutImage_, &memReqs);
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = context_->FindMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    vkAllocateMemory(device, &allocInfo, nullptr, &agxLutMemory_);
+    vkBindImageMemory(device, agxLutImage_, agxLutMemory_, 0);
+
+    // Staging buffer
+    VkDeviceSize dataSize = lutData.size() * sizeof(float);
+    VkBuffer stagingBuf;
+    VkDeviceMemory stagingMem;
+    VkBufferCreateInfo bufInfo{};
+    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufInfo.size = dataSize;
+    bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    vkCreateBuffer(device, &bufInfo, nullptr, &stagingBuf);
+    VkMemoryRequirements bufReqs;
+    vkGetBufferMemoryRequirements(device, stagingBuf, &bufReqs);
+    VkMemoryAllocateInfo bufAlloc{};
+    bufAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    bufAlloc.allocationSize = bufReqs.size;
+    bufAlloc.memoryTypeIndex = context_->FindMemoryType(bufReqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    vkAllocateMemory(device, &bufAlloc, nullptr, &stagingMem);
+    vkBindBufferMemory(device, stagingBuf, stagingMem, 0);
+    void* mapped;
+    vkMapMemory(device, stagingMem, 0, dataSize, 0, &mapped);
+    memcpy(mapped, lutData.data(), dataSize);
+    vkUnmapMemory(device, stagingMem);
+
+    // Copy to 3D image
+    VkCommandBuffer cmd = context_->BeginSingleTimeCommands();
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.image = agxLutImage_;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {lutSize, lutSize, lutSize};
+    vkCmdCopyBufferToImage(cmd, stagingBuf, agxLutImage_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+    context_->EndSingleTimeCommands(cmd);
+
+    vkDestroyBuffer(device, stagingBuf, nullptr);
+    vkFreeMemory(device, stagingMem, nullptr);
+
+    // Image view
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = agxLutImage_;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_3D;
+    viewInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCreateImageView(device, &viewInfo, nullptr, &agxLutView_);
+
+    // Sampler
+    VkSamplerCreateInfo sampInfo{};
+    sampInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sampInfo.magFilter = VK_FILTER_LINEAR;
+    sampInfo.minFilter = VK_FILTER_LINEAR;
+    sampInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    vkCreateSampler(device, &sampInfo, nullptr, &agxLutSampler_);
+
+    Log(L"[VK Renderer] LUT uploaded in-memory: %dx%dx%d (%zu KB)\n",
+        lutSize, lutSize, lutSize, dataSize / 1024);
+    agxLutPath_ = "(memory)";
+    agxLutStamp_ = 1;  // mark as valid
+    return true;
+}
+
 void Renderer::DestroyAgXLut() {
     VkDevice device = context_ ? context_->GetDevice() : VK_NULL_HANDLE;
     if (device == VK_NULL_HANDLE) return;
@@ -3027,6 +3144,7 @@ void Renderer::DestroyAgXLut() {
 }
 
 bool Renderer::ReloadAgXLutIfChanged() {
+    if (agxLutPath_ == "(memory)") return false;  // managed via ignis_upload_lut
     std::string nextPath;
     uint64_t nextStamp = 0;
     if (!ResolveTonemapLutPath(nextPath, nextStamp)) {
