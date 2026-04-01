@@ -3996,6 +3996,11 @@ def _pack_gpu_material(
     volume_noise_lacunarity=2.0,
     volume_noise_contrast=0.0,
     volume_mapping_offset=(0.0, 0.0, 0.0),
+    volume_absorption_color=(0.0, 0.0, 0.0),
+    volume_emission_strength=0.0,
+    volume_emission_color=(1.0, 1.0, 1.0),
+    volume_blackbody=0.0,
+    volume_temperature=1000.0,
     hair_shift=0.035,
     hair_radial_roughness=0.3,
 ):
@@ -4078,6 +4083,18 @@ def _pack_gpu_material(
         vm_uints[9] = _pf(volume_mapping_offset[1])
         vm_uints[10] = _pf(volume_mapping_offset[2])
         vm_uints[11] = 0
+        # nodeVmCode[2] = uvec4(absorptionR, absorptionG, absorptionB, emissionStrength)
+        vm_uints[12] = _pf(volume_absorption_color[0])
+        vm_uints[13] = _pf(volume_absorption_color[1])
+        vm_uints[14] = _pf(volume_absorption_color[2])
+        vm_uints[15] = _pf(volume_emission_strength)
+        # nodeVmCode[3] = uvec4(emissionR, emissionG, emissionB, temperature)
+        vm_uints[16] = _pf(volume_emission_color[0])
+        vm_uints[17] = _pf(volume_emission_color[1])
+        vm_uints[18] = _pf(volume_emission_color[2])
+        vm_uints[19] = _pf(volume_temperature)
+        # nodeVmCode[4].x = blackbody intensity
+        vm_uints[20] = _pf(volume_blackbody)
 
     return base + _GPU_MATERIAL_VM.pack(*vm_uints)
 
@@ -5642,6 +5659,11 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         volume_noise_lacunarity = 2.0
         volume_noise_contrast = 0.0
         volume_mapping_offset = (0.0, 0.0, 0.0)
+        volume_absorption_color = (0.0, 0.0, 0.0)
+        volume_emission_strength = 0.0
+        volume_emission_color = (1.0, 1.0, 1.0)
+        volume_blackbody = 0.0
+        volume_temperature = 1000.0
 
         if mat.use_nodes and mat.node_tree:
             # Check for Volume Scatter node on Volume input
@@ -5663,6 +5685,30 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                 aniso_inp = volume_node.inputs.get('Anisotropy')
                 if aniso_inp:
                     volume_anisotropy = float(aniso_inp.default_value)
+
+                # Absorption Color (Principled Volume / Volume Absorption)
+                abs_color_inp = volume_node.inputs.get('Absorption Color')
+                if abs_color_inp:
+                    c = abs_color_inp.default_value
+                    volume_absorption_color = (c[0], c[1], c[2])
+                else:
+                    volume_absorption_color = (0.0, 0.0, 0.0)  # no absorption
+
+                # Emission (Principled Volume)
+                emission_str_inp = volume_node.inputs.get('Emission Strength')
+                volume_emission_strength = float(emission_str_inp.default_value) if emission_str_inp else 0.0
+                emission_col_inp = volume_node.inputs.get('Emission Color')
+                if emission_col_inp:
+                    c = emission_col_inp.default_value
+                    volume_emission_color = (c[0], c[1], c[2])
+                else:
+                    volume_emission_color = (1.0, 1.0, 1.0)
+
+                # Blackbody (Principled Volume)
+                bb_inp = volume_node.inputs.get('Blackbody Intensity')
+                volume_blackbody = float(bb_inp.default_value) if bb_inp else 0.0
+                temp_inp = volume_node.inputs.get('Temperature')
+                volume_temperature = float(temp_inp.default_value) if temp_inp else 1000.0
 
                 # Trace Color/Density input chain for noise texture (heterogeneous volume)
                 # Extract ALL properties: noise scale/detail/roughness/lacunarity,
@@ -6237,6 +6283,11 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
             volume_noise_lacunarity=volume_noise_lacunarity,
             volume_noise_contrast=volume_noise_contrast,
             volume_mapping_offset=volume_mapping_offset,
+            volume_absorption_color=volume_absorption_color,
+            volume_emission_strength=volume_emission_strength,
+            volume_emission_color=volume_emission_color,
+            volume_blackbody=volume_blackbody,
+            volume_temperature=volume_temperature,
             hair_shift=hair_shift,
             hair_radial_roughness=hair_radial_roughness,
         )
