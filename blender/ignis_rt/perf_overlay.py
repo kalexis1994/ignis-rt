@@ -32,20 +32,29 @@ _samples = []      # list of (perf_counter, dt_ms)
 _prev_time = 0.0
 _fps = 0.0
 _stats = {
-    'avg': 0.0,
-    'min': 0.0,
-    'max': 0.0,
-    'p1': 0.0,        # 99th percentile frame time (1% low)
+    'avg': 0.0,       # windowed average (5s)
+    'min': 0.0,        # session absolute min frame time
+    'max': 0.0,        # session absolute max frame time
+    'p1': 0.0,         # windowed 99th percentile (1% low)
 }
+_session_min_ms = 999999.0   # absolute min across entire session
+_session_max_ms = 0.0        # absolute max across entire session
+_session_sum_ms = 0.0        # sum for session average
+_session_count = 0           # frame count for session average
 
 
 def reset():
     """Clear all history (call on renderer destroy)."""
     global _samples, _prev_time, _fps
+    global _session_min_ms, _session_max_ms, _session_sum_ms, _session_count
     _samples.clear()
     _prev_time = 0.0
     _fps = 0.0
     _stats.update(avg=0.0, min=0.0, max=0.0, p1=0.0)
+    _session_min_ms = 999999.0
+    _session_max_ms = 0.0
+    _session_sum_ms = 0.0
+    _session_count = 0
 
 
 def get_frame_times():
@@ -56,11 +65,18 @@ def get_frame_times():
 def update():
     """Record a frame and recompute stats. Call once per frame."""
     global _prev_time, _fps
+    global _session_min_ms, _session_max_ms, _session_sum_ms, _session_count
 
     now = time.perf_counter()
     if _prev_time > 0:
         dt = (now - _prev_time) * 1000.0
         _samples.append((now, dt))
+
+        # Session-absolute tracking
+        _session_min_ms = min(_session_min_ms, dt)
+        _session_max_ms = max(_session_max_ms, dt)
+        _session_sum_ms += dt
+        _session_count += 1
     _prev_time = now
 
     # Trim to time window
@@ -70,17 +86,17 @@ def update():
 
     n = len(_samples)
     if n >= 2:
-        # EMA-smoothed FPS: fast response to drops, stable readout
-        # alpha ~0.1 = smooth over ~10 frames (~0.3s at 30fps)
+        # EMA-smoothed FPS
         last_dt = _samples[-1][1]
         instant_fps = 1000.0 / last_dt if last_dt > 0 else 0
         alpha = 0.1
         _fps = _fps + alpha * (instant_fps - _fps) if _fps > 0 else instant_fps
 
+        # Windowed avg (5s) + session absolute min/max
         times = [s[1] for s in _samples]
         _stats['avg'] = sum(times) / n
-        _stats['min'] = min(times)
-        _stats['max'] = max(times)
+        _stats['min'] = _session_min_ms if _session_min_ms < 999999.0 else 0.0
+        _stats['max'] = _session_max_ms
         sorted_ft = sorted(times)
         _stats['p1'] = sorted_ft[min(int(n * 0.99), n - 1)]
 
