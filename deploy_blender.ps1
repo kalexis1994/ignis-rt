@@ -174,6 +174,17 @@ if ($nrdDll -and (Test-Path $nrdDll)) {
     Write-Host "  NRD.dll -> lib/ ($([math]::Round($nrdSize)) KB)" -ForegroundColor Green
 }
 
+# Copy NRC DLLs (NRC_Vulkan.dll + CUDA runtime)
+$nrcBin = Join-Path (Split-Path $repoRoot -Parent) "NRC\Bin"
+if (Test-Path $nrcBin) {
+    $nrcDlls = Get-ChildItem $nrcBin -Filter "*.dll"
+    foreach ($dll in $nrcDlls) {
+        Copy-Item $dll.FullName -Destination $libDir -Force
+        $dllSize = $dll.Length / 1KB
+        Write-Host "  $($dll.Name) -> lib/ ($([math]::Round($dllSize)) KB)" -ForegroundColor Green
+    }
+}
+
 # ============================================================================
 # 4. Deploy addon to Blender
 # ============================================================================
