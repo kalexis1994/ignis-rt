@@ -13,7 +13,7 @@ if %ERRORLEVEL% neq 0 (
 )
 
 set SHADER_DIR=%~dp0shaders
-set ARGS=--target-env vulkan1.2 -V -I"%SHADER_DIR%"
+set ARGS=--target-env vulkan1.2 -V -Os -I"%SHADER_DIR%"
 
 echo Compiling ray tracing shaders...
 %GLSLC% %ARGS% "%SHADER_DIR%\raygen.rgen"           -o "%SHADER_DIR%\raygen.rgen.spv"

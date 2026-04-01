@@ -1145,6 +1145,15 @@ void main() {
     surfelGrid.cameraPosition = sharcGrid.cameraPosition;
     surfelGrid.sceneScale = cam.sharcSceneScale * SURFEL_GRID_SCALE_MULT;
 
+    // Pre-compute sun direction and tangent frame (invariant across bounces)
+    vec3 sunDir = normalize(cam.sunLight.xyz);
+    float sunIntensity = cam.sunLight.w;
+    vec3 sunColor = cam.skyLight.rgb;
+    vec3 sunTangent = abs(sunDir.y) < 0.999
+        ? normalize(cross(sunDir, vec3(0, 1, 0)))
+        : normalize(cross(sunDir, vec3(1, 0, 0)));
+    vec3 sunBitangent = cross(sunDir, sunTangent);
+
     for (int bounce = 0; bounce < maxBounces; bounce++) {
         shaderCost += 4u;  // each bounce = base cost of BVH traversal + shading
 
@@ -1655,7 +1664,7 @@ void main() {
             vec3 entryPos = worldPos + rayDir * 0.001;
             float marchDist = 0.0;
             vec3 probeOrigin = entryPos;
-            for (int attempt = 0; attempt < 8; attempt++) {
+            for (int attempt = 0; attempt < 2; attempt++) {
                 rayQueryEXT exitRQ;
                 rayQueryInitializeEXT(exitRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
                                       0xFF, probeOrigin, 0.0, rayDir, 100000.0);
@@ -2056,7 +2065,7 @@ void main() {
         // bool skipSunNEE = (bounce >= 2 && maxThroughput < 0.01);
         // bool skipLocalNEE = false;  // NEE on all bounces (Cycles behavior)
         bool skipSunNEE = (bounce >= 2 && maxThroughput < 0.01) || hairFastSecondary;
-        bool skipLocalNEE = hairFastSecondary;
+        bool skipLocalNEE = hairFastSecondary || (bounce >= 3);
 
         // Glass/transmission surfaces don't scatter light — skip NEE entirely.
         // Light reaches through glass via refraction paths, not direct illumination.
@@ -2076,20 +2085,26 @@ void main() {
         uint neeEnd = min(cam.lightCount, 32u);
         float neeScale = 1.0;
         if ((bounce >= 2 || hairFastPrimary) && cam.lightCount > 1u && !skipLocalNEE) {
+            // Bounce 2+: sample 1 random light, scale contribution
             uint randIdx = min(uint(rand01() * float(cam.lightCount)), cam.lightCount - 1u);
             neeStart = randIdx;
             neeEnd = randIdx + 1u;
             neeScale = float(cam.lightCount);
+        } else if (cam.lightCount > 4u && !skipLocalNEE) {
+            // Bounce 0-1: cap to 4 lights, rotate selection by frame
+            uint maxNEE = 4u;
+            uint offset = (frameIndex * 3u) % cam.lightCount;
+            neeStart = offset;
+            neeEnd = min(offset + maxNEE, cam.lightCount);
+            neeScale = float(cam.lightCount) / float(min(maxNEE, cam.lightCount));
         }
 
         // Snapshot radiance BEFORE NEE (for SHARC: compute local contribution)
         vec3 preBounceRadiance = diffuseRadiance + specularRadiance;
 
         // ---- NEE: Direct sun light ----
-        vec3 sunDir = normalize(cam.sunLight.xyz);
-        float sunIntensity = cam.sunLight.w;
-        vec3 sunColor = cam.skyLight.rgb;
-        int sunShadowSkipMax = isHairSurface ? 4 : 16;
+        // sunDir, sunIntensity, sunColor precomputed above bounce loop
+        int sunShadowSkipMax = isHairSurface ? 2 : 4;
 
         if (!skipSunNEE && sunIntensity > 0.0 && sunDir.y > -0.01) { shaderCost += 2u;  // sun shadow ray
             float NdotL = isHairSurface
@@ -2111,9 +2126,8 @@ void main() {
                     );
                     float diskR = sqrt(diskSample.x) * sunRadius;
                     float diskAngle = diskSample.y * 2.0 * PI;
-                    vec3 sT = abs(sunDir.y) < 0.999 ? normalize(cross(sunDir, vec3(0,1,0))) : normalize(cross(sunDir, vec3(1,0,0)));
-                    vec3 sB = cross(sunDir, sT);
-                    shadowDir = normalize(sunDir + sT * (cos(diskAngle) * diskR) + sB * (sin(diskAngle) * diskR));
+                    // sunTangent/sunBitangent precomputed above bounce loop
+                    shadowDir = normalize(sunDir + sunTangent * (cos(diskAngle) * diskR) + sunBitangent * (sin(diskAngle) * diskR));
                 }
                 vec3 shadowOrigin = pbrHit.worldPos + N * shadowBias;
                 bool inShadow = false;
@@ -2684,7 +2698,7 @@ void main() {
             vec3 ptShadowOrigin = pbrHit.worldPos + N * shadowBias;
             bool inShadow = false;
             vec3 shadowFilter = vec3(1.0);
-            for (int ptShadowSkip = 0; ptShadowSkip < 16; ptShadowSkip++) {
+            for (int ptShadowSkip = 0; ptShadowSkip < 4; ptShadowSkip++) {
                 rayQueryEXT shadowRQ;
                 rayQueryInitializeEXT(shadowRQ, topLevelAS,
                     gl_RayFlagsOpaqueEXT,
@@ -2807,7 +2821,7 @@ void main() {
                     vec3 eShadowOrigin = pbrHit.worldPos + N * shadowBias;
                     bool eInShadow = false;
                     vec3 eShadowFilter = vec3(1.0);
-                    for (int eShadowSkip = 0; eShadowSkip < 16; eShadowSkip++) {
+                    for (int eShadowSkip = 0; eShadowSkip < 4; eShadowSkip++) {
                         rayQueryEXT eShadowRQ;
                         rayQueryInitializeEXT(eShadowRQ, topLevelAS,
                             gl_RayFlagsOpaqueEXT,
