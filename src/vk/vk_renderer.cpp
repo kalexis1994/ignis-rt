@@ -1275,8 +1275,8 @@ void Renderer::RenderFrameRT() {
     if (!timestampReady_) InitTimestampQueries();
     if (timestampReady_ && frameIndex_ > 0) ReadbackTimestamps();
 
-    if (tonemapReady_ && (frameIndex_ % 60) == 0) {
-        ReloadAgXLutIfChanged();
+    if (tonemapReady_ && (frameIndex_ % 300) == 0) {
+        ReloadAgXLutIfChanged();  // filesystem stat every ~10s, not every 2s
     }
 
     // Single command buffer: RT → NRD → Composite → ImGui → Readback

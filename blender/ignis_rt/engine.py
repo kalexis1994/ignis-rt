@@ -1997,11 +1997,11 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         _ignis_changed_objects = set()
         global _ignis_frames_since_sync
 
-        # Periodic validation: if no sync for 60 frames, force full sync
+        # Periodic validation: if no sync for 600 frames (~20s), force full sync
         # Catches missed undo/redo, duplications, or any edge case
         if not _need_full_sync and not _changed:
             _ignis_frames_since_sync += 1
-            if _ignis_frames_since_sync >= 60:
+            if _ignis_frames_since_sync >= 600:
                 _need_full_sync = True
                 _ignis_frames_since_sync = 0
 
