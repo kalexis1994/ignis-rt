@@ -574,7 +574,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
     bl_idname = "IGNIS_RT"
     bl_label = "Ignis RT"
     bl_use_preview = False
-    bl_use_eevee_viewport = False
+    bl_use_eevee_viewport = True
     bl_use_gpu_context = True
     bl_use_shading_nodes_custom = False  # Use standard Blender shader nodes (Principled BSDF etc.)
 
