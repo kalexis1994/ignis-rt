@@ -1182,9 +1182,7 @@ bool RTPipeline::LoadShaderModule(const char* path, VkShaderModule* outModule) {
 
 bool RTPipeline::CreatePipeline() {
     VkShaderModule raygenModule = VK_NULL_HANDLE;
-    const char* shaderPath = (acpt::g_config.shaderMode == 1)
-        ? "shaders/raygen_blender.rgen.spv"
-        : "shaders/raygen.rgen.spv";
+    const char* shaderPath = "shaders/raygen_blender.rgen.spv";
     if (!LoadShaderModule(shaderPath, &raygenModule)) {
         return false;
     }

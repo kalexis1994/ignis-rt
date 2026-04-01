@@ -140,6 +140,7 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
             ('4', "Depth", "Linear depth as grayscale gradient"),
             ('5', "UV", "UV coordinates as RG color"),
             ('6', "Complexity", "Shader cost heatmap (green=cheap, red=expensive)"),
+            ('7', "UV Checker", "Checkerboard pattern on UV coordinates"),
         ],
         default='0',
         description="Viewport visualization mode",

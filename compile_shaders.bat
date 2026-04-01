@@ -16,7 +16,6 @@ set SHADER_DIR=%~dp0shaders
 set ARGS=--target-env vulkan1.2 -V -Os -I"%SHADER_DIR%"
 
 echo Compiling ray tracing shaders...
-%GLSLC% %ARGS% "%SHADER_DIR%\raygen.rgen"           -o "%SHADER_DIR%\raygen.rgen.spv"
 %GLSLC% %ARGS% "%SHADER_DIR%\raygen_blender.rgen"   -o "%SHADER_DIR%\raygen_blender.rgen.spv"
 %GLSLC% %ARGS% "%SHADER_DIR%\hybrid.rgen"           -o "%SHADER_DIR%\hybrid.rgen.spv"
 %GLSLC% %ARGS% "%SHADER_DIR%\closesthit.rchit"      -o "%SHADER_DIR%\closesthit.rchit.spv"

@@ -965,6 +965,13 @@ void main() {
 
     // Multi-SPP: configurable samples per pixel (lightPad1 from CPU)
     int spp = clamp(int(cam.lightPad1), 1, 128);
+
+    // Debug view modes 2-5 (Unlit, Normals, Depth, UV) only need primary hit
+    uint debugViewEarly = cam.parameters.y;
+    if ((debugViewEarly >= 2u && debugViewEarly <= 5u) || debugViewEarly == 7u) {
+        maxBounces = 1;
+        spp = 1;
+    }
     bool rrModeGlobal = (cam.parameters.w == 2u);
     bool backfaceCulling = (cam.lightPad2 & 1u) != 0u;  // bit 0 of lightPad2
     bool hybridRasterMode = (cam.lightPad2 & 4u) != 0u; // bit 2 of lightPad2
@@ -3353,7 +3360,7 @@ void main() {
 
     // ---- Debug view override (after SPP averaging) ----
     uint debugView = cam.parameters.y;
-    if (debugView >= 2u && debugView <= 6u) {
+    if (debugView >= 2u && debugView <= 7u) {
         if (debugView == 2u) {
             // Unlit: albedo only
             color = primaryHit ? primaryBaseColor : vec3(0.0);
@@ -3378,6 +3385,15 @@ void main() {
             float g = 1.0 - smoothstep(0.5, 1.0, complexity);
             float b = 0.0;
             color = vec3(r, g, b);
+        } else if (debugView == 7u) {
+            // UV Checkerboard: 8×8 tiles alternating dark/light
+            if (primaryHit) {
+                vec2 uv = fract(primaryUV * 8.0);
+                bool check = (uv.x < 0.5) ^^ (uv.y < 0.5);
+                color = check ? vec3(0.85) : vec3(0.25);
+            } else {
+                color = vec3(0.1);
+            }
         }
     }
 
@@ -3528,8 +3544,8 @@ void main() {
     // Debug views: all modes bypass DLSS/HDR pipeline (C++ routes output to interop).
     // Mode 1 (Lighting) keeps tonemap (HDR white-albedo shading).
     // Modes 2-5 skip tonemap (already LDR).
-    bool isDebugView = (debugView >= 2u && debugView <= 6u);
-    bool isDebugLDR = (debugView >= 2u && debugView <= 6u);
+    bool isDebugView = (debugView >= 2u && debugView <= 7u);
+    bool isDebugLDR = (debugView >= 2u && debugView <= 7u);
 
     // HDR output flag: when DLSS SR or RR is active, skip tonemap in raygen
     // (DLSS/RR processes HDR; a dedicated tonemap pass converts to LDR)
