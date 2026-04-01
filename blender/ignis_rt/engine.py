@@ -1997,13 +1997,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         _ignis_changed_objects = set()
         global _ignis_frames_since_sync
 
-        # Periodic validation: if no sync for 600 frames (~20s), force full sync
-        # Catches missed undo/redo, duplications, or any edge case
-        if not _need_full_sync and not _changed:
-            _ignis_frames_since_sync += 1
-            if _ignis_frames_since_sync >= 600:
-                _need_full_sync = True
-                _ignis_frames_since_sync = 0
+        # No periodic forced sync — rely on depsgraph/undo handlers to flag changes.
+        # The old periodic sync iterated all objects every N frames causing stutters.
 
         if _ignis_blas_handles is not None and (_need_full_sync or _changed):
             _ignis_frames_since_sync = 0
