@@ -146,21 +146,21 @@ bool NircIntegration::Initialize(Context* ctx, uint32_t renderWidth, uint32_t re
 
     // Training samples: 16 floats per sample × MAX_TRAINING_SAMPLES
     trainingSampleBufSize_ = MAX_TRAINING_SAMPLES * 16 * sizeof(float);
-    if (!CreateBuffer(trainingSampleBufSize_, storageUsage, gpuMem, trainingSampleBuf_, trainingSampleMem_)) {
+    if (!CreateBuffer(trainingSampleBufSize_, storageUsage, hostVisible, trainingSampleBuf_, trainingSampleMem_)) {
         Log(L"[NIRC] Failed to create training sample buffer\n");
         return false;
     }
 
     // Query input: position(3) + direction(3) + roughness(1) + pad(1) = 8 floats per query
     queryInputBufSize_ = (VkDeviceSize)renderWidth * renderHeight * 8 * sizeof(float);
-    if (!CreateBuffer(queryInputBufSize_, storageUsage, gpuMem, queryInputBuf_, queryInputMem_)) {
+    if (!CreateBuffer(queryInputBufSize_, storageUsage, hostVisible, queryInputBuf_, queryInputMem_)) {
         Log(L"[NIRC] Failed to create query input buffer\n");
         return false;
     }
 
-    // Query output: RGB per pixel = 4 floats (padded)
+    // Query output: vec4 per pixel (host visible for sentinel write + GPU read/write)
     queryOutputBufSize_ = (VkDeviceSize)renderWidth * renderHeight * 4 * sizeof(float);
-    if (!CreateBuffer(queryOutputBufSize_, storageUsage, gpuMem, queryOutputBuf_, queryOutputMem_)) {
+    if (!CreateBuffer(queryOutputBufSize_, storageUsage, hostVisible, queryOutputBuf_, queryOutputMem_)) {
         Log(L"[NIRC] Failed to create query output buffer\n");
         return false;
     }
@@ -175,6 +175,16 @@ bool NircIntegration::Initialize(Context* ctx, uint32_t renderWidth, uint32_t re
     if (!CreateInferPipeline()) {
         Log(L"[NIRC] Failed to create inference pipeline\n");
         return false;
+    }
+
+    // Write ready flag to queryOutput[0].a so the shader knows buffers are valid
+    {
+        VkDevice dev = ctx_->GetDevice();
+        void* mapped;
+        vkMapMemory(dev, queryOutputMem_, 0, 16, 0, &mapped);
+        float sentinel[4] = { 0.0f, 0.0f, 0.0f, 1.0f };  // .a = 1.0 = ready
+        memcpy(mapped, sentinel, 16);
+        vkUnmapMemory(dev, queryOutputMem_);
     }
 
     ready_ = true;

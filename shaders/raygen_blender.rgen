@@ -1022,6 +1022,7 @@ void main() {
     bool rrModeGlobal = (cam.parameters.w == 2u);
     bool backfaceCulling = (cam.lightPad2 & 1u) != 0u;  // bit 0 of lightPad2
     bool hybridRasterMode = (cam.lightPad2 & 4u) != 0u; // bit 2 of lightPad2
+    bool nircReady = (cam.lightPad2 & 16u) != 0u;       // bit 4 of lightPad2
 
     // Accumulators across SPP samples
     vec3 accumDiffuse = vec3(0.0);
@@ -2071,9 +2072,10 @@ void main() {
         }
 
         // ---- NIRC: write query input + read previous frame prediction ----
-        if (bounce == 0 && sampleIdx == 0) {
+        // nircQueryOutput[0].a > 0 signals that NIRC buffers are valid
+        bool nircActive = (nircReady);
+        if (nircActive && bounce == 0 && sampleIdx == 0) {
             uint nircPixelIdx = uint(pixel.y) * uint(launchSize.x) + uint(pixel.x);
-            // Write query for this pixel (inference runs after this frame)
             uint qBase = nircPixelIdx * 8u;
             nircQueryInput[qBase]     = pbrHit.worldPos.x;
             nircQueryInput[qBase + 1] = pbrHit.worldPos.y;
@@ -2168,7 +2170,7 @@ void main() {
         }
 
         // ---- NIRC: write training sample (stochastic subset, 1/16 pixels) ----
-        if (bounce >= 1 && sampleIdx == 0) {
+        if (nircActive && bounce >= 1 && sampleIdx == 0) {
             uint nircPixelHash = uint(pixel.x) * 1973u + uint(pixel.y) * 9277u + frameIndex * 26699u;
             if ((nircPixelHash & 15u) == 0u) {
                 uint nircIdx = (uint(pixel.y) * uint(launchSize.x) + uint(pixel.x) + uint(bounce) * 65536u) % 65536u;
@@ -3483,7 +3485,8 @@ void main() {
     }
 
     // ---- NIRC Two-Level MC: blend neural prediction with path traced result ----
-    if (primaryHit && sampleIdx == 0 && frameIndex > 5u) {
+    bool nircActivePost = (nircReady);
+    if (nircActivePost && primaryHit && sampleIdx == 0 && frameIndex > 5u) {
         uint nircPixelIdx = uint(pixel.y) * uint(launchSize.x) + uint(pixel.x);
         vec4 nircPred = nircQueryOutput[nircPixelIdx];
         // nircPred.rgb = predicted incident radiance, .a = confidence
