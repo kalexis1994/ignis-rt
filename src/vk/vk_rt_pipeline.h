@@ -169,6 +169,13 @@ public:
     void UpdateHybridGBufferDescriptors(VkImageView primIdView, VkImageView instanceInfoView,
                                          VkImageView depthView);
 
+    // NRC buffer descriptors (bindings 38-42)
+    void UpdateNrcBufferDescriptors(VkBuffer counter, VkDeviceSize counterSize,
+                                     VkBuffer queryPathInfo, VkDeviceSize queryPathInfoSize,
+                                     VkBuffer trainingPathInfo, VkDeviceSize trainingPathInfoSize,
+                                     VkBuffer trainingPathVertices, VkDeviceSize trainingPathVerticesSize,
+                                     VkBuffer queryRadianceParams, VkDeviceSize queryRadianceParamsSize);
+
     // Per-instance previous transforms (binding 28)
     void UpdatePrevTransforms(const float* transforms, uint32_t instanceCount);
 

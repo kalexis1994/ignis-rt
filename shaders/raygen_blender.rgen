@@ -209,6 +209,33 @@ layout(binding = 17, set = 0, scalar) buffer PickBuffer {
     uint pickValid;
 } pickResult;
 
+// ── NRC (Neural Radiance Cache) buffers ──
+// Declared unconditionally; only written when ENABLE_NRC=1 in the shader.
+// Struct types from nrc.glsl (included below with NRC_STRUCTURES_ONLY).
+#define NRC_STRUCTURES_ONLY
+#include "include/nrc.glsl"
+#undef NRC_STRUCTURES_ONLY
+
+layout(binding = 38, set = 0, std430) buffer NrcCounterBuf      { uint nrcCounters[]; };
+layout(binding = 39, set = 0, std430) buffer NrcQueryPathBuf     { NrcPackedQueryPathInfo nrcQueryPathInfo[]; };
+layout(binding = 40, set = 0, std430) buffer NrcTrainPathBuf     { NrcPackedTrainingPathInfo nrcTrainingPathInfo[]; };
+layout(binding = 41, set = 0, std430) buffer NrcTrainVertBuf     { NrcPackedPathVertex nrcTrainingPathVertices[]; };
+layout(binding = 42, set = 0, std430) buffer NrcQueryRadBuf      { NrcRadianceParams nrcQueryRadianceParams[]; };
+
+// Define custom buffer accessors for nrc.glsl functions
+#define NRC_USE_CUSTOM_BUFFER_ACCESSORS 1
+#define NRC_BUFFER_QUERY_PATH_INFO         nrcQueryPathInfo
+#define NRC_BUFFER_TRAINING_PATH_INFO      nrcTrainingPathInfo
+#define NRC_BUFFER_TRAINING_PATH_VERTICES  nrcTrainingPathVertices
+#define NRC_BUFFER_QUERY_RADIANCE_PARAMS   nrcQueryRadianceParams
+#define NRC_BUFFER_QUERY_COUNTERS_DATA     nrcCounters
+
+// Include NRC functions (disabled by default — set ENABLE_NRC=1 to activate)
+#ifndef ENABLE_NRC
+#define ENABLE_NRC 0
+#endif
+#include "include/nrc.glsl"
+
 // Buffer references
 layout(buffer_reference, scalar) buffer Vertices { float v[]; };
 layout(buffer_reference, scalar) buffer Indices { uint i[]; };

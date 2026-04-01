@@ -554,6 +554,21 @@ bool Renderer::InitRT() {
             Log(L"[VK Renderer] NRC init failed — continuing without neural cache\n");
             delete nrc_;
             nrc_ = nullptr;
+        } else if (rtPipeline_ && nrc_->GetBuffers()) {
+            // Bind NRC buffers to the RT pipeline descriptor set
+            auto* bufs = nrc_->GetBuffers();
+            rtPipeline_->UpdateNrcBufferDescriptors(
+                (*bufs)[nrc::BufferIdx::Counter].resource,
+                (*bufs)[nrc::BufferIdx::Counter].allocatedSize,
+                (*bufs)[nrc::BufferIdx::QueryPathInfo].resource,
+                (*bufs)[nrc::BufferIdx::QueryPathInfo].allocatedSize,
+                (*bufs)[nrc::BufferIdx::TrainingPathInfo].resource,
+                (*bufs)[nrc::BufferIdx::TrainingPathInfo].allocatedSize,
+                (*bufs)[nrc::BufferIdx::TrainingPathVertices].resource,
+                (*bufs)[nrc::BufferIdx::TrainingPathVertices].allocatedSize,
+                (*bufs)[nrc::BufferIdx::QueryRadianceParams].resource,
+                (*bufs)[nrc::BufferIdx::QueryRadianceParams].allocatedSize);
+            Log(L"[VK Renderer] NRC buffers bound to RT pipeline descriptors\n");
         }
     }
 #endif
