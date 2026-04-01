@@ -209,39 +209,6 @@ layout(binding = 17, set = 0, scalar) buffer PickBuffer {
     uint pickValid;
 } pickResult;
 
-// ── NRC (Neural Radiance Cache) buffers ──
-// Declared unconditionally; only written when ENABLE_NRC=1 in the shader.
-// Struct types from nrc.glsl (included below with NRC_STRUCTURES_ONLY).
-#define NRC_STRUCTURES_ONLY
-#include "include/nrc.glsl"
-#undef NRC_STRUCTURES_ONLY
-
-layout(binding = 38, set = 0, std430) buffer NrcCounterBuf      { uint nrcCounters[]; };
-layout(binding = 39, set = 0, std430) buffer NrcQueryPathBuf     { NrcPackedQueryPathInfo nrcQueryPathInfo[]; };
-layout(binding = 40, set = 0, std430) buffer NrcTrainPathBuf     { NrcPackedTrainingPathInfo nrcTrainingPathInfo[]; };
-layout(binding = 41, set = 0, std430) buffer NrcTrainVertBuf     { NrcPackedPathVertex nrcTrainingPathVertices[]; };
-layout(binding = 42, set = 0, std430) buffer NrcQueryRadBuf      { NrcRadianceParams nrcQueryRadianceParams[]; };
-
-// Define custom buffer accessors for nrc.glsl functions
-#define NRC_USE_CUSTOM_BUFFER_ACCESSORS 1
-#define NRC_BUFFER_QUERY_PATH_INFO         nrcQueryPathInfo
-#define NRC_BUFFER_TRAINING_PATH_INFO      nrcTrainingPathInfo
-#define NRC_BUFFER_TRAINING_PATH_VERTICES  nrcTrainingPathVertices
-#define NRC_BUFFER_QUERY_RADIANCE_PARAMS   nrcQueryRadianceParams
-#define NRC_BUFFER_QUERY_COUNTERS_DATA     nrcCounters
-
-// NRC constants UBO (binding 43, populated by NRC SDK)
-layout(binding = 43, set = 0) uniform NrcConstantsUBO {
-    NrcConstants nrcConstants;
-};
-
-// NRC mode: controlled at runtime via nrcConstants.enableTerminationHeuristic > 0.
-// Compiled with ENABLE_NRC=1 but all NRC functions check NrcIsEnabled() which
-// tests g_nrcMode. We set g_nrcMode based on a runtime flag in the constants UBO.
-#define ENABLE_NRC 1
-// Don't define NRC_QUERY or NRC_UPDATE — let g_nrcMode be set at runtime
-#include "include/nrc.glsl"
-
 // Buffer references
 layout(buffer_reference, scalar) buffer Vertices { float v[]; };
 layout(buffer_reference, scalar) buffer Indices { uint i[]; };
@@ -1236,27 +1203,6 @@ void main() {
         : normalize(cross(sunDir, vec3(1, 0, 0)));
     vec3 sunBitangent = cross(sunDir, sunTangent);
 
-    // NRC: create context and path state for this sample
-    // NRC: detect mode from dispatch resolution
-    // Update pass dispatches at trainingDimensions, query pass at frameDimensions
-    if (nrcConstants.maxPathVertices > 0u) {
-        if (launchSize.x == int(nrcConstants.trainingDimensions.x) &&
-            launchSize.y == int(nrcConstants.trainingDimensions.y)) {
-            g_nrcMode = NRC_MODE_UPDATE;
-            // Update pass: use deeper paths for better training data
-            maxBounces = int(nrcConstants.maxPathVertices);
-            spp = 1;  // single sample for training
-        } else {
-            g_nrcMode = NRC_MODE_QUERY;
-        }
-    }
-
-    NrcBuffers nrcBufs;  // empty struct (buffers accessed via custom macros)
-    NrcContext nrcCtx = NrcCreateContext(nrcConstants, nrcBufs, uvec2(pixel));
-    NrcSetSampleIndex(nrcCtx, uint(sampleIdx));
-    NrcPathState nrcPath = NrcCreatePathState(nrcConstants, rand01());
-    bool nrcTerminated = false;
-
     for (int bounce = 0; bounce < maxBounces; bounce++) {
         shaderCost += 4u;  // each bounce = base cost of BVH traversal + shading
 
@@ -1361,7 +1307,6 @@ void main() {
                 if (sharcEnabled && sharcUpdatePixel) {
                     SharcUpdateMiss(sharcGrid, sharcState, skyColor, sharcCapacity);
                 }
-                NrcUpdateOnMiss(nrcPath);
                 if (bounce == 0) {
                     totalRadiance += skyColor * throughput;
                 } else {
@@ -2164,37 +2109,6 @@ void main() {
             specularMV = rpUV - rcUV;
         }
 
-        // ---- NRC: report surface hit to neural cache ----
-        if (NrcIsEnabled() && !nrcTerminated) {
-            NrcSurfaceAttributes nrcSurf;
-            nrcSurf.encodedPosition = NrcEncodePosition(pbrHit.worldPos, nrcConstants);
-            nrcSurf.roughness = pbrHit.roughness;
-            nrcSurf.specularF0 = mix(vec3(0.04), pbrHit.baseColor, pbrHit.metallic);
-            nrcSurf.diffuseReflectance = pbrHit.baseColor * (1.0 - pbrHit.metallic);
-            nrcSurf.shadingNormal = N;
-            nrcSurf.viewVector = -rayDir;
-            nrcSurf.isDeltaLobe = (pbrHit.roughness < 0.02 && pbrHit.transmission > 0.5);
-
-            vec3 nrcThroughput = throughput;
-            vec3 nrcRadiance = totalRadiance;
-            uint nrcProgress = NrcUpdateOnHit(
-                nrcCtx, nrcPath, nrcSurf, hitT, uint(bounce),
-                nrcThroughput, nrcRadiance);
-
-            if (NrcIsUpdateMode()) {
-                throughput = nrcThroughput;
-                totalRadiance = nrcRadiance;
-            }
-
-            if (nrcProgress == NRC_PROGRESS_TERMINATE_IMMEDIATELY) {
-                nrcTerminated = true;
-                break;
-            }
-            if (nrcProgress == NRC_PROGRESS_TERMINATE_AFTER_DIRECT_LIGHTING) {
-                nrcTerminated = true;
-                // Continue to NEE but break after
-            }
-        }
 
         // ---- NIRC: write training sample (stochastic subset, 1/16 pixels) ----
         if (nircActive && bounce >= 1 && sampleIdx == 0) {
@@ -3206,8 +3120,6 @@ void main() {
             }
         }
 
-        // ---- NRC: terminate after direct lighting if requested ----
-        if (nrcTerminated) break;
 
         // ---- NIRC: early path termination using neural cache prediction ----
         // Only at bounce 3+ (let bounce 0-2 trace normally for quality)
@@ -3228,9 +3140,6 @@ void main() {
         if (tpMax < 0.01) break;
 
         // ---- Russian roulette (NRD guidance: min survival prob 0.05 → max 20x boost) ----
-        if (!NrcCanUseRussianRoulette(nrcPath) && NrcIsEnabled()) {
-            // NRC unbiased training path — skip RR
-        } else
         if (bounce >= 1) {
             float p = clamp(sqrt(tpMax), 0.05, 1.0);
             if (rand01() > p) break;
@@ -3472,7 +3381,6 @@ void main() {
 
         // NRC: report BRDF PDF for termination heuristic
         float nrcBrdfPdf = max(dot(rayDir, N), 0.0) * INV_PI;  // cosine-weighted approximation
-        NrcSetBrdfPdf(nrcPath, nrcBrdfPdf);
     }
 
     // ---- ReSTIR GI: temporal reuse from previous frame ----
@@ -3515,32 +3423,6 @@ void main() {
     // Write current reservoir for next frame
     if (giReservoirEnabled) {
         writeReservoir(pixelLinearIdx, reservoir);
-    }
-
-    // ---- NRC: finalize path info ----
-    NrcWriteFinalPathInfo(nrcCtx, nrcPath, throughput, totalRadiance);
-
-    // NRC update pass: only writes training data, skip image output
-    if (NrcIsUpdateMode()) {
-        return;
-    }
-
-    // ---- NIRC Two-Level MC: blend neural prediction with path traced result ----
-    bool nircActivePost = (nircReady);
-    if (nircActivePost && primaryHit && sampleIdx == 0 && frameIndex > 5u) {
-        uint nircPixelIdx = uint(pixel.y) * uint(launchSize.x) + uint(pixel.x);
-        vec4 nircPred = nircQueryOutput[nircPixelIdx];
-        // nircPred.rgb = predicted incident radiance, .a = confidence
-        if (nircPred.a > 0.0) {
-            // Two-Level MC: F_total = F_cache + F_residual
-            // F_cache = neural prediction (cheap, potentially biased)
-            // F_residual = (path_traced - prediction) → converges to 0
-            // Weighted blend based on confidence (increases as network trains)
-            float nircWeight = clamp(float(frameIndex) / 300.0, 0.0, 0.3);  // ramp up over ~10s
-            vec3 nircRadiance = max(nircPred.rgb, vec3(0.0));
-            // Blend: use prediction for indirect, keep path traced for direct
-            diffuseRadiance = mix(diffuseRadiance, diffuseRadiance + nircRadiance * 0.2, nircWeight);
-        }
     }
 
     // ---- Accumulate this sample ----

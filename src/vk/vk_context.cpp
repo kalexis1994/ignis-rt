@@ -3,9 +3,6 @@
 #include <vector>
 #include <algorithm>
 #include <cstring>
-#ifdef IGNIS_HAVE_NRC
-#include <NrcVk.h>
-#endif
 
 namespace acpt {
 namespace vk {
@@ -247,20 +244,6 @@ bool Context::CreateLogicalDevice() {
             }
         }
     }
-
-    // NRC (Neural Radiance Cache) — add required extensions if available
-#ifdef IGNIS_HAVE_NRC
-    {
-        char const* const* nrcExts = nullptr;
-        uint32_t nrcExtCount = nrc::vulkan::GetVulkanDeviceExtensions(nrcExts);
-        for (uint32_t i = 0; i < nrcExtCount; i++) {
-            deviceExtensions.push_back(nrcExts[i]);
-        }
-        if (nrcExtCount > 0) {
-            Log(L"[VK Context] NRC: added %u device extensions\n", nrcExtCount);
-        }
-    }
-#endif
 
     // Shader Execution Reordering (SER) — reduces thread divergence
     // when rays hit different materials. RTX 40+ hardware, software fallback on 30.

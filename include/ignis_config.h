@@ -134,9 +134,6 @@ struct PathTracerConfig {
     // ReSTIR DI (reservoir-based light sampling)
     bool  restirDI           = false;
 
-    // NRC (Neural Radiance Cache)
-    bool  nrcEnabled         = false;
-
     // HDRI environment map
     int   hdriTexIndex       = -1;     // texture index (-1 = no HDRI, use procedural sky)
     float hdriStrength       = 1.0f;   // environment intensity multiplier

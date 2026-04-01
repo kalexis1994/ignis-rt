@@ -139,9 +139,6 @@ private:
     RTPipeline* rtPipeline_ = nullptr;
     WavefrontPipeline* wavefrontPipeline_ = nullptr;
     Interop* interop_ = nullptr;
-#ifdef IGNIS_HAVE_NRC
-    class NrcIntegration* nrc_ = nullptr;
-#endif
     class NircIntegration* nirc_ = nullptr;
     bool rtReady_ = false;
     bool useDirectInterop_ = false;

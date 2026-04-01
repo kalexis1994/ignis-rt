@@ -12,10 +12,6 @@
 #include "ignis_config.h"
 #include "vk_check.h"
 #include "nrd_vulkan_integration.h"
-#ifdef IGNIS_HAVE_NRC
-#include "nrc_integration.h"
-#include <NrcStructures.h>
-#endif
 #include "nirc_integration.h"
 #include <vector>
 #include <fstream>
@@ -544,36 +540,6 @@ bool Renderer::InitRT() {
     }
 
     // Initialize NRC (Neural Radiance Cache)
-#ifdef IGNIS_HAVE_NRC
-    if (cfg) {
-        nrc_ = new NrcIntegration();
-        float sceneMin[3] = { cfg->sceneAABBMin[0], cfg->sceneAABBMin[1], cfg->sceneAABBMin[2] };
-        float sceneMax[3] = { cfg->sceneAABBMax[0], cfg->sceneAABBMax[1], cfg->sceneAABBMax[2] };
-        // Ensure valid AABB (non-zero)
-        if (sceneMin[0] == sceneMax[0]) { sceneMin[0] = -50; sceneMax[0] = 50; sceneMin[1] = -50; sceneMax[1] = 50; sceneMin[2] = -50; sceneMax[2] = 50; }
-        if (!nrc_->Initialize(context_, renderWidth_, renderHeight_,
-                              cfg->samplesPerPixel, cfg->maxBounces, sceneMin, sceneMax)) {
-            Log(L"[VK Renderer] NRC init failed — continuing without neural cache\n");
-            delete nrc_;
-            nrc_ = nullptr;
-        } else if (rtPipeline_ && nrc_->GetBuffers()) {
-            // Bind NRC buffers to the RT pipeline descriptor set
-            auto* bufs = nrc_->GetBuffers();
-            rtPipeline_->UpdateNrcBufferDescriptors(
-                (*bufs)[nrc::BufferIdx::Counter].resource,
-                (*bufs)[nrc::BufferIdx::Counter].allocatedSize,
-                (*bufs)[nrc::BufferIdx::QueryPathInfo].resource,
-                (*bufs)[nrc::BufferIdx::QueryPathInfo].allocatedSize,
-                (*bufs)[nrc::BufferIdx::TrainingPathInfo].resource,
-                (*bufs)[nrc::BufferIdx::TrainingPathInfo].allocatedSize,
-                (*bufs)[nrc::BufferIdx::TrainingPathVertices].resource,
-                (*bufs)[nrc::BufferIdx::TrainingPathVertices].allocatedSize,
-                (*bufs)[nrc::BufferIdx::QueryRadianceParams].resource,
-                (*bufs)[nrc::BufferIdx::QueryRadianceParams].allocatedSize);
-            Log(L"[VK Renderer] NRC buffers bound to RT pipeline descriptors\n");
-        }
-    }
-#endif
 
     // Initialize wavefront pipeline (experimental)
     if (cfg && cfg->useWavefront) {
@@ -706,34 +672,6 @@ void Renderer::InitRT_Remaining() {
     }
 
     // NRC (Neural Radiance Cache)
-#ifdef IGNIS_HAVE_NRC
-    if (cfg && !nrc_) {
-        nrc_ = new NrcIntegration();
-        float sceneMin[3] = { cfg->sceneAABBMin[0], cfg->sceneAABBMin[1], cfg->sceneAABBMin[2] };
-        float sceneMax[3] = { cfg->sceneAABBMax[0], cfg->sceneAABBMax[1], cfg->sceneAABBMax[2] };
-        if (sceneMin[0] == sceneMax[0]) { sceneMin[0] = -50; sceneMax[0] = 50; sceneMin[1] = -50; sceneMax[1] = 50; sceneMin[2] = -50; sceneMax[2] = 50; }
-        if (!nrc_->Initialize(context_, renderWidth_, renderHeight_,
-                              cfg->samplesPerPixel, cfg->maxBounces, sceneMin, sceneMax)) {
-            Log(L"[VK Renderer] NRC init failed — continuing without neural cache\n");
-            delete nrc_;
-            nrc_ = nullptr;
-        } else if (rtPipeline_ && nrc_->GetBuffers()) {
-            auto* bufs = nrc_->GetBuffers();
-            rtPipeline_->UpdateNrcBufferDescriptors(
-                (*bufs)[nrc::BufferIdx::Counter].resource,
-                (*bufs)[nrc::BufferIdx::Counter].allocatedSize,
-                (*bufs)[nrc::BufferIdx::QueryPathInfo].resource,
-                (*bufs)[nrc::BufferIdx::QueryPathInfo].allocatedSize,
-                (*bufs)[nrc::BufferIdx::TrainingPathInfo].resource,
-                (*bufs)[nrc::BufferIdx::TrainingPathInfo].allocatedSize,
-                (*bufs)[nrc::BufferIdx::TrainingPathVertices].resource,
-                (*bufs)[nrc::BufferIdx::TrainingPathVertices].allocatedSize,
-                (*bufs)[nrc::BufferIdx::QueryRadianceParams].resource,
-                (*bufs)[nrc::BufferIdx::QueryRadianceParams].allocatedSize);
-            Log(L"[VK Renderer] NRC buffers bound to RT pipeline\n");
-        }
-    }
-#endif
 
     // NIRC (custom Neural Incident Radiance Cache)
     if (cfg && !nirc_) {
@@ -1423,30 +1361,6 @@ void Renderer::RenderFrameRT() {
     bool diagFlush = false;  // Set true to flush GPU between stages for crash isolation
 
     // NRC: populate constants + begin frame (only when user enabled)
-#ifdef IGNIS_HAVE_NRC
-    PathTracerConfig* nrcCfg = VK_GetConfig();
-    bool nrcActive = nrc_ && nrc_->IsReady() && nrcCfg && nrcCfg->nrcEnabled;
-    if (nrcActive) {
-        // Reconfigure NRC if user changed bounces/SPP/scene
-        nrc_->SyncSettings(nrcCfg->maxBounces, nrcCfg->samplesPerPixel,
-                           nrcCfg->sceneAABBMin, nrcCfg->sceneAABBMax);
-        NrcConstants nrcConst = {};
-        if (nrc_->PopulateShaderConstants(nrcConst)) {
-            if (frameIndex_ < 3) {
-                Log(L"[NRC] Constants: maxPathVerts=%u trainDim=%ux%u frameDim=%ux%u threshold=%.3f\n",
-                    nrcConst.maxPathVertices, nrcConst.trainingDimensions.x, nrcConst.trainingDimensions.y,
-                    nrcConst.frameDimensions.x, nrcConst.frameDimensions.y,
-                    nrcConst.terminationHeuristicThreshold);
-            }
-            rtPipeline_->UpdateNrcConstants(&nrcConst, sizeof(nrcConst));
-        }
-        nrc_->BeginFrame(cmd);
-    } else if (rtPipeline_) {
-        // Clear NRC constants so shader sees maxPathVertices=0 → NRC disabled
-        NrcConstants nrcZero = {};
-        rtPipeline_->UpdateNrcConstants(&nrcZero, sizeof(nrcZero));
-    }
-#endif
 
     WriteTimestamp(cmd, TS_START);
 
@@ -1472,30 +1386,6 @@ void Renderer::RenderFrameRT() {
     WriteTimestamp(cmd, TS_HYBRID);
 
     // 0.5 NRC update pass: trace at training resolution to generate training data
-#ifdef IGNIS_HAVE_NRC
-    if (nrcActive) {
-        // Dispatch at training resolution — shader detects NRC_MODE_UPDATE from launch size
-        NrcConstants nrcConst = {};
-        if (nrc_->PopulateShaderConstants(nrcConst)) {
-            rtPipeline_->UpdateNrcConstants(&nrcConst, sizeof(nrcConst));
-        }
-        uint32_t trainW = nrcConst.trainingDimensions.x;
-        uint32_t trainH = nrcConst.trainingDimensions.y;
-        if (trainW > 0 && trainH > 0) {
-            rtPipeline_->RecordDispatch(cmd, trainW, trainH);
-
-            // Barrier: update pass writes → query pass reads + SDK reads
-            VkMemoryBarrier updateBarrier{};
-            updateBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-            updateBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            updateBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            vkCmdPipelineBarrier(cmd,
-                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0, 1, &updateBarrier, 0, nullptr, 0, nullptr);
-        }
-    }
-#endif
 
     // 1. Path tracing dispatch (wavefront or monolithic) — NRC query mode
     interop_->TransitionForRTWrite(cmd);
@@ -2012,19 +1902,6 @@ void Renderer::RenderFrameRT() {
     }
 
     // NRC: query neural cache + train network
-#ifdef IGNIS_HAVE_NRC
-    if (nrcActive) {
-        VkMemoryBarrier rtToNrc{};
-        rtToNrc.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        rtToNrc.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        rtToNrc.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 1, &rtToNrc, 0, nullptr, 0, nullptr);
-        nrc_->QueryAndTrain(cmd);
-    }
-#endif
 
     // NIRC: train neural incident radiance cache from path tracer samples
     if (nirc_ && nirc_->IsReady()) {
@@ -2087,11 +1964,6 @@ void Renderer::RenderFrameRT() {
     }
 
     // NRC: end frame (must be called after queue submit)
-#ifdef IGNIS_HAVE_NRC
-    if (nrcActive) {
-        nrc_->EndFrame(context_->GetGraphicsQueue());
-    }
-#endif
 
     // No WaitIdle — double-buffered readback with per-buffer fence sync
 
@@ -4271,9 +4143,6 @@ void Renderer::Shutdown() {
     ShutdownHybridGBuffer();
     ShutdownNRD();
     ShutdownDLSS();
-#ifdef IGNIS_HAVE_NRC
-    if (nrc_) { nrc_->Shutdown(); delete nrc_; nrc_ = nullptr; }
-#endif
     if (nirc_) { nirc_->Shutdown(); delete nirc_; nirc_ = nullptr; }
 
     // Shutdown wavefront + RT modules

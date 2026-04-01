@@ -745,7 +745,6 @@ IGNIS_API void ignis_set_int(const char* key, int value) {
     else if (strcmp(key, "dof_blades") == 0)        cfg->dofBlades = value;
     else if (strcmp(key, "backface_culling") == 0) cfg->backfaceCulling = (value != 0);
     else if (strcmp(key, "restir_di") == 0)      cfg->restirDI = (value != 0);
-    else if (strcmp(key, "nrc_enabled") == 0)    cfg->nrcEnabled = (value != 0);
     else if (strcmp(key, "hdri_tex_index") == 0)  cfg->hdriTexIndex = value;
     else if (strcmp(key, "reset_history") == 0 && value != 0) {
         if (g_renderer) g_renderer->ResetFrameIndex();
