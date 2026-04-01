@@ -58,28 +58,20 @@ void NircIntegration::ComputeSceneBounds(const float sceneMin[3], const float sc
 }
 
 void NircIntegration::InitializeWeights() {
-    // Xavier initialization for MLP weights
+    // Xavier initialization for MLP weights (2 layers × 16 hidden)
     VkDevice device = ctx_->GetDevice();
     std::vector<float> weights(TOTAL_WEIGHTS, 0.0f);
     std::mt19937 rng(42);
 
-    // Layer 1: 32 → 64
+    // Layer 1: 32 → 16
     float scale1 = sqrtf(2.0f / 32.0f);
     std::normal_distribution<float> dist1(0.0f, scale1);
-    for (uint32_t i = 0; i < 32 * 64; i++) weights[i] = dist1(rng);
+    for (uint32_t i = 0; i < 32 * 16; i++) weights[i] = dist1(rng);
 
-    // Layer 2: 64 → 64
-    float scale2 = sqrtf(2.0f / 64.0f);
+    // Layer 2: 16 → 3
+    float scale2 = sqrtf(2.0f / 16.0f);
     std::normal_distribution<float> dist2(0.0f, scale2);
-    for (uint32_t i = 2048 + 64; i < 2048 + 64 + 64 * 64; i++) weights[i] = dist2(rng);
-
-    // Layer 3: 64 → 64
-    for (uint32_t i = 6208 + 64; i < 6208 + 64 + 64 * 64; i++) weights[i] = dist2(rng);
-
-    // Layer 4: 64 → 3
-    float scale4 = sqrtf(2.0f / 64.0f);
-    std::normal_distribution<float> dist4(0.0f, scale4);
-    for (uint32_t i = 10368 + 64; i < 10368 + 64 + 64 * 3; i++) weights[i] = dist4(rng);
+    for (uint32_t i = 512 + 16; i < 512 + 16 + 16 * 3; i++) weights[i] = dist2(rng);
 
     // Upload to GPU
     void* mapped;

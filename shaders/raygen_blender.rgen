@@ -265,6 +265,33 @@ layout(binding = 46, set = 0, scalar) buffer NircWeightBuf { float nircWeights[]
 layout(binding = 47, set = 0, scalar) buffer NircQueryIn   { float nircQueryInput[]; };
 layout(binding = 48, set = 0, scalar) buffer NircQueryOut  { vec4  nircQueryOutput[]; };
 
+// NIRC inline inference macros (for hash grid + MLP in raygen)
+#define NIRC_HASH_FEATURES_BUFFER nircHashFeatures
+#define NIRC_MLP_WEIGHTS_BUFFER nircWeights
+#include "include/nirc_hash_grid.glsl"
+#include "include/nirc_mlp.glsl"
+
+// Inline NIRC query: hash grid encode → MLP → predicted incident radiance
+// Scene bounds from camera UBO: jitterPattern[0..2]=min, jitterPattern[4..6]=max
+vec3 nircInlineQuery(vec3 worldPos, vec3 direction, float roughness) {
+    // Compute scene bounds normalization from AABB
+    vec3 sceneMin = vec3(intBitsToFloat(cam.jitterPattern[0].x),
+                         intBitsToFloat(cam.jitterPattern[0].y),
+                         intBitsToFloat(cam.jitterPattern[0].z));
+    vec3 sceneMax = vec3(intBitsToFloat(cam.jitterPattern[1].x),
+                         intBitsToFloat(cam.jitterPattern[1].y),
+                         intBitsToFloat(cam.jitterPattern[1].z));
+    vec3 range = max(sceneMax - sceneMin, vec3(0.01));
+    vec3 posScale = vec3(1.0) / range;
+    vec3 posOffset = -sceneMin / range;
+
+    float hashFeats[NIRC_TOTAL_FEATURES];
+    nircHashGridEncode(worldPos, posScale, posOffset, hashFeats);
+    float inp[NIRC_MLP_INPUT];
+    nircBuildInput(hashFeats, direction, roughness, inp);
+    return nircMlpForward(inp);
+}
+
 // ============================================================
 // Shared includes (extracted for reuse across shaders)
 // ============================================================
@@ -3181,6 +3208,20 @@ void main() {
 
         // ---- NRC: terminate after direct lighting if requested ----
         if (nrcTerminated) break;
+
+        // ---- NIRC: early path termination using neural cache prediction ----
+        // Only at bounce 3+ (let bounce 0-2 trace normally for quality)
+        // Only for diffuse paths (specular needs full tracing)
+        // After 60 frames warmup (~2s for network to learn)
+        if (nircReady && bounce >= 3 && isDiffusePath && frameIndex > 60u) {
+            // Terminate 70% of diffuse paths at bounce 3+ and inject neural prediction
+            if (rand01() > 0.3) {
+                vec3 nircPred = nircInlineQuery(pbrHit.worldPos, -rayDir, pbrHit.roughness);
+                vec3 cachedContrib = nircPred * throughput;
+                diffuseRadiance += clampRadiance(cachedContrib);
+                break;
+            }
+        }
 
         // ---- Early termination: throughput too low to contribute visibly ----
         float tpMax = max(throughput.r, max(throughput.g, throughput.b));

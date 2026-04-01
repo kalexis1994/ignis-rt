@@ -57,8 +57,8 @@ private:
     VkDeviceMemory hashFeatureMem_ = VK_NULL_HANDLE;
     VkDeviceSize hashFeatureBufSize_ = 0;
 
-    // MLP weights + biases: ~10627 floats
-    static constexpr uint32_t TOTAL_WEIGHTS = 10627;
+    // MLP weights + biases: 579 floats (2 layers × 16 hidden)
+    static constexpr uint32_t TOTAL_WEIGHTS = 579;
     VkBuffer weightBuf_ = VK_NULL_HANDLE;
     VkDeviceMemory weightMem_ = VK_NULL_HANDLE;
     VkDeviceSize weightBufSize_ = 0;
