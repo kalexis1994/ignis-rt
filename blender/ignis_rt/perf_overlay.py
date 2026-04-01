@@ -146,77 +146,161 @@ def _draw_graph(shader, gx, gy):
         _draw_rect(shader, bx, gy, bar_w, bh, _bar_color(ms))
 
 
-def _draw_text(tx, ty_base):
-    """Draw stats text."""
+def _overlay_height(mode):
+    """Return overlay height for a given mode."""
+    if mode == 'FPS':
+        return 28
+    elif mode == 'MS':
+        return 28
+    elif mode == 'STATS':
+        return 54
+    else:  # FULL
+        return _TEXT_H + _GRAPH_H + _PAD * 3
+
+
+def _anchor(w, h, bw, bh, pos, y_offset=0):
+    """Compute x0, y0 for a box of size bw x bh at the given anchor position."""
+    margin = 8
+    # Horizontal
+    if pos[1] == 'L':
+        x0 = margin
+    elif pos[1] == 'C':
+        x0 = (w - bw) // 2
+    else:  # R
+        x0 = w - bw - margin
+    # Vertical
+    if pos[0] == 'T':
+        y0 = h - bh - margin - y_offset
+    else:  # B
+        y0 = margin + y_offset
+    return x0, y0
+
+
+def draw_fps(w, h, mode, pos='TR'):
+    """Draw FPS overlay. mode: 'FPS', 'MS', 'STATS', 'FULL'. pos: 'TL','TC','TR','BL','BC','BR'."""
     fid = 0
     avg = _stats['avg']
     lo = _stats['min']
     hi = _stats['max']
     p1 = _stats['p1']
-
-    # FPS + avg ms
-    blf.size(fid, 22)
-    blf.color(fid, 1.0, 1.0, 1.0, 1.0)
-    blf.position(fid, tx, ty_base + 56, 0)
-    blf.draw(fid, f"{_fps:.0f} FPS")
-
-    blf.size(fid, 14)
-    blf.color(fid, 0.7, 0.7, 0.7, 1.0)
-    blf.position(fid, tx + 90, ty_base + 60, 0)
-    blf.draw(fid, f"{avg:.1f} ms")
-
-    # Min / Max / 1%
-    blf.size(fid, 13)
-    cw = 68
-
-    blf.color(fid, 0.3, 0.9, 0.4, 1.0)
-    blf.position(fid, tx, ty_base + 30, 0)
-    blf.draw(fid, f"Min {lo:.1f}")
-
-    blf.color(fid, 0.9, 0.9, 0.3, 1.0)
-    blf.position(fid, tx + cw, ty_base + 30, 0)
-    blf.draw(fid, f"Max {hi:.1f}")
-
-    blf.color(fid, 0.9, 0.4, 0.3, 1.0)
-    blf.position(fid, tx + cw * 2, ty_base + 30, 0)
-    blf.draw(fid, f"1% {p1:.1f}")
-
-    blf.color(fid, 0.6, 0.6, 0.6, 1.0)
-    blf.position(fid, tx + cw * 3, ty_base + 30, 0)
-    blf.draw(fid, "ms")
-
-    # 1% low FPS + frame count
     p1_fps = 1000.0 / p1 if p1 > 0 else 0
-    blf.color(fid, 0.9, 0.5, 0.3, 1.0)
-    blf.position(fid, tx, ty_base + 8, 0)
-    blf.draw(fid, f"1% Low: {p1_fps:.0f} FPS")
-
-    blf.color(fid, 0.5, 0.5, 0.5, 1.0)
-    blf.position(fid, tx + 140, ty_base + 8, 0)
-    blf.draw(fid, f"({len(_samples)} frames)")
-
-
-def draw(w, h):
-    """Draw the full performance overlay at top-right of viewport."""
-    x0 = w - _TOTAL_W - 6
-    y0 = h - _TOTAL_H - 6
 
     gpu.state.blend_set('ALPHA')
     gpu.state.depth_test_set('NONE')
     gpu.state.depth_mask_set(False)
-
     shader = gpu.shader.from_builtin('UNIFORM_COLOR')
 
-    # Background panel
-    _draw_rect(shader, x0, y0, _TOTAL_W, _TOTAL_H, _COLOR_BG)
+    if mode == 'FPS':
+        # Compact: "60 FPS"
+        bw, bh = 90, 28
+        x0, y0 = _anchor(w, h, bw, bh, pos)
+        _draw_rect(shader, x0, y0, bw, bh, _COLOR_BG)
+        blf.size(fid, 16)
+        blf.color(fid, 1.0, 1.0, 1.0, 1.0)
+        blf.position(fid, x0 + 8, y0 + 7, 0)
+        blf.draw(fid, f"{_fps:.0f} FPS")
 
-    # Graph
-    gx = x0 + _PAD
-    gy = y0 + _PAD
-    _draw_graph(shader, gx, gy)
+    elif mode == 'MS':
+        # Compact: "60 FPS  16.7 ms"
+        bw, bh = 180, 28
+        x0, y0 = _anchor(w, h, bw, bh, pos)
+        _draw_rect(shader, x0, y0, bw, bh, _COLOR_BG)
+        blf.size(fid, 16)
+        blf.color(fid, 1.0, 1.0, 1.0, 1.0)
+        blf.position(fid, x0 + 8, y0 + 7, 0)
+        blf.draw(fid, f"{_fps:.0f} FPS")
+        blf.size(fid, 13)
+        blf.color(fid, 0.7, 0.7, 0.7, 1.0)
+        blf.position(fid, x0 + 80, y0 + 8, 0)
+        blf.draw(fid, f"{avg:.1f} ms")
 
-    # Text
-    _draw_text(x0 + _PAD, gy + _GRAPH_H + _PAD + 4)
+    elif mode == 'STATS':
+        # Two rows: FPS + ms, then Min/Max/1%
+        bw, bh = 280, 54
+        x0, y0 = _anchor(w, h, bw, bh, pos)
+        _draw_rect(shader, x0, y0, bw, bh, _COLOR_BG)
+        tx = x0 + 8
+
+        # Row 1: FPS + ms + 1% low
+        blf.size(fid, 16)
+        blf.color(fid, 1.0, 1.0, 1.0, 1.0)
+        blf.position(fid, tx, y0 + 30, 0)
+        blf.draw(fid, f"{_fps:.0f} FPS")
+        blf.size(fid, 13)
+        blf.color(fid, 0.7, 0.7, 0.7, 1.0)
+        blf.position(fid, tx + 72, y0 + 31, 0)
+        blf.draw(fid, f"{avg:.1f} ms")
+        blf.color(fid, 0.9, 0.5, 0.3, 1.0)
+        blf.position(fid, tx + 148, y0 + 31, 0)
+        blf.draw(fid, f"1%Low {p1_fps:.0f}")
+
+        # Row 2: Min / Max / 1%
+        blf.size(fid, 12)
+        cw = 65
+
+        blf.color(fid, 0.3, 0.9, 0.4, 1.0)
+        blf.position(fid, tx, y0 + 8, 0)
+        blf.draw(fid, f"Min {lo:.1f}")
+
+        blf.color(fid, 0.9, 0.9, 0.3, 1.0)
+        blf.position(fid, tx + cw, y0 + 8, 0)
+        blf.draw(fid, f"Max {hi:.1f}")
+
+        blf.color(fid, 0.9, 0.4, 0.3, 1.0)
+        blf.position(fid, tx + cw * 2, y0 + 8, 0)
+        blf.draw(fid, f"1% {p1:.1f}")
+
+        blf.color(fid, 0.5, 0.5, 0.5, 1.0)
+        blf.position(fid, tx + cw * 3, y0 + 8, 0)
+        blf.draw(fid, "ms")
+
+    else:  # FULL
+        panel_w = _GRAPH_W + _PAD * 2
+        panel_h = _TEXT_H + _GRAPH_H + _PAD * 3
+        x0, y0 = _anchor(w, h, panel_w, panel_h, pos)
+
+        _draw_rect(shader, x0, y0, panel_w, panel_h, _COLOR_BG)
+
+        gx = x0 + _PAD
+        gy = y0 + _PAD
+        _draw_graph(shader, gx, gy)
+
+        tx = x0 + _PAD
+        ty = gy + _GRAPH_H + _PAD + 4
+
+        # FPS + avg
+        blf.size(fid, 22)
+        blf.color(fid, 1.0, 1.0, 1.0, 1.0)
+        blf.position(fid, tx, ty + 56, 0)
+        blf.draw(fid, f"{_fps:.0f} FPS")
+        blf.size(fid, 14)
+        blf.color(fid, 0.7, 0.7, 0.7, 1.0)
+        blf.position(fid, tx + 90, ty + 60, 0)
+        blf.draw(fid, f"{avg:.1f} ms")
+
+        # Min / Max / 1%
+        blf.size(fid, 13)
+        cw = 68
+        blf.color(fid, 0.3, 0.9, 0.4, 1.0)
+        blf.position(fid, tx, ty + 30, 0)
+        blf.draw(fid, f"Min {lo:.1f}")
+        blf.color(fid, 0.9, 0.9, 0.3, 1.0)
+        blf.position(fid, tx + cw, ty + 30, 0)
+        blf.draw(fid, f"Max {hi:.1f}")
+        blf.color(fid, 0.9, 0.4, 0.3, 1.0)
+        blf.position(fid, tx + cw * 2, ty + 30, 0)
+        blf.draw(fid, f"1% {p1:.1f}")
+        blf.color(fid, 0.6, 0.6, 0.6, 1.0)
+        blf.position(fid, tx + cw * 3, ty + 30, 0)
+        blf.draw(fid, "ms")
+
+        # 1% low FPS + frame count
+        blf.color(fid, 0.9, 0.5, 0.3, 1.0)
+        blf.position(fid, tx, ty + 8, 0)
+        blf.draw(fid, f"1% Low: {p1_fps:.0f} FPS")
+        blf.color(fid, 0.5, 0.5, 0.5, 1.0)
+        blf.position(fid, tx + 140, ty + 8, 0)
+        blf.draw(fid, f"({len(_samples)} frames)")
 
     gpu.state.blend_set('NONE')
 
@@ -228,7 +312,7 @@ _GPU_ROW_H = 18
 _GPU_PAD = 8
 _GPU_LABEL_W = 100
 
-def draw_gpu_profiler(w, h, fps_visible):
+def draw_gpu_profiler(w, h, fps_visible, fps_mode='FULL', pos='TR'):
     """Draw GPU + CPU timing breakdown at top-right, below FPS overlay if visible."""
     from . import dll_wrapper
 
@@ -267,9 +351,8 @@ def draw_gpu_profiler(w, h, fps_visible):
     panel_w = _GPU_LABEL_W + _GPU_BAR_W + 70 + _GPU_PAD * 2
     panel_h = rows * _GPU_ROW_H + _GPU_PAD * 2 + 8
 
-    x0 = w - panel_w - 6
-    y_offset = (_TOTAL_H + 10) if fps_visible else 0
-    y0 = h - panel_h - 6 - y_offset
+    y_offset = (_overlay_height(fps_mode) + 10) if fps_visible else 0
+    x0, y0 = _anchor(w, h, panel_w, panel_h, pos, y_offset)
 
     gpu.state.blend_set('ALPHA')
     gpu.state.depth_test_set('NONE')

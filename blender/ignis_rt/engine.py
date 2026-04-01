@@ -476,18 +476,6 @@ _load_tex_buffers = []
 MESH_BATCH_SIZE = 4    # meshes per frame during loading
 
 
-def _update_fps():
-    """Track frame times — delegates to perf_overlay."""
-    from . import perf_overlay
-    perf_overlay.update()
-
-
-def _draw_fps_overlay(w, h):
-    """Draw performance overlay — delegates to perf_overlay."""
-    from . import perf_overlay
-    perf_overlay.draw(w, h)
-
-
 from . import loading_screen
 
 
@@ -2412,14 +2400,17 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             pass  # still fading — will redraw
 
         # FPS overlay
-        if props.show_fps:
-            _update_fps()
-            _draw_fps_overlay(w, h)
+        _fps_mode = props.fps_overlay
+        _fps_pos = props.fps_position
+        if _fps_mode != 'OFF':
+            from . import perf_overlay
+            perf_overlay.update()
+            perf_overlay.draw_fps(w, h, _fps_mode, _fps_pos)
 
         # GPU profiler overlay
         if props.show_gpu_profiler:
             from . import perf_overlay
-            perf_overlay.draw_gpu_profiler(w, h, props.show_fps)
+            perf_overlay.draw_gpu_profiler(w, h, _fps_mode != 'OFF', _fps_mode, _fps_pos)
 
         # Always request next frame — NRD needs continuous accumulation to converge
         self.tag_redraw()

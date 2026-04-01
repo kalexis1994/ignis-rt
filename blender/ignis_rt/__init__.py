@@ -213,16 +213,50 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
     )
 
     # -- Overlay --
-    show_fps: BoolProperty(
-        name="Show FPS",
-        description="Display frames per second in the viewport",
-        default=False, update=_tag_redraw,
+    fps_overlay: EnumProperty(
+        name="FPS Overlay",
+        items=[
+            ('OFF', "Off", "No FPS overlay"),
+            ('FPS', "FPS", "FPS counter only"),
+            ('MS', "FPS + ms", "FPS and frame time"),
+            ('STATS', "Stats", "Min, Max, Avg, 1% low"),
+            ('FULL', "Full", "Stats + frame time graph"),
+        ],
+        default='OFF',
+        description="Performance overlay detail level",
+        update=_tag_redraw,
+    )
+    fps_position: EnumProperty(
+        name="Position",
+        items=[
+            ('TL', "Top Left", ""),
+            ('TC', "Top Center", ""),
+            ('TR', "Top Right", ""),
+            ('BL', "Bottom Left", ""),
+            ('BC', "Bottom Center", ""),
+            ('BR', "Bottom Right", ""),
+        ],
+        default='TR',
+        description="Overlay position in viewport",
+        update=_tag_redraw,
     )
     show_gpu_profiler: BoolProperty(
         name="GPU Profiler",
         description="Display GPU timing breakdown (RT, PostProcess, Total)",
         default=False, update=_tag_redraw,
     )
+
+
+class IGNIS_OT_set_fps_position(bpy.types.Operator):
+    bl_idname = "ignis.set_fps_position"
+    bl_label = "Set Overlay Position"
+    bl_options = {'INTERNAL'}
+
+    position: StringProperty()
+
+    def execute(self, context):
+        context.scene.ignis_rt.fps_position = self.position
+        return {'FINISHED'}
 
 
 class IGNIS_OT_reload_scene(bpy.types.Operator):
@@ -341,8 +375,30 @@ class IGNIS_PT_performance(bpy.types.Panel):
         layout.use_property_decorate = False
         layout.prop(props, "vsync")
         layout.prop(props, "fps_limit")
-        layout.prop(props, "show_fps")
+        layout.prop(props, "fps_overlay")
         layout.prop(props, "show_gpu_profiler")
+
+        # Position grid (3x2) — visual selector
+        if props.fps_overlay != 'OFF' or props.show_gpu_profiler:
+            layout.label(text="Position:")
+            positions = [
+                ('TL', 'TC', 'TR'),
+                ('BL', 'BC', 'BR'),
+            ]
+            labels = {
+                'TL': '', 'TC': '', 'TR': '',
+                'BL': '', 'BC': '', 'BR': '',
+            }
+            current = props.fps_position
+            for row_positions in positions:
+                row = layout.row(align=True)
+                for pos in row_positions:
+                    op = row.operator(
+                        "ignis.set_fps_position",
+                        text=labels[pos],
+                        depress=(current == pos),
+                    )
+                    op.position = pos
 
 
 class IGNIS_PT_advanced(bpy.types.Panel):
@@ -412,6 +468,7 @@ def register():
 
     bpy.utils.register_class(IgnisRTPreferences)
     bpy.utils.register_class(IgnisRTSceneProperties)
+    bpy.utils.register_class(IGNIS_OT_set_fps_position)
     bpy.utils.register_class(IGNIS_OT_reload_scene)
     bpy.utils.register_class(IGNIS_OT_reload_shaders)
     bpy.utils.register_class(IGNIS_PT_sampling)
@@ -485,6 +542,7 @@ def unregister():
     bpy.utils.unregister_class(IGNIS_PT_sampling)
     bpy.utils.unregister_class(IGNIS_OT_reload_shaders)
     bpy.utils.unregister_class(IGNIS_OT_reload_scene)
+    bpy.utils.unregister_class(IGNIS_OT_set_fps_position)
     del bpy.types.Scene.ignis_rt
     bpy.utils.unregister_class(IgnisRTSceneProperties)
     bpy.utils.unregister_class(IgnisRTPreferences)
