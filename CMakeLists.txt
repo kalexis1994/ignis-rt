@@ -154,7 +154,6 @@ if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     set(IGNIS_SHADER_SOURCES
         basic.vert:basic.vert.spv
         basic.frag:basic.frag.spv
-        raygen.rgen:raygen.rgen.spv
         closesthit.rchit:closesthit.rchit.spv
         miss.rmiss:miss.rmiss.spv
         nrd_composite.comp:nrd_composite.spv
