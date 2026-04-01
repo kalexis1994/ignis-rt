@@ -2091,12 +2091,11 @@ void main() {
             neeEnd = randIdx + 1u;
             neeScale = float(cam.lightCount);
         } else if (cam.lightCount > 4u && !skipLocalNEE) {
-            // Bounce 0-1: cap to 4 lights, rotate selection by frame
-            uint maxNEE = 4u;
-            uint offset = (frameIndex * 3u) % cam.lightCount;
-            neeStart = offset;
-            neeEnd = min(offset + maxNEE, cam.lightCount);
-            neeScale = float(cam.lightCount) / float(min(maxNEE, cam.lightCount));
+            // Bounce 0-1: sample 4 random lights per pixel (stochastic, denoiser-friendly)
+            uint randIdx = min(uint(rand01() * float(cam.lightCount)), cam.lightCount - 1u);
+            neeStart = randIdx;
+            neeEnd = min(randIdx + 4u, cam.lightCount);
+            neeScale = float(cam.lightCount) / float(min(4u, cam.lightCount - randIdx));
         }
 
         // Snapshot radiance BEFORE NEE (for SHARC: compute local contribution)
