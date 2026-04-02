@@ -2283,19 +2283,29 @@ void main() {
             }
 
             float cosI = abs(dot(Vglass, Hglass));
-            float fresnel = fresnelDielectric(cosI, eta);
+            float F = fresnelDielectric(cosI, eta);
             vec3 refracted = refract(-Vglass, Hglass, eta);
             bool canRefract = dot(refracted, refracted) > 0.0001;
 
-            if (!canRefract || rand01() < fresnel) {
+            // Cycles: reflection_tint=1, transmission_tint=sqrt(baseColor)
+            // Probability-weighted lobe selection (closure.h:341-342)
+            vec3 tint = cyclesPrincipledTransmissionTint(pbrHit.baseColor);
+            vec3 R = vec3(F);
+            vec3 T = canRefract ? (1.0 - F) * tint : vec3(0.0);
+            float avgR = dot(R, vec3(1.0/3.0));
+            float avgT = dot(T, vec3(1.0/3.0));
+            float pReflect = (!canRefract) ? 1.0 : avgR / max(avgR + avgT, 1e-6);
+            float pTransmit = 1.0 - pReflect;
+
+            if (!canRefract || rand01() < pReflect) {
                 rayDir = reflect(rayDir, Hglass);
                 rayOrigin = pbrHit.worldPos + refractN * 0.001;
+                throughput *= R / max(glassProb * pReflect, 1e-4);
             } else {
                 rayDir = refracted;
                 rayOrigin = pbrHit.worldPos - refractN * 0.001;
+                throughput *= T / max(glassProb * pTransmit, 1e-4);
             }
-
-            throughput *= cyclesPrincipledTransmissionTint(pbrHit.baseColor) / max(glassProb, 0.01);
             if (bounce == 0) { isDiffusePath = false; captureSpecularMV = true; throughPrimarySpecularInterface = true; }
             bounce--;
             continue;
@@ -3478,22 +3488,29 @@ void main() {
 
             // Dielectric Fresnel (exact, not Schlick approximation — matches Cycles)
             float cosI = abs(dot(V, H));
-            float fresnel = fresnelDielectric(cosI, eta);
+            float F = fresnelDielectric(cosI, eta);
 
-            // Decide reflect vs refract based on Fresnel
             vec3 refracted = refract(-V, H, eta);
             bool canRefract = dot(refracted, refracted) > 0.0001;
 
-            if (!canRefract || rand01() < fresnel) {
-                // Reflection: stay on incident side
+            // Cycles: reflection=F*white, transmission=(1-F)*sqrt(baseColor)
+            vec3 tint = cyclesPrincipledTransmissionTint(pbrHit.baseColor);
+            vec3 R = vec3(F);
+            vec3 T = canRefract ? (1.0 - F) * tint : vec3(0.0);
+            float avgR = dot(R, vec3(1.0/3.0));
+            float avgT = dot(T, vec3(1.0/3.0));
+            float pReflect = (!canRefract) ? 1.0 : avgR / max(avgR + avgT, 1e-6);
+            float pTransmit = 1.0 - pReflect;
+
+            if (!canRefract || rand01() < pReflect) {
                 rayDir = reflect(rayDir, H);
                 rayOrigin = pbrHit.worldPos + refractN * 0.001;
+                throughput *= R / max(glassProb * pReflect, 1e-4);
             } else {
-                // Refraction: cross to other side of surface
                 rayDir = refracted;
                 rayOrigin = pbrHit.worldPos - refractN * 0.001;
+                throughput *= T / max(glassProb * pTransmit, 1e-4);
             }
-            throughput *= cyclesPrincipledTransmissionTint(pbrHit.baseColor) / max(glassProb, 0.01);  // Cycles Principled transmission tint
             if (bounce == 0) { isDiffusePath = false; captureSpecularMV = true; }
             bounce--;  // glass doesn't count against main bounce budget
             continue;
