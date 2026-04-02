@@ -167,6 +167,9 @@ if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
         sharc_resolve.comp:sharc_resolve.comp.spv
         surfel_resolve.comp:surfel_resolve.comp.spv
         cluster_culling.comp:cluster_culling.comp.spv
+        hair_generate.comp:hair_generate.comp.spv
+        gbuffer_hybrid.vert:gbuffer_hybrid.vert.spv
+        gbuffer_hybrid.frag:gbuffer_hybrid.frag.spv
         hybrid.rgen:hybrid.rgen.spv
         raygen_blender.rgen:raygen_blender.rgen.spv
     )
