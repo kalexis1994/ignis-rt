@@ -78,6 +78,116 @@ float perlinNoise3D(vec3 p) {
 }
 
 // ============================================================
+// Noise scale — maps raw Perlin [-1,1] to [0,1] (Cycles noise_scale3/4)
+// ============================================================
+
+float noiseScale01(float n) { return 0.982 * n + 0.5; }
+
+// ============================================================
+// 4D Hash — Jenkins Lookup3 extended
+// ============================================================
+
+uint hash4(uvec4 k) {
+    uint a = 0xdeadbf0eu + k.x;
+    uint b = 0xdeadbf0eu + k.y;
+    uint c = 0xdeadbf0eu + k.z;
+    c ^= b; c -= (b << 14u) | (b >> 18u);
+    a ^= c; a -= (c << 11u) | (c >> 21u);
+    b ^= a; b -= (a << 25u) | (a >> 7u);
+    c ^= b; c -= (b << 16u) | (b >> 16u);
+    a ^= c; a -= (c << 4u)  | (c >> 28u);
+    b ^= a; b -= (a << 14u) | (a >> 18u);
+    c ^= b; c -= (b << 24u) | (b >> 8u);
+    a += k.w;
+    c ^= b; c -= (b << 14u) | (b >> 18u);
+    a ^= c; a -= (c << 11u) | (c >> 21u);
+    b ^= a; b -= (a << 25u) | (a >> 7u);
+    c ^= b; c -= (b << 16u) | (b >> 16u);
+    a ^= c; a -= (c << 4u)  | (c >> 28u);
+    b ^= a; b -= (a << 14u) | (a >> 18u);
+    c ^= b; c -= (b << 24u) | (b >> 8u);
+    return c;
+}
+
+// ============================================================
+// 4D gradient dot (Cycles grad4)
+// ============================================================
+
+float gradientDot4(uint hash, float x, float y, float z, float w) {
+    uint h = hash & 31u;
+    float u = h < 24u ? x : y;
+    float v = h < 16u ? y : z;
+    float s = h < 8u  ? z : w;
+    return ((h & 1u) != 0u ? -u : u) + ((h & 2u) != 0u ? -v : v) + ((h & 4u) != 0u ? -s : s);
+}
+
+// ============================================================
+// 4D Perlin noise — quintic fade, quadrilinear interpolation
+// ============================================================
+
+float perlinNoise4D(vec4 p) {
+    vec4 fl = floor(p);
+    ivec4 i = ivec4(fl);
+    vec4 f = p - fl;
+    vec4 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+
+    float g0000 = gradientDot4(hash4(uvec4(i)),                      f.x,     f.y,     f.z,     f.w);
+    float g1000 = gradientDot4(hash4(uvec4(i + ivec4(1,0,0,0))),     f.x-1.0, f.y,     f.z,     f.w);
+    float g0100 = gradientDot4(hash4(uvec4(i + ivec4(0,1,0,0))),     f.x,     f.y-1.0, f.z,     f.w);
+    float g1100 = gradientDot4(hash4(uvec4(i + ivec4(1,1,0,0))),     f.x-1.0, f.y-1.0, f.z,     f.w);
+    float g0010 = gradientDot4(hash4(uvec4(i + ivec4(0,0,1,0))),     f.x,     f.y,     f.z-1.0, f.w);
+    float g1010 = gradientDot4(hash4(uvec4(i + ivec4(1,0,1,0))),     f.x-1.0, f.y,     f.z-1.0, f.w);
+    float g0110 = gradientDot4(hash4(uvec4(i + ivec4(0,1,1,0))),     f.x,     f.y-1.0, f.z-1.0, f.w);
+    float g1110 = gradientDot4(hash4(uvec4(i + ivec4(1,1,1,0))),     f.x-1.0, f.y-1.0, f.z-1.0, f.w);
+    float g0001 = gradientDot4(hash4(uvec4(i + ivec4(0,0,0,1))),     f.x,     f.y,     f.z,     f.w-1.0);
+    float g1001 = gradientDot4(hash4(uvec4(i + ivec4(1,0,0,1))),     f.x-1.0, f.y,     f.z,     f.w-1.0);
+    float g0101 = gradientDot4(hash4(uvec4(i + ivec4(0,1,0,1))),     f.x,     f.y-1.0, f.z,     f.w-1.0);
+    float g1101 = gradientDot4(hash4(uvec4(i + ivec4(1,1,0,1))),     f.x-1.0, f.y-1.0, f.z,     f.w-1.0);
+    float g0011 = gradientDot4(hash4(uvec4(i + ivec4(0,0,1,1))),     f.x,     f.y,     f.z-1.0, f.w-1.0);
+    float g1011 = gradientDot4(hash4(uvec4(i + ivec4(1,0,1,1))),     f.x-1.0, f.y,     f.z-1.0, f.w-1.0);
+    float g0111 = gradientDot4(hash4(uvec4(i + ivec4(0,1,1,1))),     f.x,     f.y-1.0, f.z-1.0, f.w-1.0);
+    float g1111 = gradientDot4(hash4(uvec4(i + ivec4(1,1,1,1))),     f.x-1.0, f.y-1.0, f.z-1.0, f.w-1.0);
+
+    float x00 = mix(g0000, g1000, u.x); float x10 = mix(g0100, g1100, u.x);
+    float x01 = mix(g0010, g1010, u.x); float x11 = mix(g0110, g1110, u.x);
+    float x02 = mix(g0001, g1001, u.x); float x12 = mix(g0101, g1101, u.x);
+    float x03 = mix(g0011, g1011, u.x); float x13 = mix(g0111, g1111, u.x);
+
+    float y0 = mix(x00, x10, u.y); float y1 = mix(x01, x11, u.y);
+    float y2 = mix(x02, x12, u.y); float y3 = mix(x03, x13, u.y);
+
+    float z0 = mix(y0, y1, u.z); float z1 = mix(y2, y3, u.z);
+    return mix(z0, z1, u.w);
+}
+
+// ============================================================
+// 4D fBM (Cycles-exact fractal_noise.h, 4D variant)
+// ============================================================
+
+float noise_fbm_4d(vec4 p, float detail, float roughness, float lacunarity, bool normalize) {
+    float fscale = 1.0;
+    float amp = 1.0;
+    float maxamp = 0.0;
+    float sum = 0.0;
+    int nOctaves = int(detail);
+    for (int i = 0; i <= nOctaves; i++) {
+        float t = perlinNoise4D(fscale * p);
+        sum += t * amp;
+        maxamp += amp;
+        amp *= roughness;
+        fscale *= lacunarity;
+    }
+    float rmd = detail - floor(detail);
+    if (rmd != 0.0) {
+        float t = perlinNoise4D(fscale * p);
+        float sum2 = sum + t * amp;
+        return normalize ? mix(0.5 * sum / maxamp + 0.5, 0.5 * sum2 / (maxamp + amp) + 0.5, rmd) :
+                           mix(sum, sum2, rmd);
+    }
+    return normalize ? 0.5 * sum / maxamp + 0.5 : sum;
+}
+
+// ============================================================
 // FBM — Fractal Brownian Motion (Cycles-compatible)
 // detail:     number of octaves (fractional allowed)
 // roughness:  amplitude decay per octave (typically 0.5)
@@ -221,13 +331,62 @@ float fbm3D(vec3 p, float detail, float roughness, float lacunarity) {
 }
 
 // ============================================================
-// Gradient texture helpers
+// Gradient texture — Cycles-exact (kernel/svm/gradient.h)
 // ============================================================
+
+#define GRADIENT_LINEAR           0
+#define GRADIENT_QUADRATIC        1
+#define GRADIENT_EASING           2
+#define GRADIENT_DIAGONAL         3
+#define GRADIENT_SPHERICAL        4
+#define GRADIENT_QUADRATIC_SPHERE 5
+#define GRADIENT_RADIAL           6
 
 float gradientLinear(vec3 p)    { return clamp(p.x, 0.0, 1.0); }
 float gradientQuadratic(vec3 p) { float r = max(p.x, 0.0); return clamp(r * r, 0.0, 1.0); }
-float gradientRadial(vec3 p)    { return atan(p.y, p.x) / (2.0 * 3.14159265) + 0.5; }
+float gradientEasing(vec3 p) {
+    float r = clamp(p.x, 0.0, 1.0);
+    float t = r * r;
+    return 3.0 * t - 2.0 * t * r;
+}
+float gradientDiagonal(vec3 p)  { return clamp((p.x + p.y) * 0.5, 0.0, 1.0); }
 float gradientSpherical(vec3 p) { return max(1.0 - length(p), 0.0); }
+float gradientQuadraticSphere(vec3 p) {
+    float r = max(1.0 - length(p), 0.0);
+    return r * r;
+}
+float gradientRadial(vec3 p)    { return atan(p.y, p.x) / (2.0 * 3.14159265) + 0.5; }
+
+float gradientSelect(vec3 p, int gtype) {
+    switch (gtype) {
+        case GRADIENT_LINEAR:           return gradientLinear(p);
+        case GRADIENT_QUADRATIC:        return gradientQuadratic(p);
+        case GRADIENT_EASING:           return gradientEasing(p);
+        case GRADIENT_DIAGONAL:         return gradientDiagonal(p);
+        case GRADIENT_SPHERICAL:        return gradientSpherical(p);
+        case GRADIENT_QUADRATIC_SPHERE: return gradientQuadraticSphere(p);
+        case GRADIENT_RADIAL:           return gradientRadial(p);
+        default:                        return gradientLinear(p);
+    }
+}
+
+// ============================================================
+// Color ramp — 16-entry uniform LUT with linear interpolation
+// ============================================================
+
+float sampleColorRamp16(float t, vec4 r0, vec4 r1, vec4 r2, vec4 r3) {
+    t = clamp(t, 0.0, 1.0);
+    float ramp[16] = float[16](
+        r0.x, r0.y, r0.z, r0.w,
+        r1.x, r1.y, r1.z, r1.w,
+        r2.x, r2.y, r2.z, r2.w,
+        r3.x, r3.y, r3.z, r3.w
+    );
+    float idx = t * 15.0;
+    int i0 = int(floor(idx));
+    int i1 = min(i0 + 1, 15);
+    return mix(ramp[i0], ramp[i1], idx - float(i0));
+}
 
 // ============================================================
 // Voronoi F1 — distance to closest cell point (Euclidean)

@@ -4007,6 +4007,7 @@ def _pack_gpu_material(
     volume_noise_normalize=1,
     volume_noise_offset=0.0,
     volume_noise_gain=1.0,
+    volume_ext=None,
     hair_shift=0.035,
     hair_radial_roughness=0.3,
 ):
@@ -4079,16 +4080,16 @@ def _pack_gpu_material(
         vm_uints[1] = _pf(volume_noise_scale)
         vm_uints[2] = _pf(volume_noise_detail)
         vm_uints[3] = _pf(volume_noise_brightness)
-        # nodeVmCode[0] = uvec4(roughness, lacunarity, contrast, 0)
+        # nodeVmCode[0] = uvec4(roughness, lacunarity, contrast, dimensions)
         vm_uints[4] = _pf(volume_noise_roughness)
         vm_uints[5] = _pf(volume_noise_lacunarity)
         vm_uints[6] = _pf(volume_noise_contrast)
-        vm_uints[7] = 0
-        # nodeVmCode[1] = uvec4(mapping.x, mapping.y, mapping.z, 0)
+        vm_uints[7] = volume_ext.get('noise_dimensions', 3) if volume_ext else 3
+        # nodeVmCode[1] = uvec4(mapping.x, mapping.y, mapping.z, noiseW)
         vm_uints[8] = _pf(volume_mapping_offset[0])
         vm_uints[9] = _pf(volume_mapping_offset[1])
         vm_uints[10] = _pf(volume_mapping_offset[2])
-        vm_uints[11] = 0
+        vm_uints[11] = _pf(volume_ext.get('noise_w', 0.0)) if volume_ext else 0
         # nodeVmCode[2] = uvec4(absorptionR, absorptionG, absorptionB, emissionStrength)
         vm_uints[12] = _pf(volume_absorption_color[0])
         vm_uints[13] = _pf(volume_absorption_color[1])
@@ -4114,6 +4115,22 @@ def _pack_gpu_material(
         vm_uints[29] = _pf(volume_bbox_max[1])
         vm_uints[30] = _pf(volume_bbox_max[2])
         vm_uints[31] = 0
+
+        # Extended volume chain data (nodeVmCode[7..14])
+        if volume_ext:
+            # nodeVmCode[7..9]: 3x4 mapping matrix (row-major)
+            mtx = volume_ext.get('mapping_matrix', [])
+            for i, v in enumerate(mtx[:12]):
+                vm_uints[32 + i] = _pf(v)
+            # nodeVmCode[10] = (distortion, gradientType, mixFactor, volFlags2)
+            vm_uints[44] = _pf(volume_ext.get('distortion', 0.0))
+            vm_uints[45] = volume_ext.get('gradient_type', 0)
+            vm_uints[46] = _pf(volume_ext.get('mix_factor', 0.5))
+            vm_uints[47] = volume_ext.get('vol_flags2', 0)
+            # nodeVmCode[11..14]: 16-entry color ramp LUT
+            ramp = volume_ext.get('ramp_lut', [])
+            for i, v in enumerate(ramp[:16]):
+                vm_uints[48 + i] = _pf(v)
 
     return base + _GPU_MATERIAL_VM.pack(*vm_uints)
 
@@ -4803,12 +4820,17 @@ def _find_surface_shader(node_tree):
 
 
 def _find_volume_shader(node_tree):
-    """Find the shader node connected to Material Output's Volume input."""
+    """Find the shader node connected to Material Output's Volume input.
+    Follows MIX_SHADER nodes to find the first underlying volume shader."""
     for node in node_tree.nodes:
         if node.type == 'OUTPUT_MATERIAL' and node.is_active_output:
             volume_inp = node.inputs.get('Volume')
             if volume_inp and volume_inp.is_linked:
-                return volume_inp.links[0].from_node
+                from_node = volume_inp.links[0].from_node
+                if from_node.type == 'MIX_SHADER':
+                    # Return the MIX_SHADER itself — caller will handle blending
+                    return from_node
+                return from_node
     return None
 
 
@@ -5672,6 +5694,7 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         volume_noise_type = 1   # 0=multifractal, 1=fBM, 2=hybrid, 3=ridged, 4=hetero
         volume_noise_normalize = 1  # 1=true, 0=false
         volume_noise_offset = 0.0
+        volume_ext = None
         volume_noise_gain = 1.0
 
         # Volume material properties
@@ -5691,9 +5714,82 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         volume_temperature = 1000.0
 
         if mat.use_nodes and mat.node_tree:
-            # Check for Volume Scatter node on Volume input
+            # Check for Volume node on Volume input (follow MIX_SHADER)
             volume_node = _find_volume_shader(mat.node_tree)
-            if volume_node and volume_node.type in ('VOLUME_SCATTER', 'VOLUME_ABSORPTION', 'PRINCIPLED_VOLUME'):
+
+            # Handle MIX_SHADER of two volume shaders: pre-blend coefficients
+            if volume_node and volume_node.type == 'MIX_SHADER':
+                _mix_fac_inp = volume_node.inputs[0]
+                _mix_fac = float(_mix_fac_inp.default_value) if _mix_fac_inp else 0.5
+                _vol_a = None
+                _vol_b = None
+                _s1 = volume_node.inputs[1]
+                _s2 = volume_node.inputs[2]
+                if _s1 and _s1.is_linked:
+                    _vol_a = _s1.links[0].from_node
+                if _s2 and _s2.is_linked:
+                    _vol_b = _s2.links[0].from_node
+
+                def _vol_coeffs(vn):
+                    """Extract sigma_s, sigma_a, emission from a volume node."""
+                    if vn is None:
+                        return (0,0,0), (0,0,0), (0,0,0), 0.0
+                    _ci = vn.inputs.get('Color')
+                    _c = tuple(float(_ci.default_value[i]) for i in range(3)) if _ci else (1,1,1)
+                    _di = vn.inputs.get('Density')
+                    _d = float(_di.default_value) if _di else 1.0
+                    if vn.type == 'PRINCIPLED_VOLUME':
+                        _ai = vn.inputs.get('Absorption Color')
+                        _ac = tuple(float(_ai.default_value[i]) for i in range(3)) if _ai else (0,0,0)
+                        sigma_s = tuple(_c[i] * _d for i in range(3))
+                        sigma_a = tuple(max(1-_c[i],0) * max(1-(_ac[i]**0.5),0) * _d for i in range(3))
+                        _ei = vn.inputs.get('Emission Strength')
+                        _es = float(_ei.default_value) if _ei else 0.0
+                        _eci = vn.inputs.get('Emission Color')
+                        _ec = tuple(float(_eci.default_value[i]) for i in range(3)) if _eci else (1,1,1)
+                        em = tuple(_ec[i] * _es for i in range(3))
+                        return sigma_s, sigma_a, em, 0.0
+                    elif vn.type == 'VOLUME_ABSORPTION':
+                        sigma_a = tuple((1 - _c[i]) * _d for i in range(3))
+                        return (0,0,0), sigma_a, (0,0,0), 0.0
+                    elif vn.type == 'VOLUME_SCATTER':
+                        sigma_s = tuple(_c[i] * _d for i in range(3))
+                        return sigma_s, (0,0,0), (0,0,0), 0.0
+                    return (0,0,0), (0,0,0), (0,0,0), 0.0
+
+                _ss_a, _sa_a, _em_a, _ = _vol_coeffs(_vol_a)
+                _ss_b, _sa_b, _em_b, _ = _vol_coeffs(_vol_b)
+                _w0 = 1.0 - _mix_fac
+                _w1 = _mix_fac
+                # Blend coefficients
+                _ss = tuple(_w0*_ss_a[i] + _w1*_ss_b[i] for i in range(3))
+                _sa = tuple(_w0*_sa_a[i] + _w1*_sa_b[i] for i in range(3))
+                _em = tuple(_w0*_em_a[i] + _w1*_em_b[i] for i in range(3))
+                _st = tuple(_ss[i] + _sa[i] for i in range(3))
+                _max_st = max(_st)
+                # Reconstruct as Principled Volume equivalent
+                if _max_st > 0.001:
+                    volume_density = _max_st
+                    base_color = tuple(_ss[i] / _max_st for i in range(3))
+                    # absorption_color: solve max(1-sqrt(ac),0) = sa/(max(1-c,0)*density)
+                    volume_absorption_color = (0.0, 0.0, 0.0)
+                    # emission: store blended emission color + strength
+                    _em_max = max(max(_em), 0.001)
+                    volume_emission_strength = _em_max
+                    volume_emission_color = tuple(_em[i] / _em_max for i in range(3))
+                else:
+                    volume_density = 0.0
+                    base_color = (1.0, 1.0, 1.0)
+                flags |= 4  # MAT_FLAG_VOLUME
+                # Use first valid volume node for anisotropy
+                _pv = _vol_a if (_vol_a and _vol_a.type == 'PRINCIPLED_VOLUME') else _vol_b
+                if _pv and _pv.type == 'PRINCIPLED_VOLUME':
+                    _ani = _pv.inputs.get('Anisotropy')
+                    if _ani: volume_anisotropy = float(_ani.default_value)
+                # Set volume_node to the first volume for chain tracing
+                volume_node = _pv if _pv else _vol_a
+
+            elif volume_node and volume_node.type in ('VOLUME_SCATTER', 'VOLUME_ABSORPTION', 'PRINCIPLED_VOLUME'):
                 flags |= 4  # MAT_FLAG_VOLUME
                 # Extract Volume Scatter properties
                 color_inp = volume_node.inputs.get('Color')
@@ -5735,74 +5831,191 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                 temp_inp = volume_node.inputs.get('Temperature')
                 volume_temperature = float(temp_inp.default_value) if temp_inp else 1000.0
 
-                # Trace Color/Density input chain for noise texture (heterogeneous volume)
-                # Extract ALL properties: noise scale/detail/roughness/lacunarity,
-                # Bright/Contrast params, Mapping offset
+                # ── Trace volume node chain (Cycles-matching) ──
+                # Walk backward from each Principled Volume input to find
+                # noise/gradient textures and intermediate nodes (Mix, ColorRamp,
+                # BrightContrast, Mapping).  Supports chains on Color and
+                # Emission Strength inputs.
+
+                def _trace_vol_chain(node, info, depth=0):
+                    """Recursively trace volume node chain."""
+                    if depth > 10 or node is None:
+                        return
+                    if node.type in ('TEX_NOISE', 'TEX_MUSGRAVE'):
+                        info['noise_node'] = node
+                        _vi = node.inputs.get('Vector')
+                        if _vi and _vi.is_linked:
+                            _trace_vol_chain(_vi.links[0].from_node, info, depth + 1)
+                    elif node.type == 'TEX_GRADIENT':
+                        info['gradient_node'] = node
+                        _vi = node.inputs.get('Vector')
+                        if _vi and _vi.is_linked:
+                            _trace_vol_chain(_vi.links[0].from_node, info, depth + 1)
+                    elif node.type == 'MIX':
+                        info['mix_node'] = node
+                        for inp in node.inputs:
+                            if inp.is_linked:
+                                _trace_vol_chain(inp.links[0].from_node, info, depth + 1)
+                    elif node.type == 'VALTORGB':
+                        info['ramp_node'] = node
+                        _fi = node.inputs[0]  # Fac input
+                        if _fi and _fi.is_linked:
+                            _trace_vol_chain(_fi.links[0].from_node, info, depth + 1)
+                    elif node.type == 'BRIGHTCONTRAST':
+                        info['bc_node'] = node
+                        _ci = node.inputs.get('Color')
+                        if _ci and _ci.is_linked:
+                            _trace_vol_chain(_ci.links[0].from_node, info, depth + 1)
+                    elif node.type == 'MAPPING':
+                        info['mapping_node'] = node
+                        _vi = node.inputs.get('Vector')
+                        if _vi and _vi.is_linked:
+                            _from = _vi.links[0].from_node
+                            if _from.type == 'TEX_COORD':
+                                info['coord_type'] = _vi.links[0].from_socket.name
+                            else:
+                                _trace_vol_chain(_from, info, depth + 1)
+                    elif node.type == 'TEX_COORD':
+                        pass  # handled via mapping
+                    else:
+                        # Unknown node — try following first linked input
+                        for inp in node.inputs:
+                            if inp.is_linked:
+                                _trace_vol_chain(inp.links[0].from_node, info, depth + 1)
+                                break
+
+                # Try Color input first, then Emission Strength
+                _chain_info = {}
+                _chain_target = 0  # 0=color, 1=emission_strength
                 _vol_color_inp = color_inp
                 if _vol_color_inp and _vol_color_inp.is_linked:
-                    _trace = _vol_color_inp.links[0].from_node
-                    for _vd in range(8):
-                        if _trace.type in ('TEX_NOISE', 'TEX_MUSGRAVE'):
-                            flags |= 16  # MAT_FLAG_VOLUME_HETERO
-                            _s = _trace.inputs.get('Scale')
-                            if _s: volume_noise_scale = float(_s.default_value)
-                            _d = _trace.inputs.get('Detail')
-                            if _d: volume_noise_detail = float(_d.default_value)
-                            _r = _trace.inputs.get('Roughness')
-                            if _r: volume_noise_roughness = float(_r.default_value)
-                            _l = _trace.inputs.get('Lacunarity')
-                            if _l: volume_noise_lacunarity = float(_l.default_value)
-                            # Musgrave/Noise type, offset, gain, normalize
-                            _noise_type_map = {
-                                'MULTIFRACTAL': 0, 'FBM': 1,
-                                'HYBRID_MULTIFRACTAL': 2, 'RIDGED_MULTIFRACTAL': 3,
-                                'HETERO_TERRAIN': 4,
-                            }
-                            _nt = getattr(_trace, 'noise_type', 'FBM')
-                            volume_noise_type = _noise_type_map.get(_nt, 1)
-                            volume_noise_normalize = 1 if getattr(_trace, 'normalize', True) else 0
-                            _off = _trace.inputs.get('Offset')
-                            if _off: volume_noise_offset = float(_off.default_value)
-                            _ga = _trace.inputs.get('Gain')
-                            if _ga: volume_noise_gain = float(_ga.default_value)
-                            # Follow Vector input for Mapping node
-                            _vi = _trace.inputs.get('Vector')
-                            if _vi and _vi.is_linked:
-                                _map_node = _vi.links[0].from_node
-                                if _map_node.type == 'MAPPING':
-                                    _loc = _map_node.inputs.get('Location')
-                                    if _loc:
-                                        volume_mapping_offset = (float(_loc.default_value[0]),
-                                                                 float(_loc.default_value[1]),
-                                                                 float(_loc.default_value[2]))
-                            break
-                        elif _trace.type == 'BRIGHTCONTRAST':
-                            _b = _trace.inputs.get('Brightness')
-                            if _b: volume_noise_brightness = float(_b.default_value)
-                            _c = _trace.inputs.get('Contrast')
-                            if _c: volume_noise_contrast = float(_c.default_value)
-                            _ci = _trace.inputs.get('Color')
-                            if _ci and _ci.is_linked:
-                                _trace = _ci.links[0].from_node
-                            else: break
-                        elif _trace.type == 'MAPPING':
-                            _loc = _trace.inputs.get('Location')
-                            if _loc:
-                                volume_mapping_offset = (float(_loc.default_value[0]),
-                                                         float(_loc.default_value[1]),
-                                                         float(_loc.default_value[2]))
-                            _vi = _trace.inputs.get('Vector')
-                            if _vi and _vi.is_linked:
-                                _trace = _vi.links[0].from_node
-                            else: break
-                        else:
-                            _found = False
-                            for _inp in _trace.inputs:
-                                if _inp.is_linked:
-                                    _trace = _inp.links[0].from_node
-                                    _found = True
-                                    break
-                            if not _found: break
+                    _trace_vol_chain(_vol_color_inp.links[0].from_node, _chain_info)
+                if 'noise_node' not in _chain_info:
+                    _em_inp = volume_node.inputs.get('Emission Strength')
+                    if _em_inp and _em_inp.is_linked:
+                        _chain_info = {}
+                        _chain_target = 1
+                        _trace_vol_chain(_em_inp.links[0].from_node, _chain_info)
+
+                volume_ext = None
+                if 'noise_node' in _chain_info:
+                    flags |= 16  # MAT_FLAG_VOLUME_HETERO
+                    _nn = _chain_info['noise_node']
+
+                    # ── Extract noise params ──
+                    _s = _nn.inputs.get('Scale')
+                    if _s: volume_noise_scale = float(_s.default_value)
+                    _d = _nn.inputs.get('Detail')
+                    if _d: volume_noise_detail = float(_d.default_value)
+                    _r = _nn.inputs.get('Roughness')
+                    if _r: volume_noise_roughness = float(_r.default_value)
+                    _l = _nn.inputs.get('Lacunarity')
+                    if _l: volume_noise_lacunarity = float(_l.default_value)
+                    _noise_type_map = {
+                        'MULTIFRACTAL': 0, 'FBM': 1,
+                        'HYBRID_MULTIFRACTAL': 2, 'RIDGED_MULTIFRACTAL': 3,
+                        'HETERO_TERRAIN': 4,
+                    }
+                    _nt = getattr(_nn, 'noise_type', 'FBM')
+                    volume_noise_type = _noise_type_map.get(_nt, 1)
+                    volume_noise_normalize = 1 if getattr(_nn, 'normalize', True) else 0
+                    _off = _nn.inputs.get('Offset')
+                    if _off: volume_noise_offset = float(_off.default_value)
+                    _ga = _nn.inputs.get('Gain')
+                    if _ga: volume_noise_gain = float(_ga.default_value)
+                    # Distortion (Cycles: kernel/svm/tex_noise.h)
+                    _dist_inp = _nn.inputs.get('Distortion')
+                    noise_distortion = float(_dist_inp.default_value) if _dist_inp else 0.0
+                    # Dimensions and W (4D noise support)
+                    _dims_str = getattr(_nn, 'noise_dimensions', '3D')
+                    noise_dimensions = 4 if _dims_str == '4D' else 3
+                    _w_inp = _nn.inputs.get('W')
+                    noise_w = float(_w_inp.default_value) if _w_inp else 0.0
+
+                    # ── BrightContrast ──
+                    if 'bc_node' in _chain_info:
+                        _bc = _chain_info['bc_node']
+                        _b = _bc.inputs.get('Brightness')
+                        if _b: volume_noise_brightness = float(_b.default_value)
+                        _c = _bc.inputs.get('Contrast')
+                        if _c: volume_noise_contrast = float(_c.default_value)
+
+                    # ── Mapping (full matrix — Cycles: kernel/svm/mapping.h) ──
+                    mapping_matrix = [1,0,0,0, 0,1,0,0, 0,0,1,0]  # identity
+                    if 'mapping_node' in _chain_info:
+                        _mn = _chain_info['mapping_node']
+                        _loc_i = _mn.inputs.get('Location')
+                        _rot_i = _mn.inputs.get('Rotation')
+                        _scl_i = _mn.inputs.get('Scale')
+                        _loc = [float(v) for v in _loc_i.default_value] if _loc_i else [0,0,0]
+                        _rot = [float(v) for v in _rot_i.default_value] if _rot_i else [0,0,0]
+                        _scl = [float(v) for v in _scl_i.default_value] if _scl_i else [1,1,1]
+                        volume_mapping_offset = tuple(_loc)
+                        # Build R * diag(S) matrix (Cycles Point mode)
+                        from mathutils import Euler, Matrix, Vector
+                        R = Euler(_rot, 'XYZ').to_matrix()
+                        S = Matrix.Diagonal(Vector(_scl)).to_3x3()
+                        M = R @ S
+                        mapping_matrix = [
+                            M[0][0], M[0][1], M[0][2], _loc[0],
+                            M[1][0], M[1][1], M[1][2], _loc[1],
+                            M[2][0], M[2][1], M[2][2], _loc[2],
+                        ]
+
+                    # ── Gradient Texture ──
+                    _gradient_type_map = {
+                        'LINEAR': 0, 'QUADRATIC': 1, 'EASING': 2,
+                        'DIAGONAL': 3, 'SPHERICAL': 4,
+                        'QUADRATIC_SPHERE': 5, 'RADIAL': 6,
+                    }
+                    gradient_type = 0
+                    if 'gradient_node' in _chain_info:
+                        _gn = _chain_info['gradient_node']
+                        _gt = getattr(_gn, 'gradient_type', 'LINEAR')
+                        gradient_type = _gradient_type_map.get(_gt, 0)
+
+                    # ── Mix node ──
+                    mix_factor = 0.5
+                    if 'mix_node' in _chain_info:
+                        _mx = _chain_info['mix_node']
+                        _mf = _mx.inputs[0]  # Factor is always first input
+                        mix_factor = float(_mf.default_value) if _mf else 0.5
+
+                    # ── ColorRamp (precompute 16-entry LUT — Cycles: color_ramp.evaluate) ──
+                    ramp_lut = []
+                    if 'ramp_node' in _chain_info:
+                        _rn = _chain_info['ramp_node']
+                        _cr = _rn.color_ramp
+                        for _ri in range(16):
+                            _t = _ri / 15.0
+                            _c = _cr.evaluate(_t)
+                            # Cycles color→float: linear_rgb_to_gray (Rec.709 luminance)
+                            ramp_lut.append(0.2126 * _c[0] + 0.7152 * _c[1] + 0.0722 * _c[2])
+
+                    # ── Coordinate type ──
+                    coord_type = _chain_info.get('coord_type', 'Generated')
+                    use_object_coords = 1 if coord_type == 'Object' else 0
+
+                    # ── Build volFlags2 ──
+                    vol_flags2 = 0
+                    vol_flags2 |= (1 << 0) if use_object_coords else 0
+                    vol_flags2 |= (1 << 1) if 'gradient_node' in _chain_info else 0
+                    vol_flags2 |= (1 << 2) if 'mix_node' in _chain_info else 0
+                    vol_flags2 |= (1 << 3) if ramp_lut else 0
+                    vol_flags2 |= (_chain_target & 3) << 4
+                    vol_flags2 |= (1 << 6) if noise_distortion != 0.0 else 0
+                    vol_flags2 |= (1 << 7)  # has full mapping matrix
+
+                    volume_ext = {
+                        'mapping_matrix': mapping_matrix,
+                        'distortion': noise_distortion,
+                        'gradient_type': gradient_type,
+                        'mix_factor': mix_factor,
+                        'ramp_lut': ramp_lut,
+                        'vol_flags2': vol_flags2,
+                        'noise_dimensions': noise_dimensions,
+                        'noise_w': noise_w,
+                    }
 
             # ALWAYS resolve from Material Output first (correct shader chain)
             principled_node = None
@@ -5813,7 +6026,8 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
             # Volume-only: Surface input empty but Volume input connected
             if surface_node is None and (flags & 4) != 0:
                 flags |= 8  # MAT_FLAG_VOLUME_ONLY
-                # Get bounding box from first object using this material (for Generated coords)
+            # Get bounding box for any material with volume (needed for Generated coords)
+            if (flags & 4) != 0:
                 import bpy as _bpy_vol
                 for _vobj in _bpy_vol.data.objects:
                     if _vobj.type == 'MESH' and mat.name in [s.material.name for s in _vobj.material_slots if s.material]:
@@ -6345,6 +6559,7 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
             volume_noise_normalize=volume_noise_normalize,
             volume_noise_offset=volume_noise_offset,
             volume_noise_gain=volume_noise_gain,
+            volume_ext=volume_ext,
             hair_shift=hair_shift,
             hair_radial_roughness=hair_radial_roughness,
         )

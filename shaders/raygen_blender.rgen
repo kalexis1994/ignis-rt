@@ -857,6 +857,33 @@ PBRHit evaluateShadowMaterial(
     );
 }
 
+// Volume shadow attenuation: Beer-Lambert through a volume mesh
+vec3 evaluateVolumeShadowTransmittance(Material mat, vec3 origin, vec3 dir, float hitT, int hitInstanceId) {
+    float vDens = mat.sunSpecular;
+    if (vDens <= 0.0) return vec3(1.0);
+    vec3 vCol = vec3(mat.ksAmbient, mat.ksDiffuse, mat.ksSpecular);
+    vec3 vAbs = vec3(uintBitsToFloat(mat.nodeVmCode[2].x),
+                     uintBitsToFloat(mat.nodeVmCode[2].y),
+                     uintBitsToFloat(mat.nodeVmCode[2].z));
+    // Find exit distance (back face of same instance)
+    vec3 vEntry = origin + dir * (hitT + 0.001);
+    float vDist = 2.0;
+    rayQueryEXT vExitRQ;
+    rayQueryInitializeEXT(vExitRQ, topLevelAS, gl_RayFlagsNoneEXT, 0xFF, vEntry, 0.0, dir, 100.0);
+    while (rayQueryProceedEXT(vExitRQ)) {
+        if (rayQueryGetIntersectionTypeEXT(vExitRQ, false) == gl_RayQueryCandidateIntersectionTriangleEXT
+            && !rayQueryGetIntersectionFrontFaceEXT(vExitRQ, false)
+            && rayQueryGetIntersectionInstanceIdEXT(vExitRQ, false) == hitInstanceId)
+            rayQueryConfirmIntersectionEXT(vExitRQ);
+    }
+    if (rayQueryGetIntersectionTypeEXT(vExitRQ, true) != gl_RayQueryCommittedIntersectionNoneEXT)
+        vDist = rayQueryGetIntersectionTEXT(vExitRQ, true);
+    vec3 sigma_s = vCol * vDens;
+    vec3 sigma_a = max(vec3(1.0) - vCol, vec3(0.0))
+                 * max(vec3(1.0) - sqrt(max(vAbs, vec3(0.0))), vec3(0.0)) * vDens;
+    return exp(-(sigma_s + sigma_a) * vDist);
+}
+
 vec3 evaluateShadowMaterialTransmittance(
     Material mat, uint matIdx,
     GeometryMetadata geo, int primId,
@@ -868,7 +895,7 @@ vec3 evaluateShadowMaterialTransmittance(
     }
 
     if ((mat.flags & 4u) != 0u) {
-        return vec3(1.0); // Volumes remain non-blocking in shadow queries.
+        return vec3(1.0); // Volume shadow handled by caller with exit query
     }
 
     uint vmHeaderFlags = (mat.nodeVmHeader >> 8u) & 0xFFu;
@@ -1729,23 +1756,29 @@ void main() {
                 continue;
             }
 
-            // Find exit distance — trace from entry to back face of volume mesh
+            // Find exit distance — trace for back face of SAME INSTANCE only
+            // Uses instanceId (not customIndex/BLAS) to correctly identify the instance
             vec3 entryPos = worldPos + rayDir * 0.0005;
             float marchDist = 0.0;
-            vec3 probeOrigin = entryPos;
-            for (int attempt = 0; attempt < 4; attempt++) {
+            {
+                int volInstanceId = instanceId;  // captured from main hit
                 rayQueryEXT exitRQ;
-                rayQueryInitializeEXT(exitRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
-                                      0xFF, probeOrigin, 0.0, rayDir, 100000.0);
-                while (rayQueryProceedEXT(exitRQ)) {}
-                if (rayQueryGetIntersectionTypeEXT(exitRQ, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
-                    marchDist += 10.0;
-                    break;
+                rayQueryInitializeEXT(exitRQ, topLevelAS, gl_RayFlagsNoneEXT,
+                                      0xFF, entryPos, 0.0, rayDir, 100000.0);
+                while (rayQueryProceedEXT(exitRQ)) {
+                    if (rayQueryGetIntersectionTypeEXT(exitRQ, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                        int hitInstId = rayQueryGetIntersectionInstanceIdEXT(exitRQ, false);
+                        bool isFront = rayQueryGetIntersectionFrontFaceEXT(exitRQ, false);
+                        if (!isFront && hitInstId == volInstanceId) {
+                            rayQueryConfirmIntersectionEXT(exitRQ);
+                        }
+                    }
                 }
-                float t = rayQueryGetIntersectionTEXT(exitRQ, true);
-                marchDist += t + 0.001;
-                if (t > 0.01) break;  // found real back face
-                probeOrigin += rayDir * (t + 0.001);
+                if (rayQueryGetIntersectionTypeEXT(exitRQ, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+                    marchDist = rayQueryGetIntersectionTEXT(exitRQ, true);
+                } else {
+                    marchDist = 10.0;
+                }
             }
             marchDist = max(marchDist, 0.005);
 
@@ -1761,12 +1794,16 @@ void main() {
                                       uintBitsToFloat(mat.nodeVmCode[1].z));
             if (noiseRoughness <= 0.0) noiseRoughness = 0.5;
             if (noiseLacunarity <= 0.0) noiseLacunarity = 2.0;
+            noiseDetail = min(noiseDetail, 15.0);  // Cycles clamps detail to 15
             // Musgrave noise type + params from nodeVmCode[4].yzw
             uint noiseTypePacked = mat.nodeVmCode[4].y;
             int noiseType = int(noiseTypePacked & 0xFFFFu);
             bool noiseNormalize = (noiseTypePacked >> 16u) != 0u;
             float noiseOffset = uintBitsToFloat(mat.nodeVmCode[4].z);
             float noiseGain = uintBitsToFloat(mat.nodeVmCode[4].w);
+            // Noise dimensions (3 or 4) and W value
+            uint noiseDimensions = mat.nodeVmCode[0].w;
+            float noiseW = uintBitsToFloat(mat.nodeVmCode[1].w);
 
             // ── Homogeneous fast path: analytic solution (no stepping) ──
             if (!isHetero) {
@@ -1792,25 +1829,23 @@ void main() {
                 // Inscatter = sigma_s * L_in * (1 - T) / sigma_t
                 vec3 inscatter = sigma_s * L_in * (vec3(1.0) - T) / max(sigma_t, vec3(0.0001));
 
-                // Volume emission
+                // Volume emission (Cycles: emission enters direct, NOT multiplied by density)
                 vec3 volEmission = vec3(0.0);
                 if (emissionStrength > 0.0) {
-                    volEmission = emissionColor * emissionStrength * volumeDensity;
+                    volEmission = emissionColor * emissionStrength;
                     volEmission *= (vec3(1.0) - T) / max(sigma_t, vec3(0.0001));
                 }
                 // Blackbody emission
                 if (blackbodyIntensity > 0.0 && temperature > 0.0) {
-                    // Simplified Planck: Stefan-Boltzmann scaled by temperature color
                     float bbPower = blackbodyIntensity * 5.67e-8 * temperature * temperature * temperature * temperature * 1e-12;
-                    // Approximate blackbody color (simple red-orange-white ramp)
                     vec3 bbColor = vec3(1.0, clamp((temperature - 1000.0) / 5000.0, 0.0, 1.0),
                                          clamp((temperature - 3000.0) / 7000.0, 0.0, 1.0));
-                    volEmission += bbColor * bbPower * volumeDensity * (vec3(1.0) - T) / max(sigma_t, vec3(0.0001));
+                    volEmission += bbColor * bbPower * (vec3(1.0) - T) / max(sigma_t, vec3(0.0001));
                 }
 
                 diffuseRadiance += (inscatter + volEmission) * throughput;
                 throughput *= T;
-                rayOrigin = entryPos + rayDir * marchDist;
+                rayOrigin = entryPos + rayDir * (marchDist + 0.002);  // push past back face
                 if (bounce == 0) isDiffusePath = true;
                 bounce--;
                 continue;
@@ -1825,34 +1860,127 @@ void main() {
             vec3 inscatter = vec3(0.0);
             vec3 volEmission = vec3(0.0);
 
+            // Extended volume chain (nodeVmCode[7..14])
+            uint volFlags2 = mat.nodeVmCode[10].w;
+            bool hasFullMatrix    = (volFlags2 & (1u << 7)) != 0u;
+            bool useObjectCoords  = (volFlags2 & (1u << 0)) != 0u;
+            bool hasGradient      = (volFlags2 & (1u << 1)) != 0u;
+            bool hasMix           = (volFlags2 & (1u << 2)) != 0u;
+            bool hasRamp          = (volFlags2 & (1u << 3)) != 0u;
+            uint chainTarget      = (volFlags2 >> 4) & 3u;  // 0=color, 1=emission_str
+            bool hasDistortion    = (volFlags2 & (1u << 6)) != 0u;
+
+            // Mapping matrix rows (Cycles Point mode: R*diag(S)*p + T)
+            vec4 mapRow0 = vec4(uintBitsToFloat(mat.nodeVmCode[7].x), uintBitsToFloat(mat.nodeVmCode[7].y),
+                                uintBitsToFloat(mat.nodeVmCode[7].z), uintBitsToFloat(mat.nodeVmCode[7].w));
+            vec4 mapRow1 = vec4(uintBitsToFloat(mat.nodeVmCode[8].x), uintBitsToFloat(mat.nodeVmCode[8].y),
+                                uintBitsToFloat(mat.nodeVmCode[8].z), uintBitsToFloat(mat.nodeVmCode[8].w));
+            vec4 mapRow2 = vec4(uintBitsToFloat(mat.nodeVmCode[9].x), uintBitsToFloat(mat.nodeVmCode[9].y),
+                                uintBitsToFloat(mat.nodeVmCode[9].z), uintBitsToFloat(mat.nodeVmCode[9].w));
+
+            float noiseDistortion = uintBitsToFloat(mat.nodeVmCode[10].x);
+            int gradientType      = int(mat.nodeVmCode[10].y);
+            float mixFactor       = uintBitsToFloat(mat.nodeVmCode[10].z);
+
+            // Color ramp LUT (16 entries)
+            vec4 rampLut0 = vec4(uintBitsToFloat(mat.nodeVmCode[11].x), uintBitsToFloat(mat.nodeVmCode[11].y),
+                                 uintBitsToFloat(mat.nodeVmCode[11].z), uintBitsToFloat(mat.nodeVmCode[11].w));
+            vec4 rampLut1 = vec4(uintBitsToFloat(mat.nodeVmCode[12].x), uintBitsToFloat(mat.nodeVmCode[12].y),
+                                 uintBitsToFloat(mat.nodeVmCode[12].z), uintBitsToFloat(mat.nodeVmCode[12].w));
+            vec4 rampLut2 = vec4(uintBitsToFloat(mat.nodeVmCode[13].x), uintBitsToFloat(mat.nodeVmCode[13].y),
+                                 uintBitsToFloat(mat.nodeVmCode[13].z), uintBitsToFloat(mat.nodeVmCode[13].w));
+            vec4 rampLut3 = vec4(uintBitsToFloat(mat.nodeVmCode[14].x), uintBitsToFloat(mat.nodeVmCode[14].y),
+                                 uintBitsToFloat(mat.nodeVmCode[14].z), uintBitsToFloat(mat.nodeVmCode[14].w));
+
             for (int step = 0; step < numSteps; step++) {
                 float t = (float(step) + 0.5) * stepSize;
                 vec3 samplePos = entryPos + rayDir * t;
 
-                // Evaluate scatter color via noise in OBJECT SPACE (Generated coordinates)
-                // Cycles uses Texture Coordinate → Generated which is [0,1] in object local space
+                // ── Evaluate noise chain (Cycles-matching) ──
                 vec3 localScatterColor = volumeColor;
+                float localEmissionStr = emissionStrength;
+
                 if (noiseScale > 0.0) {
-                    // Cycles Generated coords: object space → normalized by bounding box
-                    // volume_normalized_position(P) = (P_object - bbox_min) / (bbox_max - bbox_min)
+                    // Base coordinate (Object or Generated)
                     vec3 objPos = (worldToObj * vec4(samplePos, 1.0));
-                    vec3 generatedCoord = (objPos - volBboxMin) / volBboxRange;
-                    // Apply Mapping node (Location offset) then noise Scale
-                    vec3 noisePos = (generatedCoord + mappingOffset) * noiseScale;
-                    float n = noiseSelect3D(noisePos, noiseDetail, noiseRoughness, noiseLacunarity,
-                                            noiseOffset, noiseGain, noiseType, noiseNormalize);
+                    vec3 baseCoord;
+                    if (useObjectCoords) {
+                        baseCoord = objPos;
+                    } else {
+                        baseCoord = (objPos - volBboxMin) / volBboxRange;
+                    }
+
+                    // Mapping transform (Cycles: kernel/svm/mapping.h, Point mode)
+                    vec3 mappedCoord;
+                    if (hasFullMatrix) {
+                        mappedCoord = vec3(
+                            dot(mapRow0.xyz, baseCoord) + mapRow0.w,
+                            dot(mapRow1.xyz, baseCoord) + mapRow1.w,
+                            dot(mapRow2.xyz, baseCoord) + mapRow2.w
+                        );
+                    } else {
+                        mappedCoord = baseCoord + mappingOffset;
+                    }
+
+                    // Noise evaluation with Distortion (Cycles: kernel/svm/tex_noise.h)
+                    float n;
+                    if (noiseDimensions == 4u) {
+                        // 4D: Cycles multiplies ALL components by scale, including W
+                        vec4 noisePos4 = vec4(mappedCoord, noiseW) * noiseScale;
+                        if (hasDistortion && noiseDistortion != 0.0) {
+                            // Cycles uses snoise (signed [-1,1]) for distortion, W-axis offsets
+                            vec4 distR;
+                            distR.x = perlinNoise4D(noisePos4 + vec4(0,0,0,200)) * noiseDistortion;
+                            distR.y = perlinNoise4D(noisePos4 + vec4(0,0,0,100)) * noiseDistortion;
+                            distR.z = perlinNoise4D(noisePos4)                   * noiseDistortion;
+                            distR.w = perlinNoise4D(noisePos4 + vec4(0,0,0,150)) * noiseDistortion;
+                            noisePos4 += distR;
+                        }
+                        n = noise_fbm_4d(noisePos4, noiseDetail, noiseRoughness, noiseLacunarity, noiseNormalize);
+                    } else {
+                        // 3D noise (default)
+                        vec3 noisePos = mappedCoord * noiseScale;
+                        if (hasDistortion && noiseDistortion != 0.0) {
+                            // Cycles uses snoise (signed [-1,1]) for distortion
+                            vec3 distR;
+                            distR.x = perlinNoise3D(noisePos + vec3(13.5)) * noiseDistortion;
+                            distR.y = perlinNoise3D(noisePos)              * noiseDistortion;
+                            distR.z = perlinNoise3D(noisePos - vec3(13.5)) * noiseDistortion;
+                            noisePos += distR;
+                        }
+                        n = noiseSelect3D(noisePos, noiseDetail, noiseRoughness, noiseLacunarity,
+                                          noiseOffset, noiseGain, noiseType, noiseNormalize);
+                    }
+
                     // BrightContrast (Cycles: a = 1+contrast, b = brightness - 0.5*contrast)
                     float bcA = 1.0 + noiseContrast;
                     float bcB = noiseBrightness - 0.5 * noiseContrast;
-                    n = max(bcA * n + bcB, 0.0);  // no upper clamp — Cycles doesn't clamp to 1
-                    localScatterColor *= n;
+                    n = max(bcA * n + bcB, 0.0);
+
+                    // Gradient texture (Cycles: kernel/svm/gradient.h)
+                    float chainValue = n;
+                    if (hasMix && hasGradient) {
+                        float grad = gradientSelect(mappedCoord, gradientType);
+                        // Mix node (Cycles: linear blend)
+                        chainValue = mix(n, grad, mixFactor);
+                    } else if (hasGradient) {
+                        chainValue = gradientSelect(mappedCoord, gradientType);
+                    }
+
+                    // ColorRamp (precomputed 16-entry LUT)
+                    if (hasRamp) {
+                        chainValue = sampleColorRamp16(chainValue, rampLut0, rampLut1, rampLut2, rampLut3);
+                    }
+
+                    // Route result to target
+                    if (chainTarget == 0u) {
+                        localScatterColor *= chainValue;
+                    } else if (chainTarget == 1u) {
+                        localEmissionStr = chainValue;
+                    }
                 }
 
-                // Volume coefficients (Cycles Principled Volume — node_principled_volume.osl:39):
-                // sigma_s = scatter_color * density
-                // sigma_a = max(1 - scatter_color, 0) * max(1 - sqrt(absorption_color), 0) * density
-                // With AbsorptionColor=black: sigma_a = (1 - scatter_color) * density
-                // sigma_t = sigma_s + sigma_a = density (CONSTANT — noise only changes albedo)
+                // Volume coefficients (Cycles Principled Volume)
                 vec3 sigma_s = localScatterColor * volumeDensity;
                 vec3 sigma_a = max(vec3(1.0) - localScatterColor, vec3(0.0))
                              * max(vec3(1.0) - sqrt(max(absorptionColor, vec3(0.0))), vec3(0.0))
@@ -1860,9 +1988,7 @@ void main() {
                 vec3 sigma_t = sigma_s + sigma_a;
                 if (max(sigma_t.r, max(sigma_t.g, sigma_t.b)) < 0.0001) continue;
 
-                // In-scattering (Cycles approach: throughput accumulation IS the self-shadow)
-                // The progressive transmittance attenuation naturally darkens deeper regions.
-                // Direct light sampling happens per-step without extra shadow march.
+                // In-scattering
                 vec3 L_in = vec3(0.0);
 
                 // Sun
@@ -1894,15 +2020,15 @@ void main() {
 
                 inscatter += volTransmittance * sigma_s * L_in * stepSize;
 
-                // Volume emission per step (uses base density, not noise-modulated)
-                if (emissionStrength > 0.0) {
-                    volEmission += volTransmittance * emissionColor * emissionStrength * volumeDensity * stepSize;
+                // Volume emission per step (Cycles: no density multiply on emission)
+                if (localEmissionStr > 0.0) {
+                    volEmission += volTransmittance * emissionColor * localEmissionStr * stepSize;
                 }
                 if (blackbodyIntensity > 0.0 && temperature > 0.0) {
                     float bbPower = blackbodyIntensity * 5.67e-8 * temperature * temperature * temperature * temperature * 1e-12;
                     vec3 bbColor = vec3(1.0, clamp((temperature - 1000.0) / 5000.0, 0.0, 1.0),
                                          clamp((temperature - 3000.0) / 7000.0, 0.0, 1.0));
-                    volEmission += volTransmittance * bbColor * bbPower * volumeDensity * stepSize;
+                    volEmission += volTransmittance * bbColor * bbPower * stepSize;
                 }
 
                 // Beer-Lambert
@@ -1912,7 +2038,7 @@ void main() {
 
             diffuseRadiance += (inscatter + volEmission) * throughput;
             throughput *= volTransmittance;
-            rayOrigin = entryPos + rayDir * marchDist;
+            rayOrigin = entryPos + rayDir * (marchDist + 0.002);  // push past back face
             if (bounce == 0) isDiffusePath = true;
             bounce--;
             continue;
@@ -1959,6 +2085,70 @@ void main() {
         // other objects, etc.). Each subsequent alpha surface gets tested again.
         if ((mat.flags & 1u) != 0u && pbrHit.alpha < 0.999) {
             if (rand01() > pbrHit.alpha) {
+                // Surface+Volume: if alpha rejects AND material has volume, do volume march
+                bool hasSurfaceVolume = (mat.flags & 4u) != 0u && (mat.flags & 8u) == 0u;
+                if (hasSurfaceVolume) {
+                    float svDensity = mat.sunSpecular;
+                    vec3 svColor = pbrHit.baseColor;
+                    vec3 svAbsColor = vec3(uintBitsToFloat(mat.nodeVmCode[2].x),
+                                           uintBitsToFloat(mat.nodeVmCode[2].y),
+                                           uintBitsToFloat(mat.nodeVmCode[2].z));
+                    float svEmStr = uintBitsToFloat(mat.nodeVmCode[2].w);
+                    vec3 svEmCol = vec3(uintBitsToFloat(mat.nodeVmCode[3].x),
+                                        uintBitsToFloat(mat.nodeVmCode[3].y),
+                                        uintBitsToFloat(mat.nodeVmCode[3].z));
+
+                    // Find exit: trace for back face of SAME INSTANCE
+                    vec3 svEntry = worldPos + rayDir * 0.001;
+                    float svDist = 10.0;
+                    {
+                        int svInstId = instanceId;
+                        rayQueryEXT svExitRQ;
+                        rayQueryInitializeEXT(svExitRQ, topLevelAS, gl_RayFlagsNoneEXT,
+                                              0xFF, svEntry, 0.0, rayDir, 100000.0);
+                        while (rayQueryProceedEXT(svExitRQ)) {
+                            if (rayQueryGetIntersectionTypeEXT(svExitRQ, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                                int hitInstId = rayQueryGetIntersectionInstanceIdEXT(svExitRQ, false);
+                                bool isFront = rayQueryGetIntersectionFrontFaceEXT(svExitRQ, false);
+                                if (!isFront && hitInstId == svInstId) {
+                                    rayQueryConfirmIntersectionEXT(svExitRQ);
+                                }
+                            }
+                        }
+                        if (rayQueryGetIntersectionTypeEXT(svExitRQ, true) != gl_RayQueryCommittedIntersectionNoneEXT)
+                            svDist = rayQueryGetIntersectionTEXT(svExitRQ, true);
+                    }
+                    svDist = max(svDist, 0.01);
+
+                    // Beer-Lambert with blended coefficients (homogeneous)
+                    vec3 sv_sigma_s = svColor * svDensity;
+                    vec3 sv_sigma_a = max(vec3(1.0) - svColor, vec3(0.0))
+                                   * max(vec3(1.0) - sqrt(max(svAbsColor, vec3(0.0))), vec3(0.0))
+                                   * svDensity;
+                    vec3 sv_sigma_t = sv_sigma_s + sv_sigma_a;
+                    vec3 svT = exp(-sv_sigma_t * svDist);
+
+                    // In-scattering + emission (analytic)
+                    vec3 svInscatter = vec3(0.0);
+                    vec3 svL_in = vec3(0.0);
+                    if (sunIntensity > 0.0)
+                        svL_in += sunColor * sunIntensity * INV_PI * 0.5;
+                    svL_in += evaluateSky(rayDir) * 0.25 * INV_PI;
+                    svInscatter = sv_sigma_s * svL_in * (vec3(1.0) - svT) / max(sv_sigma_t, vec3(0.0001));
+
+                    vec3 svEmission = vec3(0.0);
+                    if (svEmStr > 0.0) {
+                        svEmission = svEmCol * svEmStr * (vec3(1.0) - svT) / max(sv_sigma_t, vec3(0.0001));
+                    }
+
+                    diffuseRadiance += (svInscatter + svEmission) * throughput;
+                    throughput *= svT;
+                    rayOrigin = svEntry + rayDir * (svDist + 0.002);  // push past back face
+                    if (bounce == 0) isDiffusePath = true;
+                    bounce--;
+                    continue;
+                }
+
                 rayOrigin = worldPos + rayDir * 0.002;
                 bounce--;
                 continue;
@@ -2324,9 +2514,12 @@ void main() {
                     }
                     Material sMat = materialBuffer.materials[sMatIdx];
 
-                    // Glass/volume: let shadow ray pass through (real-time approximation —
-                    // without caustic tracing, blocking at glass creates incorrect darkness)
+                    // Glass/volume: pass through with attenuation
                     if ((sMat.flags & 6u) != 0u) {
+                        if ((sMat.flags & 4u) != 0u && rayQueryGetIntersectionFrontFaceEXT(shadowRQ, true)) {
+                            shadowFilter *= evaluateVolumeShadowTransmittance(sMat, shadowOrigin, shadowDir, sHitT,
+                                rayQueryGetIntersectionInstanceIdEXT(shadowRQ, true));
+                        }
                         shadowOrigin += shadowDir * (sHitT + 0.004);
                         continue;
                     }
@@ -2655,6 +2848,10 @@ void main() {
                     Material fMat = materialBuffer.materials[fMatIdx];
 
                     if ((fMat.flags & 6u) != 0u) {
+                        if ((fMat.flags & 4u) != 0u && rayQueryGetIntersectionFrontFaceEXT(fShadowRQ, true)) {
+                            fShadowFilter *= evaluateVolumeShadowTransmittance(fMat, fShadowOrigin, fL, fHitT,
+                                rayQueryGetIntersectionInstanceIdEXT(fShadowRQ, true));
+                        }
                         fShadowOrigin += fL * (fHitT + 0.004);
                         continue;
                     }
@@ -2887,6 +3084,10 @@ void main() {
                 Material ptsMat = materialBuffer.materials[ptsMatIdx];
 
                 if ((ptsMat.flags & 6u) != 0u) {
+                    if ((ptsMat.flags & 4u) != 0u && rayQueryGetIntersectionFrontFaceEXT(shadowRQ, true)) {
+                        shadowFilter *= evaluateVolumeShadowTransmittance(ptsMat, ptShadowOrigin, shadowDir, ptsHitT,
+                            rayQueryGetIntersectionInstanceIdEXT(shadowRQ, true));
+                    }
                     ptShadowOrigin = ptShadowOrigin + shadowDir * (ptsHitT + 0.004);
                     continue;
                 }
@@ -3009,6 +3210,10 @@ void main() {
                         Material eMat = materialBuffer.materials[eMatIdx];
 
                         if ((eMat.flags & 6u) != 0u) {
+                            if ((eMat.flags & 4u) != 0u && rayQueryGetIntersectionFrontFaceEXT(eShadowRQ, true)) {
+                                eShadowFilter *= evaluateVolumeShadowTransmittance(eMat, eShadowOrigin, eDir, eHitT,
+                                    rayQueryGetIntersectionInstanceIdEXT(eShadowRQ, true));
+                            }
                             eShadowOrigin = eShadowOrigin + eDir * (eHitT + 0.004);
                             continue;
                         }
