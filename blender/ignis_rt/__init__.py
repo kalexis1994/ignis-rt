@@ -246,6 +246,11 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         description="Display GPU timing breakdown (RT, PostProcess, Total)",
         default=False, update=_tag_redraw,
     )
+    external_window: BoolProperty(
+        name="External Window",
+        description="Open a standalone Vulkan viewer window (bypasses Blender viewport)",
+        default=False,
+    )
 
 
 class IGNIS_OT_set_fps_position(bpy.types.Operator):
@@ -258,6 +263,65 @@ class IGNIS_OT_set_fps_position(bpy.types.Operator):
     def execute(self, context):
         context.scene.ignis_rt.fps_position = self.position
         return {'FINISHED'}
+
+
+class IGNIS_OT_external_viewer(bpy.types.Operator):
+    bl_idname = "ignis.external_viewer"
+    bl_label = "Open External Viewer"
+    bl_description = "Open a standalone Vulkan render window (viewport stays in Solid mode)"
+
+    _timer = None
+    _running = False
+
+    def execute(self, context):
+        if IGNIS_OT_external_viewer._running:
+            # Toggle off — stop
+            IGNIS_OT_external_viewer._running = False
+            return {'FINISHED'}
+        IGNIS_OT_external_viewer._running = True
+        from . import engine
+        engine.start_external_viewer(context)
+        # Register timer for camera sync + loading ticks
+        wm = context.window_manager
+        IGNIS_OT_external_viewer._timer = wm.event_timer_add(0.016, window=context.window)
+        wm.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if not IGNIS_OT_external_viewer._running:
+            self._cleanup(context)
+            return {'FINISHED'}
+        if event.type == 'TIMER':
+            from . import engine
+            if not engine.tick_external_viewer(context):
+                IGNIS_OT_external_viewer._running = False
+                self._cleanup(context)
+                return {'FINISHED'}
+        return {'PASS_THROUGH'}
+
+    def _cleanup(self, context):
+        if IGNIS_OT_external_viewer._timer:
+            context.window_manager.event_timer_remove(IGNIS_OT_external_viewer._timer)
+            IGNIS_OT_external_viewer._timer = None
+        from . import engine
+        engine.stop_external_viewer()
+
+    def cancel(self, context):
+        IGNIS_OT_external_viewer._running = False
+        self._cleanup(context)
+
+
+def _draw_external_viewer_button(self, context):
+    """Draw the external viewer button in the 3D viewport header."""
+    if context.engine != 'IGNIS_RT':
+        return
+    _running = IGNIS_OT_external_viewer._running
+    self.layout.operator(
+        "ignis.external_viewer",
+        text="" if _running else "",
+        icon='WINDOW' if not _running else 'CANCEL',
+        depress=_running,
+    )
 
 
 class IGNIS_OT_reload_scene(bpy.types.Operator):
@@ -378,6 +442,13 @@ class IGNIS_PT_performance(bpy.types.Panel):
         layout.prop(props, "fps_limit")
         layout.prop(props, "fps_overlay")
         layout.prop(props, "show_gpu_profiler")
+        layout.separator()
+        _running = IGNIS_OT_external_viewer._running
+        row = layout.row()
+        row.operator("ignis.external_viewer",
+                     text="Close External Viewer" if _running else "Open External Viewer",
+                     icon='WINDOW' if not _running else 'CANCEL',
+                     depress=_running)
 
         # Position grid (3x2) — visual selector
         if props.fps_overlay != 'OFF' or props.show_gpu_profiler:
@@ -472,6 +543,8 @@ def register():
     bpy.utils.register_class(IGNIS_OT_set_fps_position)
     bpy.utils.register_class(IGNIS_OT_reload_scene)
     bpy.utils.register_class(IGNIS_OT_reload_shaders)
+    bpy.utils.register_class(IGNIS_OT_external_viewer)
+    bpy.types.VIEW3D_HT_header.append(_draw_external_viewer_button)
     bpy.utils.register_class(IGNIS_PT_sampling)
     bpy.utils.register_class(IGNIS_PT_dlss)
     bpy.utils.register_class(IGNIS_PT_color)
@@ -541,6 +614,8 @@ def unregister():
     bpy.utils.unregister_class(IGNIS_PT_color)
     bpy.utils.unregister_class(IGNIS_PT_dlss)
     bpy.utils.unregister_class(IGNIS_PT_sampling)
+    bpy.types.VIEW3D_HT_header.remove(_draw_external_viewer_button)
+    bpy.utils.unregister_class(IGNIS_OT_external_viewer)
     bpy.utils.unregister_class(IGNIS_OT_reload_shaders)
     bpy.utils.unregister_class(IGNIS_OT_reload_scene)
     bpy.utils.unregister_class(IGNIS_OT_set_fps_position)

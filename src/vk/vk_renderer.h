@@ -4,8 +4,12 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <thread>
+#include <mutex>
+#include <atomic>
 #include <vulkan/vulkan.h>
 #include "vk_accel_structure.h"
+#include "vk_rt_pipeline.h"
 #include "../../include/dlss_ngx.h"
 
 namespace acpt {
@@ -13,6 +17,7 @@ namespace vk {
 
 class Context;
 class Pipeline;
+class ExternalWindow;
 class Geometry;
 class Rasterizer;
 class RTPipeline;
@@ -128,6 +133,20 @@ public:
     bool UploadLutData(const float* rgbData, uint32_t lutSize);
     void UpdateTonemapDescriptors();
 
+    // External window (standalone Vulkan viewer)
+    bool OpenExternalWindow();
+    void CloseExternalWindow();
+    bool IsExternalWindowActive() const;
+    ExternalWindow* GetExternalWindow() const { return externalWindow_; }
+
+    // Independent render thread (decoupled from Blender's view_draw)
+    void StartRenderThread();
+    void StopRenderThread();
+    bool IsRenderThreadActive() const { return renderThreadRunning_.load(); }
+    void SetPendingCamera(const CameraUBO& cam);
+    // Call from main thread: pump window messages + present last frame
+    void PumpAndPresentExternal();
+
 private:
     bool CreateCommandBuffers();
     bool CreateSyncObjects();
@@ -144,6 +163,15 @@ private:
     WavefrontPipeline* wavefrontPipeline_ = nullptr;
     Interop* interop_ = nullptr;
     class NircIntegration* nirc_ = nullptr;
+    ExternalWindow* externalWindow_ = nullptr;
+
+    // Render thread state
+    std::thread renderThread_;
+    std::atomic<bool> renderThreadRunning_{false};
+    CameraUBO pendingCamera_{};
+    std::mutex pendingCameraMutex_;
+    std::atomic<bool> pendingCameraDirty_{false};
+    void RenderThreadLoop();
     bool rtReady_ = false;
     bool useDirectInterop_ = false;
     int initStep_ = 0;          // phased init progress

@@ -105,6 +105,10 @@ IGNIS_API bool   ignis_load_config(const char* path);
 // Tonemap LUT (in-memory upload, no disk I/O)
 IGNIS_API bool   ignis_upload_lut(const float* rgbData, uint32_t lutSize);
 
+// Independent render thread (decoupled from Blender viewport)
+IGNIS_API void   ignis_start_render_thread(void);
+IGNIS_API void   ignis_stop_render_thread(void);
+
 // Texture management
 IGNIS_API void*  ignis_create_texture_manager(void);
 IGNIS_API void   ignis_destroy_texture_manager(void* mgr);

@@ -62,6 +62,16 @@ def get_frame_times():
     return [s[1] for s in _samples]
 
 
+def get_fps():
+    """Return current smoothed FPS."""
+    return _fps
+
+
+def get_frame_ms():
+    """Return current frame time in ms."""
+    return 1000.0 / max(_fps, 0.001) if _fps > 0 else 0.0
+
+
 def update():
     """Record a frame and recompute stats. Call once per frame."""
     global _prev_time, _fps

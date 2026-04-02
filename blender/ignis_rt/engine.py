@@ -348,6 +348,34 @@ def _bake_view_transform_lut(scene):
     return True
 
 
+def _draw_external_window_placeholder(w, h, status=None):
+    """Draw dark viewport with message when rendering in external window."""
+    import blf
+    gpu.state.blend_set('ALPHA')
+    gpu.state.depth_test_set('NONE')
+    gpu.state.depth_mask_set(False)
+    from gpu_extras.batch import batch_for_shader as _bfs
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    batch = _bfs(shader, 'TRI_FAN', {"pos": ((0, 0), (w, 0), (w, h), (0, h))})
+    shader.bind()
+    shader.uniform_float("color", (0.05, 0.05, 0.05, 1.0))
+    batch.draw(shader)
+    font_id = 0
+    blf.size(font_id, 16)
+    msg = "Rendering in External Window"
+    if status:
+        msg += f"\n{status}"
+    tw, th = blf.dimensions(font_id, msg.split('\n')[0])
+    cy = (h + th) * 0.5
+    for line in msg.split('\n'):
+        lw, lh = blf.dimensions(font_id, line)
+        blf.position(font_id, (w - lw) * 0.5, cy, 0)
+        blf.color(font_id, 0.6, 0.6, 0.6, 1.0)
+        blf.draw(font_id, line)
+        cy -= lh + 6
+    gpu.state.blend_set('NONE')
+
+
 def _draw_texture_flipped(texture, w, h):
     """Draw texture fullscreen with V flipped (Vulkan top-down -> OpenGL bottom-up)."""
     gpu.state.blend_set('NONE')
@@ -463,6 +491,7 @@ _load_stage = LOAD_IDLE
 _load_start_time = 0.0
 _load_status = ""
 _ignis_rendering = False  # guard flag: True while render_frame+draw_gl are in-flight
+_ignis_render_thread_active = False  # True when C++ render thread is driving frames
 _load_progress = 0.0   # 0.0-1.0
 # Cached data between stages
 _load_unique_meshes = None
@@ -480,6 +509,291 @@ MESH_BATCH_SIZE = 4    # meshes per frame during loading
 
 
 from . import loading_screen
+
+# ── External viewer (standalone, no viewport) ──
+_ext_viewer_active = False
+_ext_viewer_load_stage = 0  # reuses LOAD_* constants
+_ext_viewer_depsgraph = None
+
+
+def start_external_viewer(context):
+    """Called by the operator to start the external viewer."""
+    global _ext_viewer_active, _ext_viewer_load_stage, _ignis_initialized
+    global _load_stage, _ignis_render_thread_active
+    _ext_viewer_active = True
+
+    # Ensure DLL is loaded (normally done by RenderEngine, but we skip that)
+    if not dll_wrapper.load():
+        _log("External viewer: failed to load DLL")
+        _ext_viewer_active = False
+        return
+
+    if _ignis_initialized:
+        # Already initialized — just open window + start thread
+        dll_wrapper.set_int("external_window", 1)
+        dll_wrapper.start_render_thread()
+        _ignis_render_thread_active = True
+        _log("External viewer: opened (renderer already active)")
+    else:
+        # Need to initialize — set up loading
+        _load_stage = LOAD_INIT
+        _log("External viewer: starting initialization")
+
+
+def tick_external_viewer(context):
+    """Called every ~16ms by the modal timer. Returns False to stop."""
+    global _ext_viewer_active, _ignis_initialized, _ignis_render_thread_active
+    global _load_stage, _ignis_frame_index
+
+    if not _ext_viewer_active:
+        return False
+
+    # ── Loading phase: tick staged load ──
+    if _load_stage != LOAD_IDLE:
+        try:
+            depsgraph = context.evaluated_depsgraph_get()
+            # Reuse the existing staged loading infrastructure
+            # We need a temporary engine-like object to call _tick_staged_load
+            _tick_external_load_stage(depsgraph, context)
+        except Exception:
+            _log_exception("tick_external_viewer -> load")
+            _load_stage = LOAD_IDLE
+        return True
+
+    # ── Rendering phase: sync camera from viewport ──
+    if _ignis_initialized and not _ignis_render_thread_active:
+        # First frame after loading — open window + start thread
+        dll_wrapper.set_int("external_window", 1)
+        dll_wrapper.start_render_thread()
+        _ignis_render_thread_active = True
+        _log("External viewer: render thread started")
+        return True
+
+    if _ignis_render_thread_active:
+        # Sync camera from active 3D viewport
+        _sync_camera_from_viewport(context)
+        # Pump window messages
+        dll_wrapper.set_int("pump_external", 1)
+        # Check if window was closed
+        if not dll_wrapper.get_int("ext_window_active"):
+            _ext_viewer_active = False
+            return False
+
+    return True
+
+
+def stop_external_viewer():
+    """Called when the operator is cancelled/stopped."""
+    global _ext_viewer_active, _ignis_render_thread_active
+    _ext_viewer_active = False
+    try:
+        if _ignis_render_thread_active:
+            dll_wrapper.stop_render_thread()
+            _ignis_render_thread_active = False
+        dll_wrapper.set_int("external_window", 0)
+    except Exception:
+        pass  # DLL may not be loaded
+    _log("External viewer: stopped")
+
+
+def _sync_camera_from_viewport(context):
+    """Read camera + scene settings from viewport and send to renderer."""
+    import ctypes
+
+    # ── Scene settings (bounces, SPP, sun, lights, etc.) ──
+    try:
+        props = context.scene.ignis_rt
+        dll_wrapper.set_int("max_bounces", props.max_bounces)
+        dll_wrapper.set_int("spp", props.samples_per_pixel)
+        dll_wrapper.set_int("auto_sky_colors", 1)
+        dll_wrapper.set_int("auto_exposure", 0)
+
+        # Sun + lights
+        depsgraph = context.evaluated_depsgraph_get()
+        sun = scene_export.export_sun(depsgraph)
+        dll_wrapper.set_float("sun_elevation", sun.get("sun_elevation", 0.5))
+        dll_wrapper.set_float("sun_azimuth", sun.get("sun_azimuth", 0.0))
+        dll_wrapper.set_float("sun_intensity", sun.get("sun_intensity", 1.0))
+        sun_color = sun.get("sun_color", (1.0, 1.0, 1.0))
+        dll_wrapper.set_float("sun_color_r", sun_color[0])
+        dll_wrapper.set_float("sun_color_g", sun_color[1])
+        dll_wrapper.set_float("sun_color_b", sun_color[2])
+
+        light_data = scene_export.export_lights(depsgraph)
+        n_lights = len(light_data) // 16
+        dll_wrapper.upload_lights(light_data, n_lights)
+    except Exception:
+        pass
+
+    # ── Camera from 3D viewport ──
+    for area in context.screen.areas:
+        if area.type != 'VIEW_3D':
+            continue
+        for space in area.spaces:
+            if space.type != 'VIEW_3D':
+                continue
+            r3d = space.region_3d
+            if r3d is None:
+                continue
+            view_mat = r3d.view_matrix
+            proj_mat = r3d.window_matrix
+            view_inv = view_mat.inverted()
+            proj_inv = proj_mat.inverted()
+
+            def _mat_to_floats(m):
+                return [m[j][i] for i in range(4) for j in range(4)]
+
+            vi = _mat_to_floats(view_inv)
+            pi = _mat_to_floats(proj_inv)
+            v = _mat_to_floats(view_mat)
+            p = _mat_to_floats(proj_mat)
+
+            vi_arr = (ctypes.c_float * 16)(*vi)
+            pi_arr = (ctypes.c_float * 16)(*pi)
+            v_arr = (ctypes.c_float * 16)(*v)
+            p_arr = (ctypes.c_float * 16)(*p)
+
+            global _ignis_frame_index
+            dll_wrapper.set_camera(vi_arr, pi_arr, v_arr, p_arr, _ignis_frame_index)
+            _ignis_frame_index += 1
+            return
+
+
+def _tick_external_load_stage(depsgraph, context):
+    """Tick one loading stage for external viewer mode."""
+    global _load_stage, _ignis_initialized
+
+    # Use the same _tick_staged_load but we need the IgnisRenderEngine methods.
+    # For the external viewer, we create a minimal load using the same functions.
+    # This is a simplified version that doesn't draw loading screens.
+
+    if _load_stage == LOAD_INIT:
+        # Initialize renderer (phased — one step per tick)
+        global _ext_init_base_set
+        if not getattr(start_external_viewer, '_base_set', False):
+            from . import get_base_path
+            dll_wrapper.set_base_path(get_base_path())
+            dll_wrapper.set_log_path(os.path.join(os.path.expanduser("~"), "ignis-rt.log"))
+            start_external_viewer._base_set = True
+        w, h = 1280, 720
+        step = dll_wrapper.create_step(w, h)
+        if step is None:
+            # All init steps complete
+            _load_stage = LOAD_EXPORT
+            _log("External viewer: init complete, exporting scene")
+        else:
+            _log(f"External viewer: init step '{step}'")
+        return
+
+    # For EXPORT onwards, we need the full staged loading infrastructure.
+    # Delegate to the existing IgnisRenderEngine._tick_staged_load method.
+    # Since we don't have an engine instance, we simulate it.
+    from . import scene_export
+
+    if _load_stage == LOAD_EXPORT:
+        global _load_unique_meshes, _load_scene_instances, _load_mesh_keys, _load_mesh_idx
+        global _load_materials_data, _load_mat_name_to_index, _load_textures_list
+        global _load_obj_to_mesh_key, _load_hidden, _load_depsgraph
+        global _ignis_blas_handles, _ignis_obj_to_mesh, _ignis_hidden_objects
+
+        _load_depsgraph = depsgraph
+        meshes, instances, obj_to_mesh, hidden = scene_export.export_meshes(depsgraph)
+        _load_unique_meshes = meshes
+        _load_scene_instances = instances
+        _load_obj_to_mesh_key = obj_to_mesh
+        _load_hidden = hidden
+        _ignis_hidden_objects = hidden
+        _ignis_obj_to_mesh = obj_to_mesh
+        _load_mesh_keys = list(meshes.keys())
+        _load_mesh_idx = 0
+        _ignis_blas_handles = {}
+        _load_stage = LOAD_MESHES
+        _log(f"External viewer: exported {len(meshes)} meshes, {len(instances)} instances")
+        return
+
+    # For remaining stages, just do a fast all-at-once load
+    if _load_stage == LOAD_MESHES:
+        for key in _load_mesh_keys:
+            md = _load_unique_meshes[key]
+            handle = dll_wrapper.upload_mesh(md["positions"], md["vertex_count"],
+                                             md["indices"], md["index_count"])
+            if handle >= 0:
+                _ignis_blas_handles[key] = handle
+                dll_wrapper.upload_mesh_attributes(handle,
+                    md.get("normals"), md.get("uvs"), md["vertex_count"],
+                    md.get("colors"))
+        _load_stage = LOAD_MATERIALS
+        _log(f"External viewer: uploaded {len(_load_mesh_keys)} meshes")
+        return
+
+    if _load_stage == LOAD_MATERIALS:
+        global _ignis_mat_name_to_index, _ignis_tex_manager
+        mats_data, mat_map, tex_list = scene_export.export_materials(
+            depsgraph, hidden_objects=_load_hidden)
+        dll_wrapper.upload_materials(mats_data, len(mat_map))
+        _ignis_mat_name_to_index = mat_map
+        # Textures
+        import ctypes as _ct
+        _ignis_tex_manager = dll_wrapper.create_texture_manager()
+        for tex_info in tex_list:
+            if tex_info.get("data") is None:
+                scene_export.extract_texture_bytes(tex_info)
+            if tex_info.get("data") is not None:
+                data_bytes = tex_info["data"]
+                data_np = np.frombuffer(data_bytes, dtype=np.uint8).copy()
+                dll_wrapper.texture_manager_add(
+                    _ignis_tex_manager, tex_info["name"],
+                    data_np.ctypes.data_as(_ct.POINTER(_ct.c_uint8)),
+                    len(data_bytes), tex_info["width"], tex_info["height"],
+                    1, tex_info.get("dxgi_format", 0))
+        dll_wrapper.texture_manager_upload_all(_ignis_tex_manager)
+        dll_wrapper.update_texture_descriptors(_ignis_tex_manager)
+        _load_stage = LOAD_MATIDS
+        _log(f"External viewer: uploaded {len(mat_map)} materials, {len(tex_list)} textures")
+        return
+
+    if _load_stage == LOAD_MATIDS:
+        for key, handle in _ignis_blas_handles.items():
+            md = _load_unique_meshes.get(key)
+            if md and md.get("tri_material_indices") is not None:
+                dll_wrapper.upload_mesh_primitive_materials(handle,
+                    md["tri_material_indices"], md["tri_count"])
+        _load_stage = LOAD_TLAS
+        return
+
+    if _load_stage == LOAD_TLAS:
+        if _load_scene_instances:
+            count = len(_load_scene_instances)
+            InstanceArray = TLASInstance * count
+            tlas_arr = InstanceArray()
+            for i, inst in enumerate(_load_scene_instances):
+                blas_idx = _ignis_blas_handles.get(inst["mesh_key"], 0)
+                tlas_arr[i].blasIndex = blas_idx
+                for j in range(12):
+                    tlas_arr[i].transform[j] = inst["transform_3x4"][j]
+                tlas_arr[i].customIndex = blas_idx
+                tlas_arr[i].mask = 0xFF
+            dll_wrapper.build_tlas(tlas_arr, count)
+            _log(f"External viewer: TLAS built with {count} instances")
+        _load_stage = LOAD_FINALIZE
+        return
+
+    if _load_stage == LOAD_FINALIZE:
+        # Sun + lights
+        sun = scene_export.export_sun(depsgraph)
+        dll_wrapper.set_float("sun_elevation", sun.get("sun_elevation", 0.5))
+        dll_wrapper.set_float("sun_azimuth", sun.get("sun_azimuth", 0.0))
+        dll_wrapper.set_float("sun_intensity", sun.get("sun_intensity", 1.0))
+
+        # LUT
+        try:
+            _bake_view_transform_lut(context.scene)
+        except Exception:
+            pass
+
+        _ignis_initialized = True
+        _load_stage = LOAD_IDLE
+        _log("External viewer: scene loaded, ready to render")
 
 
 @bpy.app.handlers.persistent
@@ -541,7 +855,14 @@ def _ignis_shutdown():
     global _fps_times
     global _load_stage, _ignis_last_draw_time
     global _ignis_cm_lut_signature, _ignis_cm_lut_valid
-    global _ignis_rendering
+    global _ignis_rendering, _ignis_render_thread_active
+    # Stop render thread before destroying
+    if _ignis_render_thread_active:
+        try:
+            dll_wrapper.stop_render_thread()
+        except Exception:
+            pass
+        _ignis_render_thread_active = False
     # Wait for any in-flight render to complete before destroying
     _wait_count = 0
     while _ignis_rendering and _wait_count < 100:
@@ -715,7 +1036,12 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         global _load_unique_meshes, _load_scene_instances, _load_mesh_keys, _load_mesh_idx
         global _load_materials_data, _load_mat_name_to_index, _load_textures_list, _load_obj_to_mesh_key, _load_hidden
         global _load_depsgraph
-        global _ignis_blas_handles, _ignis_init_config
+        global _ignis_blas_handles, _ignis_init_config, _ignis_render_thread_active
+        # Stop render thread before modifying GPU resources
+        if _ignis_render_thread_active:
+            dll_wrapper.stop_render_thread()
+            _ignis_render_thread_active = False
+            _log("Render thread stopped (scene reload)")
 
         _load_stage = LOAD_EXPORT
         _load_start_time = time.perf_counter()
@@ -1767,7 +2093,15 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         global _ignis_float_buffer, _ignis_gpu_texture
 
         region = context.region
-        w, h = region.width, region.height
+        vp_w, vp_h = region.width, region.height  # always the Blender viewport size
+        w, h = vp_w, vp_h  # render resolution (may be overridden by external window)
+        # External window: use its dimensions for render resolution instead of viewport
+        props = context.scene.ignis_rt
+        if props.external_window and _ignis_initialized:
+            _ew = dll_wrapper.get_int("ext_window_width")
+            _eh = dll_wrapper.get_int("ext_window_height")
+            if _ew > 0 and _eh > 0:
+                w, h = _ew, _eh
         self._last_w, self._last_h = w, h
 
         # ── Resume detection: user switched back from Solid/Wireframe ──
@@ -1800,17 +2134,24 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         _ignis_last_draw_time = now
 
         # ── First contact: capture viewport and start cross-fade ──
+        _ext_loading = props.external_window  # show placeholder instead of loading screen
         if not _ignis_initialized and _load_stage == LOAD_IDLE:
             _load_stage = LOAD_FADEIN
             _load_start_time = time.perf_counter()
             loading_screen.reset()
-            loading_screen.draw(w, h, "", 0.0)
+            if _ext_loading:
+                _draw_external_window_placeholder(vp_w, vp_h, "Loading...")
+            else:
+                loading_screen.draw(w, h, "", 0.0)
             self.tag_redraw()
             return
 
         # ── Loading screen: show and process one stage per call ──
         if _load_stage != LOAD_IDLE:
-            loading_screen.draw(w, h, _load_status, _load_progress)
+            if _ext_loading:
+                _draw_external_window_placeholder(vp_w, vp_h, _load_status or "Loading...")
+            else:
+                loading_screen.draw(w, h, _load_status, _load_progress)
             try:
                 done = self._tick_staged_load(depsgraph)
             except Exception:
@@ -1828,7 +2169,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             if _ignis_last_full_upload == 0 or time_since_last >= 5.0:
                 _log(f"full_dirty triggered ({time_since_last:.1f}s since last)")
                 self._begin_staged_load(depsgraph)
-                loading_screen.draw(w, h, "Preparing scene...", 0.0)
+                if _ext_loading:
+                    _draw_external_window_placeholder(vp_w, vp_h, "Preparing scene...")
+                else:
+                    loading_screen.draw(w, h, "Preparing scene...", 0.0)
                 self.tag_redraw()
                 return
             else:
@@ -2218,6 +2562,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         dll_wrapper.set_int("backface_culling", 1 if props.backface_culling else 0)
         dll_wrapper.set_int("restir_di", 1 if props.restir_di else 0)
         dll_wrapper.set_int("debug_view", int(props.debug_view))
+        dll_wrapper.set_int("external_window", 1 if props.external_window else 0)
         # Auto sky colors always on — sun/ambient come from World settings
         dll_wrapper.set_int("auto_sky_colors", 1)
         # Sync World background color (from Surface → Background node)
@@ -2369,67 +2714,89 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             dll_wrapper.set_float("dof_rotation", cam.get("dof_rotation", 0.0))
             dll_wrapper.set_float("dof_ratio", cam.get("dof_ratio", 1.0))
 
-            # Render
+            # Render + Display
             _prf.end("render")
-            _prf.begin("gpu")
-            global _ignis_rendering
-            _ignis_rendering = True
-            try:
-                dll_wrapper.render_frame()
-            except Exception as _render_err:
-                _log(f"render_frame error: {_render_err}")
-                _ignis_rendering = False
-                return
-            _prf.end("gpu")
+            global _ignis_rendering, _ignis_render_thread_active
+            _ext_win = props.external_window
 
-            # Display
-            _prf.begin("interop")
-            try:
-                gl_ok = dll_wrapper.draw_gl(w, h)
-            except Exception as _gl_err:
-                _log(f"draw_gl error: {_gl_err}")
-                _ignis_rendering = False
+            if _ext_win and _ignis_render_thread_active:
+                # ── Render thread active: camera was sent via set_camera (pending) ──
+                # Thread handles render_frame + present.
+                # Pump window messages on main thread (Win32 requirement)
+                dll_wrapper.set_int("pump_external", 1)
+                # NO OpenGL drawing — avoids Vulkan/OpenGL driver conflict on NVIDIA
+                _ignis_frame_index += 1
+                self.tag_redraw()
                 return
-            _ignis_rendering = False
-            if not gl_ok:
-                # Final fallback: legacy LDR readback of the already tonemapped interop image
-                rw = dll_wrapper.get_int("render_width") or w
-                rh = dll_wrapper.get_int("render_height") or h
-                pixel_count = rw * rh
-                needed = pixel_count * 4
-                if _ignis_float_buffer is None or len(_ignis_float_buffer) < needed:
-                    _ignis_float_buffer = (ctypes.c_float * needed)()
-                ok = dll_wrapper.readback_float(_ignis_float_buffer, pixel_count)
-                if ok:
-                    gpu_buf = gpu.types.Buffer('FLOAT', [pixel_count * 4], _ignis_float_buffer)
-                    _ignis_gpu_texture = gpu.types.GPUTexture((rw, rh), format='RGBA32F', data=gpu_buf)
-                    _draw_texture_flipped(_ignis_gpu_texture, w, h)
-                    if _ignis_frame_index < 3:
-                        _log(f"LDR fallback readback OK ({rw}x{rh} -> {w}x{h})")
-                elif _ignis_gpu_texture is not None:
-                    _draw_texture_flipped(_ignis_gpu_texture, w, h)
-
-            _prf.end("interop")
+            elif _ext_win:
+                # ── External window but no thread yet: start it now ──
+                _ignis_render_thread_active = True
+                dll_wrapper.start_render_thread()
+                _log("Render thread started (external window)")
+                _draw_external_window_placeholder(vp_w, vp_h)
+            else:
+                # ── Normal viewport path ──
+                if _ignis_render_thread_active:
+                    # Was using render thread, now switching back to viewport
+                    dll_wrapper.stop_render_thread()
+                    _ignis_render_thread_active = False
+                    _log("Render thread stopped (back to viewport)")
+                _prf.begin("gpu")
+                _ignis_rendering = True
+                try:
+                    dll_wrapper.render_frame()
+                except Exception as _render_err:
+                    _log(f"render_frame error: {_render_err}")
+                    _ignis_rendering = False
+                    return
+                _prf.end("gpu")
+                _prf.begin("interop")
+                try:
+                    gl_ok = dll_wrapper.draw_gl(w, h)
+                except Exception as _gl_err:
+                    _log(f"draw_gl error: {_gl_err}")
+                    _ignis_rendering = False
+                    return
+                _ignis_rendering = False
+                if not gl_ok:
+                    rw = dll_wrapper.get_int("render_width") or w
+                    rh = dll_wrapper.get_int("render_height") or h
+                    pixel_count = rw * rh
+                    needed = pixel_count * 4
+                    if _ignis_float_buffer is None or len(_ignis_float_buffer) < needed:
+                        _ignis_float_buffer = (ctypes.c_float * needed)()
+                    ok = dll_wrapper.readback_float(_ignis_float_buffer, pixel_count)
+                    if ok:
+                        gpu_buf = gpu.types.Buffer('FLOAT', [pixel_count * 4], _ignis_float_buffer)
+                        _ignis_gpu_texture = gpu.types.GPUTexture((rw, rh), format='RGBA32F', data=gpu_buf)
+                        _draw_texture_flipped(_ignis_gpu_texture, w, h)
+                    elif _ignis_gpu_texture is not None:
+                        _draw_texture_flipped(_ignis_gpu_texture, w, h)
+                _prf.end("interop")
             _ignis_frame_index += 1
         except Exception:
             _log_exception(f"view_draw render/display (frame {_ignis_frame_index})")
 
         # Loading screen fade-out overlay (cross-fade from loader to render)
-        if loading_screen.draw_fadeout(w, h):
-            pass  # still fading — will redraw
+        _ext_win_final = props.external_window  # safe read outside try block
+        if not _ext_win_final:
+            if loading_screen.draw_fadeout(vp_w, vp_h):
+                pass  # still fading — will redraw
 
         # FPS overlay
         _fps_mode = props.fps_overlay
         _fps_pos = props.fps_position
-        if _fps_mode != 'OFF':
-            from . import perf_overlay
-            perf_overlay.update()
-            perf_overlay.draw_fps(w, h, _fps_mode, _fps_pos)
-
-        # GPU profiler overlay
-        if props.show_gpu_profiler:
-            from . import perf_overlay
-            perf_overlay.draw_gpu_profiler(w, h, _fps_mode != 'OFF', _fps_mode, _fps_pos)
+        if _ext_win_final:
+            # External window: FPS shown in window title bar (C++ side), not viewport
+            pass
+        else:
+            if _fps_mode != 'OFF':
+                from . import perf_overlay
+                perf_overlay.update()
+                perf_overlay.draw_fps(vp_w, vp_h, _fps_mode, _fps_pos)
+            if props.show_gpu_profiler:
+                from . import perf_overlay
+                perf_overlay.draw_gpu_profiler(vp_w, vp_h, _fps_mode != 'OFF', _fps_mode, _fps_pos)
 
         # Always request next frame — NRD needs continuous accumulation to converge
         self.tag_redraw()

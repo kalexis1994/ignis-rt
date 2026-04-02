@@ -7,6 +7,7 @@
 #include "vk/vk_accel_structure.h"
 #include "vk/vk_texture_manager.h"
 #include "vk/vk_context.h"
+#include "vk/vk_external_window.h"
 
 #include <cstring>
 #include <cstdio>
@@ -389,6 +390,16 @@ IGNIS_API bool ignis_upload_lut(const float* rgbData, uint32_t lutSize) {
     return true;
 }
 
+IGNIS_API void ignis_start_render_thread(void) {
+    std::lock_guard<std::recursive_mutex> lock(g_rendererMutex);
+    if (g_renderer) g_renderer->StartRenderThread();
+}
+
+IGNIS_API void ignis_stop_render_thread(void) {
+    std::lock_guard<std::recursive_mutex> lock(g_rendererMutex);
+    if (g_renderer) g_renderer->StopRenderThread();
+}
+
 IGNIS_API bool ignis_reload_shaders() {
     if (!g_renderer) return false;
     auto* pipeline = g_renderer->GetRTPipeline();
@@ -582,7 +593,13 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
     };
     memcpy(&cam.jitterPattern[8], skyAtmo, 6 * sizeof(float));
 
-    g_renderer->UpdateCamera(cam);
+    // When render thread is active, stage the camera for the thread to pick up.
+    // Otherwise, upload directly (synchronous path).
+    if (g_renderer->IsRenderThreadActive()) {
+        g_renderer->SetPendingCamera(cam);
+    } else {
+        g_renderer->UpdateCamera(cam);
+    }
 
     // Store current frame as prev for next frame
     if (view) memcpy(s_viewPrev, view, 64);
@@ -765,6 +782,18 @@ IGNIS_API void ignis_set_int(const char* key, int value) {
     else if (strcmp(key, "reset_history") == 0 && value != 0) {
         if (g_renderer) g_renderer->ResetFrameIndex();
     }
+    else if (strcmp(key, "pump_external") == 0 && value != 0) {
+        if (g_renderer) g_renderer->PumpAndPresentExternal();
+    }
+    else if (strcmp(key, "external_window") == 0) {
+        std::lock_guard<std::recursive_mutex> lock(g_rendererMutex);
+        if (g_renderer) {
+            bool wantOpen = (value != 0);
+            bool isOpen = g_renderer->IsExternalWindowActive();
+            if (wantOpen && !isOpen) g_renderer->OpenExternalWindow();
+            else if (!wantOpen && isOpen) g_renderer->CloseExternalWindow();
+        }
+    }
 }
 
 IGNIS_API int ignis_get_int(const char* key) {
@@ -794,6 +823,26 @@ IGNIS_API int ignis_get_int(const char* key) {
 
     // Actual DLSS quality mode used (may differ from requested if GPU doesn't support it)
     if (strcmp(key, "dlss_quality_actual") == 0) return g_renderer ? g_renderer->GetActualDLSSQuality() : 0;
+
+    // Render thread query
+    if (strcmp(key, "render_thread_active") == 0) return g_renderer && g_renderer->IsRenderThreadActive() ? 1 : 0;
+
+    // External window queries
+    if (strcmp(key, "ext_window_active") == 0) return g_renderer && g_renderer->IsExternalWindowActive() ? 1 : 0;
+    if (strcmp(key, "ext_window_width") == 0) {
+        if (g_renderer && g_renderer->IsExternalWindowActive()) {
+            auto* ew = g_renderer->GetExternalWindow();
+            return ew ? (int)ew->GetWidth() : 0;
+        }
+        return 0;
+    }
+    if (strcmp(key, "ext_window_height") == 0) {
+        if (g_renderer && g_renderer->IsExternalWindowActive()) {
+            auto* ew = g_renderer->GetExternalWindow();
+            return ew ? (int)ew->GetHeight() : 0;
+        }
+        return 0;
+    }
 
     return 0;
 }

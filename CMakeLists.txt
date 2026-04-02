@@ -63,6 +63,7 @@ set(IGNIS_CORE_SOURCES
     src/vk/vk_rt_pipeline.cpp
     src/vk/vk_interop.cpp
     src/vk/vk_texture_manager.cpp
+    src/vk/vk_external_window.cpp
 )
 
 # ============================================================================

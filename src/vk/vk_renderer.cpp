@@ -8,6 +8,7 @@
 #include "vk_wavefront_pipeline.h"
 #include "vk_interop.h"
 #include "vk_texture_manager.h"
+#include "vk_external_window.h"
 #include "ignis_log.h"
 #include "ignis_config.h"
 #include "vk_check.h"
@@ -1947,6 +1948,18 @@ void Renderer::RenderFrameRT() {
         interop_->TransitionForExternalRead(cmd);
     }
 
+    // External window: blit tonemapped output to swapchain (inside command buffer)
+    bool extWindowPresent = false;
+    if (externalWindow_ && externalWindow_->IsActive() && interop_) {
+        externalWindow_->PumpMessages();
+        if (externalWindow_->NeedsResize()) {
+            // Resize handled in PumpMessages — skip this frame
+        } else {
+            extWindowPresent = externalWindow_->RecordBlit(
+                cmd, interop_->GetSharedImage(), width_, height_);
+        }
+    }
+
     if (!VK_CHECK(vkEndCommandBuffer(cmd))) return;
 
     VkSubmitInfo submitInfo{};
@@ -1961,6 +1974,11 @@ void Renderer::RenderFrameRT() {
             nrdInitialized_ = false;
         }
         return;
+    }
+
+    // External window: present to screen (after submit, queue-ordered)
+    if (extWindowPresent) {
+        externalWindow_->Present(context_->GetGraphicsQueue());
     }
 
     // NRC: end frame (must be called after queue submit)
@@ -4235,7 +4253,97 @@ void Renderer::ReadbackTimestamps() {
     gpuStageMs_[6] = delta(TS_START, TS_TONEMAP);      // Total
 }
 
+// ============================================================================
+// Independent render thread
+// ============================================================================
+
+void Renderer::SetPendingCamera(const CameraUBO& cam) {
+    std::lock_guard<std::mutex> lock(pendingCameraMutex_);
+    pendingCamera_ = cam;
+    pendingCameraDirty_.store(true);
+}
+
+void Renderer::RenderThreadLoop() {
+    Log(L"[VK Renderer] Render thread started\n");
+    while (renderThreadRunning_.load()) {
+        // Apply pending camera update
+        if (pendingCameraDirty_.exchange(false)) {
+            std::lock_guard<std::mutex> lock(pendingCameraMutex_);
+            UpdateCamera(pendingCamera_);
+        }
+
+        // Render frame (compute + blit to swapchain image, but NOT present)
+        // Present happens on main thread to avoid OpenGL/Vulkan driver conflict
+        if (IsRTReady()) {
+            RenderFrameRT();
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        }
+    }
+    Log(L"[VK Renderer] Render thread stopped\n");
+}
+
+void Renderer::PumpAndPresentExternal() {
+    if (!externalWindow_ || !externalWindow_->IsActive()) return;
+    // Pump Win32 messages on main thread (required for window events)
+    externalWindow_->PumpMessages();
+    // Handle deferred resize safely (render thread pauses on needsResize)
+    if (externalWindow_->NeedsResize()) {
+        // Briefly pause render thread, resize swapchain, resume
+        bool wasRunning = renderThreadRunning_.load();
+        if (wasRunning) StopRenderThread();
+        externalWindow_->HandleDeferredResize();
+        if (wasRunning) StartRenderThread();
+    }
+}
+
+void Renderer::StartRenderThread() {
+    if (renderThreadRunning_.load()) return;
+    renderThreadRunning_.store(true);
+    renderThread_ = std::thread(&Renderer::RenderThreadLoop, this);
+}
+
+void Renderer::StopRenderThread() {
+    if (!renderThreadRunning_.load()) return;
+    renderThreadRunning_.store(false);
+    if (renderThread_.joinable()) {
+        renderThread_.join();
+    }
+    // Ensure GPU is idle after stopping
+    if (context_ && context_->GetDevice())
+        vkDeviceWaitIdle(context_->GetDevice());
+}
+
+// ============================================================================
+// External window
+// ============================================================================
+
+bool Renderer::OpenExternalWindow() {
+    if (externalWindow_) return true;
+    externalWindow_ = new ExternalWindow();
+    if (!externalWindow_->Init(context_, width_, height_)) {
+        delete externalWindow_;
+        externalWindow_ = nullptr;
+        return false;
+    }
+    return true;
+}
+
+void Renderer::CloseExternalWindow() {
+    if (externalWindow_) {
+        externalWindow_->Shutdown();
+        delete externalWindow_;
+        externalWindow_ = nullptr;
+    }
+}
+
+bool Renderer::IsExternalWindowActive() const {
+    return externalWindow_ && externalWindow_->IsActive();
+}
+
 void Renderer::Shutdown() {
+    StopRenderThread();
+    CloseExternalWindow();
     ShutdownImGui();
     ShutdownTimestampQueries();
     if (context_ && context_->GetDevice() != VK_NULL_HANDLE) {

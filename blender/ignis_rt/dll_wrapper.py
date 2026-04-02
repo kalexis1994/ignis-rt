@@ -187,6 +187,14 @@ def load():
     _lib.ignis_upload_lut.restype = c_bool
 
     # ------------------------------------------------------------------
+    # Render thread
+    # ------------------------------------------------------------------
+    _lib.ignis_start_render_thread.argtypes = []
+    _lib.ignis_start_render_thread.restype = None
+    _lib.ignis_stop_render_thread.argtypes = []
+    _lib.ignis_stop_render_thread.restype = None
+
+    # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
     _lib.ignis_render_frame.argtypes = []
@@ -473,6 +481,12 @@ def upload_lights(light_data_floats, count: int):
     arr = (c_float * len(light_data_floats))(*light_data_floats)
     _lib.ignis_upload_lights(arr, c_uint32(count))
 
+
+def start_render_thread():
+    _lib.ignis_start_render_thread()
+
+def stop_render_thread():
+    _lib.ignis_stop_render_thread()
 
 def upload_lut(rgb_floats, lut_size: int):
     """Upload tonemap 3D LUT in-memory. rgb_floats = flat float array (3 per entry, lut_size^3 entries)."""
