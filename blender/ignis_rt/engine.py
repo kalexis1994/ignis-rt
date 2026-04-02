@@ -462,6 +462,7 @@ FADEIN_DURATION = 0.8  # seconds to show loading screen before starting work
 _load_stage = LOAD_IDLE
 _load_start_time = 0.0
 _load_status = ""
+_ignis_rendering = False  # guard flag: True while render_frame+draw_gl are in-flight
 _load_progress = 0.0   # 0.0-1.0
 # Cached data between stages
 _load_unique_meshes = None
@@ -540,6 +541,13 @@ def _ignis_shutdown():
     global _fps_times
     global _load_stage, _ignis_last_draw_time
     global _ignis_cm_lut_signature, _ignis_cm_lut_valid
+    global _ignis_rendering
+    # Wait for any in-flight render to complete before destroying
+    _wait_count = 0
+    while _ignis_rendering and _wait_count < 100:
+        import time as _tw
+        _tw.sleep(0.01)
+        _wait_count += 1
     if _ignis_initialized:
         _log("ignis_destroy()")
         if _ignis_tex_manager is not None:
@@ -1838,6 +1846,14 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 materials_data, mat_map, tex_list = scene_export.export_materials(
                     depsgraph, hidden_objects=_ignis_hidden_objects,
                     existing_mapping=_ignis_mat_name_to_index)
+                # Safety: if material count changed (rename/add/delete), trigger full reload
+                if len(mat_map) != len(_ignis_mat_name_to_index):
+                    _log(f"Material count changed ({len(_ignis_mat_name_to_index)} -> {len(mat_map)}), full reload")
+                    _ignis_materials_dirty = False
+                    _ignis_full_dirty = True
+                    _load_stage = LOAD_FADEIN
+                    _load_start_time = time.perf_counter()
+                    return
                 # Upload material buffer (parameters + VM bytecode)
                 dll_wrapper.upload_materials(materials_data, len(mat_map))
                 # Upload any NEW textures (e.g., ramp bakes from node changes)
@@ -2356,19 +2372,25 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             # Render
             _prf.end("render")
             _prf.begin("gpu")
-            dll_wrapper.render_frame()
+            global _ignis_rendering
+            _ignis_rendering = True
+            try:
+                dll_wrapper.render_frame()
+            except Exception as _render_err:
+                _log(f"render_frame error: {_render_err}")
+                _ignis_rendering = False
+                return
             _prf.end("gpu")
 
             # Display
             _prf.begin("interop")
-            # Keep the zero-copy interop path as the main viewport route.
-            # The experimental HDR readback path was intentionally disabled here:
-            # it forced GPU->CPU->GPU traffic plus vkQueueWaitIdle() every frame,
-            # which is too slow for interactive viewport use and was not color-stable.
-            # Blender reference for the intended exact display path:
-            # - doc/python_api/examples/bpy.types.RenderEngine.1.py `bind_display_space_shader()`
-            # A correct version must wrap a shared HDR GPU texture directly instead of readback.
-            gl_ok = dll_wrapper.draw_gl(w, h)
+            try:
+                gl_ok = dll_wrapper.draw_gl(w, h)
+            except Exception as _gl_err:
+                _log(f"draw_gl error: {_gl_err}")
+                _ignis_rendering = False
+                return
+            _ignis_rendering = False
             if not gl_ok:
                 # Final fallback: legacy LDR readback of the already tonemapped interop image
                 rw = dll_wrapper.get_int("render_width") or w

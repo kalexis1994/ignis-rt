@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <chrono>
+#include <mutex>
 #include "light_tree.h"
 
 // ============================================================================
@@ -24,6 +25,7 @@ namespace acpt {
 }
 
 static acpt::vk::Renderer* g_renderer = nullptr;
+static std::recursive_mutex g_rendererMutex;  // protects g_renderer from concurrent access
 static HWND g_hiddenWindow = nullptr;
 static bool g_hiddenWindowClassRegistered = false;
 static std::string g_basePath;  // shader/resource root directory
@@ -250,6 +252,7 @@ IGNIS_API const char* ignis_create_step(uint32_t width, uint32_t height) {
 void ignis_reset_prev_frame();  // forward declaration
 
 IGNIS_API void ignis_destroy(void) {
+    std::lock_guard<std::recursive_mutex> lock(g_rendererMutex);
     Log(L"[Ignis] ignis_destroy() called\n");
     if (g_renderer) {
         g_renderer->Shutdown();
@@ -303,10 +306,12 @@ IGNIS_API bool ignis_upload_mesh_primitive_materials(int blasHandle,
 }
 
 IGNIS_API void ignis_upload_materials(const void* data, uint32_t count) {
+    std::lock_guard<std::recursive_mutex> lock(g_rendererMutex);
     if (g_renderer) g_renderer->UploadMaterialBuffer(data, count);
 }
 
 IGNIS_API bool ignis_build_tlas(const void* instances, uint32_t count) {
+    std::lock_guard<std::recursive_mutex> lock(g_rendererMutex);
     if (!g_renderer || !instances || count == 0) return false;
 
     struct IgnisTLASInstance {
@@ -330,6 +335,7 @@ IGNIS_API bool ignis_build_tlas(const void* instances, uint32_t count) {
 IGNIS_API bool ignis_update_instance_transforms(const uint32_t* indices,
                                                  const float* transforms,
                                                  uint32_t count) {
+    std::lock_guard<std::recursive_mutex> lock(g_rendererMutex);
     if (!g_renderer || !indices || !transforms || count == 0) return false;
     return g_renderer->UpdateInstanceTransforms(indices, transforms, count);
 }
@@ -375,6 +381,7 @@ IGNIS_API int ignis_generate_hair_gpu(const float* parentKeys, uint32_t nParents
 }
 
 IGNIS_API bool ignis_upload_lut(const float* rgbData, uint32_t lutSize) {
+    std::lock_guard<std::recursive_mutex> lock(g_rendererMutex);
     if (!g_renderer || !rgbData || lutSize == 0) return false;
     vkDeviceWaitIdle(g_renderer->GetContext()->GetDevice());
     if (!g_renderer->UploadLutData(rgbData, lutSize)) return false;
@@ -632,6 +639,7 @@ IGNIS_API void ignis_upload_emissive_triangles(const float* data, uint32_t trian
 }
 
 IGNIS_API void ignis_render_frame(void) {
+    std::lock_guard<std::recursive_mutex> lock(g_rendererMutex);
     if (!g_renderer) return;
     if (!g_renderer->IsRTReady()) {
         static int s_notReadyCount = 0;
@@ -856,10 +864,9 @@ IGNIS_API void ignis_update_texture_descriptors(void* mgr) {
 }
 
 IGNIS_API bool ignis_draw_gl(uint32_t viewportWidth, uint32_t viewportHeight) {
+    std::lock_guard<std::recursive_mutex> lock(g_rendererMutex);
     if (!g_renderer) return false;
     if (!g_renderer->InitGLInterop()) return false;
-    // No sync needed here — RenderFrameRT waits for both in-flight fences
-    // at the start, guaranteeing the GL read buffer is complete before we get here.
     g_renderer->DrawGL(viewportWidth, viewportHeight);
     return true;
 }

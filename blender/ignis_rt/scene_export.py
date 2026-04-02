@@ -5542,20 +5542,21 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         mat_name_to_index = {}
         mat_list = []
 
+    # Build reverse lookup: detect renames by finding materials whose name changed
+    # but still occupy the same slot in the scene.
+    _old_keys = set(mat_name_to_index.keys()) if existing_mapping else set()
+
     for inst in depsgraph.object_instances:
         obj = inst.object
         if obj.type != 'MESH':
             continue
         if not inst.show_self:
             continue
-        # Don't filter collection instances by hidden_objects — their source
-        # collection is excluded but the instances themselves are visible
         if obj.name in hidden_objects and not inst.is_instance:
             continue
         if obj.hide_viewport:
             continue
         if not obj.material_slots:
-            # Mesh with no material slots — register a default "None" material
             if '__ignis_default__' not in mat_name_to_index:
                 mat_name_to_index['__ignis_default__'] = len(mat_list)
                 mat_list.append(None)
@@ -5563,7 +5564,6 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         for slot in obj.material_slots:
             mat = slot.material
             if mat is None:
-                # Empty material slot — register default
                 if '__ignis_default__' not in mat_name_to_index:
                     mat_name_to_index['__ignis_default__'] = len(mat_list)
                     mat_list.append(None)
@@ -5576,8 +5576,22 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                 if idx < len(mat_list):
                     mat_list[idx] = mat
                 continue
-            mat_name_to_index[mat_key] = len(mat_list)
-            mat_list.append(mat)
+            # Handle material rename: if this material's key is new but there's
+            # an old key with a None slot, it was likely renamed. Reuse the old index.
+            _reused = False
+            if existing_mapping and mat_key not in _old_keys:
+                for _okey, _oidx in list(mat_name_to_index.items()):
+                    if _okey in _old_keys and _oidx < len(mat_list) and mat_list[_oidx] is None:
+                        # Old slot is empty — assume this is the renamed material
+                        mat_name_to_index[mat_key] = _oidx
+                        del mat_name_to_index[_okey]
+                        _old_keys.discard(_okey)
+                        mat_list[_oidx] = mat
+                        _reused = True
+                        break
+            if not _reused:
+                mat_name_to_index[mat_key] = len(mat_list)
+                mat_list.append(mat)
 
     # Collect unique textures across all materials
     # image_key → {"index": int, "data": bytes, "name": str, "width": int, "height": int}
