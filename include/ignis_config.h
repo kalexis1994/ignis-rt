@@ -80,6 +80,9 @@ struct PathTracerConfig {
     float nrdDiffusePhiLuminance = 2.0f;   // [0.5..8.0] luminance edge stopping for diffuse A-trous
     float nrdSpecularPhiLuminance= 1.0f;   // [0.5..8.0] luminance edge stopping for specular A-trous (lower = sharper reflections)
 
+    // Camera jitter
+    float cameraJitterScale  = 0.25f;  // [0..1] scale for Halton sub-pixel jitter (0.25 = ignis-ac default)
+
     // DLSS
     bool  dlssEnabled        = false;
     int   dlssQualityMode    = 0;       // maps to DLSSQualityMode enum

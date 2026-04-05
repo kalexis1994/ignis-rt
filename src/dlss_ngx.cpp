@@ -762,25 +762,38 @@ void DLSS_NGX::EvaluateRR(
     if (viewMatrix) evalParams.pInWorldToViewMatrix = const_cast<float*>(viewMatrix);
     if (projMatrix) evalParams.pInViewToClipMatrix = const_cast<float*>(projMatrix);
 
+    // Specular motion vectors (temporal guide for glossy/reflective surfaces)
+    NVSDK_NGX_Resource_VK specularMVResource = {};
+    if (specularMVView != VK_NULL_HANDLE && specularMVImage != VK_NULL_HANDLE) {
+        specularMVResource = NVSDK_NGX_Create_ImageView_Resource_VK(
+            specularMVView, specularMVImage, fullRange, VK_FORMAT_R16G16B16A16_SFLOAT,
+            m_renderWidth, m_renderHeight, false);
+        evalParams.pInMotionVectorsReflections = &specularMVResource;
+    }
+
     // Hit distance for edge-stopping
     NVSDK_NGX_Resource_VK diffHitDistResource = {};
-    NVSDK_NGX_Resource_VK specHitDistResource = {};
-    if (diffuseHitDistView != VK_NULL_HANDLE) {
+    if (diffuseHitDistView != VK_NULL_HANDLE && diffuseHitDistImage != VK_NULL_HANDLE) {
         diffHitDistResource = NVSDK_NGX_Create_ImageView_Resource_VK(
             diffuseHitDistView, diffuseHitDistImage, fullRange, VK_FORMAT_R16G16B16A16_SFLOAT,
             m_renderWidth, m_renderHeight, false);
         evalParams.pInDiffuseHitDistance = &diffHitDistResource;
     }
-    if (specularHitDistView != VK_NULL_HANDLE) {
+    NVSDK_NGX_Resource_VK specHitDistResource = {};
+    if (specularHitDistView != VK_NULL_HANDLE && specularHitDistImage != VK_NULL_HANDLE) {
         specHitDistResource = NVSDK_NGX_Create_ImageView_Resource_VK(
             specularHitDistView, specularHitDistImage, fullRange, VK_FORMAT_R16G16B16A16_SFLOAT,
             m_renderWidth, m_renderHeight, false);
         evalParams.pInSpecularHitDistance = &specHitDistResource;
+        evalParams.pInRayTracingHitDistance = &specHitDistResource;
+    } else if (evalParams.pInDiffuseHitDistance) {
+        // Fallback: use diffuse hit distance as ray tracing guide
+        if (!evalParams.pInRayTracingHitDistance) {
+            evalParams.pInRayTracingHitDistance = &diffHitDistResource;
+        }
     }
-    // Specular MVs: using Path B (hit distance + matrices) instead of direct MVs
 
     // Reactive mask: disabled for now — pInBiasCurrentColorMask causes artifacts.
-    // TODO: investigate correct field and format for RR reactive mask.
     // (void)reactiveMaskImage;
     // (void)reactiveMaskView;
 

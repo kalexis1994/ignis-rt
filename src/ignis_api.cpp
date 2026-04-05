@@ -442,8 +442,9 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
         uint32_t rw, rh;
         g_renderer->GetRenderResolution(&rw, &rh);
 
-        float jitterX = HaltonSeq((frameIndex % 256) + 1, 2) - 0.5f;
-        float jitterY = HaltonSeq((frameIndex % 256) + 1, 3) - 0.5f;
+        float jitterScale = std::clamp(acpt::g_config.cameraJitterScale, 0.0f, 1.0f);
+        float jitterX = (HaltonSeq((frameIndex % 256) + 1, 2) - 0.5f) * jitterScale;
+        float jitterY = (HaltonSeq((frameIndex % 256) + 1, 3) - 0.5f) * jitterScale;
 
         // Pass pixel-space jitter to renderer for DLSS SR/RR
         // Y is negated to match Vulkan's flipped Y convention (same as NDC transform)
