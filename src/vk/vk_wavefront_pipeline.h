@@ -57,6 +57,8 @@ private:
     VkDeviceMemory countersMemory_ = VK_NULL_HANDLE;
     VkBuffer indirectDispatchBuffer_ = VK_NULL_HANDLE;  // VkDispatchIndirectCommand[3]
     VkDeviceMemory indirectDispatchMemory_ = VK_NULL_HANDLE;
+    VkBuffer sharcStateBuffer_ = VK_NULL_HANDLE;       // SharcState[] per-pixel (persists across bounces)
+    VkDeviceMemory sharcStateMemory_ = VK_NULL_HANDLE;
 
     // Descriptor sets for ping-pong (2 sets, no host updates during recording)
     // Set A: binding 0 = buffer[0] (read), binding 7 = buffer[1] (write)

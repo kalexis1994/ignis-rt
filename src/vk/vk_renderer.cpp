@@ -1430,8 +1430,13 @@ void Renderer::RenderFrameRT() {
         rtToSharc.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         rtToSharc.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         rtToSharc.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        // Source stage depends on whether wavefront (compute) or monolithic (raygen) ran
+        bool wavefrontActive = wavefrontPipeline_ && wavefrontPipeline_->IsReady();
+        VkPipelineStageFlags sharcSrcStage = wavefrontActive ?
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT :
+            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
         vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+            sharcSrcStage,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0, 1, &rtToSharc, 0, nullptr, 0, nullptr);
 

@@ -5,6 +5,7 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_shader_atomic_int64 : require
 #extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 256) in;
@@ -118,6 +119,11 @@ layout(binding = 5, set = 0) uniform sampler2D textures[];
 layout(binding = 12, set = 0) uniform sampler2D blueNoiseTexture;
 layout(binding = 18, set = 0, r16f) uniform image2D penumbraImg;
 
+// SHARC radiance cache (hash entries + combined accum/resolved/guide)
+layout(binding = 20, set = 0, std430) buffer SHARCHashEntries { uint64_t keys[]; } _sharcHashEntries;
+layout(binding = 21, set = 0, std430) buffer SHARCData        { uint data[];     } _sharcAccum;
+#define _sharcResolved _sharcAccum
+
 // ReSTIR DI reservoir buffers (ping-pong: current write, previous read)
 layout(binding = 24, set = 0, std430) buffer DIReservoirCurrBuf { vec4 data[]; } diReservoirCurr;
 layout(binding = 25, set = 0, std430) buffer DIReservoirPrevBuf { vec4 data[]; } diReservoirPrev;
@@ -155,6 +161,10 @@ layout(binding = 5, set = 1, scalar) buffer CountersBuffer {
     uint pad0;
 } counters;
 
+// SHARC per-pixel state (persists across bounces, indexed by pixelIndex)
+// Layout: 20 uints per pixel [cacheIndices(4) + sampleWeights(12) + pathLength(1) + pad(3)]
+layout(binding = 8, set = 1, scalar) buffer SharcStateBuffer { uint sharcData[]; } sharcStates;
+
 layout(push_constant) uniform PushConst {
     uint width;
     uint height;
@@ -176,15 +186,45 @@ const uint VM_HEADER_FLAG_TRANSMISSION = 4u;
 const uint VM_HEADER_FLAG_SHADOW_DYNAMIC = 8u;
 
 #include "../include/common.glsl"
+#include "../include/sky.glsl"
 #include "../include/pbr_brdf.glsl"
 #include "../include/sampling.glsl"
 #include "../include/nrd_encode.glsl"
 #include "../include/emissive_sampling.glsl"
 #include "../include/node_vm.glsl"
+#include "../include/sharc_setup.glsl"
 #include "../include/hair_bsdf.glsl"
 #include "../include/hair_cylinder.glsl"
 #include "../include/volume_march.glsl"
 #include "../include/di_reservoir.glsl"
+
+// SHARC state load/store (20 uints per pixel, indexed by pixelIndex)
+SharcState loadSharcState(uint pixelIndex) {
+    uint base = pixelIndex * 20u;
+    SharcState s;
+    for (uint i = 0u; i < 4u; i++) s.cacheIndices[i] = sharcStates.sharcData[base + i];
+    for (uint i = 0u; i < 4u; i++) {
+        uint off = base + 4u + i * 3u;
+        s.sampleWeights[i] = vec3(
+            uintBitsToFloat(sharcStates.sharcData[off+0u]),
+            uintBitsToFloat(sharcStates.sharcData[off+1u]),
+            uintBitsToFloat(sharcStates.sharcData[off+2u]));
+    }
+    s.pathLength = sharcStates.sharcData[base + 16u];
+    return s;
+}
+
+void storeSharcState(uint pixelIndex, SharcState s) {
+    uint base = pixelIndex * 20u;
+    for (uint i = 0u; i < 4u; i++) sharcStates.sharcData[base + i] = s.cacheIndices[i];
+    for (uint i = 0u; i < 4u; i++) {
+        uint off = base + 4u + i * 3u;
+        sharcStates.sharcData[off+0u] = floatBitsToUint(s.sampleWeights[i].x);
+        sharcStates.sharcData[off+1u] = floatBitsToUint(s.sampleWeights[i].y);
+        sharcStates.sharcData[off+2u] = floatBitsToUint(s.sampleWeights[i].z);
+    }
+    sharcStates.sharcData[base + 16u] = s.pathLength;
+}
 
 vec3 cyclesPrincipledTransmissionTint(vec3 baseColor) {
     return sqrt(clamp(baseColor, vec3(0.0), vec3(1.0)));
@@ -244,7 +284,35 @@ void main() {
     // Read HitResult (20 floats: 8 base + 12 objToWorld)
     uint hBase = idx * 20u;
     uint hitType = floatBitsToUint(hitResults.hitData[hBase+6]);
-    if (hitType == 0u) return; // miss — already handled by K1
+    // SHARC setup
+    bool sharcEnabled = (cam.sharcCapacity > 0u);
+    uint sharcCapacity = cam.sharcCapacity;
+    SharcGridParams sharcGrid;
+    sharcGrid.cameraPosition = vec3(cam.viewInverse[3][0], cam.viewInverse[3][1], cam.viewInverse[3][2]);
+    sharcGrid.sceneScale = cam.sharcSceneScale;
+    uint pixX_s = pixelIndex % pc.width;
+    uint pixY_s = pixelIndex / pc.width;
+    bool sharcUpdatePixel = sharcEnabled && isSharcUpdatePixel(uvec2(pixX_s, pixY_s), pc.frameIndex);
+
+    if (hitType == 0u) {
+        // Miss — sky already accumulated by K1. Do SHARC backpropagation if update pixel.
+        if (sharcUpdatePixel) {
+            SharcState state = loadSharcState(pixelIndex);
+            if (state.pathLength > 0u) {
+                // Re-evaluate sky for SHARC (K2 has rayDir from PathState)
+                vec3 skyColor = evaluateSky(rayDir);
+                int hdriIdx = int(cam.windParams.x);
+                if (hdriIdx >= 0) {
+                    float phi = atan(-rayDir.z, rayDir.x);
+                    float u = 0.5 - phi / (2.0 * PI);
+                    float v = acos(clamp(rayDir.y, -1.0, 1.0)) / PI;
+                    skyColor = texture(textures[nonuniformEXT(uint(hdriIdx))], vec2(u, v)).rgb * cam.windParams.y;
+                }
+                SharcUpdateMiss(sharcGrid, state, skyColor, sharcCapacity);
+            }
+        }
+        return;
+    }
 
     float hitT = hitResults.hitData[hBase+0];
     uint customIndex = floatBitsToUint(hitResults.hitData[hBase+1]);
@@ -539,6 +607,34 @@ void main() {
         nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(flags);
         pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u); // mark original terminated
         return;
+    }
+
+    // ---- SHARC cache query (bounce 1+): early-out with cached GI ----
+    if (sharcEnabled && bounce >= 1u) {
+        vec3 cachedRadiance;
+        if (SharcGetCachedRadiance(sharcGrid, worldPos, N, sharcCapacity, cachedRadiance)) {
+            cachedRadiance *= cam.ptParams0.y; // giIntensity
+            uint rBase = pixelIndex * 8u;
+            vec3 contrib = cachedRadiance * throughput;
+            if (isDiffusePath) {
+                atomicAddFloat(rBase+0, contrib.x);
+                atomicAddFloat(rBase+1, contrib.y);
+                atomicAddFloat(rBase+2, contrib.z);
+            } else {
+                atomicAddFloat(rBase+4, contrib.x);
+                atomicAddFloat(rBase+5, contrib.y);
+                atomicAddFloat(rBase+6, contrib.z);
+            }
+            // Backpropagate cached radiance through SHARC state history
+            if (sharcUpdatePixel) {
+                SharcState state = loadSharcState(pixelIndex);
+                for (uint i = 0u; i < state.pathLength; i++) {
+                    sharcAccumulate(state.cacheIndices[i], cachedRadiance, state.sampleWeights[i]);
+                }
+            }
+            pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
+            return;
+        }
     }
 
     // ---- Volume rendering (replaces surface BRDF for volume materials) ----
@@ -1496,6 +1592,36 @@ void main() {
         atomicAddFloat(rBase+2, ambient.z);
     }
 
+    // ---- SHARC update: accumulate direct lighting + guide bins + backpropagation ----
+    if (sharcUpdatePixel && !isGlass) {
+        SharcState state = loadSharcState(pixelIndex);
+
+        // Direct lighting estimate: emission + ambient (NEE deferred to K3)
+        vec3 directLighting = emission * throughput;
+        directLighting = max(directLighting, vec3(0.0));
+
+        // Guide bin accumulation: record light direction
+        float directLum = dot(directLighting, vec3(0.2126, 0.7152, 0.0722));
+        if (directLum > 0.001) {
+            uint64_t guideKey = sharcHashKey(worldPos, N, sharcGrid);
+            uint guideSlot = sharcInsert(guideKey, sharcCapacity);
+            if (guideSlot != 0xFFFFFFFFu) {
+                guideAccumulate(guideSlot, -rayDir, directLum, sharcCapacity);
+            }
+        }
+
+        // SharcUpdateHit: insert/update cache, possibly early-out
+        bool continueTracing = SharcUpdateHit(sharcGrid, state,
+            worldPos, N, directLighting, rand01(), sharcCapacity);
+        SharcSetThroughput(state, throughput);
+        storeSharcState(pixelIndex, state);
+
+        if (!continueTracing) {
+            pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
+            return;
+        }
+    }
+
     // ---- Russian roulette (Cycles-style: sqrt perceptual, min bounce guard) ----
     uint minBounces = 2u;
     if (bounce >= minBounces) {
@@ -1796,9 +1922,28 @@ void main() {
         bool chooseDiffuse = (diffuseWeight > 0.001) ? (rand01() > specWeight) : false;
 
         if (chooseDiffuse && metallic < 1.0) {
-            // Diffuse
-            rayDir = sampleCosineHemisphere(rand2(), N);
-            throughput *= baseColor * (1.0 - metallic) * nonGlassCompensation;
+            // Diffuse — with SHARC path guiding for bounce 1+
+            bool useGuide = false;
+            if (sharcEnabled && bounce >= 1u) {
+                uint64_t guideKey = sharcHashKey(worldPos, N, sharcGrid);
+                uint guideSlot = sharcFind(guideKey, sharcCapacity);
+                if (guideSlot != 0xFFFFFFFFu) {
+                    float guidePdf;
+                    vec3 guideDir = guideSampleDirection(guideSlot, N, rand01(), rand01(),
+                                                         sharcCapacity, guidePdf);
+                    if (guidePdf > 0.0 && dot(guideDir, N) > 0.0) {
+                        rayDir = guideDir;
+                        float cosinePdf = max(dot(rayDir, N), 0.0) * INV_PI;
+                        float misWeight = guideMISWeight(cosinePdf, guidePdf, 0.5);
+                        throughput *= baseColor * (1.0 - metallic) * nonGlassCompensation * misWeight;
+                        useGuide = true;
+                    }
+                }
+            }
+            if (!useGuide) {
+                rayDir = sampleCosineHemisphere(rand2(), N);
+                throughput *= baseColor * (1.0 - metallic) * nonGlassCompensation;
+            }
             isDiffusePath = true;
         } else {
             // Specular

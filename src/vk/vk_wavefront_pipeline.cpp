@@ -135,6 +135,7 @@ void WavefrontPipeline::Shutdown() {
     DestroySSBO(device, primaryGBufBuffer_, primaryGBufMemory_);
     DestroySSBO(device, countersBuffer_, countersMemory_);
     DestroySSBO(device, indirectDispatchBuffer_, indirectDispatchMemory_);
+    DestroySSBO(device, sharcStateBuffer_, sharcStateMemory_);
 
     ready_ = false;
 }
@@ -181,16 +182,21 @@ bool WavefrontPipeline::CreateBuffers(uint32_t pixelCount) {
     if (vkAllocateMemory(device, &allocInfo, nullptr, &indirectDispatchMemory_) != VK_SUCCESS) return false;
     vkBindBufferMemory(device, indirectDispatchBuffer_, indirectDispatchMemory_, 0);
 
-    Log(L"[Wavefront] Buffers allocated: PathState=%uMB HitResult=%uMB ShadowRay=%uMB Radiance=%uMB PrimaryGB=%uMB\n",
+    // SharcState: 80 bytes per pixel (20 uints: 4 cacheIndices + 4 vec3 weights + pathLength + pad)
+    // Indexed by pixelIndex, persists across bounces within a frame. Cleared per SPP sample.
+    if (!CreateSSBO(device, physDevice, pixelCount * 80, &sharcStateBuffer_, &sharcStateMemory_)) return false;
+
+    Log(L"[Wavefront] Buffers allocated: PathState=%uMB HitResult=%uMB ShadowRay=%uMB Radiance=%uMB PrimaryGB=%uMB SharcState=%uMB\n",
         (pixelCount * 48) >> 20, (pixelCount * 32) >> 20,
-        (maxShadowRays * 48) >> 20, (pixelCount * 32) >> 20, (pixelCount * 64) >> 20);
+        (maxShadowRays * 48) >> 20, (pixelCount * 32) >> 20, (pixelCount * 64) >> 20,
+        (pixelCount * 80) >> 20);
     return true;
 }
 
 bool WavefrontPipeline::CreateDescriptorSet() {
     VkDevice device = context_->GetDevice();
 
-    // Descriptor set 1 layout: 8 SSBOs for wavefront buffers
+    // Descriptor set 1 layout: 9 SSBOs for wavefront buffers
     // binding 0: PathState read (current bounce)
     // binding 1: HitResult
     // binding 2: ShadowRay
@@ -199,8 +205,9 @@ bool WavefrontPipeline::CreateDescriptorSet() {
     // binding 5: Counters
     // binding 6: IndirectDispatch
     // binding 7: PathState write (next bounce)
-    VkDescriptorSetLayoutBinding bindings[8] = {};
-    for (int i = 0; i < 8; i++) {
+    // binding 8: SharcState (per-pixel, persists across bounces)
+    VkDescriptorSetLayoutBinding bindings[9] = {};
+    for (int i = 0; i < 9; i++) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1;
@@ -209,13 +216,13 @@ bool WavefrontPipeline::CreateDescriptorSet() {
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 8;
+    layoutInfo.bindingCount = 9;
     layoutInfo.pBindings = bindings;
 
     if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &wfDescSetLayout_) != VK_SUCCESS) return false;
 
-    // Pool — 2 sets × 8 SSBOs = 16 descriptors
-    VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16};
+    // Pool — 2 sets × 9 SSBOs = 18 descriptors
+    VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 18};
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.maxSets = 2;
@@ -241,15 +248,16 @@ bool WavefrontPipeline::CreateDescriptorSet() {
         VkBuffer readBuf  = pathStateBuffer_[setIdx];      // 0 for A, 1 for B
         VkBuffer writeBuf = pathStateBuffer_[1 - setIdx];  // 1 for A, 0 for B
 
-        VkBuffer buffers[8] = {
+        VkBuffer buffers[9] = {
             readBuf, hitResultBuffer_, shadowRayBuffer_,
             pixelRadianceBuffer_, primaryGBufBuffer_, countersBuffer_,
-            indirectDispatchBuffer_, writeBuf
+            indirectDispatchBuffer_, writeBuf,
+            sharcStateBuffer_   // binding 8: same buffer in both sets (indexed by pixelIndex)
         };
 
-        VkDescriptorBufferInfo bufInfos[8] = {};
-        VkWriteDescriptorSet writes[8] = {};
-        for (int i = 0; i < 8; i++) {
+        VkDescriptorBufferInfo bufInfos[9] = {};
+        VkWriteDescriptorSet writes[9] = {};
+        for (int i = 0; i < 9; i++) {
             bufInfos[i].buffer = buffers[i];
             bufInfos[i].range = VK_WHOLE_SIZE;
 
@@ -261,7 +269,7 @@ bool WavefrontPipeline::CreateDescriptorSet() {
             writes[i].pBufferInfo = &bufInfos[i];
         }
 
-        vkUpdateDescriptorSets(device, 8, writes, 0, nullptr);
+        vkUpdateDescriptorSets(device, 9, writes, 0, nullptr);
     }
 
     return true;
@@ -370,9 +378,10 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
     // Set 1 (B): read=buffer[1], write=buffer[0]
     pathStateCurrent_ = 0;
 
-    // Clear pixel radiance and primary G-buffer (once per frame, before all SPP samples)
+    // Clear pixel radiance, primary G-buffer, and SharcState (once per frame, before all SPP samples)
     vkCmdFillBuffer(cmd, pixelRadianceBuffer_, 0, totalPixels * 32, 0);
     vkCmdFillBuffer(cmd, primaryGBufBuffer_, 0, totalPixels * 64, 0);
+    vkCmdFillBuffer(cmd, sharcStateBuffer_, 0, totalPixels * 80, 0);  // pathLength=0 = initialized
 
     VkMemoryBarrier clearBarrier{};
     clearBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
