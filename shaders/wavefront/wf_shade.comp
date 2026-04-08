@@ -57,35 +57,48 @@ struct Material {
     uint normalTexIndex;
     uint mapsTexIndex;
     uint detailTexIndex;
+
     uint normalDetailTexIndex;
     float ksAmbient;
     float ksDiffuse;
     float ksSpecular;
+
     float ksSpecularEXP;
     float emissiveR, emissiveG, emissiveB;
+
     float fresnelC;
     float fresnelEXP;
     float detailUVMultiplier;
     float detailNormalBlend;
+
     uint flags;
     float alphaRef;
     uint shaderType;
     float fresnelMaxLevel;
+
     uint maskTexIndex;
     uint detailRTexIndex;
     uint detailGTexIndex;
     uint detailBTexIndex;
+
     uint detailATexIndex;
     uint detailNMTexIndex;
     float multR;
     float multG;
+
     float multB;
     float multA;
     float magicMult;
     float detailNMMult;
     float detailNMMultV;
+
     float sunSpecular;
     float sunSpecularEXP;
+
+    // Node VM bytecode
+    uint nodeVmHeader;       // [7:0]=instrCount, [15:8]=flags
+    uint nodeVmPad[3];
+    uvec4 nodeVmCode[128];   // 128 instructions
 };
 
 layout(binding = 4, set = 0, scalar) buffer MaterialBuffer {
@@ -110,6 +123,8 @@ layout(buffer_reference, scalar) buffer Indices { uint i[]; };
 layout(buffer_reference, scalar) buffer Normals { float n[]; };
 layout(buffer_reference, scalar) buffer UVs { float uv[]; };
 layout(buffer_reference, scalar) buffer PrimMaterials { uint m[]; };
+layout(buffer_reference, scalar) buffer Colors { float c[]; };
+layout(buffer_reference, scalar) buffer Bitangents { float b[]; };
 
 // Wavefront buffers (set 1)
 layout(binding = 0, set = 1, scalar) buffer PathStateReadBuffer { float pathData[]; } pathStates;
@@ -131,13 +146,31 @@ layout(push_constant) uniform PushConst {
     uint frameIndex;
     uint maxBounces;
     uint currentBounce;
+    uint spp;
+    uint sampleIdx;
 } pc;
+
+// Material flags (must match raygen_blender.rgen)
+const uint MAT_FLAG_HAIR = 32u;
+const uint MAT_FLAG_DIFFUSE_SCENE_LINEAR = 64u;
+const uint MAT_FLAG_THIN_TRANSMISSION = 128u;
+const uint MAT_FLAG_LIGHTPATH_TRANSPARENT = 256u;
+const uint VM_HEADER_FLAG_BASE_COLOR = 1u;
+const uint VM_HEADER_FLAG_ALPHA = 2u;
+const uint VM_HEADER_FLAG_TRANSMISSION = 4u;
+const uint VM_HEADER_FLAG_SHADOW_DYNAMIC = 8u;
 
 #include "../include/common.glsl"
 #include "../include/pbr_brdf.glsl"
 #include "../include/sampling.glsl"
 #include "../include/nrd_encode.glsl"
 #include "../include/emissive_sampling.glsl"
+#include "../include/node_vm.glsl"
+#include "../include/hair_bsdf.glsl"
+
+vec3 cyclesPrincipledTransmissionTint(vec3 baseColor) {
+    return sqrt(clamp(baseColor, vec3(0.0), vec3(1.0)));
+}
 
 // Thread-safe float accumulation via uint CAS
 void atomicAddFloat(uint index, float value) {
@@ -253,43 +286,136 @@ void main() {
     }
     Material mat = materialBuffer.materials[matIdx];
 
-    // Simple PBR material eval (without normal mapping for now)
-    vec3 baseColor;
-    float alpha = 1.0;
-    if (mat.diffuseTexIndex != 0xFFFFFFFFu) {
-        vec4 texColor = texture(textures[nonuniformEXT(mat.diffuseTexIndex)], hitUV);
-        baseColor = texColor.rgb;
-        alpha = texColor.a * mat.multG;
-    } else {
-        baseColor = vec3(mat.ksAmbient, mat.ksDiffuse, mat.ksSpecular);
-        alpha = mat.multG;
+    // Vertex colors
+    vec4 vertexColor = vec4(1.0);
+    if (geo.colorBufferAddress != 0u) {
+        Colors colorData = Colors(geo.colorBufferAddress);
+        vec4 vc0 = vec4(colorData.c[i0*4+0], colorData.c[i0*4+1], colorData.c[i0*4+2], colorData.c[i0*4+3]);
+        vec4 vc1 = vec4(colorData.c[i1*4+0], colorData.c[i1*4+1], colorData.c[i1*4+2], colorData.c[i1*4+3]);
+        vec4 vc2 = vec4(colorData.c[i2*4+0], colorData.c[i2*4+1], colorData.c[i2*4+2], colorData.c[i2*4+3]);
+        vertexColor = vc0 * bary.x + vc1 * bary.y + vc2 * bary.z;
     }
 
+    // Hair detection
+    bool isHairSurface = (geo.bitangentBufferAddress != 0u);
+    vec3 hairSmoothT = vec3(1, 0, 0);
+    float hairV = 0.0;
+    if (isHairSurface) {
+        Bitangents bitangents = Bitangents(geo.bitangentBufferAddress);
+        vec3 localTangent = vec3(bitangents.b[i0*3+0], bitangents.b[i0*3+1], bitangents.b[i0*3+2]) * bary.x
+                          + vec3(bitangents.b[i1*3+0], bitangents.b[i1*3+1], bitangents.b[i1*3+2]) * bary.y
+                          + vec3(bitangents.b[i2*3+0], bitangents.b[i2*3+1], bitangents.b[i2*3+2]) * bary.z;
+        hairSmoothT = normalize(mat3(objToWorld) * localTangent);
+    }
+
+    // ── Node VM: per-pixel node tree evaluation ──
+    uint vmInstrCount = mat.nodeVmHeader & 0xFFu;
+    bool vmActive = vmInstrCount > 0u;
+    NodeVmResult vm;
+    if (vmActive) {
+        vm = executeNodeVm(matIdx, hitUV, worldPos, rayDir, worldN, vertexColor, uint(instanceId), localPos);
+    } else {
+        vm.hasBaseColor = false;
+        vm.hasRoughness = false;
+        vm.hasMetallic = false;
+        vm.hasEmission = false;
+        vm.hasAlpha = false;
+        vm.hasIor = false;
+        vm.hasTransmission = false;
+        vm.hasTransformedUV = false;
+        vm.hasNormalStrength = false;
+        vm.hasBump = false;
+    }
+
+    // ── Material evaluation: VM is the single authority ──
+    vec3 baseColor;
+    float texAlpha = 1.0;
+    vec2 texUV = (vmActive && vm.hasTransformedUV) ? vm.transformedUV : hitUV;
     float roughness = clamp(mat.ksSpecularEXP, 0.01, 1.0);
     float metallic = clamp(mat.fresnelC, 0.0, 1.0);
     float specularLevel = mat.fresnelEXP;
     float ior = mat.detailUVMultiplier;
+    float transmission = mat.multR;
+    float hairShift = ((mat.flags & MAT_FLAG_HAIR) != 0u) ? mat.sunSpecular : 0.035;
+    float hairRadialRoughness = ((mat.flags & MAT_FLAG_HAIR) != 0u) ?
+                                clamp(mat.sunSpecularEXP, 0.01, 1.0) : roughness;
 
-    // ORM map
+    // Stochastic passthrough disables glass refraction
+    float tpCheck = mat.multB;
+    if (tpCheck > 0.0) transmission = 0.0;
+
+    if (vmActive && vm.hasBaseColor) {
+        baseColor = vm.baseColor;
+        if (vm.hasAlpha) {
+            texAlpha = vm.alpha;
+        } else if (mat.diffuseTexIndex != 0xFFFFFFFFu) {
+            texAlpha = texture(textures[nonuniformEXT(mat.diffuseTexIndex)], texUV).a;
+        }
+    } else {
+        if (mat.diffuseTexIndex != 0xFFFFFFFFu) {
+            vec4 texColor = texture(textures[nonuniformEXT(mat.diffuseTexIndex)], hitUV);
+            bool diffuseIsSceneLinear = (mat.flags & MAT_FLAG_DIFFUSE_SCENE_LINEAR) != 0u;
+            baseColor = diffuseIsSceneLinear ? texColor.rgb : srgbToLinearExact(max(texColor.rgb, vec3(0.0)));
+            texAlpha = texColor.a;
+        } else {
+            baseColor = vec3(mat.ksAmbient, mat.ksDiffuse, mat.ksSpecular);
+        }
+    }
+    float alpha = texAlpha * mat.multG;
+
+    // VM overrides
+    if (vmActive) {
+        if (vm.hasRoughness)    roughness = clamp(vm.roughness, 0.01, 1.0);
+        if (vm.hasMetallic)     metallic = clamp(vm.metallic, 0.0, 1.0);
+        if (vm.hasIor)          ior = vm.ior;
+        if (vm.hasTransmission) transmission = vm.transmission;
+    }
+
+    // ORM map (fills what VM didn't provide)
     if (mat.mapsTexIndex != 0xFFFFFFFFu) {
-        vec4 orm = texture(textures[nonuniformEXT(mat.mapsTexIndex)], hitUV);
-        roughness = clamp(orm.g, 0.01, 1.0);
-        metallic = clamp(orm.b, 0.0, 1.0);
+        vec4 orm = texture(textures[nonuniformEXT(mat.mapsTexIndex)], texUV);
+        if (!(vmActive && vm.hasRoughness)) roughness = clamp(orm.g, 0.01, 1.0);
+        if (!(vmActive && vm.hasMetallic))  metallic = clamp(orm.b, 0.0, 1.0);
     }
 
     // Normal mapping
     vec3 N = worldN;
+    vec3 smoothN = worldN;  // un-bumped normal for glass refraction
     if (mat.normalTexIndex != 0xFFFFFFFFu) {
+        vec3 T, B;
+        computeTBN(wp0, wp1, wp2, uv0_, uv1_, uv2_, N, T, B);
         float rawStrength = mat.detailNormalBlend;
-        if (rawStrength >= 0.0) {
-            // RGB normal map — compute TBN from world-space triangle
-            vec3 T, B;
-            computeTBN(wp0, wp1, wp2, uv0_, uv1_, uv2_, N, T, B);
-            vec3 texN = texture(textures[nonuniformEXT(mat.normalTexIndex)], hitUV).rgb;
+        if (rawStrength < 0.0) {
+            // Bump/height map (Cycles-style)
+            float packed = abs(rawStrength);
+            float bumpDistance = floor(packed) / 100.0;
+            float bumpStrength = fract(packed);
+            ivec2 texDim = textureSize(textures[nonuniformEXT(mat.normalTexIndex)], 0);
+            float texelSize = 1.0 / float(max(texDim.x, texDim.y));
+            float h_c = texture(textures[nonuniformEXT(mat.normalTexIndex)], texUV).r;
+            float h_x = texture(textures[nonuniformEXT(mat.normalTexIndex)], texUV + vec2(texelSize, 0)).r;
+            float h_y = texture(textures[nonuniformEXT(mat.normalTexIndex)], texUV + vec2(0, texelSize)).r;
+            vec3 Tn = normalize(T);
+            vec3 Bn = normalize(B);
+            float texScale = pow(float(max(texDim.x, texDim.y)), 0.65);
+            vec3 surfgrad = (h_x - h_c) * Tn + (h_y - h_c) * Bn;
+            vec3 bumpN = normalize(N - bumpDistance * texScale * surfgrad);
+            N = normalize(bumpStrength * bumpN + (1.0 - bumpStrength) * N);
+        } else {
+            vec3 texN = texture(textures[nonuniformEXT(mat.normalTexIndex)], texUV).rgb;
             float strength = rawStrength > 0.0 ? rawStrength : 1.0;
             N = applyNormalMap(texN, T, N, B, strength);
         }
-        // Bump mapping omitted for compute path (minor quality difference)
+    }
+    // Procedural bump from VM (Noise Texture → Bump)
+    if (vmActive && vm.hasBump) {
+        vec3 T, B;
+        computeTBN(wp0, wp1, wp2, uv0_, uv1_, uv2_, N, T, B);
+        vec3 Tn = normalize(T);
+        vec3 Bn = normalize(B);
+        vec3 surfgrad = vm.bumpGradient.x * Tn + vm.bumpGradient.y * Bn;
+        vec3 bumpN = normalize(N - vm.bumpDistance * surfgrad);
+        N = normalize(vm.bumpStrength * bumpN + (1.0 - vm.bumpStrength) * N);
     }
 
     bool frontFace = dot(N, -rayDir) >= 0.0;
@@ -318,10 +444,21 @@ void main() {
         return;
     }
 
-    // Emission
-    vec3 emission = vec3(mat.emissiveR, mat.emissiveG, mat.emissiveB) * mat.fresnelMaxLevel * PI;
-    if (mat.detailTexIndex != 0xFFFFFFFFu) {
-        emission *= texture(textures[nonuniformEXT(mat.detailTexIndex)], hitUV).rgb;
+    // Emission (VM-aware, matching raygen_blender.rgen)
+    vec3 emission;
+    if (vmActive && vm.hasEmission) {
+        emission = vm.emission * PI;
+    } else {
+        vec3 emissionColor = vec3(mat.emissiveR, mat.emissiveG, mat.emissiveB);
+        if (mat.detailTexIndex != 0xFFFFFFFFu) {
+            vec3 emTex = texture(textures[nonuniformEXT(mat.detailTexIndex)], hitUV).rgb;
+            if (dot(emissionColor, emissionColor) < 0.001) {
+                emissionColor = emTex;
+            } else {
+                emissionColor *= emTex;
+            }
+        }
+        emission = emissionColor * mat.fresnelMaxLevel * PI;
     }
     vec3 emissionContrib = emission * throughput;
 
@@ -343,8 +480,8 @@ void main() {
         }
     }
 
-    // Bounce 0: write primary G-buffer data (16 floats per pixel)
-    if (bounce == 0u) {
+    // Bounce 0, first sample: write primary G-buffer data (16 floats per pixel)
+    if (bounce == 0u && pc.sampleIdx == 0u) {
         uint gBase = pixelIndex * 16u;
         primaryGBuf.gbufData[gBase+0] = N.x;
         primaryGBuf.gbufData[gBase+1] = N.y;
@@ -365,6 +502,15 @@ void main() {
         primaryGBuf.gbufData[gBase+14] = localPos.z;
         primaryGBuf.gbufData[gBase+15] = uintBitsToFloat(uint(instanceId));
 
+        // Extended G-buffer fields (PrimaryGBuffer struct offsets 16-19)
+        // customIndex, metallic, specularLevel, ior
+        // We need separate storage but primaryGBuf is only 16 floats.
+        // Store metallic in the hitDist field's unused w component — actually
+        // use the radiance buffer's pad slot for metallic.
+        // Alternatively, reuse the existing layout by packing.
+        // For now, store metallic alongside pixel radiance padding.
+        pixelRadiance.radDataU[rBase+7] = floatBitsToUint(metallic);
+
         // Store hitDist in pixel radiance (bounce 0 only, no contention)
         pixelRadiance.radDataU[rBase+3] = floatBitsToUint(hitT);
     }
@@ -379,14 +525,27 @@ void main() {
     bool skipSunNEE = (bounce >= 2u && maxT < 0.01);
     bool skipLocalNEE = (bounce >= 2u);
 
+    // Glass/transmission surfaces don't scatter light — skip NEE entirely
+    float _glassP = (1.0 - metallic) * transmission;
+    bool isGlass = (_glassP > 0.99);
+    if (isGlass) skipSunNEE = true;
+    if (isGlass) skipLocalNEE = true;
+
     if (!skipSunNEE && sunIntensity > 0.0 && sunDir.y > -0.01) {
         float NdotL = dot(N, sunDir);
         if (NdotL > 0.0) {
             vec3 V = -rayDir;
             vec3 sunRadiance = sunColor * sunIntensity;
             vec3 diffContrib, specContrib;
-            evaluateCookTorrance(N, V, sunDir, baseColor, roughness, metallic, specularLevel, ior,
-                                 diffContrib, specContrib);
+            if (isHairSurface) {
+                diffContrib = hair_eval(V, sunDir, hairSmoothT,
+                    baseColor, max(roughness, 0.05), max(hairRadialRoughness, 0.05),
+                    hairShift, max(ior, 1.01), hairV);
+                specContrib = vec3(0.0);
+            } else {
+                evaluateCookTorrance(N, V, sunDir, baseColor, roughness, metallic, specularLevel, ior, transmission,
+                                     diffContrib, specContrib);
+            }
 
             bool rrMode = (cam.parameters.w == 2u);
             if (bounce == 0u && !rrMode) {
@@ -430,7 +589,14 @@ void main() {
 
             vec3 V = -rayDir;
             vec3 diffC, specC;
-            evaluateCookTorrance(N, V, L, baseColor, roughness, metallic, specularLevel, ior, diffC, specC);
+            if (isHairSurface) {
+                diffC = hair_eval(V, L, hairSmoothT,
+                    baseColor, max(roughness, 0.05), max(hairRadialRoughness, 0.05),
+                    hairShift, max(ior, 1.01), hairV);
+                specC = vec3(0.0);
+            } else {
+                evaluateCookTorrance(N, V, L, baseColor, roughness, metallic, specularLevel, ior, transmission, diffC, specC);
+            }
 
             vec3 lightRadiance = lightColor * lightInt * falloff * window;
             vec3 contrib = (diffC + specC) * lightRadiance * throughput;
@@ -456,8 +622,15 @@ void main() {
                 // BRDF evaluation
                 vec3 V = -rayDir;
                 vec3 eDiffC, eSpecC;
-                evaluateCookTorrance(N, V, eDir, baseColor, roughness, metallic, specularLevel, ior,
-                                     eDiffC, eSpecC);
+                if (isHairSurface) {
+                    eDiffC = hair_eval(V, eDir, hairSmoothT,
+                        baseColor, max(roughness, 0.05), max(hairRadialRoughness, 0.05),
+                        hairShift, max(ior, 1.01), hairV);
+                    eSpecC = vec3(0.0);
+                } else {
+                    evaluateCookTorrance(N, V, eDir, baseColor, roughness, metallic, specularLevel, ior, transmission,
+                                         eDiffC, eSpecC);
+                }
 
                 // Geometric term
                 vec3 eRadiance = eSample.emission * eCosTheta / (eDist * eDist);
@@ -501,24 +674,216 @@ void main() {
         throughput = min(throughput, vec3(MAX_RADIANCE));
     }
 
+    // ---- Stochastic passthrough (Transparent BSDF) ----
+    float transparentProb = mat.multB;
+    if (transparentProb > 0.0) {
+        float cosTheta = abs(dot(N, -rayDir));
+        float iorGlass = max(ior, 1.01);
+        float f0g = (iorGlass - 1.0) / (iorGlass + 1.0);
+        f0g = f0g * f0g;
+        float fresnelRefl = f0g + (1.0 - f0g) * pow(1.0 - cosTheta, 5.0);
+        transparentProb = 1.0 - fresnelRefl;
+    }
+    if (transparentProb > 0.0 && rand01() < transparentProb) {
+        // Ray passes through — no refraction, like Cycles Transparent BSDF
+        // Does NOT consume bounce budget (monolithic uses bounce--)
+        uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
+        uint nBase = nextIdx * 12u;
+        vec3 skipOrigin = worldPos + rayDir * 0.002;
+        nextPathStates.nextPathData[nBase+0] = skipOrigin.x;
+        nextPathStates.nextPathData[nBase+1] = skipOrigin.y;
+        nextPathStates.nextPathData[nBase+2] = skipOrigin.z;
+        nextPathStates.nextPathData[nBase+3] = uintBitsToFloat(pixelIndex);
+        nextPathStates.nextPathData[nBase+4] = rayDir.x;
+        nextPathStates.nextPathData[nBase+5] = rayDir.y;
+        nextPathStates.nextPathData[nBase+6] = rayDir.z;
+        nextPathStates.nextPathData[nBase+7] = uintBitsToFloat(rngState);
+        nextPathStates.nextPathData[nBase+8] = throughput.x;
+        nextPathStates.nextPathData[nBase+9] = throughput.y;
+        nextPathStates.nextPathData[nBase+10] = throughput.z;
+        // Preserve bounce + glass counter, clear isDiffuse
+        uint tpFlags = bounce | (flags & 0xFF00u); // keep glass counter bits
+        nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(tpFlags);
+        pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
+        return;
+    }
+
+    // Lightpath transparent: secondary specular rays pass through cheaply
+    if ((mat.flags & MAT_FLAG_LIGHTPATH_TRANSPARENT) != 0u && bounce > 0u && !isDiffusePath) {
+        uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
+        uint nBase = nextIdx * 12u;
+        vec3 skipOrigin = worldPos + rayDir * 0.002;
+        nextPathStates.nextPathData[nBase+0] = skipOrigin.x;
+        nextPathStates.nextPathData[nBase+1] = skipOrigin.y;
+        nextPathStates.nextPathData[nBase+2] = skipOrigin.z;
+        nextPathStates.nextPathData[nBase+3] = uintBitsToFloat(pixelIndex);
+        nextPathStates.nextPathData[nBase+4] = rayDir.x;
+        nextPathStates.nextPathData[nBase+5] = rayDir.y;
+        nextPathStates.nextPathData[nBase+6] = rayDir.z;
+        nextPathStates.nextPathData[nBase+7] = uintBitsToFloat(rngState);
+        nextPathStates.nextPathData[nBase+8] = throughput.x;
+        nextPathStates.nextPathData[nBase+9] = throughput.y;
+        nextPathStates.nextPathData[nBase+10] = throughput.z;
+        uint lpFlags = bounce | (flags & 0xFF00u);
+        nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(lpFlags);
+        pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
+        return;
+    }
+
     // ---- BRDF sampling for next bounce ----
-    float transmission = mat.multR;
-    if (transmission > 0.5) {
-        // Glass: simplified refraction
-        float eta = frontFace ? (1.0 / ior) : ior;
-        vec3 refracted = refract(-(-rayDir), N, eta);
-        if (dot(refracted, refracted) < 0.001 || rand01() < 0.5) {
-            rayDir = reflect(rayDir, N);
-            rayOrigin = worldPos + N * 0.003;
+    float glassProb = (1.0 - metallic) * transmission;
+    vec3 V = -rayDir;
+
+    // Glass bounce counter stored in flags bits [8:11] (4 bits = max 15)
+    uint glassBounces = (flags >> 8u) & 0xFu;
+    const uint MAX_GLASS_BOUNCES = 16u;
+
+    // Glass / Transmission (Cycles-matching Fresnel)
+    // Glass does NOT consume main bounce budget — writes same bounce, early return.
+    if (glassProb > 0.01 && rand01() < glassProb) {
+        glassBounces++;
+        if (glassBounces >= MAX_GLASS_BOUNCES) {
+            pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
+            return;
+        }
+
+        bool enteringGlass = dot(smoothN, -rayDir) >= 0.0;
+        // Bump maps (detailNormalBlend < 0) should affect refraction (frosted glass effect).
+        // Normal maps (detailNormalBlend >= 0) should NOT — they cause distortion on curved glass.
+        bool hasBumpMap = (mat.normalTexIndex != 0xFFFFFFFFu);
+        bool isBumpNotNormalMap = hasBumpMap && (mat.detailNormalBlend < 0.0);
+        vec3 refractN = enteringGlass
+            ? (isBumpNotNormalMap ? N : smoothN)
+            : (isBumpNotNormalMap ? -N : -smoothN);
+        float eta = enteringGlass ? (1.0 / max(ior, 1.01)) : ior;
+        float alphaGlass = roughness * roughness;
+
+        // Bump-to-roughness: only for smooth glass with bump map
+        if (hasBumpMap && alphaGlass < 0.001) {
+            float bumpCos = dot(N, smoothN);
+            if (bumpCos < 0.9999) {
+                alphaGlass = max(alphaGlass, max(1.0 - bumpCos * bumpCos, 0.0));
+            }
+        }
+
+        vec3 Hglass;
+        if (alphaGlass >= 0.0005) {
+            alphaGlass = max(alphaGlass, 0.001);
+            Hglass = sampleGGX_VNDF(rand2(), V, refractN, alphaGlass);
+        } else {
+            Hglass = refractN;
+        }
+
+        float cosI = abs(dot(V, Hglass));
+        float F = fresnelDielectric(cosI, eta);
+        vec3 refracted = refract(-V, Hglass, eta);
+        bool canRefract = dot(refracted, refracted) > 0.0001;
+
+        // Cycles: reflection=F*white, transmission=(1-F)*sqrt(baseColor)
+        vec3 tint = cyclesPrincipledTransmissionTint(baseColor);
+        vec3 R = vec3(F);
+        vec3 T = canRefract ? (1.0 - F) * tint : vec3(0.0);
+        float avgR = dot(R, vec3(1.0/3.0));
+        float avgT = dot(T, vec3(1.0/3.0));
+        float pReflect = (!canRefract) ? 1.0 : avgR / max(avgR + avgT, 1e-6);
+
+        if (!canRefract || rand01() < pReflect) {
+            rayDir = reflect(rayDir, Hglass);
+            rayOrigin = worldPos + refractN * 0.001;
+            throughput *= R / max(glassProb * pReflect, 1e-4);
         } else {
             rayDir = refracted;
-            rayOrigin = worldPos + rayDir * 0.01;
+            rayOrigin = worldPos - refractN * 0.001;
+            throughput *= T / max(glassProb * (1.0 - pReflect), 1e-4);
         }
-        throughput *= baseColor;
-        isDiffusePath = false;
+
+        // Write PathState at SAME bounce (glass doesn't consume bounce budget)
+        uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
+        uint nBase = nextIdx * 12u;
+        nextPathStates.nextPathData[nBase+0] = rayOrigin.x;
+        nextPathStates.nextPathData[nBase+1] = rayOrigin.y;
+        nextPathStates.nextPathData[nBase+2] = rayOrigin.z;
+        nextPathStates.nextPathData[nBase+3] = uintBitsToFloat(pixelIndex);
+        nextPathStates.nextPathData[nBase+4] = rayDir.x;
+        nextPathStates.nextPathData[nBase+5] = rayDir.y;
+        nextPathStates.nextPathData[nBase+6] = rayDir.z;
+        nextPathStates.nextPathData[nBase+7] = uintBitsToFloat(rngState);
+        nextPathStates.nextPathData[nBase+8] = throughput.x;
+        nextPathStates.nextPathData[nBase+9] = throughput.y;
+        nextPathStates.nextPathData[nBase+10] = throughput.z;
+        // Same bounce, not diffuse, updated glass counter
+        uint glassFlags = bounce | ((glassBounces & 0xFu) << 8u);
+        nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(glassFlags);
+        pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
+        return;
+
+    } else if (isHairSurface) {
+        // ---- Hair BSDF: Karis simplified Marschner (R + TT + TRT) ----
+        if (bounce > 1u) {
+            pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
+            return;
+        }
+
+        float NdotV = max(dot(N, V), 0.001);
+        float f0_d = (ior - 1.0) / (ior + 1.0);
+        f0_d = f0_d * f0_d;
+        vec3 F0 = mix(vec3(f0_d * specularLevel * 2.0), baseColor, metallic);
+        vec3 Fh = fresnelSchlick(NdotV, F0);
+        float specWeight = (Fh.r + Fh.g + Fh.b) / 3.0;
+
+        float hairRoughness = max(roughness, 0.05);
+        float hairIor = max(ior, 1.01);
+        float hairSpecularWeight = max(specularLevel * 2.0, 0.0);
+        float hairF0 = (hairIor - 1.0) / (hairIor + 1.0);
+        hairF0 *= hairF0;
+        float specProb = clamp(hairSpecularWeight * (0.35 + 0.45 * (1.0 - hairRoughness)) + hairF0 * 2.0,
+                               0.12, 0.9);
+        if (hairSpecularWeight <= 1e-5) specProb = 0.0;
+
+        vec3 bounceN = N;
+        bool chooseHairSpec = specProb > 0.0 && rand01() < specProb;
+        vec3 newDir;
+
+        if (chooseHairSpec) {
+            float a2 = max(hairRoughness * hairRoughness, 0.001);
+            vec3 H = sampleGGX_VNDF(rand2(), V, bounceN, a2);
+            newDir = reflect(-V, H);
+            float NdotL = max(dot(bounceN, newDir), 0.0);
+            float VdotH = max(dot(V, H), 1e-6);
+            if (NdotL <= 0.0 || VdotH <= 1e-6) {
+                pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
+                return;
+            }
+            float NdotH = max(dot(bounceN, H), 0.0);
+            float NdotVHair = max(dot(bounceN, V), 0.001);
+            float specPdf = (GGX_D(NdotH, a2) * SmithG1(NdotVHair, a2) * VdotH)
+                          / max(4.0 * NdotVHair * VdotH, 1e-6);
+            vec3 hairSpec = hair_eval(V, newDir, hairSmoothT,
+                                      baseColor, hairRoughness, max(hairRadialRoughness, 0.05),
+                                      hairShift, hairIor, hairV);
+            float branchPdf = specProb * max(specPdf, 1e-6);
+            throughput *= hairSpec / branchPdf;
+            isDiffusePath = false;
+        } else {
+            newDir = sampleCosineHemisphere(rand2(), bounceN);
+            vec3 hairDiffuse = hair_eval(V, newDir, hairSmoothT,
+                                         baseColor, hairRoughness, max(hairRadialRoughness, 0.05),
+                                         hairShift, hairIor, hairV);
+            float cosPdf = max(dot(newDir, bounceN), 0.0) * INV_PI;
+            float branchPdf = max((1.0 - specProb) * cosPdf, 1e-6);
+            if (branchPdf <= 1e-6) {
+                pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
+                return;
+            }
+            throughput *= hairDiffuse / branchPdf;
+            isDiffusePath = true;
+        }
+        throughput = min(throughput, vec3(MAX_RADIANCE));
+        rayDir = newDir;
+        rayOrigin = worldPos + N * 0.02;
+
     } else {
-        // Standard BRDF lobe selection
-        vec3 V = -rayDir;
+        // ---- Standard BRDF lobe selection ----
         float NdotV = max(dot(N, V), 0.001);
         float f0_d = (ior - 1.0) / (ior + 1.0);
         f0_d = f0_d * f0_d;
@@ -526,10 +891,14 @@ void main() {
         vec3 F = fresnelSchlick(NdotV, F0);
         float specWeight = (F.r + F.g + F.b) / 3.0;
 
-        if (rand01() > specWeight && metallic < 1.0) {
+        float diffuseWeight = (1.0 - metallic) * (1.0 - transmission);
+        float nonGlassCompensation = (glassProb > 0.01) ? 1.0 / max(1.0 - glassProb, 0.5) : 1.0;
+        bool chooseDiffuse = (diffuseWeight > 0.001) ? (rand01() > specWeight) : false;
+
+        if (chooseDiffuse && metallic < 1.0) {
             // Diffuse
             rayDir = sampleCosineHemisphere(rand2(), N);
-            throughput *= baseColor * (1.0 - metallic);
+            throughput *= baseColor * (1.0 - metallic) * nonGlassCompensation;
             isDiffusePath = true;
         } else {
             // Specular
@@ -545,7 +914,7 @@ void main() {
             vec3 Fw = fresnelSchlick(VdotH, F0);
             float G2 = SmithG2(NdotL, NdotV, alpha2);
             float G1 = SmithG1(NdotV, alpha2);
-            throughput *= (Fw / max(specWeight, 0.001)) * (G2 / max(G1, 0.001));
+            throughput *= (Fw / max(specWeight, 0.001)) * (G2 / max(G1, 0.001)) * nonGlassCompensation;
             isDiffusePath = false;
         }
         rayOrigin = worldPos + N * 0.002;

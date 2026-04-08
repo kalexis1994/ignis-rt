@@ -35,6 +35,8 @@ layout(binding = 7, set = 0, r32f)    uniform image2D viewDepthImg;
 layout(binding = 8, set = 0, rgba16f) uniform image2D motionVectorsImg;
 layout(binding = 9, set = 0, rgba16f) uniform image2D diffuseRadianceImg;
 layout(binding = 10, set = 0, rgba16f) uniform image2D specularRadianceImg;
+layout(binding = 13, set = 0, rgba16f) uniform image2D specularMVImg;
+layout(binding = 15, set = 0, rgba16f) uniform image2D specularAlbedoImg;
 layout(binding = 16, set = 0, rgba16f) uniform image2D albedoBufferImg;
 layout(binding = 18, set = 0, r16f) uniform image2D penumbraImg;
 layout(binding = 22, set = 0, r32f) uniform image2D dlssDepthImg;
@@ -57,11 +59,24 @@ layout(push_constant) uniform PushConst {
     uint frameIndex;
     uint maxBounces;
     uint currentBounce;
+    uint spp;
+    uint sampleIdx;
 } pc;
 
 #include "../include/common.glsl"
+#include "../include/pbr_brdf.glsl"
 #include "../include/nrd_encode.glsl"
 #include "../include/tonemap.glsl"
+
+// EnvBRDFApprox — Epic/Karis approximation for split-sum specular albedo
+vec3 EnvBRDFApprox(vec3 F0, float roughness, float NdotV) {
+    const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+    const vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
+    vec4 r = roughness * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * NdotV)) * r.x + r.y;
+    vec2 AB = vec2(-1.04, 1.04) * a004 + r.zw;
+    return F0 * AB.x + vec3(AB.y);
+}
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -71,13 +86,14 @@ void main() {
 
     // Read accumulated radiance (8 uints per pixel, reinterpret as float)
     uint rBase = pixelIndex * 8u;
+    float sppInv = 1.0 / float(max(pc.spp, 1u));
     vec3 diffuse = vec3(uintBitsToFloat(pixelRadiance.radDataU[rBase+0]),
                         uintBitsToFloat(pixelRadiance.radDataU[rBase+1]),
-                        uintBitsToFloat(pixelRadiance.radDataU[rBase+2]));
+                        uintBitsToFloat(pixelRadiance.radDataU[rBase+2])) * sppInv;
     float hitDist = uintBitsToFloat(pixelRadiance.radDataU[rBase+3]);
     vec3 specular = vec3(uintBitsToFloat(pixelRadiance.radDataU[rBase+4]),
                          uintBitsToFloat(pixelRadiance.radDataU[rBase+5]),
-                         uintBitsToFloat(pixelRadiance.radDataU[rBase+6]));
+                         uintBitsToFloat(pixelRadiance.radDataU[rBase+6])) * sppInv;
 
     // Read primary G-buffer (16 floats per pixel, written by K2)
     uint gBase = pixelIndex * 16u;
@@ -136,6 +152,19 @@ void main() {
         float ndcZ = clamp(clipPos.z / clipPos.w, 0.0, 1.0);
         imageStore(dlssDepthImg, pixel, vec4(ndcZ, 0, 0, 0));
 
+        // Specular MV (same as regular MV for wavefront — no PSR tracking yet)
+        imageStore(specularMVImg, pixel, vec4(motionVector, 0, 0));
+
+        // Specular albedo (EnvBRDFApprox) for DLSS Ray Reconstruction
+        float primaryMetallic = uintBitsToFloat(pixelRadiance.radDataU[rBase+7]);
+        vec3 camPos = (cam.viewInverse * vec4(0, 0, 0, 1)).xyz;
+        vec3 viewDir = normalize(camPos - primaryWorldPos);
+        float NdotV = max(dot(primaryNormal, viewDir), 0.001);
+        float f0_d = 0.04;  // default dielectric F0
+        vec3 F0 = mix(vec3(f0_d), primaryAlbedo, primaryMetallic);
+        vec3 specAlbedo = EnvBRDFApprox(F0, primaryRoughness, NdotV);
+        imageStore(specularAlbedoImg, pixel, vec4(specAlbedo, 0.0));
+
         // Penumbra, reactive, confidence — simplified
         imageStore(penumbraImg, pixel, vec4(65504.0));
         float transformDelta = distance(primaryWorldPos, prevWorldPos);
@@ -168,6 +197,8 @@ void main() {
 
         imageStore(diffuseRadianceImg, pixel, vec4(0, 0, 0, 0));
         imageStore(specularRadianceImg, pixel, vec4(0, 0, 0, 0));
+        imageStore(specularMVImg, pixel, vec4(0, 0, 0, 0));
+        imageStore(specularAlbedoImg, pixel, vec4(0, 0, 0, 0));
         imageStore(albedoBufferImg, pixel, vec4(0, 0, 0, 0));
         imageStore(dlssDepthImg, pixel, vec4(1.0, 0, 0, 0));
         imageStore(penumbraImg, pixel, vec4(0.0));

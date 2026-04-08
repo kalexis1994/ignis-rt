@@ -81,7 +81,7 @@ struct PathTracerConfig {
     float nrdSpecularPhiLuminance= 1.0f;   // [0.5..8.0] luminance edge stopping for specular A-trous (lower = sharper reflections)
 
     // Camera jitter
-    float cameraJitterScale  = 0.25f;  // [0..1] scale for Halton sub-pixel jitter (0.25 = ignis-ac default)
+    float cameraJitterScale  = 0.25f;  // [0..1] scale for Halton sub-pixel jitter (ignis-ac default)
 
     // DLSS
     bool  dlssEnabled        = false;
@@ -119,7 +119,7 @@ struct PathTracerConfig {
     int   shaderMode         = 0;
 
     // Wavefront path tracing (experimental — compute-based multi-kernel pipeline)
-    bool  useWavefront       = false;
+    bool  useWavefront       = true;
 
     // Hybrid rasterization: rasterize primary visibility, path trace secondary bounces
     bool  hybridRasterization = true;

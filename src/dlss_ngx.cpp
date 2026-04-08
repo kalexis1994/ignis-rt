@@ -564,7 +564,7 @@ bool DLSS_NGX::InitializeRR() {
     rrParams->Set(NVSDK_NGX_Parameter_DLSS_Denoise_Mode, (int)NVSDK_NGX_DLSS_Denoise_Mode_DLUnified);
     // Roughness is packed in normalRoughness.a
     rrParams->Set(NVSDK_NGX_Parameter_DLSS_Roughness_Mode, (unsigned int)NVSDK_NGX_DLSS_Roughness_Mode_Packed);
-    rrParams->Set(NVSDK_NGX_Parameter_Use_HW_Depth, (unsigned int)1);  // NDC depth [0,1]
+    rrParams->Set(NVSDK_NGX_Parameter_Use_HW_Depth, (unsigned int)0);  // linear view-space depth (better temporal reprojection)
     // RR model preset: E = latest transformer model (D and E are the only valid RR presets)
     rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA, (unsigned int)NVSDK_NGX_RayReconstruction_Hint_Render_Preset_E);
     rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality, (unsigned int)NVSDK_NGX_RayReconstruction_Hint_Render_Preset_E);

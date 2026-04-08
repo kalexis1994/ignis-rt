@@ -1398,7 +1398,8 @@ void Renderer::RenderFrameRT() {
         uint32_t dispW = (dlssDebugBypass_ && debugViewActive) ? width_ : renderWidth_;
         uint32_t dispH = (dlssDebugBypass_ && debugViewActive) ? height_ : renderHeight_;
         wavefrontPipeline_->RecordDispatch(cmd, dispW, dispH,
-            rtPipeline_->GetDescriptorSet(), wfCfg ? wfCfg->maxBounces : 2);
+            rtPipeline_->GetDescriptorSet(), wfCfg ? wfCfg->maxBounces : 2,
+            wfCfg ? static_cast<uint32_t>(wfCfg->samplesPerPixel) : 1);
     } else {
         uint32_t dispW = (dlssDebugBypass_ && debugViewActive) ? width_ : renderWidth_;
         uint32_t dispH = (dlssDebugBypass_ && debugViewActive) ? height_ : renderHeight_;
@@ -1599,8 +1600,8 @@ void Renderer::RenderFrameRT() {
         dlss_->EvaluateRR(cmd,
             dlssColorInput_, dlssColorInputView_,           // noisy color (render res)
             dlssHdrOutput_, dlssHdrOutputView_,              // output (display res)
-            rtPipeline_->GetDlssDepthImage(),                // NDC depth
-            rtPipeline_->GetDlssDepthView(),
+            rtPipeline_->GetViewDepthImage(),                // linear view-space depth (better for RR)
+            rtPipeline_->GetViewDepthView(),
             rtPipeline_->GetMotionVectorsImage(),            // MVs
             rtPipeline_->GetMotionVectorsView(),
             rtPipeline_->GetNormalRoughnessImage(),          // normals + roughness

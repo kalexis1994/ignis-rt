@@ -24,7 +24,8 @@ public:
     /// Record all wavefront dispatches into the command buffer.
     /// Uses the same descriptor set 0 as RTPipeline for scene data.
     void RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint32_t height,
-                        VkDescriptorSet sceneDescSet, uint32_t maxBounces);
+                        VkDescriptorSet sceneDescSet, uint32_t maxBounces,
+                        uint32_t spp = 1);
 
     bool IsReady() const { return ready_; }
 

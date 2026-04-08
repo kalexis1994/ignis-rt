@@ -52,6 +52,8 @@ layout(push_constant) uniform PushConst {
     uint frameIndex;
     uint maxBounces;
     uint currentBounce;
+    uint spp;
+    uint sampleIdx;
 } pc;
 
 #include "../include/common.glsl"
@@ -64,8 +66,8 @@ void main() {
     uint px = idx % pc.width;
     uint py = idx / pc.width;
 
-    // Initialize RNG
-    rngState = px * 1973u + py * 9277u + pc.frameIndex * 26699u;
+    // Initialize RNG (sampleIdx varies per SPP sample for different jitter)
+    rngState = px * 1973u + py * 9277u + pc.frameIndex * 26699u + pc.sampleIdx * 12347u;
     pcg(rngState);
 
     // Blue noise temporal offset

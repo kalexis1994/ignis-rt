@@ -271,7 +271,7 @@ bool WavefrontPipeline::CreatePipelines() {
     VkPushConstantRange pushRange{};
     pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pushRange.offset = 0;
-    pushRange.size = 5 * sizeof(uint32_t); // width, height, frameIndex, maxBounces, currentBounce
+    pushRange.size = 7 * sizeof(uint32_t); // width, height, frameIndex, maxBounces, currentBounce, spp, sampleIdx
 
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -335,21 +335,26 @@ bool WavefrontPipeline::CreatePipelines() {
 }
 
 void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint32_t height,
-                                         VkDescriptorSet sceneDescSet, uint32_t maxBounces) {
+                                         VkDescriptorSet sceneDescSet, uint32_t maxBounces,
+                                         uint32_t spp) {
     if (!ready_) return;
 
     uint32_t totalPixels = width * height;
     uint32_t groupsAll = (totalPixels + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+    if (spp < 1) spp = 1;
+    if (spp > 128) spp = 128;
 
     // Push constants shared by all kernels
     struct {
-        uint32_t width, height, frameIndex, maxBounces, currentBounce;
+        uint32_t width, height, frameIndex, maxBounces, currentBounce, spp, sampleIdx;
     } push;
     push.width = width;
     push.height = height;
     push.frameIndex = frameIndex_++;
     push.maxBounces = maxBounces;
     push.currentBounce = 0;
+    push.spp = spp;
+    push.sampleIdx = 0;
 
     // Bind both descriptor sets (set 0 = scene, set 1 = wavefront)
     VkDescriptorSet sets[2] = { sceneDescSet, wfDescSet_ };
@@ -372,11 +377,9 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
         vkUpdateDescriptorSets(context_->GetDevice(), 2, resetWrites, 0, nullptr);
     }
 
-    // Clear pixel radiance and primary G-buffer
+    // Clear pixel radiance and primary G-buffer (once per frame, before all SPP samples)
     vkCmdFillBuffer(cmd, pixelRadianceBuffer_, 0, totalPixels * 32, 0);
     vkCmdFillBuffer(cmd, primaryGBufBuffer_, 0, totalPixels * 64, 0);
-    // Set viewZ to 1e7 (sky default) — float 1e7 = 0x4B189680
-    // Actually, 0 is fine: K5 checks abs(viewZ) < 1e6 for primaryHit
 
     VkMemoryBarrier clearBarrier{};
     clearBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -385,22 +388,26 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &clearBarrier, 0, nullptr, 0, nullptr);
 
-    // K0: Camera ray generation
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK0_);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
-        0, 2, sets, 0, nullptr);
-    vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-    vkCmdDispatch(cmd, groupsAll, 1, 1);
-
-    // Barrier: K0 writes → K1 reads
     VkMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
-    // Bounce loop: K1 → K2 → compact(shadow args) → K3 → K4 → compact(swap+active args)
+    // ---- SPP loop: each sample generates new camera rays + full bounce chain ----
+    for (uint32_t sampleIdx = 0; sampleIdx < spp; sampleIdx++) {
+        push.sampleIdx = sampleIdx;
+
+        // K0: Camera ray generation (different jitter per sample via sampleIdx)
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK0_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+            0, 2, sets, 0, nullptr);
+        vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, groupsAll, 1, 1);
+
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+    // Bounce loop: K1 → K2 → compact(shadow args) → K3 → swap
     for (uint32_t bounce = 0; bounce < maxBounces; bounce++) {
         push.currentBounce = bounce;
 
@@ -491,7 +498,27 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
         vkUpdateDescriptorSets(context_->GetDevice(), 2, swapWrites, 0, nullptr);
     }
 
-    // K5: Output
+    // Reset ping-pong for next SPP sample
+    pathStateCurrent_ = 0;
+    if (sampleIdx + 1 < spp) {
+        VkDescriptorBufferInfo resetInfos2[2] = {};
+        VkWriteDescriptorSet resetWrites2[2] = {};
+        resetInfos2[0].buffer = pathStateBuffer_[0]; resetInfos2[0].range = VK_WHOLE_SIZE;
+        resetWrites2[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        resetWrites2[0].dstSet = wfDescSet_; resetWrites2[0].dstBinding = 0;
+        resetWrites2[0].descriptorCount = 1; resetWrites2[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        resetWrites2[0].pBufferInfo = &resetInfos2[0];
+        resetInfos2[1].buffer = pathStateBuffer_[1]; resetInfos2[1].range = VK_WHOLE_SIZE;
+        resetWrites2[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        resetWrites2[1].dstSet = wfDescSet_; resetWrites2[1].dstBinding = 7;
+        resetWrites2[1].descriptorCount = 1; resetWrites2[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        resetWrites2[1].pBufferInfo = &resetInfos2[1];
+        vkUpdateDescriptorSets(context_->GetDevice(), 2, resetWrites2, 0, nullptr);
+    }
+
+    } // end SPP loop
+
+    // K5: Output (after all SPP samples accumulated)
     uint32_t groupsX = (width + 7) / 8;
     uint32_t groupsY = (height + 7) / 8;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK5_);

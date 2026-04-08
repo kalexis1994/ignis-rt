@@ -50,6 +50,8 @@ layout(push_constant) uniform PushConst {
     uint frameIndex;
     uint maxBounces;
     uint currentBounce;
+    uint spp;
+    uint sampleIdx;
 } pc;
 
 #include "../include/common.glsl"
