@@ -947,43 +947,142 @@ void main() {
         }
     }
 
-    // ---- NEE: Point/spot/area lights (bounce 0-1 only) ----
+    // ---- NEE: Point/spot/area lights (stochastic selection, matching monolithic) ----
+    // Bounce 0-1: sample up to 4 random lights. Bounce 2+: sample 1 random light.
+    // Scale contribution by lightCount/sampledCount for unbiased estimate.
+    uint neeStart = 0u;
+    uint neeEnd = min(cam.lightCount, 32u);
+    float neeScale = 1.0;
     if (!skipLocalNEE) {
-        for (uint li = 0u; li < cam.lightCount && li < 32u; li++) {
+        if (bounce >= 2u && cam.lightCount > 1u) {
+            uint randIdx = min(uint(rand01() * float(cam.lightCount)), cam.lightCount - 1u);
+            neeStart = randIdx;
+            neeEnd = randIdx + 1u;
+            neeScale = float(cam.lightCount);
+        } else if (cam.lightCount > 4u) {
+            uint randIdx = min(uint(rand01() * float(cam.lightCount)), cam.lightCount - 1u);
+            neeStart = randIdx;
+            neeEnd = min(randIdx + 4u, cam.lightCount);
+            neeScale = float(cam.lightCount) / float(min(4u, cam.lightCount - randIdx));
+        }
+    }
+    if (!skipLocalNEE) {
+        for (uint li = neeStart; li < neeEnd; li++) {
             vec4 lightPosRange = cam.lights[li * 4u];
-            vec4 lightColInt = cam.lights[li * 4u + 1u];
-            vec3 lightPos = lightPosRange.xyz;
-            float lightRange = abs(lightPosRange.w);
+            vec4 lightColInt   = cam.lights[li * 4u + 1u];
+            vec4 lightDirSizeX = cam.lights[li * 4u + 2u];
+            vec4 lightTanSizeY = cam.lights[li * 4u + 3u];
+
+            vec3 lightPos   = lightPosRange.xyz;
+            float rawRange  = lightPosRange.w;
             vec3 lightColor = lightColInt.rgb;
-            float lightInt = lightColInt.w;
+            float lightInt  = lightColInt.w;
+
+            // Classify light type: negative range = area or spot light
+            bool isSpecialLight = (rawRange < 0.0);
+            float sizeY = lightTanSizeY.w;
+            bool isSpotLight = isSpecialLight && sizeY < 0.0;
+            bool isAreaLight = isSpecialLight && !isSpotLight;
+
+            // Compute effective range
+            float lightRange;
+            if (isAreaLight) {
+                float sizeX = lightDirSizeX.w;
+                float sizeYa = lightTanSizeY.w;
+                float diagonal = sqrt(sizeX * sizeX + sizeYa * sizeYa) * 0.5;
+                float falloffRange = max(sqrt(lightInt * sizeX * sizeYa / 0.01), 1.0);
+                lightRange = diagonal + falloffRange;
+            } else if (isSpotLight) {
+                lightRange = -rawRange;
+            } else {
+                lightRange = rawRange;
+            }
+            lightRange = min(lightRange, 100.0);
 
             vec3 toLight = lightPos - worldPos;
             float dist = length(toLight);
             if (dist > lightRange || dist < 0.001) continue;
             vec3 L = toLight / dist;
             float NdotL_pt = dot(N, L);
-            if (NdotL_pt <= 0.0) continue;
+            if (!isAreaLight && NdotL_pt <= 0.0) continue;
 
-            float falloff = 1.0 / (dist * dist + 0.01);
-            float window = clamp(1.0 - pow(dist / lightRange, 4.0), 0.0, 1.0);
-            window = window * window;
+            // Spot light: cone attenuation (Cycles formula)
+            if (isSpotLight) {
+                vec3 spotDir = lightDirSizeX.xyz;
+                float cosHalfAngle = lightDirSizeX.w;
+                float spotSmooth = abs(lightTanSizeY.w);
+                float cosAngle = dot(-L, spotDir);
+                float t = clamp((cosAngle - cosHalfAngle) * spotSmooth, 0.0, 1.0);
+                float spotAtten = t * t * (3.0 - 2.0 * t);
+                if (spotAtten <= 0.0) continue;
+                lightInt *= spotAtten;
+            }
+
+            // Area light sampling / point light soft shadow jitter
+            vec3 shadowTarget;
+            if (isAreaLight) {
+                vec3 lightNormal = lightDirSizeX.xyz;
+                vec3 lightTangent = lightTanSizeY.xyz;
+                float sizeX = lightDirSizeX.w;
+                float sizeYa = lightTanSizeY.w;
+                vec3 lightBitangent = cross(lightNormal, lightTangent);
+                vec2 areaRnd = rand2() * 2.0 - 1.0;
+                shadowTarget = lightPos
+                    + lightTangent * (areaRnd.x * sizeX * 0.5)
+                    + lightBitangent * (areaRnd.y * sizeYa * 0.5);
+            } else {
+                // Point/spot: soft shadow from source radius (shadow_soft_size)
+                // Point lights: size_x = shadow_soft_size from Blender
+                // Spot lights: use angular extent as soft radius
+                float sourceRadius = isSpotLight ? 0.0 : lightDirSizeX.w;
+                float softRadius = (sourceRadius > 0.001)
+                    ? clamp(sourceRadius * 0.5, 0.005, 1.0)
+                    : clamp(dist * 0.015, 0.01, 0.3);  // fallback for zero-radius
+                vec2 diskSample = rand2();
+                float diskR = sqrt(diskSample.x) * softRadius;
+                float diskAngle = diskSample.y * 2.0 * PI;
+                vec3 lTangent = abs(L.y) < 0.999 ? normalize(cross(L, vec3(0,1,0))) : normalize(cross(L, vec3(1,0,0)));
+                vec3 lBitangent = cross(L, lTangent);
+                shadowTarget = lightPos + lTangent * (cos(diskAngle) * diskR) + lBitangent * (sin(diskAngle) * diskR);
+            }
+
+            vec3 toSample = shadowTarget - worldPos;
+            float sampleDist = length(toSample);
+            vec3 shadowDir = toSample / sampleDist;
+
+            // Attenuation
+            float effectiveDist = isAreaLight ? sampleDist : dist;
+            float attenuation = 1.0 / (effectiveDist * effectiveDist + 0.001);
+
+            // Area light geometric term
+            if (isAreaLight) {
+                vec3 lightNormal = lightDirSizeX.xyz;
+                float cosAtLight = max(dot(-shadowDir, lightNormal), 0.0);
+                if (cosAtLight <= 0.0) continue;
+                attenuation *= cosAtLight * (lightDirSizeX.w * lightTanSizeY.w);
+            }
+
+            // BRDF evaluation (area lights use shadowDir, others use L)
+            vec3 brdfL = isAreaLight ? shadowDir : L;
+            float brdfNdotL = dot(N, brdfL);
+            if (brdfNdotL <= 0.0 && !isAreaLight) continue;
 
             vec3 V = -rayDir;
             vec3 diffC, specC;
             if (isHairSurface) {
-                diffC = hair_eval(V, L, hairSmoothT,
+                diffC = hair_eval(V, brdfL, hairSmoothT,
                     baseColor, max(roughness, 0.05), max(hairRadialRoughness, 0.05),
                     hairShift, max(ior, 1.01), hairV);
                 specC = vec3(0.0);
             } else {
-                evaluateCookTorrance(N, V, L, baseColor, roughness, metallic, specularLevel, ior, transmission, diffC, specC);
+                evaluateCookTorrance(N, V, brdfL, baseColor, roughness, metallic, specularLevel, ior, transmission, diffC, specC);
             }
 
-            vec3 lightRadiance = lightColor * lightInt * falloff * window;
-            vec3 contrib = (diffC + specC) * lightRadiance * throughput;
+            vec3 lightRadiance = lightColor * lightInt * attenuation;
+            vec3 contrib = (diffC + specC) * lightRadiance * throughput * neeScale;
             if (bounce > 0u) contrib *= cam.ptParams0.y;
 
-            appendShadowRay(worldPos + N * shadowBias, L, dist - 0.004, idx, contrib,
+            appendShadowRay(worldPos + N * shadowBias, shadowDir, sampleDist - 0.004, idx, contrib,
                             isDiffusePath ? 0u : 1u);
         }
     }

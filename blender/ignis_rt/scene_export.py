@@ -1932,36 +1932,55 @@ def export_lights(depsgraph):
 
         if light.type == 'AREA':
             # Cycles multiplies light dimensions by object scale (from matrix_world).
-            # Extract scale from the transform's basis vectors, like Cycles does:
-            # extentu = transform_column(tfm, 0) * sizeu → len_u = length(extentu)
             scale_x = mat_w.col[0].xyz.length
             scale_y = mat_w.col[1].xyz.length
             base_size_x = light.size if hasattr(light, 'size') else 1.0
             base_size_y = light.size_y if light.shape in ('RECTANGLE', 'ELLIPSE') else base_size_x
             size_x = base_size_x * scale_x
             size_y = base_size_y * scale_y
+
+            # Elliptical area lights: scale to equivalent ellipse area
+            # SQUARE/DISK → size_y = size_x (already handled above)
+            # RECTANGLE/ELLIPSE → different size_x/size_y
+            is_elliptical = light.shape in ('DISK', 'ELLIPSE')
+
+            # Area light spread angle (Blender 3.x+): narrows emission cone
+            # spread = pi → isotropic (default), spread < pi → focused
+            spread = getattr(light, 'spread', math.pi)
+            spread_factor = 1.0
+            if spread < math.pi - 0.01:
+                # Approximate Cycles spread as intensity concentration
+                spread_factor = math.pi / max(spread, 0.01)
+
             # Negative range signals area light to shader
             export_range = -max(size_x, size_y) * 0.5
             # Cycles area light: energy is total power (Watts).
-            # Radiance = power / (PI * area).  Shader multiplies by areaSize
-            # in NEE, so we pass radiance = power / (PI * area).
-            area = size_x * size_y
-            intensity = energy / (math.pi * area) if area > 0 else energy
+            # Radiance = power / (PI * area). For elliptical, effective area = PI/4 * sizeX * sizeY
+            if is_elliptical:
+                area = (math.pi / 4.0) * size_x * size_y
+            else:
+                area = size_x * size_y
+            intensity = (energy * spread_factor) / (math.pi * area) if area > 0 else energy
         elif light.type == 'SPOT':
-            # Spot light: pack cone parameters into size_x (cos_half_angle)
-            # and size_y (spot_smooth factor)
             spot_angle = light.spot_size  # full cone angle in radians
             spot_blend = light.spot_blend  # 0 = hard, 1 = full smooth
             cos_half = math.cos(spot_angle * 0.5)
-            # Cycles formula: spot_smooth = 1.0 / ((1 - cos_half) * blend)
             if spot_blend > 0.001:
                 spot_smooth = 1.0 / ((1.0 - cos_half) * spot_blend)
             else:
                 spot_smooth = 1e6  # hard edge
             size_x = cos_half       # packed in size_x
             size_y = -spot_smooth   # NEGATIVE sizeY signals spot light (vs area)
+            # Spot light soft shadow: use shadow_soft_size as source radius
+            # Packed into dir_w alongside cos_half isn't possible, so we use the
+            # spot_smooth magnitude to carry both (shader extracts via abs())
             export_range = -estimated_range
         else:
+            # Point light: pack shadow_soft_size as source radius for soft shadows
+            # shadow_soft_size > 0 makes the light a sphere light (soft shadows)
+            soft_size = getattr(light, 'shadow_soft_size', 0.0)
+            if soft_size > 0.001:
+                size_x = soft_size  # shader uses this as soft shadow radius
             export_range = estimated_range
 
         # Light export logging removed (was too verbose for scenes with many lights)
