@@ -408,7 +408,12 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
     // Bounce loop: K1 → K2 → compact(shadow args) → K3 → swap
-    for (uint32_t bounce = 0; bounce < maxBounces; bounce++) {
+    // Extra iterations for glass: glass bounces don't consume the shader bounce
+    // counter but DO consume dispatch loop iterations. Add headroom for glass
+    // traversal (enter + exit = 2 extra iterations minimum).
+    uint32_t glassHeadroom = 4; // covers enter/exit + rough glass multi-bounce
+    uint32_t totalIterations = maxBounces + glassHeadroom;
+    for (uint32_t bounce = 0; bounce < totalIterations; bounce++) {
         push.currentBounce = bounce;
 
         // K1: Intersection

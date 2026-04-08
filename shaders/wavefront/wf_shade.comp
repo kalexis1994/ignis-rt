@@ -221,6 +221,7 @@ void main() {
 
     uint bounce = flags & 0xFu;
     bool isDiffusePath = (flags & 0x10u) != 0u;
+    uint glassBouncesPrev = (flags >> 8u) & 0xFu;  // glass bounces from previous iterations
 
     // Read HitResult (20 floats: 8 base + 12 objToWorld)
     uint hBase = idx * 20u;
@@ -265,16 +266,23 @@ void main() {
     vec3 wp1 = objToWorld * vec4(p1, 1.0);
     vec3 wp2 = objToWorld * vec4(p2, 1.0);
 
-    // True triangle normal (geometric, for frontFace detection)
-    vec3 geoNormal = normalize(cross(wp1 - wp0, wp2 - wp0));
-    if (dot(geoNormal, -rayDir) < 0.0) geoNormal = -geoNormal; // flip toward camera
-
     // Normals — transform to world space via objToWorld 3x3
     vec3 n0 = vec3(normals.n[i0*3+0], normals.n[i0*3+1], normals.n[i0*3+2]);
     vec3 n1 = vec3(normals.n[i1*3+0], normals.n[i1*3+1], normals.n[i1*3+2]);
     vec3 n2 = vec3(normals.n[i2*3+0], normals.n[i2*3+1], normals.n[i2*3+2]);
     vec3 localN = normalize(n0 * bary.x + n1 * bary.y + n2 * bary.z);
     vec3 worldN = normalize(mat3(objToWorld) * localN);
+
+    // Shadow terminator fix (matching monolithic raygen_blender.rgen):
+    // When interpolated normals cross below the geometric face plane on
+    // smooth-shaded curved meshes, snap to geometric normal to prevent
+    // dark silhouette edges.
+    vec3 geoNormal = normalize(cross(wp1 - wp0, wp2 - wp0));
+    if (dot(geoNormal, -rayDir) < 0.0) geoNormal = -geoNormal;
+    float NdotNg = dot(worldN, geoNormal);
+    if (NdotNg < 0.0) {
+        worldN = geoNormal;
+    }
 
     // UVs
     vec2 uv0_ = vec2(uvData.uv[i0*2+0], 1.0 - uvData.uv[i0*2+1]);
@@ -375,6 +383,9 @@ void main() {
         if (vm.hasTransmission) transmission = vm.transmission;
     }
 
+    // Glass detection (after VM overrides, before emission/ambient)
+    bool isGlass = ((1.0 - metallic) * transmission > 0.99);
+
     // ORM map (fills what VM didn't provide)
     if (mat.mapsTexIndex != 0xFFFFFFFFu) {
         vec4 orm = texture(textures[nonuniformEXT(mat.mapsTexIndex)], texUV);
@@ -422,17 +433,15 @@ void main() {
         N = normalize(vm.bumpStrength * bumpN + (1.0 - vm.bumpStrength) * N);
     }
 
-    // Use geometric normal for frontFace detection (not bump-mapped N)
-    // This prevents black bands at grazing angles where normal mapping
-    // can perturb N to face away from the camera.
-    vec3 gN = geoNormal;
+    // frontFace + NdotV clamp (matching monolithic raygen_blender.rgen)
+    vec3 gN = geoNormal;  // camera-facing geometric normal
     bool frontFace = dot(gN, -rayDir) >= 0.0;
     if (!frontFace) {
         gN = -gN;
         N = -N;
     }
-    // Clamp perturbed normal: if normal map made it face away from camera,
-    // blend back toward geometric normal to avoid black artifacts
+    // Clamp perturbed normal: if normal map pushed N behind the surface,
+    // blend back toward geometric normal to avoid black bands at grazing angles.
     float NdotV_check = dot(N, -rayDir);
     if (NdotV_check < 0.01) {
         float blend = clamp(-NdotV_check * 50.0 + 0.5, 0.0, 1.0);
@@ -481,6 +490,7 @@ void main() {
     vec3 emissionContrib = emission * throughput;
 
     // Accumulate emission (atomic for thread safety across bounces)
+    // Accumulate emission (atomic for thread safety across bounces)
     uint rBase = pixelIndex * 8u;
     if (bounce == 0u) {
         atomicAddFloat(rBase+0, emissionContrib.x);
@@ -498,7 +508,9 @@ void main() {
         }
     }
 
-    // Bounce 0, first sample: write primary G-buffer data (16 floats per pixel)
+    // Bounce 0, first sample: write primary G-buffer data
+    // Early glass returns before here, so this only fires for non-glass or
+    // the resolved surface behind glass (last surface at bounce 0 wins).
     if (bounce == 0u && pc.sampleIdx == 0u) {
         uint gBase = pixelIndex * 16u;
         primaryGBuf.gbufData[gBase+0] = N.x;
@@ -533,6 +545,97 @@ void main() {
         pixelRadiance.radDataU[rBase+3] = floatBitsToUint(hitT);
     }
 
+    // ---- Glass/thin transmission detection ----
+    float glassProb_pre = (1.0 - metallic) * transmission;
+    bool thinTransmissionMaterial = (mat.flags & MAT_FLAG_THIN_TRANSMISSION) != 0u;
+    uint materialVmHeaderFlags = (mat.nodeVmHeader >> 8u) & 0xFFu;
+    bool mappedTransmissionMaterial = (materialVmHeaderFlags & VM_HEADER_FLAG_TRANSMISSION) != 0u;
+    bool partialTransmissionHit = (glassProb_pre < 0.98) || (alpha < 0.999);
+    bool useThinTransmissionPath = thinTransmissionMaterial || (mappedTransmissionMaterial && partialTransmissionHit);
+
+    // ---- Early glass fast path (pure glass — skip NEE/ambient, refract immediately) ----
+    // Matching monolithic earlyGlassExit: glass doesn't scatter via diffuse NEE.
+    float transparentProb_check = mat.multB;
+    bool earlyGlassExit =
+        glassProb_pre > 0.99 &&
+        !useThinTransmissionPath &&
+        transparentProb_check <= 0.0 &&
+        alpha >= 0.999 &&
+        metallic <= 0.001;
+    if (earlyGlassExit) {
+        uint glassBounces = glassBouncesPrev + 1u;
+        if (glassBounces >= 16u) {
+            pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
+            return;
+        }
+
+        vec3 Veg = -rayDir;
+        bool enteringGlass = dot(smoothN, -rayDir) >= 0.0;
+        bool hasBumpMap = (mat.normalTexIndex != 0xFFFFFFFFu);
+        bool isBumpNotNormalMap = hasBumpMap && (mat.detailNormalBlend < 0.0);
+        vec3 refractN = enteringGlass
+            ? (isBumpNotNormalMap ? N : smoothN)
+            : (isBumpNotNormalMap ? -N : -smoothN);
+        float eta = enteringGlass ? (1.0 / max(ior, 1.01)) : ior;
+        float alphaGlass = roughness * roughness;
+
+        if (hasBumpMap && alphaGlass < 0.001) {
+            float bumpCos = dot(N, smoothN);
+            if (bumpCos < 0.9999) {
+                alphaGlass = max(alphaGlass, max(1.0 - bumpCos * bumpCos, 0.0));
+            }
+        }
+
+        vec3 Hglass;
+        if (alphaGlass >= 0.0005) {
+            alphaGlass = max(alphaGlass, 0.001);
+            Hglass = sampleGGX_VNDF(rand2(), Veg, refractN, alphaGlass);
+        } else {
+            Hglass = refractN;
+        }
+
+        float cosI = abs(dot(Veg, Hglass));
+        float F = fresnelDielectric(cosI, eta);
+        vec3 refracted = refract(-Veg, Hglass, eta);
+        bool canRefract = dot(refracted, refracted) > 0.0001;
+
+        vec3 tint = cyclesPrincipledTransmissionTint(baseColor);
+        vec3 R = vec3(F);
+        vec3 T = canRefract ? (1.0 - F) * tint : vec3(0.0);
+        float avgR = dot(R, vec3(1.0/3.0));
+        float avgT = dot(T, vec3(1.0/3.0));
+        float pReflect = (!canRefract) ? 1.0 : avgR / max(avgR + avgT, 1e-6);
+
+        vec3 newDir, newOrigin;
+        if (!canRefract || rand01() < pReflect) {
+            newDir = reflect(rayDir, Hglass);
+            newOrigin = worldPos + refractN * 0.001;
+            throughput *= R / max(pReflect, 1e-4);
+        } else {
+            newDir = refracted;
+            newOrigin = worldPos - refractN * 0.001;
+            throughput *= T / max(1.0 - pReflect, 1e-4);
+        }
+
+        uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
+        uint nBase = nextIdx * 12u;
+        nextPathStates.nextPathData[nBase+0] = newOrigin.x;
+        nextPathStates.nextPathData[nBase+1] = newOrigin.y;
+        nextPathStates.nextPathData[nBase+2] = newOrigin.z;
+        nextPathStates.nextPathData[nBase+3] = uintBitsToFloat(pixelIndex);
+        nextPathStates.nextPathData[nBase+4] = newDir.x;
+        nextPathStates.nextPathData[nBase+5] = newDir.y;
+        nextPathStates.nextPathData[nBase+6] = newDir.z;
+        nextPathStates.nextPathData[nBase+7] = uintBitsToFloat(rngState);
+        nextPathStates.nextPathData[nBase+8] = throughput.x;
+        nextPathStates.nextPathData[nBase+9] = throughput.y;
+        nextPathStates.nextPathData[nBase+10] = throughput.z;
+        uint glassFlags = bounce | ((glassBounces & 0xFu) << 8u);
+        nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(glassFlags);
+        pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
+        return;
+    }
+
     // ---- NEE: Direct sun light ----
     vec3 sunDir = normalize(cam.sunLight.xyz);
     float sunIntensity = cam.sunLight.w;
@@ -544,8 +647,6 @@ void main() {
     bool skipLocalNEE = (bounce >= 2u);
 
     // Glass/transmission surfaces don't scatter light — skip NEE entirely
-    float _glassP = (1.0 - metallic) * transmission;
-    bool isGlass = (_glassP > 0.99);
     if (isGlass) skipSunNEE = true;
     if (isGlass) skipLocalNEE = true;
 
@@ -690,6 +791,72 @@ void main() {
         }
         throughput /= p;
         throughput = min(throughput, vec3(MAX_RADIANCE));
+    }
+
+    // ---- Thin transmission fast path (windows, curtains, VM-mapped partial glass) ----
+    if (glassProb_pre > 0.01 && useThinTransmissionPath) {
+        vec3 Vthin = -rayDir;
+        float cosTheta = abs(dot(N, Vthin));
+        float etaThin = 1.0 / max(ior, 1.01);
+        float fresnelThin = fresnelDielectric(cosTheta, etaThin);
+        float thinPassProb = glassProb_pre * (1.0 - fresnelThin);
+        float thinReflectProb = glassProb_pre * fresnelThin;
+        float thinTotalProb = thinPassProb + thinReflectProb;
+        float thinRnd = rand01();
+
+        if (thinPassProb > 0.01 && thinRnd < thinPassProb) {
+            // Thin passthrough with transmission tint (no refraction bend)
+            throughput *= cyclesPrincipledTransmissionTint(baseColor) / max(thinPassProb, 0.01);
+            uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
+            uint nBase = nextIdx * 12u;
+            vec3 thinOrigin = worldPos + rayDir * 0.002;
+            nextPathStates.nextPathData[nBase+0] = thinOrigin.x;
+            nextPathStates.nextPathData[nBase+1] = thinOrigin.y;
+            nextPathStates.nextPathData[nBase+2] = thinOrigin.z;
+            nextPathStates.nextPathData[nBase+3] = uintBitsToFloat(pixelIndex);
+            nextPathStates.nextPathData[nBase+4] = rayDir.x;
+            nextPathStates.nextPathData[nBase+5] = rayDir.y;
+            nextPathStates.nextPathData[nBase+6] = rayDir.z;
+            nextPathStates.nextPathData[nBase+7] = uintBitsToFloat(rngState);
+            nextPathStates.nextPathData[nBase+8] = throughput.x;
+            nextPathStates.nextPathData[nBase+9] = throughput.y;
+            nextPathStates.nextPathData[nBase+10] = throughput.z;
+            uint thinFlags = bounce | (flags & 0xFF00u); // same bounce, preserve glass counter
+            nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(thinFlags);
+            pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
+            return;
+        } else if (thinReflectProb > 0.001 && thinRnd < thinTotalProb) {
+            // Thin reflection (GGX microfacet)
+            float alphaThin = roughness * roughness;
+            vec3 Hthin;
+            if (alphaThin > 0.0005) {
+                alphaThin = max(alphaThin, 0.001);
+                Hthin = sampleGGX_VNDF(rand2(), Vthin, N, alphaThin);
+            } else {
+                Hthin = N;
+            }
+            vec3 newDir = reflect(rayDir, Hthin);
+            throughput *= vec3(1.0) / max(thinReflectProb, 0.01);
+            uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
+            uint nBase = nextIdx * 12u;
+            vec3 reflOrigin = worldPos + N * 0.001;
+            nextPathStates.nextPathData[nBase+0] = reflOrigin.x;
+            nextPathStates.nextPathData[nBase+1] = reflOrigin.y;
+            nextPathStates.nextPathData[nBase+2] = reflOrigin.z;
+            nextPathStates.nextPathData[nBase+3] = uintBitsToFloat(pixelIndex);
+            nextPathStates.nextPathData[nBase+4] = newDir.x;
+            nextPathStates.nextPathData[nBase+5] = newDir.y;
+            nextPathStates.nextPathData[nBase+6] = newDir.z;
+            nextPathStates.nextPathData[nBase+7] = uintBitsToFloat(rngState);
+            nextPathStates.nextPathData[nBase+8] = throughput.x;
+            nextPathStates.nextPathData[nBase+9] = throughput.y;
+            nextPathStates.nextPathData[nBase+10] = throughput.z;
+            uint reflFlags = bounce | (flags & 0xFF00u); // same bounce
+            nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(reflFlags);
+            pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
+            return;
+        }
+        // If neither passthrough nor reflect triggered, fall through to standard BRDF
     }
 
     // ---- Stochastic passthrough (Transparent BSDF) ----

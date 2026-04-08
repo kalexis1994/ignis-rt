@@ -2,12 +2,93 @@
 #extension GL_EXT_ray_tracing : require
 #extension GL_EXT_ray_query : require
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
 #extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 256) in;
 
 // Scene data (set 0)
 layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+
+// Geometry metadata (for shadow transparency checks)
+struct GeometryMetadata {
+    uint64_t vertexBufferAddress;
+    uint64_t indexBufferAddress;
+    uint64_t normalBufferAddress;
+    uint64_t uvBufferAddress;
+    uint64_t primMaterialBufferAddress;
+    uint64_t bitangentBufferAddress;
+    uint64_t primYBoundsAddress;
+    uint64_t colorBufferAddress;
+    uint vertexCount;
+    uint indexCount;
+};
+
+layout(binding = 3, set = 0, scalar) buffer GeometryMetadataBuffer {
+    GeometryMetadata geometries[];
+} geometryMetadata;
+
+struct Material {
+    uint diffuseTexIndex;
+    uint normalTexIndex;
+    uint mapsTexIndex;
+    uint detailTexIndex;
+
+    uint normalDetailTexIndex;
+    float ksAmbient;
+    float ksDiffuse;
+    float ksSpecular;
+
+    float ksSpecularEXP;
+    float emissiveR, emissiveG, emissiveB;
+
+    float fresnelC;
+    float fresnelEXP;
+    float detailUVMultiplier;
+    float detailNormalBlend;
+
+    uint flags;
+    float alphaRef;
+    uint shaderType;
+    float fresnelMaxLevel;
+
+    uint maskTexIndex;
+    uint detailRTexIndex;
+    uint detailGTexIndex;
+    uint detailBTexIndex;
+
+    uint detailATexIndex;
+    uint detailNMTexIndex;
+    float multR;
+    float multG;
+
+    float multB;
+    float multA;
+    float magicMult;
+    float detailNMMult;
+    float detailNMMultV;
+
+    float sunSpecular;
+    float sunSpecularEXP;
+
+    uint nodeVmHeader;
+    uint nodeVmPad[3];
+    uvec4 nodeVmCode[128];
+};
+
+layout(binding = 4, set = 0, scalar) buffer MaterialBuffer {
+    Material materials[];
+} materialBuffer;
+
+layout(binding = 5, set = 0) uniform sampler2D textures[];
+
+layout(buffer_reference, scalar) buffer Indices { uint i[]; };
+layout(buffer_reference, scalar) buffer UVs { float uv[]; };
+layout(buffer_reference, scalar) buffer PrimMaterials { uint m[]; };
+
+const uint MAT_FLAG_LIGHTPATH_TRANSPARENT = 256u;
 
 // Wavefront buffers (set 1)
 layout(binding = 0, set = 1, scalar) buffer PathStateBuffer { float pathData[]; } pathStates;
@@ -45,17 +126,88 @@ void main() {
     vec3 radiance = vec3(shadowRays.shadowData[base+8], shadowRays.shadowData[base+9], shadowRays.shadowData[base+10]);
     uint channel = floatBitsToUint(shadowRays.shadowData[base+11]);
 
-    // Trace shadow ray
-    rayQueryEXT rq;
-    rayQueryInitializeEXT(rq, topLevelAS,
-        gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
-        0xFF, origin, 0.0, dir, maxDist);
-    while (rayQueryProceedEXT(rq)) {}
+    if (radiance.x <= 0.0 && radiance.y <= 0.0 && radiance.z <= 0.0) return;
 
-    // If occluded, skip accumulation
-    if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) return;
+    // Shadow ray with transparency loop (matching monolithic):
+    // Skip through glass, transparent, and lightpath-transparent surfaces.
+    vec3 shadowFilter = vec3(1.0);
+    vec3 shadowOrigin = origin;
+    bool inShadow = false;
 
-    // Not occluded — accumulate radiance directly
+    for (int shadowIter = 0; shadowIter < 8; shadowIter++) {
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, topLevelAS,
+            gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+            0xFF, shadowOrigin, 0.0, dir, maxDist);
+        while (rayQueryProceedEXT(rq)) {}
+
+        if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+            break;  // No more hits — light is visible
+        }
+
+        // Hit something — check if it's transparent/glass
+        float sHitT = rayQueryGetIntersectionTEXT(rq, true);
+        uint sCustomIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+        int sPrimId = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+
+        GeometryMetadata sGeo = geometryMetadata.geometries[sCustomIndex];
+        uint sMatIdx = 0u;
+        if (sGeo.primMaterialBufferAddress != 0u) {
+            PrimMaterials sPrimMats = PrimMaterials(sGeo.primMaterialBufferAddress);
+            sMatIdx = sPrimMats.m[sPrimId];
+        }
+        Material sMat = materialBuffer.materials[sMatIdx];
+
+        // Glass/volume surfaces (flags bit 1 = TRANSMISSION, bit 2 = VOLUME): pass through
+        if ((sMat.flags & 6u) != 0u) {
+            shadowOrigin += dir * (sHitT + 0.004);
+            maxDist -= (sHitT + 0.004);
+            if (maxDist <= 0.0) break;
+            continue;
+        }
+
+        // Transparent BSDF / lightpath transparent / alpha-tested materials
+        bool sNeedsShadowTransparency =
+            (sMat.flags & (1u | MAT_FLAG_LIGHTPATH_TRANSPARENT)) != 0u || sMat.multB > 0.0;
+        if (sNeedsShadowTransparency) {
+            // Simple alpha check for alpha-tested materials
+            if ((sMat.flags & 1u) != 0u && sMat.diffuseTexIndex != 0xFFFFFFFFu) {
+                // Sample alpha from diffuse texture
+                vec2 sBary2 = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+                vec3 sBary = vec3(1.0 - sBary2.x - sBary2.y, sBary2.x, sBary2.y);
+                Indices sIdx = Indices(sGeo.indexBufferAddress);
+                uint si0 = sIdx.i[sPrimId*3+0];
+                uint si1 = sIdx.i[sPrimId*3+1];
+                uint si2 = sIdx.i[sPrimId*3+2];
+                if (sGeo.uvBufferAddress != 0u) {
+                    UVs sUV = UVs(sGeo.uvBufferAddress);
+                    vec2 suv0 = vec2(sUV.uv[si0*2+0], 1.0 - sUV.uv[si0*2+1]);
+                    vec2 suv1 = vec2(sUV.uv[si1*2+0], 1.0 - sUV.uv[si1*2+1]);
+                    vec2 suv2 = vec2(sUV.uv[si2*2+0], 1.0 - sUV.uv[si2*2+1]);
+                    vec2 sHitUV = suv0 * sBary.x + suv1 * sBary.y + suv2 * sBary.z;
+                    float sAlpha = texture(textures[nonuniformEXT(sMat.diffuseTexIndex)], sHitUV).a * sMat.multG;
+                    if (sAlpha >= sMat.alphaRef) {
+                        inShadow = true;
+                        break;
+                    }
+                }
+            }
+            // Skip through
+            shadowOrigin += dir * (sHitT + 0.002);
+            maxDist -= (sHitT + 0.002);
+            if (maxDist <= 0.0) break;
+            continue;
+        }
+
+        // Opaque hit — in shadow
+        inShadow = true;
+        break;
+    }
+
+    if (inShadow) return;
+
+    // Not occluded — accumulate radiance with shadow filter
+    radiance *= shadowFilter;
     if (radiance.x <= 0.0 && radiance.y <= 0.0 && radiance.z <= 0.0) return;
 
     uint pBase = pathIndex * 12u;
