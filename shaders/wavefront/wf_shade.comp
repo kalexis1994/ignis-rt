@@ -118,6 +118,10 @@ layout(binding = 5, set = 0) uniform sampler2D textures[];
 layout(binding = 12, set = 0) uniform sampler2D blueNoiseTexture;
 layout(binding = 18, set = 0, r16f) uniform image2D penumbraImg;
 
+// ReSTIR DI reservoir buffers (ping-pong: current write, previous read)
+layout(binding = 24, set = 0, std430) buffer DIReservoirCurrBuf { vec4 data[]; } diReservoirCurr;
+layout(binding = 25, set = 0, std430) buffer DIReservoirPrevBuf { vec4 data[]; } diReservoirPrev;
+
 // Emissive triangles for MIS (16 floats per triangle)
 layout(binding = 26, set = 0, std430) buffer EmissiveTriBuf {
     vec4 data[];
@@ -180,6 +184,7 @@ const uint VM_HEADER_FLAG_SHADOW_DYNAMIC = 8u;
 #include "../include/hair_bsdf.glsl"
 #include "../include/hair_cylinder.glsl"
 #include "../include/volume_march.glsl"
+#include "../include/di_reservoir.glsl"
 
 vec3 cyclesPrincipledTransmissionTint(vec3 baseColor) {
     return sqrt(clamp(baseColor, vec3(0.0), vec3(1.0)));
@@ -1111,14 +1116,198 @@ void main() {
         }
     }
 
-    // ---- NEE: Point/spot/area lights (stochastic selection, matching monolithic) ----
-    // Bounce 0-1: sample up to 4 random lights. Bounce 2+: sample 1 random light.
-    // Scale contribution by lightCount/sampledCount for unbiased estimate.
+    // ---- ReSTIR DI: Reservoir-based light sampling (bounce 0 only) ----
+    bool restirDone = false;
+    bool restirEnabled = (cam.lightPad2 & 2u) != 0u;
+    if (restirEnabled && !skipLocalNEE && bounce == 0u && cam.lightCount > 0u && !isHairSurface) {
+        DIReservoir reservoir = emptyDIReservoir();
+        vec3 V = -rayDir;
+        uint localRng = rngState;
+
+        // Phase 1: Candidate generation — sample M=min(lightCount, 8) random lights
+        uint M = min(cam.lightCount, 8u);
+        float sourcePDF = 1.0 / float(cam.lightCount);
+        for (uint m = 0u; m < M; m++) {
+            localRng ^= localRng << 13u; localRng ^= localRng >> 17u; localRng ^= localRng << 5u;
+            uint li = min(uint(float(localRng) / 4294967295.0 * float(cam.lightCount)), cam.lightCount - 1u);
+
+            vec4 lPR = cam.lights[li*4u]; vec4 lCI = cam.lights[li*4u+1u];
+            vec4 lDS = cam.lights[li*4u+2u]; vec4 lTS = cam.lights[li*4u+3u];
+            vec3 toL = lPR.xyz - worldPos;
+            float dist = length(toL);
+            if (dist < 0.001) continue;
+            vec3 L = toL / dist;
+            float NdotL_r = dot(N, L);
+            if (NdotL_r <= 0.0) continue;
+
+            float spotA = 1.0;
+            bool isSpec = (lPR.w < 0.0);
+            bool isSp = isSpec && lTS.w < 0.0;
+            bool isAr = isSpec && !isSp;
+            if (isSp) {
+                float cH = lDS.w, sm = abs(lTS.w), cA = dot(-L, lDS.xyz);
+                float st = clamp((cA - cH) * sm, 0.0, 1.0);
+                spotA = st*st*(3.0-2.0*st);
+                if (spotA <= 0.0) continue;
+            }
+            float att = 1.0 / (dist*dist + 0.001);
+            if (isAr) {
+                float fd = max(dot(-L, lDS.xyz), 0.0);
+                if (fd <= 0.0) continue;
+                att *= fd * lDS.w * lTS.w;
+            }
+            vec3 lRad = lCI.rgb * lCI.w * att * spotA;
+            float pHat = diTargetPDF(N, V, L, NdotL_r, baseColor, roughness, metallic, lRad);
+            diReservoirUpdate(reservoir, li, lPR.xyz, pHat, sourcePDF, localRng);
+        }
+
+        // Phase 2: Temporal reuse
+        uint pixLin = pixelIndex;
+        uint prevBase = pixLin * 3u;
+        vec4 prevD2 = diReservoirPrev.data[prevBase + 2u];
+        bool prevFresh = diReservoirIsFresh(prevD2, pc.frameIndex);
+        if (prevFresh) {
+            DIReservoir prev = diUnpack(diReservoirPrev.data[prevBase], diReservoirPrev.data[prevBase+1u]);
+            if (prev.M > 0.0 && prev.lightIndex < cam.lightCount && prev.age < 20.0) {
+                uint pLi = prev.lightIndex;
+                vec4 pPR = cam.lights[pLi*4u]; vec4 pCI = cam.lights[pLi*4u+1u];
+                vec4 pDS = cam.lights[pLi*4u+2u]; vec4 pTS = cam.lights[pLi*4u+3u];
+                vec3 pTL = pPR.xyz - worldPos; float pD = length(pTL);
+                vec3 pL = pTL / max(pD, 0.001); float pNdL = dot(N, pL);
+                float pA = 1.0/(pD*pD+0.001); float pSA = 1.0;
+                bool pSpec = (pPR.w < 0.0); bool pSp = pSpec && pTS.w < 0.0; bool pAr = pSpec && !pSp;
+                if (pSp) { float c=pDS.w,s=abs(pTS.w),a=dot(-pL,pDS.xyz); float t=clamp((a-c)*s,0.0,1.0); pSA=t*t*(3.0-2.0*t); }
+                if (pAr) { pA *= max(dot(-pL, pDS.xyz), 0.0) * pDS.w * pTS.w; }
+                vec3 pRad = pCI.rgb * pCI.w * pA * pSA;
+                float prevTP = diTargetPDF(N, V, pL, max(pNdL,0.0), baseColor, roughness, metallic, pRad);
+                DIReservoir cp = prev;
+                float mc = min(cp.M, 20.0);
+                if (mc < cp.M) cp.weightSum *= mc / cp.M;
+                cp.M = mc;
+                diReservoirMerge(reservoir, cp, prevTP, localRng);
+            }
+        }
+
+        // Phase 3: Spatial reuse (RTXPT parameters: 1 neighbor, 32px radius)
+        // Normal threshold 0.5 (cosine) + depth threshold 0.1 (10% relative)
+        // to prevent light leaking across geometry edges
+        uint pixX = pixelIndex % pc.width;
+        uint pixY = pixelIndex / pc.width;
+        float myViewZ = dot(vec3(cam.view[0][2], cam.view[1][2], cam.view[2][2]), worldPos)
+                      + cam.view[3][2];  // linear view-space depth
+
+        // RTXPT: 1 spatial sample normally, 8 for disoccluded pixels (no temporal history)
+        int spatialCount = (prevFresh && prevBase < pc.width * pc.height * 3u) ? 1 : 4;
+        for (int sn = 0; sn < spatialCount; sn++) {
+            localRng ^= localRng << 13u; localRng ^= localRng >> 17u; localRng ^= localRng << 5u;
+            float ang = float(localRng) / 4294967295.0 * 6.28318;
+            localRng ^= localRng << 13u; localRng ^= localRng >> 17u; localRng ^= localRng << 5u;
+            float rad = sqrt(float(localRng) / 4294967295.0) * 32.0;  // RTXPT: 32px radius
+            ivec2 nb = ivec2(int(pixX) + int(cos(ang)*rad), int(pixY) + int(sin(ang)*rad));
+            nb = clamp(nb, ivec2(0), ivec2(pc.width-1u, pc.height-1u));
+            uint nIdx = uint(nb.y) * pc.width + uint(nb.x);
+            uint nBase = nIdx * 3u;
+            if (!diReservoirIsFresh(diReservoirPrev.data[nBase+2u], pc.frameIndex)) continue;
+            DIReservoir nr = diUnpack(diReservoirPrev.data[nBase], diReservoirPrev.data[nBase+1u]);
+            if (nr.M <= 0.0 || nr.lightIndex >= cam.lightCount) continue;
+
+            // Normal similarity check (RTXPT: threshold 0.5 cosine = ~60°)
+            // Read neighbor's primary normal from G-buffer (stored in primaryGBuf)
+            uint ngBase = nIdx * 16u;
+            vec3 neighborN = vec3(primaryGBuf.gbufData[ngBase+0],
+                                  primaryGBuf.gbufData[ngBase+1],
+                                  primaryGBuf.gbufData[ngBase+2]);
+            if (dot(N, neighborN) < 0.5) continue;
+
+            // Depth similarity check (RTXPT: threshold 0.1 = 10% relative)
+            float neighborViewZ = primaryGBuf.gbufData[ngBase+7];
+            if (abs(myViewZ) > 0.01 && abs(neighborViewZ - myViewZ) / abs(myViewZ) > 0.1) continue;
+
+            uint nLi = nr.lightIndex;
+            vec4 nPR = cam.lights[nLi*4u]; vec4 nCI = cam.lights[nLi*4u+1u];
+            vec4 nDS = cam.lights[nLi*4u+2u]; vec4 nTS = cam.lights[nLi*4u+3u];
+            vec3 nTL = nPR.xyz - worldPos; float nD = length(nTL);
+            vec3 nL = nTL / max(nD, 0.001); float nNdL = dot(N, nL);
+            float nA = 1.0/(nD*nD+0.001); float nSA = 1.0;
+            bool nSpc = (nPR.w < 0.0); bool nSp = nSpc && nTS.w < 0.0; bool nAr = nSpc && !nSp;
+            if (nSp) { float c=nDS.w,s=abs(nTS.w),a=dot(-nL,nDS.xyz); float t=clamp((a-c)*s,0.0,1.0); nSA=t*t*(3.0-2.0*t); }
+            if (nAr) { nA *= max(dot(-nL, nDS.xyz), 0.0) * nDS.w * nTS.w; }
+            vec3 nRad = nCI.rgb * nCI.w * nA * nSA;
+            float nTP = diTargetPDF(N, V, nL, max(nNdL,0.0), baseColor, roughness, metallic, nRad);
+            DIReservoir cn = nr;
+            float nmc = min(cn.M, 10.0);
+            if (nmc < cn.M) cn.weightSum *= nmc / cn.M;
+            cn.M = nmc;
+            diReservoirMerge(reservoir, cn, nTP, localRng);
+        }
+
+        // Phase 4: Final shading — trace ONE shadow ray to selected light
+        if (reservoir.lightIndex < cam.lightCount && reservoir.targetPDF > 0.0) {
+            uint fLi = reservoir.lightIndex;
+            vec4 fPR = cam.lights[fLi*4u]; vec4 fCI = cam.lights[fLi*4u+1u];
+            vec4 fDS = cam.lights[fLi*4u+2u]; vec4 fTS = cam.lights[fLi*4u+3u];
+            vec3 fTL = fPR.xyz - worldPos; float fD = length(fTL);
+            vec3 fL = fTL / max(fD, 0.001);
+
+            // Inline shadow trace with transparency skip
+            vec3 fSO = worldPos + N * shadowBias;
+            bool fOcc = false;
+            vec3 fSF = vec3(1.0);
+            for (int fs = 0; fs < 4; fs++) {
+                rayQueryEXT fsrq;
+                rayQueryInitializeEXT(fsrq, topLevelAS, gl_RayFlagsOpaqueEXT,
+                    0xFF, fSO, 0.0, fL, fD - 0.004);
+                while (rayQueryProceedEXT(fsrq)) {}
+                if (rayQueryGetIntersectionTypeEXT(fsrq, true) == gl_RayQueryCommittedIntersectionNoneEXT) break;
+                float fHT = rayQueryGetIntersectionTEXT(fsrq, true);
+                uint fCI2 = rayQueryGetIntersectionInstanceCustomIndexEXT(fsrq, true);
+                int fPI = rayQueryGetIntersectionPrimitiveIndexEXT(fsrq, true);
+                GeometryMetadata fGeo = geometryMetadata.geometries[fCI2];
+                uint fMI = 0u;
+                if (fGeo.primMaterialBufferAddress != 0u) { PrimMaterials fPM = PrimMaterials(fGeo.primMaterialBufferAddress); fMI = fPM.m[fPI]; }
+                Material fMat = materialBuffer.materials[fMI];
+                if ((fMat.flags & 6u) != 0u) { fSO += fL*(fHT+0.004); continue; }
+                bool fTr = (fMat.flags & (1u|MAT_FLAG_LIGHTPATH_TRANSPARENT)) != 0u || fMat.multB > 0.0;
+                if (fTr) { fSO += fL*(fHT+0.002); continue; }
+                fOcc = true; break;
+            }
+
+            if (!fOcc) {
+                float W = diReservoirWeight(reservoir);
+                float fAtt = 1.0 / (fD*fD + 0.001); float fSA = 1.0;
+                bool fSpec = (fPR.w < 0.0); bool fSp = fSpec && fTS.w < 0.0; bool fAr = fSpec && !fSp;
+                if (fSp) { float c=fDS.w,s=abs(fTS.w),a=dot(-fL,fDS.xyz); float t=clamp((a-c)*s,0.0,1.0); fSA=t*t*(3.0-2.0*t); }
+                if (fAr) { fAtt *= max(dot(-fL, fDS.xyz), 0.0) * fDS.w * fTS.w; }
+                vec3 fRad = fCI.rgb * fCI.w * fAtt * fSA;
+
+                vec3 fDC, fSC;
+                evaluateCookTorrance(N, V, fL, baseColor, roughness, metallic, specularLevel, ior, transmission, fDC, fSC);
+                vec3 fDiffR = fDC * fRad * W * throughput * fSF;
+                vec3 fSpecR = fSC * fRad * W * throughput * fSF;
+                // RTXPT: DenoiserRadianceClampK = 8.0
+                fDiffR = min(fDiffR, vec3(MAX_RADIANCE));
+                fSpecR = min(fSpecR, vec3(MAX_RADIANCE));
+                atomicAddFloat(rBase+0, fDiffR.x); atomicAddFloat(rBase+1, fDiffR.y); atomicAddFloat(rBase+2, fDiffR.z);
+                atomicAddFloat(rBase+4, fSpecR.x); atomicAddFloat(rBase+5, fSpecR.y); atomicAddFloat(rBase+6, fSpecR.z);
+            }
+        }
+
+        // Store reservoir for next frame
+        reservoir.age += 1.0;
+        uint currBase = pixLin * 3u;
+        diReservoirCurr.data[currBase + 0u] = diPackV0(reservoir);
+        diReservoirCurr.data[currBase + 1u] = diPackV1(reservoir);
+        diReservoirCurr.data[currBase + 2u] = vec4(uintBitsToFloat(pc.frameIndex), 0, 0, 0);
+        rngState = localRng;
+        restirDone = true;
+    }
+
+    // ---- NEE: Point/spot/area lights (fallback when ReSTIR skipped) ----
     uint neeStart = 0u;
     uint neeEnd = min(cam.lightCount, 32u);
     float neeScale = 1.0;
     bool hairFastPrimary = isHairSurface && (bounce == 0u);
-    if (!skipLocalNEE) {
+    if (!skipLocalNEE && !restirDone) {
         if ((bounce >= 2u || hairFastPrimary) && cam.lightCount > 1u) {
             // Bounce 2+ or hair primary: sample 1 random light (cheap)
             uint randIdx = min(uint(rand01() * float(cam.lightCount)), cam.lightCount - 1u);
