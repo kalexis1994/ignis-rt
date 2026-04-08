@@ -265,6 +265,10 @@ void main() {
     vec3 wp1 = objToWorld * vec4(p1, 1.0);
     vec3 wp2 = objToWorld * vec4(p2, 1.0);
 
+    // True triangle normal (geometric, for frontFace detection)
+    vec3 geoNormal = normalize(cross(wp1 - wp0, wp2 - wp0));
+    if (dot(geoNormal, -rayDir) < 0.0) geoNormal = -geoNormal; // flip toward camera
+
     // Normals — transform to world space via objToWorld 3x3
     vec3 n0 = vec3(normals.n[i0*3+0], normals.n[i0*3+1], normals.n[i0*3+2]);
     vec3 n1 = vec3(normals.n[i1*3+0], normals.n[i1*3+1], normals.n[i1*3+2]);
@@ -418,8 +422,22 @@ void main() {
         N = normalize(vm.bumpStrength * bumpN + (1.0 - vm.bumpStrength) * N);
     }
 
-    bool frontFace = dot(N, -rayDir) >= 0.0;
-    if (!frontFace) N = -N;
+    // Use geometric normal for frontFace detection (not bump-mapped N)
+    // This prevents black bands at grazing angles where normal mapping
+    // can perturb N to face away from the camera.
+    vec3 gN = geoNormal;
+    bool frontFace = dot(gN, -rayDir) >= 0.0;
+    if (!frontFace) {
+        gN = -gN;
+        N = -N;
+    }
+    // Clamp perturbed normal: if normal map made it face away from camera,
+    // blend back toward geometric normal to avoid black artifacts
+    float NdotV_check = dot(N, -rayDir);
+    if (NdotV_check < 0.01) {
+        float blend = clamp(-NdotV_check * 50.0 + 0.5, 0.0, 1.0);
+        N = normalize(mix(N, gN, blend));
+    }
 
     // Alpha cutout — advance ray and re-queue
     if ((mat.flags & 1u) != 0u && alpha < mat.alphaRef) {
