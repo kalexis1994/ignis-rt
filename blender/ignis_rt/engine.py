@@ -504,14 +504,15 @@ def _on_depsgraph_update(scene, depsgraph=None):
         if isinstance(uid, bpy.types.Object):
             _ignis_changed_objects.add(uid.name)
             # Only flag for deformation if object has deforming modifiers
-            if uid.name in _ignis_blas_handles and len(uid.modifiers) > 0:
-                # Filter: only modifiers that deform geometry (not Boolean cutters, etc.)
+            if uid.name in _ignis_blas_handles and update.is_updated_geometry and len(uid.modifiers) > 0:
+                # Filter: only modifiers that ACTUALLY deform geometry at runtime
+                # Exclude NODES (Geometry Nodes) unless the GN tree has animated inputs —
+                # hair grooms use GN for static generation, not per-frame deformation.
+                # Also exclude topology-changing modifiers that don't deform (BOOLEAN, etc.)
                 _DEFORM_TYPES = {'SIMPLE_DEFORM', 'LATTICE', 'ARMATURE', 'MESH_DEFORM',
                                  'SHRINKWRAP', 'SMOOTH', 'CORRECTIVE_SMOOTH', 'LAPLACIANSMOOTH',
                                  'SURFACE_DEFORM', 'WARP', 'WAVE', 'CLOTH', 'SOFT_BODY',
-                                 'HOOK', 'DISPLACE', 'CAST', 'CURVE', 'LAPLACIANDEFORM',
-                                 'SUBSURF', 'MULTIRES', 'SKIN', 'SOLIDIFY', 'ARRAY',
-                                 'MIRROR', 'SCREW', 'BEVEL', 'NODES'}
+                                 'HOOK', 'DISPLACE', 'CAST', 'CURVE', 'LAPLACIANDEFORM'}
                 has_deform = any(m.type in _DEFORM_TYPES for m in uid.modifiers)
                 if has_deform:
                     _ignis_deformed_meshes.add(uid.name)

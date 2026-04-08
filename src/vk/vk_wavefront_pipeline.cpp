@@ -214,47 +214,56 @@ bool WavefrontPipeline::CreateDescriptorSet() {
 
     if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &wfDescSetLayout_) != VK_SUCCESS) return false;
 
-    // Pool
-    VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8};
+    // Pool — 2 sets × 8 SSBOs = 16 descriptors
+    VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16};
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.maxSets = 1;
+    poolInfo.maxSets = 2;
     poolInfo.poolSizeCount = 1;
     poolInfo.pPoolSizes = &poolSize;
 
     if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &wfDescPool_) != VK_SUCCESS) return false;
 
-    // Allocate
+    // Allocate 2 descriptor sets (ping-pong A and B)
+    VkDescriptorSetLayout layouts[2] = { wfDescSetLayout_, wfDescSetLayout_ };
     VkDescriptorSetAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     allocInfo.descriptorPool = wfDescPool_;
-    allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &wfDescSetLayout_;
+    allocInfo.descriptorSetCount = 2;
+    allocInfo.pSetLayouts = layouts;
 
-    if (vkAllocateDescriptorSets(device, &allocInfo, &wfDescSet_) != VK_SUCCESS) return false;
+    if (vkAllocateDescriptorSets(device, &allocInfo, wfDescSet_) != VK_SUCCESS) return false;
 
-    // Write descriptors (initial: buffer A=read at binding 0, buffer B=write at binding 7)
-    VkBuffer buffers[8] = {
-        pathStateBuffer_[0], hitResultBuffer_, shadowRayBuffer_,
-        pixelRadianceBuffer_, primaryGBufBuffer_, countersBuffer_,
-        indirectDispatchBuffer_, pathStateBuffer_[1]
-    };
+    // Write descriptors for BOTH sets at init time (never updated during recording)
+    // Set A: binding 0 = buffer[0] (read), binding 7 = buffer[1] (write)
+    // Set B: binding 0 = buffer[1] (read), binding 7 = buffer[0] (write)
+    for (int setIdx = 0; setIdx < 2; setIdx++) {
+        VkBuffer readBuf  = pathStateBuffer_[setIdx];      // 0 for A, 1 for B
+        VkBuffer writeBuf = pathStateBuffer_[1 - setIdx];  // 1 for A, 0 for B
 
-    VkDescriptorBufferInfo bufInfos[8] = {};
-    VkWriteDescriptorSet writes[8] = {};
-    for (int i = 0; i < 8; i++) {
-        bufInfos[i].buffer = buffers[i];
-        bufInfos[i].range = VK_WHOLE_SIZE;
+        VkBuffer buffers[8] = {
+            readBuf, hitResultBuffer_, shadowRayBuffer_,
+            pixelRadianceBuffer_, primaryGBufBuffer_, countersBuffer_,
+            indirectDispatchBuffer_, writeBuf
+        };
 
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = wfDescSet_;
-        writes[i].dstBinding = i;
-        writes[i].descriptorCount = 1;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].pBufferInfo = &bufInfos[i];
+        VkDescriptorBufferInfo bufInfos[8] = {};
+        VkWriteDescriptorSet writes[8] = {};
+        for (int i = 0; i < 8; i++) {
+            bufInfos[i].buffer = buffers[i];
+            bufInfos[i].range = VK_WHOLE_SIZE;
+
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = wfDescSet_[setIdx];
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &bufInfos[i];
+        }
+
+        vkUpdateDescriptorSets(device, 8, writes, 0, nullptr);
     }
 
-    vkUpdateDescriptorSets(device, 8, writes, 0, nullptr);
     return true;
 }
 
@@ -356,26 +365,10 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
     push.spp = spp;
     push.sampleIdx = 0;
 
-    // Bind both descriptor sets (set 0 = scene, set 1 = wavefront)
-    VkDescriptorSet sets[2] = { sceneDescSet, wfDescSet_ };
-
-    // Reset ping-pong to buffer 0 for this frame
+    // Ping-pong: use two pre-allocated descriptor sets (no host updates during recording)
+    // Set 0 (A): read=buffer[0], write=buffer[1]
+    // Set 1 (B): read=buffer[1], write=buffer[0]
     pathStateCurrent_ = 0;
-    {
-        VkDescriptorBufferInfo resetInfos[2] = {};
-        VkWriteDescriptorSet resetWrites[2] = {};
-        resetInfos[0].buffer = pathStateBuffer_[0]; resetInfos[0].range = VK_WHOLE_SIZE;
-        resetWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        resetWrites[0].dstSet = wfDescSet_; resetWrites[0].dstBinding = 0;
-        resetWrites[0].descriptorCount = 1; resetWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        resetWrites[0].pBufferInfo = &resetInfos[0];
-        resetInfos[1].buffer = pathStateBuffer_[1]; resetInfos[1].range = VK_WHOLE_SIZE;
-        resetWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        resetWrites[1].dstSet = wfDescSet_; resetWrites[1].dstBinding = 7;
-        resetWrites[1].descriptorCount = 1; resetWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        resetWrites[1].pBufferInfo = &resetInfos[1];
-        vkUpdateDescriptorSets(context_->GetDevice(), 2, resetWrites, 0, nullptr);
-    }
 
     // Clear pixel radiance and primary G-buffer (once per frame, before all SPP samples)
     vkCmdFillBuffer(cmd, pixelRadianceBuffer_, 0, totalPixels * 32, 0);
@@ -397,10 +390,11 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
     for (uint32_t sampleIdx = 0; sampleIdx < spp; sampleIdx++) {
         push.sampleIdx = sampleIdx;
 
-        // K0: Camera ray generation (different jitter per sample via sampleIdx)
+        // K0: Camera ray generation — always writes to buffer[0] (set A: binding 0)
+        VkDescriptorSet setsK0[2] = { sceneDescSet, wfDescSet_[0] };
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK0_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
-            0, 2, sets, 0, nullptr);
+            0, 2, setsK0, 0, nullptr);
         vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
         vkCmdDispatch(cmd, groupsAll, 1, 1);
 
@@ -416,10 +410,11 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
     for (uint32_t bounce = 0; bounce < totalIterations; bounce++) {
         push.currentBounce = bounce;
 
-        // K1: Intersection
+        // K1: Intersection — bind current ping-pong descriptor set
+        VkDescriptorSet setsBounce[2] = { sceneDescSet, wfDescSet_[pathStateCurrent_] };
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK1_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
-            0, 2, sets, 0, nullptr);
+            0, 2, setsBounce, 0, nullptr);
         vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
         if (bounce == 0) {
             vkCmdDispatch(cmd, groupsAll, 1, 1);  // bounce 0: all pixels
@@ -430,10 +425,10 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
-        // K2: Shade + NEE + bounce setup
+        // K2: Shade + NEE + bounce setup (same descriptor set as K1)
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK2_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
-            0, 2, sets, 0, nullptr);
+            0, 2, setsBounce, 0, nullptr);
         vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
         if (bounce == 0) {
             vkCmdDispatch(cmd, groupsAll, 1, 1);
@@ -447,7 +442,7 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
         // Compact: write shadow dispatch args + swap counters + write active dispatch args
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineCompact_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
-            0, 2, sets, 0, nullptr);
+            0, 2, setsBounce, 0, nullptr);
         vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
         vkCmdDispatch(cmd, 1, 1, 1);
 
@@ -463,7 +458,7 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
         // K3: Shadow trace + accumulate (merged — indirect dispatch)
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK3_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
-            0, 2, sets, 0, nullptr);
+            0, 2, setsBounce, 0, nullptr);
         vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
         vkCmdDispatchIndirect(cmd, indirectDispatchBuffer_, 3 * sizeof(uint32_t));
 
@@ -478,57 +473,22 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
-        // Swap PathState ping-pong: next-bounce writes become current-bounce reads
+        // Swap PathState ping-pong: just flip the index (no host descriptor updates!)
         pathStateCurrent_ = 1 - pathStateCurrent_;
-        VkDescriptorBufferInfo swapInfos[2] = {};
-        VkWriteDescriptorSet swapWrites[2] = {};
-        // binding 0 = read buffer (what was the write buffer)
-        swapInfos[0].buffer = pathStateBuffer_[pathStateCurrent_];
-        swapInfos[0].range = VK_WHOLE_SIZE;
-        swapWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        swapWrites[0].dstSet = wfDescSet_;
-        swapWrites[0].dstBinding = 0;
-        swapWrites[0].descriptorCount = 1;
-        swapWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        swapWrites[0].pBufferInfo = &swapInfos[0];
-        // binding 7 = write buffer (what was the read buffer)
-        swapInfos[1].buffer = pathStateBuffer_[1 - pathStateCurrent_];
-        swapInfos[1].range = VK_WHOLE_SIZE;
-        swapWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        swapWrites[1].dstSet = wfDescSet_;
-        swapWrites[1].dstBinding = 7;
-        swapWrites[1].descriptorCount = 1;
-        swapWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        swapWrites[1].pBufferInfo = &swapInfos[1];
-        vkUpdateDescriptorSets(context_->GetDevice(), 2, swapWrites, 0, nullptr);
     }
 
     // Reset ping-pong for next SPP sample
     pathStateCurrent_ = 0;
-    if (sampleIdx + 1 < spp) {
-        VkDescriptorBufferInfo resetInfos2[2] = {};
-        VkWriteDescriptorSet resetWrites2[2] = {};
-        resetInfos2[0].buffer = pathStateBuffer_[0]; resetInfos2[0].range = VK_WHOLE_SIZE;
-        resetWrites2[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        resetWrites2[0].dstSet = wfDescSet_; resetWrites2[0].dstBinding = 0;
-        resetWrites2[0].descriptorCount = 1; resetWrites2[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        resetWrites2[0].pBufferInfo = &resetInfos2[0];
-        resetInfos2[1].buffer = pathStateBuffer_[1]; resetInfos2[1].range = VK_WHOLE_SIZE;
-        resetWrites2[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        resetWrites2[1].dstSet = wfDescSet_; resetWrites2[1].dstBinding = 7;
-        resetWrites2[1].descriptorCount = 1; resetWrites2[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        resetWrites2[1].pBufferInfo = &resetInfos2[1];
-        vkUpdateDescriptorSets(context_->GetDevice(), 2, resetWrites2, 0, nullptr);
-    }
 
     } // end SPP loop
 
-    // K5: Output (after all SPP samples accumulated)
+    // K5: Output (after all SPP samples accumulated) — uses set A (radiance + gbuf are shared)
+    VkDescriptorSet setsK5[2] = { sceneDescSet, wfDescSet_[0] };
     uint32_t groupsX = (width + 7) / 8;
     uint32_t groupsY = (height + 7) / 8;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK5_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
-        0, 2, sets, 0, nullptr);
+        0, 2, setsK5, 0, nullptr);
     vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     vkCmdDispatch(cmd, groupsX, groupsY, 1);
 }

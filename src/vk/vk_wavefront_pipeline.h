@@ -58,10 +58,12 @@ private:
     VkBuffer indirectDispatchBuffer_ = VK_NULL_HANDLE;  // VkDispatchIndirectCommand[3]
     VkDeviceMemory indirectDispatchMemory_ = VK_NULL_HANDLE;
 
-    // Descriptor set 1 (wavefront buffers)
+    // Descriptor sets for ping-pong (2 sets, no host updates during recording)
+    // Set A: binding 0 = buffer[0] (read), binding 7 = buffer[1] (write)
+    // Set B: binding 0 = buffer[1] (read), binding 7 = buffer[0] (write)
     VkDescriptorSetLayout wfDescSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool wfDescPool_ = VK_NULL_HANDLE;
-    VkDescriptorSet wfDescSet_ = VK_NULL_HANDLE;
+    VkDescriptorSet wfDescSet_[2] = {};  // [0] = A, [1] = B
 
     // Compute pipelines (K0-K5 + compact)
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;  // shared layout for all kernels

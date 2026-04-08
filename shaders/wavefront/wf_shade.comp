@@ -328,23 +328,44 @@ void main() {
         vertexColor = vc0 * bary.x + vc1 * bary.y + vc2 * bary.z;
     }
 
-    // Hair detection + full cylinder normal computation
+    // Hair detection + cylinder normal computation
+    // Strategy (matching monolithic fast paths):
+    //  - Bounce 0: full ray-cylinder intersection (60-70 buffer reads, quality primary hit)
+    //  - Bounce 1: ribbon fallback (3 normal reads, tangent decode, cross-product normal)
+    //  - Bounce 2+: terminated immediately (hair BRDF section handles this)
     bool isHairSurface = (geo.bitangentBufferAddress != 0u);
     vec3 hairSmoothT = vec3(1, 0, 0);
     float hairV = 0.0;
     vec3 hairShadePos = worldPos;
     uint hairStrandId = INVALID_HAIR_STRAND;
     if (isHairSurface) {
-        vec3 hairCylN;
-        computeHairCylinder(geo, vertices, indices, normals, objToWorld,
-            rayOrigin, rayDir, worldPos, i0, i1, i2, wp0, wp1, wp2,
-            bary, primitiveId,
-            hairCylN, hairSmoothT, hairV, hairShadePos, hairStrandId);
-        // Override ALL normals with cylindrical normal for proper shading
-        worldN = hairCylN;
-        geoNormalRaw = hairCylN;
-        geoNormal = hairCylN;
-        smoothN = hairCylN;
+        if (bounce == 0u) {
+            // Full cylinder intersection for primary hits (quality matters)
+            vec3 hairCylN;
+            computeHairCylinder(geo, vertices, indices, normals, objToWorld,
+                rayOrigin, rayDir, worldPos, i0, i1, i2, wp0, wp1, wp2,
+                bary, primitiveId,
+                hairCylN, hairSmoothT, hairV, hairShadePos, hairStrandId);
+            worldN = hairCylN;
+            geoNormalRaw = hairCylN;
+            geoNormal = hairCylN;
+            smoothN = hairCylN;
+        } else {
+            // Ribbon fallback: decode tangent from packed normals, derive normal from cross product
+            // Cost: 9 normal reads + tangent decode (vs 60-70 scattered reads for full cylinder)
+            vec3 rawN = vec3(normals.n[i0*3+0], normals.n[i0*3+1], normals.n[i0*3+2]) * bary.x
+                      + vec3(normals.n[i1*3+0], normals.n[i1*3+1], normals.n[i1*3+2]) * bary.y
+                      + vec3(normals.n[i2*3+0], normals.n[i2*3+1], normals.n[i2*3+2]) * bary.z;
+            hairSmoothT = normalize(mat3(objToWorld) * octDecode_hair(vec2(rawN.y, rawN.z)));
+            // Use ribbon geometric normal (perpendicular to tangent and view)
+            vec3 ribbonN = normalize(cross(hairSmoothT, -rayDir));
+            ribbonN = normalize(cross(ribbonN, hairSmoothT));
+            if (dot(ribbonN, -rayDir) < 0.0) ribbonN = -ribbonN;
+            worldN = ribbonN;
+            geoNormalRaw = ribbonN;
+            geoNormal = ribbonN;
+            smoothN = ribbonN;
+        }
     }
 
     // ── Node VM: per-pixel node tree evaluation ──
@@ -506,6 +527,12 @@ void main() {
     bool isHetero = (mat.flags & 16u) != 0u;
 
     if (isVolumeOnly || hasSurfaceVolume) {
+        // Skip volume march on deep bounces (matching monolithic: volume only at primary/first hit)
+        if (bounce >= 2u) {
+            pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
+            return;
+        }
+
         // Only enter from front face
         bool entering = dot(geoNormalRaw, -rayDir) > 0.0;
         if (!entering) {
@@ -905,8 +932,12 @@ void main() {
 
     // Throughput early-out for deep bounces
     float maxT = max(throughput.r, max(throughput.g, throughput.b));
-    bool skipSunNEE = (bounce >= 2u && maxT < 0.01);
-    bool skipLocalNEE = (bounce >= 2u);
+    // Hair fast paths (matching monolithic hairFastPrimary/Secondary):
+    // - Hair bounce 1+: skip all local NEE (hair inter-strand scattering doesn't need it)
+    // - Hair bounce 0: still gets sun + stochastic lights (but fewer, via neeScale)
+    bool hairFastSecondary = isHairSurface && (bounce > 0u);
+    bool skipSunNEE = (bounce >= 2u && maxT < 0.01) || hairFastSecondary;
+    bool skipLocalNEE = (bounce >= 2u) || hairFastSecondary;
 
     // Glass/transmission surfaces don't scatter light — skip NEE entirely
     if (isGlass) skipSunNEE = true;
@@ -953,8 +984,10 @@ void main() {
     uint neeStart = 0u;
     uint neeEnd = min(cam.lightCount, 32u);
     float neeScale = 1.0;
+    bool hairFastPrimary = isHairSurface && (bounce == 0u);
     if (!skipLocalNEE) {
-        if (bounce >= 2u && cam.lightCount > 1u) {
+        if ((bounce >= 2u || hairFastPrimary) && cam.lightCount > 1u) {
+            // Bounce 2+ or hair primary: sample 1 random light (cheap)
             uint randIdx = min(uint(rand01() * float(cam.lightCount)), cam.lightCount - 1u);
             neeStart = randIdx;
             neeEnd = randIdx + 1u;

@@ -142,9 +142,10 @@ void marchVolumeHeterogeneous(
     // Output
     inout vec3 radiance, inout vec3 throughput)
 {
-    const int MAX_STEPS = 48;
-    float stepSize = marchDist / float(MAX_STEPS);
-    stepSize = max(stepSize, 0.01);
+    // Adaptive step count: shorter volumes need fewer steps
+    // Max 32 for wavefront (vs 48 monolithic) to balance quality vs perf
+    const int MAX_STEPS = 32;
+    float stepSize = max(marchDist / float(MAX_STEPS), 0.02);
     int numSteps = min(int(marchDist / stepSize), MAX_STEPS);
     vec3 volTransmittance = vec3(1.0);
     vec3 inscatter = vec3(0.0);
