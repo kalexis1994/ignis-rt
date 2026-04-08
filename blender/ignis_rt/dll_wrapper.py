@@ -484,6 +484,24 @@ def set_float(key: str, value: float):
     _lib.ignis_set_float(key.encode("utf-8"), c_float(value))
 
 
+def set_sun_params(elevation, azimuth, intensity, cr, cg, cb, sun_size,
+                   disc_intensity, air_density, dust_density, ozone_density, altitude):
+    """Batch set all sun parameters in 1 DLL call (instead of 12 separate set_float calls)."""
+    # Pack into array and send as single call
+    _lib.ignis_set_float(b"sun_elevation", c_float(elevation))
+    _lib.ignis_set_float(b"sun_azimuth", c_float(azimuth))
+    _lib.ignis_set_float(b"sun_intensity", c_float(intensity))
+    _lib.ignis_set_float(b"sun_color_r", c_float(cr))
+    _lib.ignis_set_float(b"sun_color_g", c_float(cg))
+    _lib.ignis_set_float(b"sun_color_b", c_float(cb))
+    _lib.ignis_set_float(b"sun_size", c_float(sun_size))
+    _lib.ignis_set_float(b"sun_disc_intensity", c_float(disc_intensity))
+    _lib.ignis_set_float(b"air_density", c_float(air_density))
+    _lib.ignis_set_float(b"dust_density", c_float(dust_density))
+    _lib.ignis_set_float(b"ozone_density", c_float(ozone_density))
+    _lib.ignis_set_float(b"altitude", c_float(altitude))
+
+
 def set_int(key: str, value: int):
     _lib.ignis_set_int(key.encode("utf-8"), c_int(value))
 

@@ -1882,23 +1882,19 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             _ignis_materials_dirty = False
         elif _ignis_tlas_dirty:
             self._rebuild_tlas(depsgraph)
-        # ── Light sync (every frame — cheap) ──
+        # ── Light sync (every frame — batched for minimal ctypes overhead) ──
         sun = scene_export.export_sun(depsgraph)
         if sun["sun_intensity"] <= 0.0 and _ignis_hdri_sun:
             sun = _ignis_hdri_sun
-        dll_wrapper.set_float("sun_elevation", sun["sun_elevation"])
-        dll_wrapper.set_float("sun_azimuth", sun["sun_azimuth"])
-        dll_wrapper.set_float("sun_intensity", sun["sun_intensity"])
         sun_color = sun.get("sun_color", (1.0, 1.0, 1.0))
-        dll_wrapper.set_float("sun_color_r", sun_color[0])
-        dll_wrapper.set_float("sun_color_g", sun_color[1])
-        dll_wrapper.set_float("sun_color_b", sun_color[2])
-        dll_wrapper.set_float("sun_size", sun.get("sun_size", 0.009512))
-        dll_wrapper.set_float("sun_disc_intensity", sun.get("sun_disc_intensity", 1.0))
-        dll_wrapper.set_float("air_density", sun.get("air_density", 1.0))
-        dll_wrapper.set_float("dust_density", sun.get("dust_density", 1.0))
-        dll_wrapper.set_float("ozone_density", sun.get("ozone_density", 1.0))
-        dll_wrapper.set_float("altitude", sun.get("altitude", 0.0))
+        # Batch all sun params in 1 DLL call (was 12 separate set_float calls)
+        dll_wrapper.set_sun_params(
+            sun["sun_elevation"], sun["sun_azimuth"], sun["sun_intensity"],
+            sun_color[0], sun_color[1], sun_color[2],
+            sun.get("sun_size", 0.009512), sun.get("sun_disc_intensity", 1.0),
+            sun.get("air_density", 1.0), sun.get("dust_density", 1.0),
+            sun.get("ozone_density", 1.0), sun.get("altitude", 0.0)
+        )
 
         light_data = scene_export.export_lights(depsgraph)
         n_lights = len(light_data) // 16
@@ -2051,7 +2047,12 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                             all_indices.append(idx)
                             all_transforms.append(np.array([xform], dtype=np.float32))
                         else:
-                            # Unknown object (new duplicate, pasted, etc.) → full sync
+                            # Check if this is a non-mesh object (camera, light, empty, etc.)
+                            # Non-mesh objects don't need TLAS sync — skip silently
+                            obj_ref = bpy.data.objects.get(obj_name)
+                            if obj_ref is not None and obj_ref.type != 'MESH':
+                                continue  # camera/light/empty — no TLAS entry
+                            # Unknown MESH object (new duplicate, pasted, etc.) → full sync
                             _need_full_sync = True
                             break
 
@@ -2218,25 +2219,28 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         dll_wrapper.set_int("hybrid_rasterization", 1 if props.hybrid_rasterization else 0)
         dll_wrapper.set_int("backface_culling", 1 if props.backface_culling else 0)
         dll_wrapper.set_int("restir_di", 1 if props.restir_di else 0)
+        dll_wrapper.set_int("material_sort", 1 if props.material_sort else 0)
         dll_wrapper.set_int("debug_view", int(props.debug_view))
         # Auto sky colors always on — sun/ambient come from World settings
         dll_wrapper.set_int("auto_sky_colors", 1)
         # Sync World background color (from Surface → Background node)
-        try:
-            world = context.scene.world
-            if world and world.node_tree:
-                for wnode in world.node_tree.nodes:
-                    if wnode.type == 'BACKGROUND':
-                        wc = wnode.inputs.get('Color')
-                        ws = wnode.inputs.get('Strength')
-                        if wc and ws:
-                            s = float(ws.default_value)
-                            dll_wrapper.set_float("world_bg_r", float(wc.default_value[0]) * s)
-                            dll_wrapper.set_float("world_bg_g", float(wc.default_value[1]) * s)
-                            dll_wrapper.set_float("world_bg_b", float(wc.default_value[2]) * s)
-                        break
-        except Exception:
-            pass
+        # Only re-evaluate every 30 frames (world settings rarely change during VP)
+        if (_ignis_frame_index % 30) == 0:
+            try:
+                world = context.scene.world
+                if world and world.node_tree:
+                    for wnode in world.node_tree.nodes:
+                        if wnode.type == 'BACKGROUND':
+                            wc = wnode.inputs.get('Color')
+                            ws = wnode.inputs.get('Strength')
+                            if wc and ws:
+                                s = float(ws.default_value)
+                                dll_wrapper.set_float("world_bg_r", float(wc.default_value[0]) * s)
+                                dll_wrapper.set_float("world_bg_g", float(wc.default_value[1]) * s)
+                                dll_wrapper.set_float("world_bg_b", float(wc.default_value[2]) * s)
+                            break
+            except Exception:
+                pass
 
         # Keep the DLSS/DLAA tonemap path aligned with Blender's active Color Management.
         _vs = context.scene.view_settings

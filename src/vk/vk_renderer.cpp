@@ -1397,6 +1397,7 @@ void Renderer::RenderFrameRT() {
         }
         uint32_t dispW = (dlssDebugBypass_ && debugViewActive) ? width_ : renderWidth_;
         uint32_t dispH = (dlssDebugBypass_ && debugViewActive) ? height_ : renderHeight_;
+        if (wfCfg) wavefrontPipeline_->SetMaterialSort(wfCfg->materialSort);
         wavefrontPipeline_->RecordDispatch(cmd, dispW, dispH,
             rtPipeline_->GetDescriptorSet(), wfCfg ? wfCfg->maxBounces : 2,
             wfCfg ? static_cast<uint32_t>(wfCfg->samplesPerPixel) : 1);

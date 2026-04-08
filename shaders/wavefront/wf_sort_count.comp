@@ -1,0 +1,33 @@
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 256) in;
+
+// Wavefront buffers (set 1)
+layout(binding = 7, set = 1, scalar) buffer PathStateWriteBuffer { float nextPathData[]; } nextPathStates;
+layout(binding = 5, set = 1, scalar) buffer CountersBuffer {
+    uint activeRayCount;
+    uint shadowRayCount;
+    uint nextActiveRayCount;
+    uint pad0;
+    uint sortBinCount[5];
+    uint sortBinOffset[5];
+    uint sortPad[2];
+} counters;
+
+// Material sort Phase 1: count paths per material category
+// Categories encoded in PathState flags bits [12:14]
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= counters.activeRayCount) return;
+
+    // Read flags from the WRITE buffer (K2 output)
+    uint nBase = idx * 12u;
+    uint flags = floatBitsToUint(nextPathStates.nextPathData[nBase + 11u]);
+
+    // Extract material category from bits [12:14]
+    uint category = (flags >> 12u) & 0x7u;
+    if (category > 4u) category = 0u;  // safety clamp
+
+    atomicAdd(counters.sortBinCount[category], 1u);
+}

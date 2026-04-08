@@ -187,6 +187,12 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         default=False,
         update=_tag_redraw,
     )
+    material_sort: BoolProperty(
+        name="Material Sort",
+        description="GPU material sorting for wavefront. Improves FPS in scenes with mixed materials (glass+hair+volume). Slight overhead for uniform scenes",
+        default=False,
+        update=_tag_redraw,
+    )
     use_wavefront: BoolProperty(
         name="Wavefront Path Tracing",
         description="Experimental: compute-based multi-kernel path tracing for better GPU occupancy",
@@ -422,6 +428,7 @@ class IGNIS_PT_advanced(bpy.types.Panel):
         layout.use_property_decorate = False
         layout.prop(props, "hybrid_rasterization")
         layout.prop(props, "restir_di")
+        layout.prop(props, "material_sort")
         # layout.prop(props, "use_wavefront")  # TODO: not ready yet
         layout.separator()
         layout.prop(props, "debug_view")

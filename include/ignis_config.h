@@ -136,6 +136,7 @@ struct PathTracerConfig {
 
     // ReSTIR DI (reservoir-based light sampling)
     bool  restirDI           = false;
+    bool  materialSort       = false;  // GPU material sorting for wavefront (helps mixed-material scenes)
 
     // HDRI environment map
     int   hdriTexIndex       = -1;     // texture index (-1 = no HDRI, use procedural sky)

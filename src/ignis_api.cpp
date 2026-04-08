@@ -562,7 +562,13 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
         cam.sharcAccumulationAddr = rtp->GetSHARCAccumulationAddr();
         cam.sharcResolvedAddr = rtp->GetSHARCResolvedAddr();
         cam.sharcCapacity = rtp->SHARC_CAPACITY;
-        cam.sharcSceneScale = 1.0f;     // meters — adjust for scene scale
+        // Auto scene scale from AABB: ensures voxels are appropriately sized
+        float sceneExtent = 0.0f;
+        for (int i = 0; i < 3; i++) {
+            float ext = cfg->sceneAABBMax[i] - cfg->sceneAABBMin[i];
+            if (ext > sceneExtent) sceneExtent = ext;
+        }
+        cam.sharcSceneScale = (sceneExtent > 0.1f) ? 2.0f / sceneExtent : 1.0f;
         cam.sharcRadianceScale = 1e3f;   // quantization for uint accumulation
     }
 
@@ -762,6 +768,7 @@ IGNIS_API void ignis_set_int(const char* key, int value) {
     else if (strcmp(key, "dof_blades") == 0)        cfg->dofBlades = value;
     else if (strcmp(key, "backface_culling") == 0) cfg->backfaceCulling = (value != 0);
     else if (strcmp(key, "restir_di") == 0)      cfg->restirDI = (value != 0);
+    else if (strcmp(key, "material_sort") == 0) cfg->materialSort = (value != 0);
     else if (strcmp(key, "hdri_tex_index") == 0)  cfg->hdriTexIndex = value;
     else if (strcmp(key, "reset_history") == 0 && value != 0) {
         if (g_renderer) g_renderer->ResetFrameIndex();

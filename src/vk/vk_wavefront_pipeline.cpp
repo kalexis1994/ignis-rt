@@ -121,6 +121,9 @@ void WavefrontPipeline::Shutdown() {
     destroyPipeline(pipelineK4_);
     destroyPipeline(pipelineK5_);
     destroyPipeline(pipelineCompact_);
+    destroyPipeline(pipelineSortCount_);
+    destroyPipeline(pipelineSortPrefix_);
+    destroyPipeline(pipelineSortScatter_);
 
     if (pipelineLayout_) { vkDestroyPipelineLayout(device, pipelineLayout_, nullptr); pipelineLayout_ = VK_NULL_HANDLE; }
     if (wfDescPool_) { vkDestroyDescriptorPool(device, wfDescPool_, nullptr); wfDescPool_ = VK_NULL_HANDLE; }
@@ -161,8 +164,8 @@ bool WavefrontPipeline::CreateBuffers(uint32_t pixelCount) {
     // PrimaryGBuffer: 64 bytes per pixel
     if (!CreateSSBO(device, physDevice, pixelCount * 64, &primaryGBufBuffer_, &primaryGBufMemory_)) return false;
 
-    // Counters: 16 bytes
-    if (!CreateSSBO(device, physDevice, 16, &countersBuffer_, &countersMemory_)) return false;
+    // Counters: 64 bytes (16 base + 20 sort bin counts + 20 sort bin offsets + 8 pad)
+    if (!CreateSSBO(device, physDevice, 64, &countersBuffer_, &countersMemory_)) return false;
 
     // Indirect dispatch args: 3 dispatches * 12 bytes
     VkBufferCreateInfo indirectInfo{};
@@ -346,8 +349,17 @@ bool WavefrontPipeline::CreatePipelines() {
         Log(L"[Wavefront] ERROR: Compact shader not found\n");
         return false;
     }
+    if (!createCompute("shaders/wavefront/wf_sort_count.comp.spv", &pipelineSortCount_)) {
+        Log(L"[Wavefront] WARNING: SortCount shader not found (material sorting disabled)\n");
+    }
+    if (!createCompute("shaders/wavefront/wf_sort_prefix.comp.spv", &pipelineSortPrefix_)) {
+        Log(L"[Wavefront] WARNING: SortPrefix shader not found\n");
+    }
+    if (!createCompute("shaders/wavefront/wf_sort_scatter.comp.spv", &pipelineSortScatter_)) {
+        Log(L"[Wavefront] WARNING: SortScatter shader not found\n");
+    }
 
-    Log(L"[Wavefront] All compute pipelines created (K0-K5 + compact)\n");
+    Log(L"[Wavefront] All compute pipelines created (K0-K5 + compact + sort)\n");
     return true;
 }
 
@@ -414,7 +426,7 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
     // Extra iterations for glass: glass bounces don't consume the shader bounce
     // counter but DO consume dispatch loop iterations. Add headroom for glass
     // traversal (enter + exit = 2 extra iterations minimum).
-    uint32_t glassHeadroom = 4; // covers enter/exit + rough glass multi-bounce
+    uint32_t glassHeadroom = 8; // covers multi-layer glass stacks (2 closed meshes = 4-6 iterations)
     uint32_t totalIterations = maxBounces + glassHeadroom;
     for (uint32_t bounce = 0; bounce < totalIterations; bounce++) {
         push.currentBounce = bounce;
@@ -482,8 +494,54 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
-        // Swap PathState ping-pong: just flip the index (no host descriptor updates!)
-        pathStateCurrent_ = 1 - pathStateCurrent_;
+        // Material sort: count → prefix sum → scatter (WRITE → READ buffer)
+        // After sort, paths are in READ buffer grouped by material category.
+        // No ping-pong swap needed — sort places data directly in READ buffer.
+        // Material sorting: only beneficial for scenes with mixed materials.
+        bool sortAvailable = materialSort_ && pipelineSortCount_ && pipelineSortPrefix_ && pipelineSortScatter_;
+        if (sortAvailable) {
+            // Clear sort bin counts (5 uints at offset 16 in counters buffer)
+            vkCmdFillBuffer(cmd, countersBuffer_, 16, 20, 0);
+            VkMemoryBarrier clearBarrier2{};
+            clearBarrier2.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            clearBarrier2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            clearBarrier2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &clearBarrier2, 0, nullptr, 0, nullptr);
+
+            // Phase 1: Count paths per material category
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineSortCount_);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+                0, 2, setsBounce, 0, nullptr);
+            vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            vkCmdDispatchIndirect(cmd, indirectDispatchBuffer_, 0);
+
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+            // Phase 2: Prefix sum (1 thread)
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineSortPrefix_);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+                0, 2, setsBounce, 0, nullptr);
+            vkCmdDispatch(cmd, 1, 1, 1);
+
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+            // Phase 3: Scatter (WRITE → READ buffer in sorted order)
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineSortScatter_);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+                0, 2, setsBounce, 0, nullptr);
+            vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            vkCmdDispatchIndirect(cmd, indirectDispatchBuffer_, 0);
+
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+            // NO swap: sorted paths are in READ buffer (binding 0)
+        } else {
+            // Fallback: simple swap (no sorting)
+            pathStateCurrent_ = 1 - pathStateCurrent_;
+        }
     }
 
     // Reset ping-pong for next SPP sample

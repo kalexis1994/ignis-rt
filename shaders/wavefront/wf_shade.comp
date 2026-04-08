@@ -508,6 +508,15 @@ void main() {
     // Shadow bias: larger for hair to avoid ribbon-on-ribbon self-shadowing
     float shadowBias = isHairSurface ? 0.1 : 0.002;
 
+    // Material category for sort (bits [12:14] of PathState flags)
+    // 0=opaque, 1=glass, 2=hair, 3=volume, 4=complex VM
+    uint materialCategory = 0u;
+    if (isHairSurface)                              materialCategory = 2u;
+    else if ((mat.flags & 4u) != 0u)                materialCategory = 3u;  // volume
+    else if ((1.0 - metallic) * transmission > 0.5) materialCategory = 1u;  // glass
+    else if ((mat.nodeVmHeader & 0xFFu) > 16u)      materialCategory = 4u;  // complex VM
+    uint matCatBits = (materialCategory & 0x7u) << 12u;
+
     // Capture secondary hit distance (bounce 1) for denoiser shadow guidance
     // DLSS RR uses diffuse hitT to guide spatial filtering — mixing in secondary
     // bounce distance helps resolve shadow penumbra (RTXPT technique)
@@ -586,26 +595,124 @@ void main() {
         N = normalize(mix(N, gN, blend));
     }
 
-    // Alpha cutout — advance ray and re-queue
-    if ((mat.flags & 1u) != 0u && alpha < mat.alphaRef) {
-        // Re-queue with advanced origin, same bounce
-        uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
-        uint nBase = nextIdx * 12u;
+    // Stochastic alpha test with INLINE re-trace (matching monolithic):
+    // Instead of re-queuing (which consumes dispatch iterations), trace through
+    // multiple transparent layers directly in K2. This handles stacked transparents
+    // (fire, foliage, curtains) without exhausting the bounce budget.
+    if ((mat.flags & 1u) != 0u && alpha < 0.999 && rand01() > alpha) {
+        // Inline alpha skip loop: trace through up to 8 transparent layers
         vec3 skipOrigin = worldPos + rayDir * 0.002;
-        nextPathStates.nextPathData[nBase+0] = skipOrigin.x;
-        nextPathStates.nextPathData[nBase+1] = skipOrigin.y;
-        nextPathStates.nextPathData[nBase+2] = skipOrigin.z;
-        nextPathStates.nextPathData[nBase+3] = uintBitsToFloat(pixelIndex);
-        nextPathStates.nextPathData[nBase+4] = rayDir.x;
-        nextPathStates.nextPathData[nBase+5] = rayDir.y;
-        nextPathStates.nextPathData[nBase+6] = rayDir.z;
-        nextPathStates.nextPathData[nBase+7] = uintBitsToFloat(rngState);
-        nextPathStates.nextPathData[nBase+8] = throughput.x;
-        nextPathStates.nextPathData[nBase+9] = throughput.y;
-        nextPathStates.nextPathData[nBase+10] = throughput.z;
-        // Same bounce (not incremented) — will re-trace from behind alpha surface
-        nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(flags);
-        pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u); // mark original terminated
+        bool foundOpaque = false;
+        for (int alphaSkip = 0; alphaSkip < 8; alphaSkip++) {
+            rayQueryEXT alphaRQ;
+            rayQueryInitializeEXT(alphaRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
+                                  0xFF, skipOrigin, MIN_HIT_DIST, rayDir, 10000.0);
+            while (rayQueryProceedEXT(alphaRQ)) {}
+
+            if (rayQueryGetIntersectionTypeEXT(alphaRQ, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+                // Sky miss — accumulate sky and terminate
+                vec3 skyThroughput = throughput;
+                vec3 skyColor = evaluateSky(rayDir);
+                int hdriIdx = int(cam.windParams.x);
+                if (hdriIdx >= 0) {
+                    float phi = atan(-rayDir.z, rayDir.x);
+                    float u = 0.5 - phi / (2.0 * PI);
+                    float v = acos(clamp(rayDir.y, -1.0, 1.0)) / PI;
+                    skyColor = texture(textures[nonuniformEXT(uint(hdriIdx))], vec2(u, v)).rgb * cam.windParams.y;
+                }
+                uint rBase = pixelIndex * 8u;
+                vec3 skyContrib = skyColor * skyThroughput;
+                if (bounce == 0u) {
+                    atomicAddFloat(rBase+0, skyContrib.x);
+                    atomicAddFloat(rBase+1, skyContrib.y);
+                    atomicAddFloat(rBase+2, skyContrib.z);
+                } else if (isDiffusePath) {
+                    float gi = cam.ptParams0.y;
+                    atomicAddFloat(rBase+0, skyContrib.x * gi);
+                    atomicAddFloat(rBase+1, skyContrib.y * gi);
+                    atomicAddFloat(rBase+2, skyContrib.z * gi);
+                } else {
+                    float gi = cam.ptParams0.y;
+                    atomicAddFloat(rBase+4, skyContrib.x * gi);
+                    atomicAddFloat(rBase+5, skyContrib.y * gi);
+                    atomicAddFloat(rBase+6, skyContrib.z * gi);
+                }
+                pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
+                return;
+            }
+
+            // Hit something — check if it's also alpha-tested
+            float aHitT = rayQueryGetIntersectionTEXT(alphaRQ, true);
+            uint aCustIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(alphaRQ, true);
+            int aPrimId = rayQueryGetIntersectionPrimitiveIndexEXT(alphaRQ, true);
+            GeometryMetadata aGeo = geometryMetadata.geometries[aCustIdx];
+            uint aMatIdx = 0u;
+            if (aGeo.primMaterialBufferAddress != 0u) {
+                PrimMaterials aPM = PrimMaterials(aGeo.primMaterialBufferAddress);
+                aMatIdx = aPM.m[aPrimId];
+            }
+            Material aMat = materialBuffer.materials[aMatIdx];
+
+            // Glass/volume: pass through silently
+            if ((aMat.flags & 6u) != 0u) {
+                skipOrigin += rayDir * (aHitT + 0.003);
+                continue;
+            }
+
+            // Check alpha of the new hit
+            bool aAlphaTest = (aMat.flags & 1u) != 0u;
+            if (aAlphaTest) {
+                // Quick alpha sample from diffuse texture
+                float aAlpha = aMat.multG; // default alpha multiplier
+                if (aMat.diffuseTexIndex != 0xFFFFFFFFu && aGeo.uvBufferAddress != 0u) {
+                    Indices aIdx = Indices(aGeo.indexBufferAddress);
+                    UVs aUV = UVs(aGeo.uvBufferAddress);
+                    uint ai0 = aIdx.i[aPrimId*3+0], ai1 = aIdx.i[aPrimId*3+1], ai2 = aIdx.i[aPrimId*3+2];
+                    vec2 aBary2 = rayQueryGetIntersectionBarycentricsEXT(alphaRQ, true);
+                    vec3 aBary = vec3(1.0-aBary2.x-aBary2.y, aBary2.x, aBary2.y);
+                    vec2 aHitUV = vec2(aUV.uv[ai0*2], 1.0-aUV.uv[ai0*2+1]) * aBary.x
+                                + vec2(aUV.uv[ai1*2], 1.0-aUV.uv[ai1*2+1]) * aBary.y
+                                + vec2(aUV.uv[ai2*2], 1.0-aUV.uv[ai2*2+1]) * aBary.z;
+                    aAlpha = texture(textures[nonuniformEXT(aMat.diffuseTexIndex)], aHitUV).a * aMat.multG;
+                } else if (aMat.detailTexIndex != 0xFFFFFFFFu && aGeo.uvBufferAddress != 0u) {
+                    Indices aIdx = Indices(aGeo.indexBufferAddress);
+                    UVs aUV = UVs(aGeo.uvBufferAddress);
+                    uint ai0 = aIdx.i[aPrimId*3+0], ai1 = aIdx.i[aPrimId*3+1], ai2 = aIdx.i[aPrimId*3+2];
+                    vec2 aBary2 = rayQueryGetIntersectionBarycentricsEXT(alphaRQ, true);
+                    vec3 aBary = vec3(1.0-aBary2.x-aBary2.y, aBary2.x, aBary2.y);
+                    vec2 aHitUV = vec2(aUV.uv[ai0*2], 1.0-aUV.uv[ai0*2+1]) * aBary.x
+                                + vec2(aUV.uv[ai1*2], 1.0-aUV.uv[ai1*2+1]) * aBary.y
+                                + vec2(aUV.uv[ai2*2], 1.0-aUV.uv[ai2*2+1]) * aBary.z;
+                    aAlpha = texture(textures[nonuniformEXT(aMat.detailTexIndex)], aHitUV).a * aMat.multG;
+                }
+                if (aAlpha < 0.999 && rand01() > aAlpha) {
+                    skipOrigin += rayDir * (aHitT + 0.002);
+                    continue; // transparent — skip this layer too
+                }
+            }
+
+            // Opaque hit found — re-queue for full shading at this position
+            foundOpaque = true;
+            // Write HitResult so K2 can process it on re-entry
+            // Actually, just re-queue the path to this new origin for next iteration
+            uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
+            uint nBase = nextIdx * 12u;
+            vec3 newOrigin = skipOrigin; // already past all transparent layers
+            nextPathStates.nextPathData[nBase+0] = newOrigin.x;
+            nextPathStates.nextPathData[nBase+1] = newOrigin.y;
+            nextPathStates.nextPathData[nBase+2] = newOrigin.z;
+            nextPathStates.nextPathData[nBase+3] = uintBitsToFloat(pixelIndex);
+            nextPathStates.nextPathData[nBase+4] = rayDir.x;
+            nextPathStates.nextPathData[nBase+5] = rayDir.y;
+            nextPathStates.nextPathData[nBase+6] = rayDir.z;
+            nextPathStates.nextPathData[nBase+7] = uintBitsToFloat(rngState);
+            nextPathStates.nextPathData[nBase+8] = throughput.x;
+            nextPathStates.nextPathData[nBase+9] = throughput.y;
+            nextPathStates.nextPathData[nBase+10] = throughput.z;
+            nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(flags | matCatBits);
+            break;
+        }
+        pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
         return;
     }
 
@@ -844,7 +951,7 @@ void main() {
         nextPathStates.nextPathData[nBase+8] = throughput.x;
         nextPathStates.nextPathData[nBase+9] = throughput.y;
         nextPathStates.nextPathData[nBase+10] = throughput.z;
-        uint volFlags = bounce | (isDiffusePath ? 0x10u : 0u) | (flags & 0xFF00u);
+        uint volFlags = bounce | (isDiffusePath ? 0x10u : 0u) | (flags & 0xFF00u) | matCatBits;
         nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(volFlags);
         pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
         return;
@@ -1015,7 +1122,7 @@ void main() {
         nextPathStates.nextPathData[nBase+8] = throughput.x;
         nextPathStates.nextPathData[nBase+9] = throughput.y;
         nextPathStates.nextPathData[nBase+10] = throughput.z;
-        uint glassFlags = bounce | ((glassBounces & 0xFu) << 8u);
+        uint glassFlags = bounce | ((glassBounces & 0xFu) << 8u) | matCatBits;
         nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(glassFlags);
         pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
         return;
@@ -1593,12 +1700,34 @@ void main() {
     }
 
     // ---- SHARC update: accumulate direct lighting + guide bins + backpropagation ----
+    // NVIDIA official: directLighting must be PRE-THROUGHPUT (just the local illumination).
+    // Throughput is applied separately via SharcSetThroughput for backpropagation weighting.
     if (sharcUpdatePixel && !isGlass) {
         SharcState state = loadSharcState(pixelIndex);
 
-        // Direct lighting estimate: emission + ambient (NEE deferred to K3)
-        vec3 directLighting = emission * throughput;
+        // Direct lighting at this vertex (PRE-throughput, matching NVIDIA SDK)
+        vec3 directLighting = emission;  // emission only — NEE contributions deferred to K3
         directLighting = max(directLighting, vec3(0.0));
+
+        // Anti-firefly filter: clamp directLighting relative to resolved cache luminance
+        // (NVIDIA SharcAddVoxelData includes this internally; we apply it before update)
+        {
+            uint64_t ffKey = sharcHashKey(worldPos, N, sharcGrid);
+            uint ffSlot = sharcFind(ffKey, sharcCapacity);
+            if (ffSlot != 0xFFFFFFFFu) {
+                uint rOff = sharcCapacity * 4u + ffSlot * 4u;
+                float resolvedLum = dot(vec3(
+                    uintBitsToFloat(_sharcResolved.data[rOff + 0u]),
+                    uintBitsToFloat(_sharcResolved.data[rOff + 1u]),
+                    uintBitsToFloat(_sharcResolved.data[rOff + 2u])),
+                    vec3(0.2126, 0.7152, 0.0722));
+                float directLum = dot(directLighting, vec3(0.2126, 0.7152, 0.0722));
+                // Clamp new sample to 10x resolved luminance (anti-firefly)
+                if (resolvedLum > 0.001 && directLum > resolvedLum * 10.0) {
+                    directLighting *= (resolvedLum * 10.0) / directLum;
+                }
+            }
+        }
 
         // Guide bin accumulation: record light direction
         float directLum = dot(directLighting, vec3(0.2126, 0.7152, 0.0722));
@@ -1611,6 +1740,7 @@ void main() {
         }
 
         // SharcUpdateHit: insert/update cache, possibly early-out
+        // directLighting is PRE-throughput; throughput applied via SharcSetThroughput
         bool continueTracing = SharcUpdateHit(sharcGrid, state,
             worldPos, N, directLighting, rand01(), sharcCapacity);
         SharcSetThroughput(state, throughput);
@@ -1647,11 +1777,53 @@ void main() {
         float thinRnd = rand01();
 
         if (thinPassProb > 0.01 && thinRnd < thinPassProb) {
-            // Thin passthrough with transmission tint (no refraction bend)
+            // Thin passthrough INLINE: trace through multiple thin layers without re-queue
+            // This avoids consuming dispatch iterations for stacked thin glass
             throughput *= cyclesPrincipledTransmissionTint(baseColor) / max(thinPassProb, 0.01);
+            vec3 thinOrigin = worldPos + rayDir * 0.002;
+
+            // Inline skip loop: trace through up to 6 more thin/glass/transparent layers
+            for (int thinSkip = 0; thinSkip < 6; thinSkip++) {
+                rayQueryEXT thinRQ;
+                rayQueryInitializeEXT(thinRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
+                    0xFF, thinOrigin, MIN_HIT_DIST, rayDir, 10000.0);
+                while (rayQueryProceedEXT(thinRQ)) {}
+                if (rayQueryGetIntersectionTypeEXT(thinRQ, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+                    break; // sky miss — will be handled by re-queued path or next iteration
+                }
+                float tHitT = rayQueryGetIntersectionTEXT(thinRQ, true);
+                uint tCustIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(thinRQ, true);
+                int tPrimId = rayQueryGetIntersectionPrimitiveIndexEXT(thinRQ, true);
+                GeometryMetadata tGeo = geometryMetadata.geometries[tCustIdx];
+                uint tMatIdx = 0u;
+                if (tGeo.primMaterialBufferAddress != 0u) {
+                    PrimMaterials tPM = PrimMaterials(tGeo.primMaterialBufferAddress);
+                    tMatIdx = tPM.m[tPrimId];
+                }
+                Material tMat = materialBuffer.materials[tMatIdx];
+
+                // Glass/volume: pass through
+                if ((tMat.flags & 6u) != 0u) {
+                    // Check if it's THIN transmission — apply tint and continue
+                    if ((tMat.flags & 128u) != 0u) { // MAT_FLAG_THIN_TRANSMISSION
+                        throughput *= cyclesPrincipledTransmissionTint(
+                            vec3(tMat.ksAmbient, tMat.ksDiffuse, tMat.ksSpecular));
+                    }
+                    thinOrigin += rayDir * (tHitT + 0.003);
+                    continue;
+                }
+                // Transparent/lightpath: pass through
+                if ((tMat.flags & (1u | 256u)) != 0u || tMat.multB > 0.0) {
+                    thinOrigin += rayDir * (tHitT + 0.002);
+                    continue;
+                }
+                // Opaque hit — stop skipping
+                break;
+            }
+
+            // Re-queue from the final position (past all thin/transparent layers)
             uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
             uint nBase = nextIdx * 12u;
-            vec3 thinOrigin = worldPos + rayDir * 0.002;
             nextPathStates.nextPathData[nBase+0] = thinOrigin.x;
             nextPathStates.nextPathData[nBase+1] = thinOrigin.y;
             nextPathStates.nextPathData[nBase+2] = thinOrigin.z;
@@ -1663,7 +1835,7 @@ void main() {
             nextPathStates.nextPathData[nBase+8] = throughput.x;
             nextPathStates.nextPathData[nBase+9] = throughput.y;
             nextPathStates.nextPathData[nBase+10] = throughput.z;
-            uint thinFlags = bounce | (flags & 0xFF00u); // same bounce, preserve glass counter
+            uint thinFlags = bounce | (flags & 0xFF00u) | matCatBits;
             nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(thinFlags);
             pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
             return;
@@ -1693,7 +1865,7 @@ void main() {
             nextPathStates.nextPathData[nBase+8] = throughput.x;
             nextPathStates.nextPathData[nBase+9] = throughput.y;
             nextPathStates.nextPathData[nBase+10] = throughput.z;
-            uint reflFlags = bounce | (flags & 0xFF00u); // same bounce
+            uint reflFlags = bounce | (flags & 0xFF00u) | matCatBits;
             nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(reflFlags);
             pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
             return;
@@ -1729,7 +1901,7 @@ void main() {
         nextPathStates.nextPathData[nBase+9] = throughput.y;
         nextPathStates.nextPathData[nBase+10] = throughput.z;
         // Preserve bounce + glass counter, clear isDiffuse
-        uint tpFlags = bounce | (flags & 0xFF00u); // keep glass counter bits
+        uint tpFlags = bounce | (flags & 0xFF00u) | matCatBits;
         nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(tpFlags);
         pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
         return;
@@ -1751,7 +1923,7 @@ void main() {
         nextPathStates.nextPathData[nBase+8] = throughput.x;
         nextPathStates.nextPathData[nBase+9] = throughput.y;
         nextPathStates.nextPathData[nBase+10] = throughput.z;
-        uint lpFlags = bounce | (flags & 0xFF00u);
+        uint lpFlags = bounce | (flags & 0xFF00u) | matCatBits;
         nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(lpFlags);
         pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
         return;
@@ -1838,7 +2010,7 @@ void main() {
         nextPathStates.nextPathData[nBase+9] = throughput.y;
         nextPathStates.nextPathData[nBase+10] = throughput.z;
         // Same bounce, not diffuse, updated glass counter
-        uint glassFlags = bounce | ((glassBounces & 0xFu) << 8u);
+        uint glassFlags = bounce | ((glassBounces & 0xFu) << 8u) | matCatBits;
         nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(glassFlags);
         pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
         return;
@@ -1981,7 +2153,7 @@ void main() {
         nextPathStates.nextPathData[nBase+8] = throughput.x;
         nextPathStates.nextPathData[nBase+9] = throughput.y;
         nextPathStates.nextPathData[nBase+10] = throughput.z;
-        uint newFlags = nextBounce | (isDiffusePath ? 0x10u : 0u);
+        uint newFlags = nextBounce | (isDiffusePath ? 0x10u : 0u) | matCatBits;
         nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(newFlags);
     }
 
