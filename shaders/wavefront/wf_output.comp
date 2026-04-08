@@ -100,7 +100,13 @@ void main() {
     vec3 diffuse = vec3(uintBitsToFloat(pixelRadiance.radDataU[rBase+0]),
                         uintBitsToFloat(pixelRadiance.radDataU[rBase+1]),
                         uintBitsToFloat(pixelRadiance.radDataU[rBase+2])) * sppInv;
-    float hitDist = uintBitsToFloat(pixelRadiance.radDataU[rBase+3]);
+    // Hit distance: K2 stores primary (positive) or secondary (negative) hitT
+    // Matching monolithic: diffHitDist = secondary > 0 ? secondary : primary
+    float rawHitDist = uintBitsToFloat(pixelRadiance.radDataU[rBase+3]);
+    float primaryHitDistRaw = rawHitDist > 0.0 ? rawHitDist : 0.0;
+    float secondaryHitDistRaw = rawHitDist < 0.0 ? -rawHitDist : 0.0;
+    float hitDist = primaryHitDistRaw;  // for specular
+    float diffHitDist = secondaryHitDistRaw > 0.0 ? secondaryHitDistRaw : primaryHitDistRaw; // for diffuse
     vec3 specular = vec3(uintBitsToFloat(pixelRadiance.radDataU[rBase+4]),
                          uintBitsToFloat(pixelRadiance.radDataU[rBase+5]),
                          uintBitsToFloat(pixelRadiance.radDataU[rBase+6])) * sppInv;
@@ -153,8 +159,8 @@ void main() {
         // Demodulate diffuse by albedo for NRD
         vec3 albedo = max(primaryAlbedo, vec3(0.01));
         vec3 demodDiffuse = diffuse / albedo;
-        imageStore(diffuseRadianceImg, pixel, NRD_PackRadiance(demodDiffuse, primaryHitDist));
-        imageStore(specularRadianceImg, pixel, NRD_PackRadiance(specular, primaryHitDist));
+        imageStore(diffuseRadianceImg, pixel, NRD_PackRadiance(demodDiffuse, diffHitDist));
+        imageStore(specularRadianceImg, pixel, NRD_PackRadiance(specular, hitDist));
         imageStore(albedoBufferImg, pixel, vec4(primaryAlbedo, 0.5));
 
         // DLSS NDC depth
@@ -175,8 +181,9 @@ void main() {
         vec3 specAlbedo = EnvBRDFApprox(F0, primaryRoughness, NdotV);
         imageStore(specularAlbedoImg, pixel, vec4(specAlbedo, 0.0));
 
-        // Penumbra, reactive, confidence — simplified
-        imageStore(penumbraImg, pixel, vec4(65504.0));
+        // Penumbra: written by K2 inline sun shadow trace (not here)
+        // Only write default if K2 didn't run (sky miss handled below)
+        // Reactive, confidence:
         float transformDelta = distance(primaryWorldPos, prevWorldPos);
         imageStore(reactiveMaskImg, pixel, vec4(clamp(transformDelta * 50.0, 0.0, 1.0)));
         float confidence = (transformDelta > 0.001) ? 0.3 : 1.0;
