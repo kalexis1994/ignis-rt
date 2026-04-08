@@ -102,6 +102,8 @@ layout(binding = 5, set = 1, scalar) buffer CountersBuffer {
 } counters;
 
 #include "../include/common.glsl"
+#include "../include/noise.glsl"
+#include "../include/volume_march.glsl"
 
 // Atomic float add via CAS
 void atomicAddFloat(uint index, float value) {
@@ -160,6 +162,17 @@ void main() {
 
         // Glass/volume surfaces (flags bit 1 = TRANSMISSION, bit 2 = VOLUME): pass through
         if ((sMat.flags & 6u) != 0u) {
+            // Volume shadow transmittance (Beer-Lambert attenuation through volume)
+            if ((sMat.flags & 4u) != 0u && rayQueryGetIntersectionFrontFaceEXT(rq, true)) {
+                int sInstId = rayQueryGetIntersectionInstanceIdEXT(rq, true);
+                vec3 vCol = vec3(sMat.ksAmbient, sMat.ksDiffuse, sMat.ksSpecular);
+                vec3 vAbs = vec3(uintBitsToFloat(sMat.nodeVmCode[2].x),
+                                 uintBitsToFloat(sMat.nodeVmCode[2].y),
+                                 uintBitsToFloat(sMat.nodeVmCode[2].z));
+                shadowFilter *= evaluateVolumeShadowTransmittance(
+                    topLevelAS, vCol, vAbs, sMat.sunSpecular,
+                    shadowOrigin, dir, sHitT, sInstId);
+            }
             shadowOrigin += dir * (sHitT + 0.004);
             maxDist -= (sHitT + 0.004);
             if (maxDist <= 0.0) break;

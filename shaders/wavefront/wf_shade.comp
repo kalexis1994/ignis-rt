@@ -178,6 +178,7 @@ const uint VM_HEADER_FLAG_SHADOW_DYNAMIC = 8u;
 #include "../include/node_vm.glsl"
 #include "../include/hair_bsdf.glsl"
 #include "../include/hair_cylinder.glsl"
+#include "../include/volume_march.glsl"
 
 vec3 cyclesPrincipledTransmissionTint(vec3 baseColor) {
     return sqrt(clamp(baseColor, vec3(0.0), vec3(1.0)));
@@ -496,6 +497,213 @@ void main() {
         // Same bounce (not incremented) — will re-trace from behind alpha surface
         nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(flags);
         pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u); // mark original terminated
+        return;
+    }
+
+    // ---- Volume rendering (replaces surface BRDF for volume materials) ----
+    bool isVolumeOnly = (mat.flags & 4u) != 0u && (mat.flags & 8u) != 0u;
+    bool hasSurfaceVolume = (mat.flags & 4u) != 0u && (mat.flags & 8u) == 0u;
+    bool isHetero = (mat.flags & 16u) != 0u;
+
+    if (isVolumeOnly || hasSurfaceVolume) {
+        // Only enter from front face
+        bool entering = dot(geoNormalRaw, -rayDir) > 0.0;
+        if (!entering) {
+            // Pass through back face
+            uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
+            uint nBase = nextIdx * 12u;
+            vec3 skipOrigin = worldPos + rayDir * 0.002;
+            nextPathStates.nextPathData[nBase+0] = skipOrigin.x;
+            nextPathStates.nextPathData[nBase+1] = skipOrigin.y;
+            nextPathStates.nextPathData[nBase+2] = skipOrigin.z;
+            nextPathStates.nextPathData[nBase+3] = uintBitsToFloat(pixelIndex);
+            nextPathStates.nextPathData[nBase+4] = rayDir.x;
+            nextPathStates.nextPathData[nBase+5] = rayDir.y;
+            nextPathStates.nextPathData[nBase+6] = rayDir.z;
+            nextPathStates.nextPathData[nBase+7] = uintBitsToFloat(rngState);
+            nextPathStates.nextPathData[nBase+8] = throughput.x;
+            nextPathStates.nextPathData[nBase+9] = throughput.y;
+            nextPathStates.nextPathData[nBase+10] = throughput.z;
+            nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(flags);
+            pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
+            return;
+        }
+
+        // Volume material properties
+        float volumeDensity = mat.sunSpecular;
+        float volumeAnisotropy = mat.sunSpecularEXP;
+        vec3 volumeColor = baseColor;
+        vec3 absorptionColor = vec3(uintBitsToFloat(mat.nodeVmCode[2].x),
+                                     uintBitsToFloat(mat.nodeVmCode[2].y),
+                                     uintBitsToFloat(mat.nodeVmCode[2].z));
+        float emStrength = uintBitsToFloat(mat.nodeVmCode[2].w);
+        vec3 emColor = vec3(uintBitsToFloat(mat.nodeVmCode[3].x),
+                            uintBitsToFloat(mat.nodeVmCode[3].y),
+                            uintBitsToFloat(mat.nodeVmCode[3].z));
+        float temperature = uintBitsToFloat(mat.nodeVmCode[3].w);
+        float blackbodyIntensity = uintBitsToFloat(mat.nodeVmCode[4].x);
+
+        // Find exit distance
+        vec3 entryPos = worldPos + rayDir * 0.0005;
+        float marchDist = traceVolumeExit(topLevelAS, entryPos, rayDir, instanceId);
+
+        // Sky/sun for in-scattering
+        vec3 sunDir = normalize(cam.sunLight.xyz);
+        float sunIntensity = cam.sunLight.w;
+        vec3 sunColor = cam.skyLight.rgb;
+
+        // Evaluate sky for ambient in-scattering (use HDRI if available)
+        int hdriIdx = int(cam.windParams.x);
+        vec3 skyColor;
+        if (hdriIdx >= 0) {
+            float hdriStr = cam.windParams.y;
+            // Simple sky approximation for volume (average of a few directions)
+            skyColor = vec3(hdriStr * 0.5);
+        } else {
+            vec3 ambColor = cam.ambientLight.rgb;
+            skyColor = ambColor * max(sunDir.y * 3.0 + 0.3, 0.05);
+        }
+
+        // Accumulate radiance
+        uint rBase = pixelIndex * 8u;
+        vec3 volRadiance = vec3(0.0);
+
+        if (!isHetero) {
+            // Homogeneous volume (analytic)
+            marchVolumeHomogeneous(entryPos, rayDir, marchDist,
+                volumeColor, absorptionColor, volumeDensity, volumeAnisotropy,
+                emColor, emStrength, temperature, blackbodyIntensity,
+                sunDir, sunIntensity, sunColor, skyColor,
+                volRadiance, throughput);
+        } else {
+            // Heterogeneous volume (ray march with noise)
+            // Noise parameters from material
+            float noiseScale = uintBitsToFloat(mat.nodeVmPad[0]);
+            float noiseDetail = uintBitsToFloat(mat.nodeVmPad[1]);
+            float noiseBrightness = uintBitsToFloat(mat.nodeVmPad[2]);
+            float noiseRoughness_ = uintBitsToFloat(mat.nodeVmCode[0].x);
+            float noiseLacunarity = uintBitsToFloat(mat.nodeVmCode[0].y);
+            float noiseContrast = uintBitsToFloat(mat.nodeVmCode[0].z);
+            vec3 mappingOffset = vec3(uintBitsToFloat(mat.nodeVmCode[1].x),
+                                      uintBitsToFloat(mat.nodeVmCode[1].y),
+                                      uintBitsToFloat(mat.nodeVmCode[1].z));
+            uint noiseTypePacked = mat.nodeVmCode[4].y;
+            int noiseType = int(noiseTypePacked & 0xFFFFu);
+            bool noiseNormalize = (noiseTypePacked >> 16u) != 0u;
+            float noiseOffset = uintBitsToFloat(mat.nodeVmCode[4].z);
+            float noiseGain = uintBitsToFloat(mat.nodeVmCode[4].w);
+            uint noiseDimensions = mat.nodeVmCode[0].w;
+            float noiseW = uintBitsToFloat(mat.nodeVmCode[1].w);
+
+            vec3 volBboxMin = vec3(uintBitsToFloat(mat.nodeVmCode[5].x),
+                                   uintBitsToFloat(mat.nodeVmCode[5].y),
+                                   uintBitsToFloat(mat.nodeVmCode[5].z));
+            vec3 volBboxMax = vec3(uintBitsToFloat(mat.nodeVmCode[6].x),
+                                   uintBitsToFloat(mat.nodeVmCode[6].y),
+                                   uintBitsToFloat(mat.nodeVmCode[6].z));
+            vec3 volBboxRange = max(volBboxMax - volBboxMin, vec3(0.001));
+
+            // Extended volume chain (nodeVmCode[7..14])
+            uint volFlags2 = mat.nodeVmCode[10].w;
+            bool useObjectCoords = (volFlags2 & 1u) != 0u;
+            bool hasFullMatrix = (volFlags2 & 2u) != 0u;
+            bool hasGradient = (volFlags2 & 4u) != 0u;
+            bool hasMix = (volFlags2 & 8u) != 0u;
+            bool hasRamp = (volFlags2 & 16u) != 0u;
+            bool hasDistortion = (volFlags2 & 32u) != 0u;
+            uint chainTarget = (volFlags2 >> 8u) & 0xFu;
+
+            vec4 mapRow0 = vec4(uintBitsToFloat(mat.nodeVmCode[7].x), uintBitsToFloat(mat.nodeVmCode[7].y),
+                                uintBitsToFloat(mat.nodeVmCode[7].z), uintBitsToFloat(mat.nodeVmCode[7].w));
+            vec4 mapRow1 = vec4(uintBitsToFloat(mat.nodeVmCode[8].x), uintBitsToFloat(mat.nodeVmCode[8].y),
+                                uintBitsToFloat(mat.nodeVmCode[8].z), uintBitsToFloat(mat.nodeVmCode[8].w));
+            vec4 mapRow2 = vec4(uintBitsToFloat(mat.nodeVmCode[9].x), uintBitsToFloat(mat.nodeVmCode[9].y),
+                                uintBitsToFloat(mat.nodeVmCode[9].z), uintBitsToFloat(mat.nodeVmCode[9].w));
+            float noiseDistortion = uintBitsToFloat(mat.nodeVmCode[10].x);
+            int gradientType = int(mat.nodeVmCode[10].y);
+            float mixFactor = uintBitsToFloat(mat.nodeVmCode[10].z);
+            vec4 rampLut0 = vec4(uintBitsToFloat(mat.nodeVmCode[11].x), uintBitsToFloat(mat.nodeVmCode[11].y),
+                                 uintBitsToFloat(mat.nodeVmCode[11].z), uintBitsToFloat(mat.nodeVmCode[11].w));
+            vec4 rampLut1 = vec4(uintBitsToFloat(mat.nodeVmCode[12].x), uintBitsToFloat(mat.nodeVmCode[12].y),
+                                 uintBitsToFloat(mat.nodeVmCode[12].z), uintBitsToFloat(mat.nodeVmCode[12].w));
+            vec4 rampLut2 = vec4(uintBitsToFloat(mat.nodeVmCode[13].x), uintBitsToFloat(mat.nodeVmCode[13].y),
+                                 uintBitsToFloat(mat.nodeVmCode[13].z), uintBitsToFloat(mat.nodeVmCode[13].w));
+            vec4 rampLut3 = vec4(uintBitsToFloat(mat.nodeVmCode[14].x), uintBitsToFloat(mat.nodeVmCode[14].y),
+                                 uintBitsToFloat(mat.nodeVmCode[14].z), uintBitsToFloat(mat.nodeVmCode[14].w));
+
+            // Compute worldToObj (inverse of objToWorld 3x3 + translation)
+            mat3 m3 = mat3(objToWorld);
+            mat4x3 worldToObj;
+            mat3 inv3 = inverse(m3);
+            vec3 trans = objToWorld[3];
+            worldToObj[0] = inv3[0];
+            worldToObj[1] = inv3[1];
+            worldToObj[2] = inv3[2];
+            worldToObj[3] = -(inv3 * trans);
+
+            marchVolumeHeterogeneous(entryPos, rayDir, marchDist, worldToObj,
+                volumeColor, absorptionColor, volumeDensity, volumeAnisotropy,
+                emColor, emStrength, temperature, blackbodyIntensity,
+                noiseScale, noiseDetail, noiseBrightness, noiseRoughness_,
+                noiseLacunarity, noiseContrast, mappingOffset,
+                noiseType, noiseNormalize, noiseOffset, noiseGain,
+                noiseDimensions, noiseW, noiseDistortion,
+                hasDistortion, hasFullMatrix, mapRow0, mapRow1, mapRow2,
+                gradientType, hasGradient, mixFactor, hasMix,
+                hasRamp, rampLut0, rampLut1, rampLut2, rampLut3,
+                chainTarget, useObjectCoords, volBboxMin, volBboxRange,
+                sunDir, sunIntensity, sunColor, skyColor,
+                cam.lightCount, cam.lights,
+                volRadiance, throughput);
+        }
+
+        // Accumulate volume radiance
+        atomicAddFloat(rBase+0, volRadiance.x);
+        atomicAddFloat(rBase+1, volRadiance.y);
+        atomicAddFloat(rBase+2, volRadiance.z);
+
+        // Write G-buffer for volume surface (bounce 0)
+        if (bounce == 0u && pc.sampleIdx == 0u) {
+            uint gBase = pixelIndex * 16u;
+            primaryGBuf.gbufData[gBase+0] = N.x;
+            primaryGBuf.gbufData[gBase+1] = N.y;
+            primaryGBuf.gbufData[gBase+2] = N.z;
+            primaryGBuf.gbufData[gBase+3] = 1.0; // roughness = 1 for volume
+            primaryGBuf.gbufData[gBase+4] = worldPos.x;
+            primaryGBuf.gbufData[gBase+5] = worldPos.y;
+            primaryGBuf.gbufData[gBase+6] = worldPos.z;
+            vec4 viewPos = cam.view * vec4(worldPos, 1.0);
+            primaryGBuf.gbufData[gBase+7] = viewPos.z;
+            primaryGBuf.gbufData[gBase+8] = baseColor.x;
+            primaryGBuf.gbufData[gBase+9] = baseColor.y;
+            primaryGBuf.gbufData[gBase+10] = baseColor.z;
+            primaryGBuf.gbufData[gBase+11] = hitT;
+            primaryGBuf.gbufData[gBase+12] = localPos.x;
+            primaryGBuf.gbufData[gBase+13] = localPos.y;
+            primaryGBuf.gbufData[gBase+14] = localPos.z;
+            primaryGBuf.gbufData[gBase+15] = uintBitsToFloat(uint(instanceId));
+            pixelRadiance.radDataU[rBase+7] = floatBitsToUint(0.0);
+            pixelRadiance.radDataU[rBase+3] = floatBitsToUint(hitT);
+        }
+
+        // Continue ray past the volume (same bounce, like glass)
+        uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
+        uint nBase = nextIdx * 12u;
+        vec3 volExit = entryPos + rayDir * (marchDist + 0.002);
+        nextPathStates.nextPathData[nBase+0] = volExit.x;
+        nextPathStates.nextPathData[nBase+1] = volExit.y;
+        nextPathStates.nextPathData[nBase+2] = volExit.z;
+        nextPathStates.nextPathData[nBase+3] = uintBitsToFloat(pixelIndex);
+        nextPathStates.nextPathData[nBase+4] = rayDir.x;
+        nextPathStates.nextPathData[nBase+5] = rayDir.y;
+        nextPathStates.nextPathData[nBase+6] = rayDir.z;
+        nextPathStates.nextPathData[nBase+7] = uintBitsToFloat(rngState);
+        nextPathStates.nextPathData[nBase+8] = throughput.x;
+        nextPathStates.nextPathData[nBase+9] = throughput.y;
+        nextPathStates.nextPathData[nBase+10] = throughput.z;
+        uint volFlags = bounce | (isDiffusePath ? 0x10u : 0u) | (flags & 0xFF00u);
+        nextPathStates.nextPathData[nBase+11] = uintBitsToFloat(volFlags);
+        pathStates.pathData[pBase+11] = uintBitsToFloat(flags | 0x20u);
         return;
     }
 
