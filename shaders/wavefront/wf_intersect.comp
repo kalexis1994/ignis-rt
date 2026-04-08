@@ -4,6 +4,7 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
 #extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 256) in;
@@ -27,10 +28,19 @@ layout(binding = 2, set = 0) uniform CameraProperties {
     vec4 ptParams1;
     vec4 windParams;
     vec4 rainParams;
+    vec4 dofParams;
+    vec4 dofParams2;
     ivec4 jitterPattern[8];
     uint lightCount;
     uint lightPad0, lightPad1, lightPad2;
     vec4 lights[128];
+    uint64_t sharcHashEntriesAddr;
+    uint64_t sharcAccumulationAddr;
+    uint64_t sharcResolvedAddr;
+    uint sharcCapacity;
+    float sharcSceneScale;
+    float sharcRadianceScale;
+    uint sharcPad;
 } cam;
 
 // Wavefront buffers (set 1)
@@ -44,6 +54,8 @@ layout(binding = 5, set = 1, scalar) buffer CountersBuffer {
     uint pad0;
 } counters;
 
+layout(binding = 5, set = 0) uniform sampler2D textures[];
+
 layout(push_constant) uniform PushConst {
     uint width;
     uint height;
@@ -56,6 +68,25 @@ layout(push_constant) uniform PushConst {
 
 #include "../include/common.glsl"
 #include "../include/sky.glsl"
+
+// HDRI equirectangular mapping (matching monolithic, Cycles Z-up → Y-up)
+vec2 directionToEquirectangular(vec3 dir) {
+    float phi = atan(-dir.z, dir.x);
+    float u = 0.5 - phi / (2.0 * PI);
+    float v = acos(clamp(dir.y, -1.0, 1.0)) / PI;
+    return vec2(u, v);
+}
+
+vec3 evaluateSkyHDRI(vec3 dir) {
+    int hdriIdx = int(cam.windParams.x);
+    if (hdriIdx >= 0) {
+        float hdriStrength = cam.windParams.y;
+        vec2 uv = directionToEquirectangular(dir);
+        vec3 hdriColor = texture(textures[nonuniformEXT(uint(hdriIdx))], uv).rgb;
+        return hdriColor * hdriStrength;
+    }
+    return evaluateSky(dir);
+}
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
@@ -83,7 +114,7 @@ void main() {
     if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
         // Sky miss — accumulate sky radiance and terminate
         vec3 throughput = vec3(pathStates.pathData[base+8], pathStates.pathData[base+9], pathStates.pathData[base+10]);
-        vec3 skyColor = evaluateSky(dir) * throughput;
+        vec3 skyColor = evaluateSkyHDRI(dir) * throughput;
         uint bounce = flags & 0xFu;
         float giIntensity = cam.ptParams0.y;
 

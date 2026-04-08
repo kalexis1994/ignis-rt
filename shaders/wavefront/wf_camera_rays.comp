@@ -2,6 +2,7 @@
 #extension GL_EXT_ray_tracing : require
 #extension GL_EXT_ray_query : require
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 256) in;
@@ -23,10 +24,19 @@ layout(binding = 2, set = 0) uniform CameraProperties {
     vec4 ptParams1;
     vec4 windParams;
     vec4 rainParams;
+    vec4 dofParams;
+    vec4 dofParams2;
     ivec4 jitterPattern[8];
     uint lightCount;
     uint lightPad0, lightPad1, lightPad2;
     vec4 lights[128];
+    uint64_t sharcHashEntriesAddr;
+    uint64_t sharcAccumulationAddr;
+    uint64_t sharcResolvedAddr;
+    uint sharcCapacity;
+    float sharcSceneScale;
+    float sharcRadianceScale;
+    uint sharcPad;
 } cam;
 
 layout(binding = 12, set = 0) uniform sampler2D blueNoiseTexture;
@@ -75,8 +85,16 @@ void main() {
     float blueNoise = texelFetch(blueNoiseTexture, bnCoord, 0).r;
     rngState += uint(blueNoise * 4294967295.0);
 
-    // Generate camera ray (same math as raygen_blender.rgen)
-    vec2 pixelCenter = vec2(px, py) + 0.5 + vec2(rand01() - 0.5, rand01() - 0.5);
+    // Generate camera ray (matching raygen_blender.rgen jitter behavior)
+    // In DLSS RR mode (parameters.w == 2), Halton jitter is baked into projInverse
+    // by the CPU — adding random jitter here would double-jitter and blur the result.
+    // In NRD mode, random sub-pixel jitter is needed for temporal accumulation.
+    bool rrMode = (cam.parameters.w == 2u);
+    bool debugView = (cam.parameters.y >= 2u);
+    vec2 pixelCenter = vec2(px, py) + 0.5;
+    if (!rrMode && !debugView) {
+        pixelCenter += vec2(rand01() - 0.5, rand01() - 0.5);
+    }
     vec2 uv = pixelCenter / vec2(pc.width, pc.height);
     vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
 
@@ -85,18 +103,75 @@ void main() {
     target4.xyz /= target4.w;
     vec4 dir4 = cam.viewInverse * vec4(normalize(target4.xyz), 0);
 
+    vec3 rayOrigin = origin4.xyz;
+    vec3 rayDir = normalize(dir4.xyz);
+
+    // ── Depth of Field (thin lens model, matching monolithic) ──
+    float dofAperture = cam.dofParams.x;
+    if (dofAperture > 0.0) {
+        float dofFocusDist = cam.dofParams.y;
+        float dofBlades = cam.dofParams.z;
+        float dofRotation = cam.dofParams.w;
+        float dofRatio = cam.dofParams2.x;
+
+        // Sample lens aperture (circular or polygonal)
+        vec2 lensRand = rand2();
+        vec2 lensUV;
+        if (dofBlades < 3.0) {
+            // Circular disk: concentric mapping (Shirley)
+            float a = 2.0 * lensRand.x - 1.0;
+            float b = 2.0 * lensRand.y - 1.0;
+            float r, phi;
+            if (abs(a) > abs(b)) {
+                r = a;
+                phi = (PI / 4.0) * (b / max(abs(a), 1e-8));
+            } else {
+                r = b;
+                phi = (PI / 2.0) - (PI / 4.0) * (a / max(abs(b), 1e-8));
+            }
+            lensUV = vec2(r * cos(phi), r * sin(phi));
+        } else {
+            // Polygonal bokeh (regular polygon sampling, matching Cycles)
+            float corners = dofBlades;
+            float u = lensRand.x, v = lensRand.y;
+            float corner = floor(u * corners);
+            u = u * corners - corner;
+            u = sqrt(u);
+            v = v * u;
+            u = 1.0 - u;
+            float angle = PI / corners;
+            vec2 p = vec2((u + v) * cos(angle), (u - v) * sin(angle));
+            float rot = dofRotation + corner * 2.0 * angle;
+            float cr = cos(rot), sr = sin(rot);
+            lensUV = vec2(cr * p.x - sr * p.y, sr * p.x + cr * p.y);
+        }
+
+        // Anamorphic distortion
+        lensUV.x *= (dofRatio > 0.01 ? 1.0 / dofRatio : 1.0);
+        lensUV *= dofAperture;
+
+        // Thin lens: focal plane intersection in camera space
+        float ft = dofFocusDist / max(abs(target4.z), 1e-6);
+        vec3 focusPoint = target4.xyz * ft;
+        vec3 camOriginOffset = vec3(lensUV, 0.0);
+        vec3 camDirDOF = normalize(focusPoint - camOriginOffset);
+
+        // Transform to world space
+        rayOrigin = (cam.viewInverse * vec4(camOriginOffset, 1.0)).xyz;
+        rayDir = normalize((cam.viewInverse * vec4(camDirDOF, 0.0)).xyz);
+    }
+
     // Write PathState (48 bytes = 12 floats per path)
     uint base = idx * 12u;
     // origin.xyz + pixelIndex
-    pathStates.pathData[base + 0] = origin4.x;
-    pathStates.pathData[base + 1] = origin4.y;
-    pathStates.pathData[base + 2] = origin4.z;
+    pathStates.pathData[base + 0] = rayOrigin.x;
+    pathStates.pathData[base + 1] = rayOrigin.y;
+    pathStates.pathData[base + 2] = rayOrigin.z;
     pathStates.pathData[base + 3] = uintBitsToFloat(idx);
     // direction.xyz + rngState
-    vec3 dir = normalize(dir4.xyz);
-    pathStates.pathData[base + 4] = dir.x;
-    pathStates.pathData[base + 5] = dir.y;
-    pathStates.pathData[base + 6] = dir.z;
+    pathStates.pathData[base + 4] = rayDir.x;
+    pathStates.pathData[base + 5] = rayDir.y;
+    pathStates.pathData[base + 6] = rayDir.z;
     pathStates.pathData[base + 7] = uintBitsToFloat(rngState);
     // throughput.xyz + flags
     pathStates.pathData[base + 8] = 1.0;
