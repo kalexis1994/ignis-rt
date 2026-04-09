@@ -115,7 +115,11 @@ void main() {
         vec3 throughput = psReadThroughput(idx);
         vec3 skyColor = evaluateSkyHDRI(dir) * throughput;
         uint bounce = flags & 0xFu;
+        bool isDiffuse = (flags & 0x10u) != 0u;
         float giIntensity = cam.ptParams0.y;
+
+        // MIS: halve diffuse BSDF-miss sky contribution (other half from env NEE in K2)
+        if (bounce > 0u && isDiffuse) skyColor *= 0.5;
 
         // Accumulate into PixelRadiance (8 floats per pixel)
         uint rBase = pixelIndex * 8u;

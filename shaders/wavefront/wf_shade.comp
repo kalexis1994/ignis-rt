@@ -623,7 +623,9 @@ void main() {
                     skyColor = texture(textures[nonuniformEXT(uint(hdriIdx))], vec2(u, v)).rgb * cam.windParams.y;
                 }
                 uint rBase = pixelIndex * 8u;
-                vec3 skyContrib = skyColor * skyThroughput;
+                // MIS: halve diffuse BSDF-miss sky contribution (other half comes from env NEE)
+                float skyMis = (bounce > 0u && isDiffusePath) ? 0.5 : 1.0;
+                vec3 skyContrib = skyColor * skyThroughput * skyMis;
                 if (bounce == 0u) {
                     atomicAddFloat(rBase+0, skyContrib.x);
                     atomicAddFloat(rBase+1, skyContrib.y);
@@ -1747,10 +1749,56 @@ void main() {
         }
     }
 
-    // ---- Ambient (disabled — indirect sky lighting handles this via bounces) ----
-    // Previously: fake NdotUp ambient on bounce 0 without occlusion.
-    // This caused flat lighting on shadow-facing surfaces. Real GI from
-    // sky/environment via NEE + bounce paths is physically correct.
+    // ---- NEE: Environment/Sky light (direct sampling of background as light source) ----
+    // Cosine-weighted hemisphere sample toward sky, with shadow ray for occlusion.
+    // This gives every surface a direct sample of the environment, dramatically
+    // improving indirect lighting quality compared to relying on BSDF miss rays alone.
+    vec3 envLe = max(vec3(cam.windParams.z, cam.windParams.w, cam.rainParams.w), vec3(0.0));
+    int hdriTexIdx = int(cam.windParams.x);
+    float envLum = dot(envLe, vec3(0.2126, 0.7152, 0.0722));
+    bool hasEnvLight = (envLum > 0.001) || (hdriTexIdx >= 0);
+
+    if (!skipLocalNEE && !isGlass && hasEnvLight) {
+        vec3 envDir = sampleCosineHemisphere(rand2(), N);
+        float envNdotL = max(dot(N, envDir), 0.0);
+
+        if (envNdotL > 0.0) {
+            // Evaluate environment radiance in sampled direction
+            vec3 envColor;
+            if (hdriTexIdx >= 0) {
+                float phi = atan(-envDir.z, envDir.x);
+                float u = 0.5 - phi / (2.0 * PI);
+                float v = acos(clamp(envDir.y, -1.0, 1.0)) / PI;
+                envColor = texture(textures[nonuniformEXT(uint(hdriTexIdx))], vec2(u, v)).rgb * cam.windParams.y;
+            } else {
+                envColor = envLe;
+            }
+
+            // Evaluate BRDF
+            vec3 V = -rayDir;
+            vec3 eDiffC, eSpecC;
+            if (isHairSurface) {
+                eDiffC = hair_eval(V, envDir, hairSmoothT,
+                    baseColor, max(roughness, 0.05), max(hairRadialRoughness, 0.05),
+                    hairShift, max(ior, 1.01), hairV);
+                eSpecC = vec3(0.0);
+            } else {
+                evaluateCookTorrance(N, V, envDir, baseColor, roughness, metallic,
+                                     specularLevel, ior, transmission,
+                                     eDiffC, eSpecC, coatWeight, coatRoughness, coatIOR);
+            }
+
+            // Cosine-weighted pdf = NdotL / PI
+            // Only use diffuse contribution — specular env reflections come from BSDF bounce
+            float envPdf = envNdotL * INV_PI;
+            vec3 envContrib = eDiffC * envColor / max(envPdf, 1e-6) * throughput;
+            if (bounce > 0u) envContrib *= cam.ptParams0.y;
+
+            // Shadow ray toward sky (maxDist = 10000 = effectively infinity)
+            appendShadowRay(worldPos + N * shadowBias, envDir, 10000.0, idx, envContrib,
+                            isDiffusePath ? 0u : 1u);
+        }
+    }
 
     // ---- SHARC update: accumulate direct lighting + guide bins + backpropagation ----
     // NVIDIA official: directLighting must be PRE-THROUGHPUT (just the local illumination).
