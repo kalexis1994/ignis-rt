@@ -238,13 +238,17 @@ bool SharcGetCachedRadiance(SharcGridParams grid, vec3 worldPos, vec3 normal,
     return false;
 }
 
-// Determine if this pixel should do SHARC update (sparse 4%)
-bool isSharcUpdatePixel(uvec2 pixel, uint frameIndex) {
-    uint blockX = pixel.x / 5u;
-    uint blockY = pixel.y / 5u;
+// Determine if this pixel should do SHARC update.
+// Fixed 4% coverage (5x5 blocks) — no warmup burst.
+// The burst approach caused hash table pressure → progressive GPU slowdown.
+// NVIDIA's reference uses 4% and that's what works reliably.
+bool isSharcUpdatePixel(uvec2 pixel, uint frameIndex, float warmupFactor) {
+    uint blockSize = 5u;  // always 4% — stable, no hash table pressure
+    uint blockX = pixel.x / blockSize;
+    uint blockY = pixel.y / blockSize;
     uint blockHash = (blockX * 73856093u ^ blockY * 19349663u ^ frameIndex * 83492791u);
-    uint selectedX = blockX * 5u + (blockHash % 5u);
-    uint selectedY = blockY * 5u + ((blockHash / 5u) % 5u);
+    uint selectedX = blockX * blockSize + (blockHash % blockSize);
+    uint selectedY = blockY * blockSize + ((blockHash / blockSize) % blockSize);
     return (pixel.x == selectedX && pixel.y == selectedY);
 }
 

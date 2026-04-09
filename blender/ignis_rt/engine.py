@@ -441,6 +441,52 @@ _ignis_last_light_count = -1   # track light count for emissive re-export
 _ignis_hdri_sun = None         # sun extracted from HDRI (used as fallback when no SUN light)
 _ignis_mat_name_to_index = {}  # persistent material name→index mapping for incremental uploads
 _ignis_last_draw_time = 0.0    # perf_counter of last view_draw (detect pause/resume)
+
+# ── Performance profiler: writes detailed timing to ~/ignis-perf.log ──
+import os as _perf_os
+_PERF_LOG_PATH = _perf_os.path.join(_perf_os.path.expanduser("~"), "ignis-perf.log")
+_perf_frame_count = 0
+_perf_timings = {}  # section_name → [start_time]
+_perf_log_lines = []
+_perf_slow_threshold = 0.025  # 25ms — log frames slower than this
+
+def _perf_begin(section):
+    _perf_timings[section] = time.perf_counter()
+
+def _perf_end(section):
+    if section in _perf_timings:
+        dt = time.perf_counter() - _perf_timings[section]
+        _perf_timings[section] = dt  # overwrite with duration
+        return dt
+    return 0.0
+
+def _perf_flush(frame_idx, total_ms, force=False):
+    """Write accumulated frame timing to log file. Only logs slow frames unless force=True."""
+    global _perf_log_lines, _perf_frame_count
+    _perf_frame_count += 1
+    if total_ms < _perf_slow_threshold * 1000 and not force and _perf_frame_count > 10:
+        return  # skip fast frames after warmup
+    parts = []
+    for k, v in _perf_timings.items():
+        if isinstance(v, float) and v > 0.0001:
+            parts.append(f"{k}={v*1000:.1f}ms")
+    line = f"[frame {frame_idx}] total={total_ms:.1f}ms {' '.join(parts)}\n"
+    _perf_log_lines.append(line)
+    # Flush every 50 lines
+    if len(_perf_log_lines) >= 50:
+        try:
+            with open(_PERF_LOG_PATH, "a") as f:
+                f.writelines(_perf_log_lines)
+        except: pass
+        _perf_log_lines = []
+
+def _perf_write_header():
+    try:
+        with open(_PERF_LOG_PATH, "a") as f:
+            f.write(f"\n{'='*80}\n")
+            f.write(f"Session start: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"{'='*80}\n")
+    except: pass
 _ignis_init_config = {}        # settings snapshot at init time (detect restart-worthy changes)
 _ignis_cm_lut_signature = None # cached Blender color-management signature for Runtime_LUT.cube
 _ignis_cm_lut_valid = False    # exact OCIO LUT bake status for DLSS/DLAA path
@@ -690,6 +736,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 _ignis_init_config = {}
 
         _ignis_initialized = True
+        _perf_write_header()
         _ignis_width = width
         _ignis_height = height
         _ignis_frame_index = 0
@@ -1882,6 +1929,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             _ignis_materials_dirty = False
         elif _ignis_tlas_dirty:
             self._rebuild_tlas(depsgraph)
+        _perf_end("sync_props")
+        _perf_begin("light_sync")
         # ── Light sync (every frame — batched for minimal ctypes overhead) ──
         sun = scene_export.export_sun(depsgraph)
         if sun["sun_intensity"] <= 0.0 and _ignis_hdri_sun:
@@ -1904,6 +1953,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         global _ignis_last_light_count
         _ignis_last_light_count = n_lights
 
+        _perf_end("light_sync")
+        _perf_begin("deform_sync")
         # ── Deformation + Transform sync globals ──
         global _ignis_deformed_meshes, _ignis_vert_hashes
         global _ignis_last_transforms, _ignis_obj_to_mesh, _ignis_objects_dirty
@@ -2005,6 +2056,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 except Exception:
                     _log_exception(f"deformation refit '{obj_key}'")
 
+        _perf_end("deform_sync")
+        _perf_begin("transform_sync")
         # ── Transform sync ──
         _need_full_sync = _ignis_objects_dirty
         _changed = _ignis_changed_objects
@@ -2211,6 +2264,9 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         # CPU profiling
         from . import perf_overlay as _prf
         _prf.begin("sync")
+        _frame_t0 = time.perf_counter()
+        _perf_begin("total")
+        _perf_begin("sync_props")
 
         # Sync scene properties
         props = context.scene.ignis_rt
@@ -2220,6 +2276,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         dll_wrapper.set_int("backface_culling", 1 if props.backface_culling else 0)
         dll_wrapper.set_int("restir_di", 1 if props.restir_di else 0)
         dll_wrapper.set_int("material_sort", 1 if props.material_sort else 0)
+        dll_wrapper.set_int("sharc_enabled", 1 if props.sharc_enabled else 0)
         dll_wrapper.set_int("debug_view", int(props.debug_view))
         # Auto sky colors always on — sun/ambient come from World settings
         dll_wrapper.set_int("auto_sky_colors", 1)
@@ -2356,8 +2413,12 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             elif _ignis_gc_disabled:
                 # Camera stopped — run GC now (safe, no visual impact)
                 import gc
+                _gc_t0 = time.perf_counter()
                 gc.collect()
+                _gc_dt = (time.perf_counter() - _gc_t0) * 1000
                 gc.enable()
+                if _gc_dt > 5.0:
+                    _perf_log_lines.append(f"[GC] gc.collect() took {_gc_dt:.1f}ms\n")
                 _ignis_gc_disabled = False
             _ignis_prev_view_hash = _view_hash
 
@@ -2375,7 +2436,11 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             dll_wrapper.set_float("dof_ratio", cam.get("dof_ratio", 1.0))
 
             # Render
+            _perf_end("transform_sync")
+            _perf_begin("camera")
             _prf.end("render")
+            _perf_end("camera")
+            _perf_begin("gpu_render")
             _prf.begin("gpu")
             global _ignis_rendering
             _ignis_rendering = True
@@ -2385,9 +2450,11 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 _log(f"render_frame error: {_render_err}")
                 _ignis_rendering = False
                 return
+            _perf_end("gpu_render")
             _prf.end("gpu")
 
             # Display
+            _perf_begin("interop")
             _prf.begin("interop")
             try:
                 gl_ok = dll_wrapper.draw_gl(w, h)
@@ -2435,6 +2502,12 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         if props.show_gpu_profiler:
             from . import perf_overlay
             perf_overlay.draw_gpu_profiler(w, h, _fps_mode != 'OFF', _fps_mode, _fps_pos)
+
+        # Performance logging
+        _perf_end("interop")
+        _perf_end("total")
+        _total_ms = _perf_timings.get("total", 0.0) * 1000
+        _perf_flush(_ignis_frame_index, _total_ms, force=(_ignis_frame_index < 20))
 
         # Always request next frame — NRD needs continuous accumulation to converge
         self.tag_redraw()

@@ -1309,7 +1309,13 @@ void Renderer::RenderFrameRT() {
     // GL reads the buffer from the most recent submit (prevSlot), so we must
     // ensure it's done before draw_gl runs after this call returns.
     // Waiting for both fences here keeps draw_gl non-blocking (~0ms).
+    auto fenceT0 = std::chrono::high_resolution_clock::now();
     vkWaitForFences(device, MAX_FRAMES_IN_FLIGHT, inFlightFences_.data(), VK_TRUE, UINT64_MAX);
+    auto fenceT1 = std::chrono::high_resolution_clock::now();
+    float fenceWaitMs = std::chrono::duration<float, std::milli>(fenceT1 - fenceT0).count();
+    if (fenceWaitMs > 5.0f && (frameIndex_ % 30 == 0 || fenceWaitMs > 50.0f)) {
+        Log(L"[PERF] frame %u: fence wait %.1f ms\n", frameIndex_, fenceWaitMs);
+    }
     vkResetFences(device, 1, &inFlightFences_[currentFrame_]);
 
     // GPU profiling: readback AFTER fence wait (all GPU work done, no blocking)
@@ -1449,7 +1455,7 @@ void Renderer::RenderFrameRT() {
         struct { uint32_t capacity; uint32_t frameIndex; uint32_t accFrameMax; uint32_t staleMax; float radScale; } sharcPC;
         sharcPC.capacity = RTPipeline::SHARC_CAPACITY;
         sharcPC.frameIndex = frameIndex_;
-        sharcPC.accFrameMax = 256;
+        sharcPC.accFrameMax = 256;  // stable temporal accumulation (warmup burst disabled)
         sharcPC.staleMax = 128;
         sharcPC.radScale = 1000.0f;
         vkCmdPushConstants(cmd, sharcResolvePipelineLayout_,

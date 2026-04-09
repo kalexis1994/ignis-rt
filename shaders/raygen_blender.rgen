@@ -47,7 +47,7 @@ layout(binding = 2, set = 0) uniform CameraProperties {
     uint sharcCapacity;
     float sharcSceneScale;
     float sharcRadianceScale;
-    uint sharcPad;
+    float sharcWarmupFactor;  // 1.0=cold (burst mode), 0.0=warm (steady state)
 } cam;
 
 // Geometry metadata
@@ -1209,7 +1209,7 @@ void main() {
     sharcGrid.sceneScale = cam.sharcSceneScale;
     SharcState sharcState;
     SharcInit(sharcState);
-    bool sharcUpdatePixel = isSharcUpdatePixel(pixel, frameIndex);
+    bool sharcUpdatePixel = isSharcUpdatePixel(pixel, frameIndex, cam.sharcWarmupFactor);
     bool sharcEnabled = (cam.sharcCapacity > 0u);
     uint sharcCapacity = cam.sharcCapacity;
     vec3 prevBounceNormal = vec3(0, 1, 0);

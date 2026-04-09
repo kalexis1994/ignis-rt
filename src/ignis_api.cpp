@@ -561,7 +561,7 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
         cam.sharcHashEntriesAddr = rtp->GetSHARCHashEntriesAddr();
         cam.sharcAccumulationAddr = rtp->GetSHARCAccumulationAddr();
         cam.sharcResolvedAddr = rtp->GetSHARCResolvedAddr();
-        cam.sharcCapacity = rtp->SHARC_CAPACITY;
+        cam.sharcCapacity = cfg->sharcEnabled ? rtp->SHARC_CAPACITY : 0;
         // Auto scene scale from AABB: ensures voxels are appropriately sized
         float sceneExtent = 0.0f;
         for (int i = 0; i < 3; i++) {
@@ -570,6 +570,28 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
         }
         cam.sharcSceneScale = (sceneExtent > 0.1f) ? 2.0f / sceneExtent : 1.0f;
         cam.sharcRadianceScale = 1e3f;   // quantization for uint accumulation
+
+        // SHARC warmup factor: 1.0 = cold (burst update), 0.0 = warm (steady state)
+        // Decays exponentially each frame. Resets on camera movement or scene reload.
+        static float s_sharcWarmup = 1.0f;
+        static float s_prevCamPos[3] = {0, 0, 0};
+        float camX = cam.viewInverse[12], camY = cam.viewInverse[13], camZ = cam.viewInverse[14];
+        float camDelta = (camX - s_prevCamPos[0]) * (camX - s_prevCamPos[0])
+                       + (camY - s_prevCamPos[1]) * (camY - s_prevCamPos[1])
+                       + (camZ - s_prevCamPos[2]) * (camZ - s_prevCamPos[2]);
+        s_prevCamPos[0] = camX; s_prevCamPos[1] = camY; s_prevCamPos[2] = camZ;
+
+        // Large camera movement (>0.5m) → partial reset; scene reload (frameIndex=0) → full reset
+        if (frameIndex == 0) {
+            s_sharcWarmup = 1.0f;
+        } else if (camDelta > 0.25f) {  // sqrt(0.25) = 0.5m threshold
+            s_sharcWarmup = std::max(s_sharcWarmup, 0.5f);  // boost but don't fully reset
+        }
+        // Exponential decay: 0.97^frame → reaches 0.05 in ~100 frames (~3s at 30fps)
+        s_sharcWarmup *= 0.97f;
+        s_sharcWarmup = std::max(s_sharcWarmup, 0.0f);
+        cam.sharcWarmupFactor = s_sharcWarmup;
+        cfg->sharcWarmupFactor = s_sharcWarmup;  // expose to renderer for resolve pass
     }
 
     // Scene AABB for early sky-ray rejection (packed into jitterPattern[0..7])
@@ -769,6 +791,7 @@ IGNIS_API void ignis_set_int(const char* key, int value) {
     else if (strcmp(key, "backface_culling") == 0) cfg->backfaceCulling = (value != 0);
     else if (strcmp(key, "restir_di") == 0)      cfg->restirDI = (value != 0);
     else if (strcmp(key, "material_sort") == 0) cfg->materialSort = (value != 0);
+    else if (strcmp(key, "sharc_enabled") == 0) cfg->sharcEnabled = (value != 0);
     else if (strcmp(key, "hdri_tex_index") == 0)  cfg->hdriTexIndex = value;
     else if (strcmp(key, "reset_history") == 0 && value != 0) {
         if (g_renderer) g_renderer->ResetFrameIndex();

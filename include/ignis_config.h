@@ -38,6 +38,7 @@ struct PathTracerConfig {
 
     // Sky Texture atmosphere (from Blender's Sky Texture node)
     float sunSize            = 0.009512f; // sun angular diameter (radians)
+    float sharcWarmupFactor  = 1.0f;      // runtime state: 1.0=cold (burst), 0.0=warm (steady)
     float sunDiscIntensity   = 1.0f;      // sun disc brightness multiplier
     float airDensity         = 1.0f;      // Rayleigh scattering density
     float dustDensity        = 1.0f;      // Mie scattering density
@@ -137,6 +138,7 @@ struct PathTracerConfig {
     // ReSTIR DI (reservoir-based light sampling)
     bool  restirDI           = false;
     bool  materialSort       = false;  // GPU material sorting for wavefront (helps mixed-material scenes)
+    bool  sharcEnabled       = false;  // SHARC radiance cache (GI caching, can cause slowdown on large scenes)
 
     // HDRI environment map
     int   hdriTexIndex       = -1;     // texture index (-1 = no HDRI, use procedural sky)

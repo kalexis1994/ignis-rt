@@ -40,7 +40,7 @@ layout(binding = 2, set = 0) uniform CameraProperties {
     uint sharcCapacity;
     float sharcSceneScale;
     float sharcRadianceScale;
-    uint sharcPad;
+    float sharcWarmupFactor;
 } cam;
 
 // Wavefront buffers (set 1)

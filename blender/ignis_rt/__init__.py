@@ -193,6 +193,12 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         default=False,
         update=_tag_redraw,
     )
+    sharc_enabled: BoolProperty(
+        name="SHARC Cache",
+        description="Spatial Hash Radiance Cache for faster GI convergence. May cause slowdown on large scenes due to hash table pressure",
+        default=False,
+        update=_tag_redraw,
+    )
     use_wavefront: BoolProperty(
         name="Wavefront Path Tracing",
         description="Experimental: compute-based multi-kernel path tracing for better GPU occupancy",
@@ -429,6 +435,7 @@ class IGNIS_PT_advanced(bpy.types.Panel):
         layout.prop(props, "hybrid_rasterization")
         layout.prop(props, "restir_di")
         layout.prop(props, "material_sort")
+        layout.prop(props, "sharc_enabled")
         # layout.prop(props, "use_wavefront")  # TODO: not ready yet
         layout.separator()
         layout.prop(props, "debug_view")

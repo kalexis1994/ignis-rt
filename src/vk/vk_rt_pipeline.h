@@ -123,7 +123,7 @@ struct CameraUBO {
     uint32_t sharcCapacity;
     float    sharcSceneScale;
     float    sharcRadianceScale;
-    uint32_t sharcPad;
+    float    sharcWarmupFactor;
 };
 
 // Pick result from GPU raycast

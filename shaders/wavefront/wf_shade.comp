@@ -41,7 +41,7 @@ layout(binding = 2, set = 0) uniform CameraProperties {
     uint sharcCapacity;
     float sharcSceneScale;
     float sharcRadianceScale;
-    uint sharcPad;
+    float sharcWarmupFactor;
 } cam;
 
 // Geometry metadata (same as raygen_blender.rgen)
@@ -292,7 +292,8 @@ void main() {
     sharcGrid.sceneScale = cam.sharcSceneScale;
     uint pixX_s = pixelIndex % pc.width;
     uint pixY_s = pixelIndex / pc.width;
-    bool sharcUpdatePixel = sharcEnabled && isSharcUpdatePixel(uvec2(pixX_s, pixY_s), pc.frameIndex);
+    float sharcWarmup = sharcEnabled ? cam.sharcWarmupFactor : 0.0;
+    bool sharcUpdatePixel = sharcEnabled && isSharcUpdatePixel(uvec2(pixX_s, pixY_s), pc.frameIndex, sharcWarmup);
 
     if (hitType == 0u) {
         // Miss — sky already accumulated by K1. Do SHARC backpropagation if update pixel.
@@ -748,7 +749,6 @@ void main() {
     bool isVolumeOnly = (mat.flags & 4u) != 0u && (mat.flags & 8u) != 0u;
     bool hasSurfaceVolume = (mat.flags & 4u) != 0u && (mat.flags & 8u) == 0u;
     bool isHetero = (mat.flags & 16u) != 0u;
-
     if (isVolumeOnly || hasSurfaceVolume) {
         // Skip volume march on deep bounces (matching monolithic: volume only at primary/first hit)
         if (bounce >= 2u) {
@@ -793,9 +793,27 @@ void main() {
         float temperature = uintBitsToFloat(mat.nodeVmCode[3].w);
         float blackbodyIntensity = uintBitsToFloat(mat.nodeVmCode[4].x);
 
-        // Find exit distance
+        // Find exit distance AND inner geometry
         vec3 entryPos = worldPos + rayDir * 0.0005;
         float marchDist = traceVolumeExit(topLevelAS, entryPos, rayDir, instanceId);
+
+        // Check for geometry INSIDE the volume — if found, clip march
+        // and re-queue PAST the inner surface (not before) to avoid re-entering volume loop
+        bool hasInnerHit = false;
+        {
+            rayQueryEXT innerRQ;
+            rayQueryInitializeEXT(innerRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
+                                  0xFF, entryPos, MIN_HIT_DIST, rayDir, marchDist - 0.001);
+            while (rayQueryProceedEXT(innerRQ)) {}
+            if (rayQueryGetIntersectionTypeEXT(innerRQ, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+                int iInstId = rayQueryGetIntersectionInstanceIdEXT(innerRQ, true);
+                if (iInstId != instanceId) {
+                    float iHitT = rayQueryGetIntersectionTEXT(innerRQ, true);
+                    marchDist = iHitT;  // clip march to inner surface
+                    hasInnerHit = true;
+                }
+            }
+        }
 
         // Sky/sun for in-scattering
         vec3 sunDir = normalize(cam.sunLight.xyz);
@@ -936,10 +954,17 @@ void main() {
             pixelRadiance.radDataU[rBase+3] = floatBitsToUint(hitT);
         }
 
-        // Continue ray past the volume (same bounce, like glass)
+        // Continue ray past the volume or to inner surface
         uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
         uint nBase = nextIdx * 12u;
-        vec3 volExit = entryPos + rayDir * (marchDist + 0.002);
+        vec3 volExit;
+        if (hasInnerHit) {
+            // Position just before inner surface — K1 will find it (not the volume
+            // front face, which is behind us since we're inside the volume)
+            volExit = entryPos + rayDir * max(marchDist - 0.001, 0.0);
+        } else {
+            volExit = entryPos + rayDir * (marchDist + 0.002);
+        }
         nextPathStates.nextPathData[nBase+0] = volExit.x;
         nextPathStates.nextPathData[nBase+1] = volExit.y;
         nextPathStates.nextPathData[nBase+2] = volExit.z;
@@ -1220,6 +1245,7 @@ void main() {
                 // This resolves penumbra per-pixel per-frame (no temporal accumulation needed).
                 const int SUN_SHADOW_SAMPLES = 4;
                 float sunVisibility = 0.0;
+                vec3 sunVisibility_filter = vec3(1.0);  // volume transmittance accumulator
                 float closestShadowDist = 65504.0;
 
                 vec3 sunT = abs(sunDir.y) < 0.999
@@ -1277,8 +1303,18 @@ void main() {
                             sMI = sPM.m[sPId];
                         }
                         Material sM = materialBuffer.materials[sMI];
-                        // Glass/volume: always pass through
+                        // Glass/volume: pass through with volume attenuation
                         if ((sM.flags & 6u) != 0u) {
+                            if ((sM.flags & 4u) != 0u && rayQueryGetIntersectionFrontFaceEXT(srq, true)) {
+                                int sInstId = rayQueryGetIntersectionInstanceIdEXT(srq, true);
+                                vec3 vCol = vec3(sM.ksAmbient, sM.ksDiffuse, sM.ksSpecular);
+                                vec3 vAbs = vec3(uintBitsToFloat(sM.nodeVmCode[2].x),
+                                                 uintBitsToFloat(sM.nodeVmCode[2].y),
+                                                 uintBitsToFloat(sM.nodeVmCode[2].z));
+                                sunVisibility_filter *= evaluateVolumeShadowTransmittance(
+                                    topLevelAS, vCol, vAbs, sM.sunSpecular,
+                                    sOrigin, sampleDir, sT, sInstId);
+                            }
                             sOrigin += sampleDir * (sT + 0.003);
                             continue;
                         }
@@ -1322,9 +1358,9 @@ void main() {
 
                 float shadowFactor = sunVisibility / float(SUN_SHADOW_SAMPLES);
 
-                // Accumulate sun contribution with soft shadow
-                vec3 sunDiffResult = diffContrib * sunRadiance * throughput * shadowFactor;
-                vec3 sunSpecResult = specContrib * sunRadiance * throughput * shadowFactor;
+                // Accumulate sun contribution with soft shadow + volume transmittance
+                vec3 sunDiffResult = diffContrib * sunRadiance * throughput * shadowFactor * sunVisibility_filter;
+                vec3 sunSpecResult = specContrib * sunRadiance * throughput * shadowFactor * sunVisibility_filter;
                 atomicAddFloat(rBase+0, sunDiffResult.x);
                 atomicAddFloat(rBase+1, sunDiffResult.y);
                 atomicAddFloat(rBase+2, sunDiffResult.z);
@@ -1501,7 +1537,18 @@ void main() {
                 uint fMI = 0u;
                 if (fGeo.primMaterialBufferAddress != 0u) { PrimMaterials fPM = PrimMaterials(fGeo.primMaterialBufferAddress); fMI = fPM.m[fPI]; }
                 Material fMat = materialBuffer.materials[fMI];
-                if ((fMat.flags & 6u) != 0u) { fSO += fL*(fHT+0.004); continue; }
+                if ((fMat.flags & 6u) != 0u) {
+                    if ((fMat.flags & 4u) != 0u && rayQueryGetIntersectionFrontFaceEXT(fsrq, true)) {
+                        int fVolInst = rayQueryGetIntersectionInstanceIdEXT(fsrq, true);
+                        vec3 fvCol = vec3(fMat.ksAmbient, fMat.ksDiffuse, fMat.ksSpecular);
+                        vec3 fvAbs = vec3(uintBitsToFloat(fMat.nodeVmCode[2].x),
+                                         uintBitsToFloat(fMat.nodeVmCode[2].y),
+                                         uintBitsToFloat(fMat.nodeVmCode[2].z));
+                        fSF *= evaluateVolumeShadowTransmittance(
+                            topLevelAS, fvCol, fvAbs, fMat.sunSpecular, fSO, fL, fHT, fVolInst);
+                    }
+                    fSO += fL*(fHT+0.004); continue;
+                }
                 if ((fMat.flags & MAT_FLAG_LIGHTPATH_TRANSPARENT) != 0u || fMat.multB > 0.0) { fSO += fL*(fHT+0.002); continue; }
                 // Alpha-tested: check actual alpha before skipping
                 if ((fMat.flags & 1u) != 0u && fMat.multG < 0.999) {
@@ -1798,8 +1845,9 @@ void main() {
 
         // SharcUpdateHit: insert/update cache, possibly early-out
         // directLighting is PRE-throughput; throughput applied via SharcSetThroughput
+        float sharcRandom = rand01();  // standard 50% resampling (warmup burst disabled)
         bool continueTracing = SharcUpdateHit(sharcGrid, state,
-            worldPos, N, directLighting, rand01(), sharcCapacity);
+            worldPos, N, directLighting, sharcRandom, sharcCapacity);
         SharcSetThroughput(state, throughput);
         storeSharcState(pixelIndex, state);
 
