@@ -332,6 +332,61 @@ class IGNIS_OT_reload_shaders(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class IGNIS_PT_gpu_info(bpy.types.Panel):
+    bl_label = "GPU Info"
+    bl_idname = "IGNIS_PT_gpu_info"
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = "render"
+    bl_options = {'DEFAULT_CLOSED'}
+    COMPAT_ENGINES = {'IGNIS_RT'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.engine in cls.COMPAT_ENGINES
+
+    def draw(self, context):
+        layout = self.layout
+        from . import engine
+
+        gpu_name = engine._dll_query_string("gpu_name")
+        gpu_arch = engine._dll_query_string("gpu_arch")
+        vendor_id = engine._dll_query_int("gpu_vendor_id")
+        device_id = engine._dll_query_int("gpu_device_id")
+        driver_ver = engine._dll_query_int("gpu_driver_version")
+        fg_cap = engine._dll_query_int("frame_gen_gpu_cap")
+        fg_cap_str = engine._dll_query_string("frame_gen_cap_str")
+        fg_active = engine._dll_query_int("frame_gen_active")
+
+        if not gpu_name or gpu_name == "Not initialized":
+            layout.label(text="Renderer not initialized", icon='INFO')
+            return
+
+        col = layout.column(align=True)
+        col.label(text=f"GPU: {gpu_name}", icon='GPU')
+        col.label(text=f"Architecture: {gpu_arch}")
+
+        # NVIDIA driver version decode: major.minor from packed uint32
+        if vendor_id == 0x10DE and driver_ver > 0:
+            nv_major = (driver_ver >> 22) & 0x3FF
+            nv_minor = (driver_ver >> 14) & 0xFF
+            col.label(text=f"Driver: {nv_major}.{nv_minor}")
+
+        col.label(text=f"Device ID: 0x{device_id:04X}")
+
+        layout.separator()
+
+        # Frame Generation capability
+        if fg_cap == 0:
+            layout.label(text="Frame Generation: Not supported", icon='CANCEL')
+        elif fg_cap == 1:
+            icon = 'CHECKMARK' if fg_active else 'DOT'
+            layout.label(text=f"Frame Generation: {fg_cap_str}", icon=icon)
+        elif fg_cap >= 2:
+            icon = 'CHECKMARK' if fg_active else 'DOT'
+            layout.label(text=f"Frame Generation: {fg_cap_str}", icon=icon)
+
+
 class IGNIS_PT_sampling(bpy.types.Panel):
     bl_label = "Sampling"
     bl_idname = "IGNIS_PT_sampling"
@@ -391,28 +446,23 @@ class IGNIS_PT_frame_gen(bpy.types.Panel):
         layout.use_property_split = True
         layout.use_property_decorate = False
 
+        from . import engine
+        gpu_cap = engine._dll_query_int("frame_gen_gpu_cap")
+
+        if gpu_cap == 0:
+            layout.label(text="Not supported on this GPU (requires RTX 40xx+)", icon='CANCEL')
+            return
+
         layout.prop(props, "frame_gen_enabled")
 
         if props.frame_gen_enabled:
-            # Query GPU capability from the DLL
-            try:
-                from . import engine
-                gpu_cap = engine._dll_query_int("frame_gen_gpu_cap") if hasattr(engine, '_dll_query_int') else 0
-                max_frames = engine._dll_query_int("frame_gen_max_frames") if hasattr(engine, '_dll_query_int') else 0
-            except Exception:
-                gpu_cap = 0
-                max_frames = 0
-
-            if gpu_cap == 0:
-                layout.label(text="Requires RTX 40xx or newer GPU", icon='ERROR')
+            layout.prop(props, "frame_gen_count")
+            if gpu_cap >= 2:  # MultiFrame (RTX 50xx)
+                layout.prop(props, "frame_gen_auto")
             else:
-                layout.prop(props, "frame_gen_count")
-                if gpu_cap >= 2:  # MultiFrame (RTX 50xx)
-                    layout.prop(props, "frame_gen_auto")
-                else:
-                    # RTX 40xx — only 1 frame supported
-                    if int(props.frame_gen_count) > 1:
-                        layout.label(text="Multi-frame requires RTX 50xx", icon='INFO')
+                # RTX 40xx — only 1 frame supported
+                if int(props.frame_gen_count) > 1:
+                    layout.label(text="Multi-frame requires RTX 50xx", icon='INFO')
 
 
 class IGNIS_PT_color(bpy.types.Panel):
@@ -553,6 +603,7 @@ def register():
     bpy.utils.register_class(IGNIS_OT_set_fps_position)
     bpy.utils.register_class(IGNIS_OT_reload_scene)
     bpy.utils.register_class(IGNIS_OT_reload_shaders)
+    bpy.utils.register_class(IGNIS_PT_gpu_info)
     bpy.utils.register_class(IGNIS_PT_sampling)
     bpy.utils.register_class(IGNIS_PT_dlss)
     bpy.utils.register_class(IGNIS_PT_frame_gen)
@@ -624,6 +675,7 @@ def unregister():
     bpy.utils.unregister_class(IGNIS_PT_frame_gen)
     bpy.utils.unregister_class(IGNIS_PT_dlss)
     bpy.utils.unregister_class(IGNIS_PT_sampling)
+    bpy.utils.unregister_class(IGNIS_PT_gpu_info)
     bpy.utils.unregister_class(IGNIS_OT_reload_shaders)
     bpy.utils.unregister_class(IGNIS_OT_reload_scene)
     bpy.utils.unregister_class(IGNIS_OT_set_fps_position)

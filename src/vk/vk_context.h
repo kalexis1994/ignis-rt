@@ -35,6 +35,12 @@ public:
     // Ray tracing support
     bool IsRayQuerySupported() const { return rayQuerySupported_; }
 
+    // GPU info (populated during PickPhysicalDevice)
+    const char* GetGPUName() const { return gpuName_; }
+    uint32_t GetGPUVendorID() const { return gpuVendorID_; }
+    uint32_t GetGPUDeviceID() const { return gpuDeviceID_; }
+    uint32_t GetGPUDriverVersion() const { return gpuDriverVersion_; }
+
     uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
 
     // One-shot command buffer helpers
@@ -72,6 +78,12 @@ private:
     uint32_t graphicsQueueFamily_ = 0;
     uint32_t presentQueueFamily_ = 0;
     bool rayQuerySupported_ = false;
+
+    // GPU info cache
+    char gpuName_[256] = {};
+    uint32_t gpuVendorID_ = 0;
+    uint32_t gpuDeviceID_ = 0;
+    uint32_t gpuDriverVersion_ = 0;
 };
 
 } // namespace vk

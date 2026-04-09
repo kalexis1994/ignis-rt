@@ -219,6 +219,9 @@ def load():
     _lib.ignis_get_float.argtypes = [c_char_p]
     _lib.ignis_get_float.restype = c_float
 
+    _lib.ignis_get_string.argtypes = [c_char_p]
+    _lib.ignis_get_string.restype = c_char_p
+
     # ------------------------------------------------------------------
     # Texture management (optional, not used by MVP)
     # ------------------------------------------------------------------
@@ -516,6 +519,13 @@ def get_float(key: str) -> float:
     if _lib is None:
         return 0.0
     return _lib.ignis_get_float(key.encode("utf-8"))
+
+
+def get_string(key: str) -> str:
+    if _lib is None:
+        return ""
+    result = _lib.ignis_get_string(key.encode("utf-8"))
+    return result.decode("utf-8") if result else ""
 
 
 def create_texture_manager():

@@ -180,6 +180,8 @@ const char* Renderer::InitializeStep(HWND hwnd, uint32_t width, uint32_t height)
         if (dlssActive_) {
             // (DLSS color/HDR images are created in InitRT — we call it from step 4)
         }
+        // Frame Generation: detect GPU capability (always, for UI info)
+        DetectFrameGenCapability();
         // Frame Generation (Streamline) — initialized after DLSS
         InitFrameGen();
         initStep_ = 4;
@@ -3788,6 +3790,46 @@ void Renderer::ShutdownDLSS() {
     dlssActive_ = false;
     dlssRRActive_ = false;
     Log(L"[VK Renderer] DLSS shutdown\n");
+}
+
+const char* Renderer::GetGPUName() const {
+    return context_ ? context_->GetGPUName() : "Unknown";
+}
+
+uint32_t Renderer::GetGPUVendorID() const {
+    return context_ ? context_->GetGPUVendorID() : 0;
+}
+
+uint32_t Renderer::GetGPUDeviceID() const {
+    return context_ ? context_->GetGPUDeviceID() : 0;
+}
+
+uint32_t Renderer::GetGPUDriverVersion() const {
+    return context_ ? context_->GetGPUDriverVersion() : 0;
+}
+
+void Renderer::DetectFrameGenCapability() {
+    if (!context_) return;
+    uint32_t vendorID = context_->GetGPUVendorID();
+    uint32_t deviceID = context_->GetGPUDeviceID();
+
+    if (vendorID != 0x10DE) {
+        frameGenGPUCap_ = FrameGenGPUCap::Unsupported;
+        return;
+    }
+
+    if (deviceID >= 0x2900) {
+        frameGenGPUCap_ = FrameGenGPUCap::MultiFrame;
+    } else if (deviceID >= 0x2600) {
+        frameGenGPUCap_ = FrameGenGPUCap::SingleFrame;
+    } else {
+        frameGenGPUCap_ = FrameGenGPUCap::Unsupported;
+    }
+
+    Log(L"[VK Renderer] Frame Gen GPU capability: %s (deviceID=0x%04X)\n",
+        frameGenGPUCap_ == FrameGenGPUCap::MultiFrame ? L"MultiFrame" :
+        frameGenGPUCap_ == FrameGenGPUCap::SingleFrame ? L"SingleFrame" : L"Unsupported",
+        deviceID);
 }
 
 void Renderer::InitFrameGen() {

@@ -829,6 +829,11 @@ IGNIS_API int ignis_get_int(const char* key) {
     // Actual DLSS quality mode used (may differ from requested if GPU doesn't support it)
     if (strcmp(key, "dlss_quality_actual") == 0) return g_renderer ? g_renderer->GetActualDLSSQuality() : 0;
 
+    // GPU info
+    if (strcmp(key, "gpu_vendor_id") == 0)   return g_renderer ? (int)g_renderer->GetGPUVendorID() : 0;
+    if (strcmp(key, "gpu_device_id") == 0)   return g_renderer ? (int)g_renderer->GetGPUDeviceID() : 0;
+    if (strcmp(key, "gpu_driver_version") == 0) return g_renderer ? (int)g_renderer->GetGPUDriverVersion() : 0;
+
     // Frame Generation queries
     if (strcmp(key, "frame_gen_active") == 0)    return g_renderer ? (g_renderer->IsFrameGenActive() ? 1 : 0) : 0;
     if (strcmp(key, "frame_gen_available") == 0) return g_renderer ? (g_renderer->IsFrameGenAvailable() ? 1 : 0) : 0;
@@ -836,6 +841,38 @@ IGNIS_API int ignis_get_int(const char* key) {
     if (strcmp(key, "frame_gen_max_frames") == 0) return g_renderer ? (int)g_renderer->GetFrameGenMaxFrames() : 0;
 
     return 0;
+}
+
+IGNIS_API const char* ignis_get_string(const char* key) {
+    if (!key) return "";
+
+    if (strcmp(key, "gpu_name") == 0)
+        return g_renderer ? g_renderer->GetGPUName() : "Not initialized";
+
+    // GPU architecture string
+    if (strcmp(key, "gpu_arch") == 0) {
+        if (!g_renderer) return "Unknown";
+        uint32_t vendorID = g_renderer->GetGPUVendorID();
+        uint32_t deviceID = g_renderer->GetGPUDeviceID();
+        if (vendorID != 0x10DE) return "Non-NVIDIA";
+        if (deviceID >= 0x2900) return "Blackwell (RTX 50xx)";
+        if (deviceID >= 0x2600) return "Ada Lovelace (RTX 40xx)";
+        if (deviceID >= 0x2200) return "Ampere (RTX 30xx)";
+        if (deviceID >= 0x1E00) return "Turing (RTX 20xx)";
+        return "Pre-Turing";
+    }
+
+    // Frame Generation capability string
+    if (strcmp(key, "frame_gen_cap_str") == 0) {
+        if (!g_renderer) return "Unknown";
+        switch (g_renderer->GetFrameGenGPUCap()) {
+            case acpt::FrameGenGPUCap::MultiFrame:  return "Multi Frame Generation (RTX 50xx)";
+            case acpt::FrameGenGPUCap::SingleFrame:  return "Frame Generation (RTX 40xx)";
+            default: return "Not supported";
+        }
+    }
+
+    return "";
 }
 
 IGNIS_API float ignis_get_float(const char* key) {

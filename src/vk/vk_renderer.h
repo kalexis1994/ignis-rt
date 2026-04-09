@@ -102,8 +102,14 @@ public:
     bool IsDLSSRRActive() const { return dlssRRActive_; }
     bool IsFrameGenActive() const { return frameGen_ && frameGen_->IsActive(); }
     bool IsFrameGenAvailable() const { return frameGen_ && frameGen_->IsAvailable(); }
-    FrameGenGPUCap GetFrameGenGPUCap() const { return frameGen_ ? frameGen_->GetGPUCapability() : FrameGenGPUCap::Unsupported; }
-    uint32_t GetFrameGenMaxFrames() const { return frameGen_ ? frameGen_->GetMaxFramesToGenerate() : 0; }
+    FrameGenGPUCap GetFrameGenGPUCap() const { return frameGenGPUCap_; }
+    uint32_t GetFrameGenMaxFrames() const { return frameGen_ ? frameGen_->GetMaxFramesToGenerate() : (frameGenGPUCap_ == FrameGenGPUCap::MultiFrame ? 3 : (frameGenGPUCap_ == FrameGenGPUCap::SingleFrame ? 1 : 0)); }
+
+    // GPU info (always available after init)
+    const char* GetGPUName() const;
+    uint32_t GetGPUVendorID() const;
+    uint32_t GetGPUDeviceID() const;
+    uint32_t GetGPUDriverVersion() const;
     bool IsHybridGBufferReady() const { return hybridGBufferRendered_; }
     void GetRenderResolution(uint32_t* w, uint32_t* h) const { *w = renderWidth_; *h = renderHeight_; }
     void GetDisplayResolution(uint32_t* w, uint32_t* h) const { *w = width_; *h = height_; }
@@ -195,6 +201,8 @@ private:
 
     // Frame Generation (Streamline)
     SLFrameGen* frameGen_ = nullptr;
+    FrameGenGPUCap frameGenGPUCap_ = FrameGenGPUCap::Unsupported;
+    void DetectFrameGenCapability();  // always runs — sets frameGenGPUCap_
     void InitFrameGen();
     void ShutdownFrameGen();
 

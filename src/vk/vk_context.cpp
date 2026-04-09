@@ -154,6 +154,17 @@ bool Context::PickPhysicalDevice() {
         Log(L"[VK Context] Selected device: %S\n", props.deviceName);
     }
 
+    // Cache GPU info for API queries
+    {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(physicalDevice_, &props);
+        strncpy(gpuName_, props.deviceName, sizeof(gpuName_) - 1);
+        gpuName_[sizeof(gpuName_) - 1] = '\0';
+        gpuVendorID_ = props.vendorID;
+        gpuDeviceID_ = props.deviceID;
+        gpuDriverVersion_ = props.driverVersion;
+    }
+
     return true;
 }
 

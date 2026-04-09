@@ -586,6 +586,14 @@ def _dll_query_int(key):
         return 0
 
 
+def _dll_query_string(key):
+    """Query a string value from the native DLL (safe to call from UI panels)."""
+    try:
+        return dll_wrapper.get_string(key) if dll_wrapper else ""
+    except Exception:
+        return ""
+
+
 def _ignis_shutdown():
     global _ignis_initialized, _ignis_width, _ignis_height
     global _ignis_blas_handles, _ignis_float_buffer, _ignis_byte_buffer
