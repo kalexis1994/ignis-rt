@@ -115,7 +115,7 @@ bool SLFrameGen::Initialize(
     prefs.pathsToPlugins = nullptr;
     prefs.numPathsToPlugins = 0;
     prefs.applicationId = 0x1337BEEF;  // Same app ID as NGX
-    prefs.engineType = sl::EngineType::eCustom;
+    prefs.engine = sl::EngineType::eCustom;
 
     // Request DLSS-G, Reflex, and PCL features
     sl::Feature features[] = { sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL };
