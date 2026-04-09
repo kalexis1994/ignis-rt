@@ -180,6 +180,8 @@ const char* Renderer::InitializeStep(HWND hwnd, uint32_t width, uint32_t height)
         if (dlssActive_) {
             // (DLSS color/HDR images are created in InitRT — we call it from step 4)
         }
+        // Frame Generation (Streamline) — initialized after DLSS
+        InitFrameGen();
         initStep_ = 4;
         return "DLSS ready";
     }
@@ -1305,6 +1307,13 @@ void Renderer::RenderFrameRT() {
     VkDevice device = context_->GetDevice();
     VkCommandBuffer cmd = commandBuffers_[currentFrame_];
 
+    // Reflex: mark simulation start (frame pacing for Frame Generation)
+    if (frameGen_ && frameGen_->IsReflexReady()) {
+        frameGen_->SetReflexMarker(ReflexMarker::SimulationStart, (uint64_t)frameIndex_);
+        frameGen_->ReflexSleep();
+        frameGen_->SetReflexMarker(ReflexMarker::SimulationEnd, (uint64_t)frameIndex_);
+    }
+
     // Wait for ALL in-flight frames to complete.  With double-buffered interop,
     // GL reads the buffer from the most recent submit (prevSlot), so we must
     // ensure it's done before draw_gl runs after this call returns.
@@ -1324,6 +1333,11 @@ void Renderer::RenderFrameRT() {
 
     if (tonemapReady_ && (frameIndex_ % 300) == 0) {
         ReloadAgXLutIfChanged();  // filesystem stat every ~10s, not every 2s
+    }
+
+    // Reflex: mark render start
+    if (frameGen_ && frameGen_->IsReflexReady()) {
+        frameGen_->SetReflexMarker(ReflexMarker::RenderStart, (uint64_t)frameIndex_);
     }
 
     // Single command buffer: RT → NRD → Composite → ImGui → Readback
@@ -1948,6 +1962,16 @@ void Renderer::RenderFrameRT() {
     // Fill any unwritten timestamp slots (skipped stages → current time → 0ms delta).
     FillMissingTimestamps(cmd);
 
+    // Frame Generation: tag resources BEFORE ImGui (HUD-less color = current interop image)
+    if (frameGen_ && frameGen_->IsActive() && rtPipeline_) {
+        frameGen_->TagResources(
+            cmd, frameIndex_,
+            interop_->GetSharedImage(), interop_->GetSharedImageView(),
+            rtPipeline_->GetViewDepthImage(), rtPipeline_->GetViewDepthView(),
+            rtPipeline_->GetMotionVectorsImage(), rtPipeline_->GetMotionVectorsView()
+        );
+    }
+
     // 4. ImGui overlay (renders on top of final output)
     if (imguiReady_) {
         RenderImGuiOverlay(cmd);
@@ -1962,6 +1986,12 @@ void Renderer::RenderFrameRT() {
 
     if (!VK_CHECK(vkEndCommandBuffer(cmd))) return;
 
+    // Reflex: mark render end
+    if (frameGen_ && frameGen_->IsReflexReady()) {
+        frameGen_->SetReflexMarker(ReflexMarker::RenderEnd, (uint64_t)frameIndex_);
+        frameGen_->SetReflexMarker(ReflexMarker::PresentStart, (uint64_t)frameIndex_);
+    }
+
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
@@ -1974,6 +2004,11 @@ void Renderer::RenderFrameRT() {
             nrdInitialized_ = false;
         }
         return;
+    }
+
+    // Reflex: mark present end
+    if (frameGen_ && frameGen_->IsReflexReady()) {
+        frameGen_->SetReflexMarker(ReflexMarker::PresentEnd, (uint64_t)frameIndex_);
     }
 
     // NRC: end frame (must be called after queue submit)
@@ -3755,6 +3790,47 @@ void Renderer::ShutdownDLSS() {
     Log(L"[VK Renderer] DLSS shutdown\n");
 }
 
+void Renderer::InitFrameGen() {
+    PathTracerConfig* cfg = VK_GetConfig();
+    if (!cfg || !cfg->frameGenEnabled) return;
+
+    frameGen_ = new SLFrameGen();
+    if (frameGen_->Initialize(
+            context_->GetInstance(),
+            context_->GetPhysicalDevice(),
+            context_->GetDevice(),
+            context_->GetGraphicsQueue(),
+            context_->GetGraphicsQueueFamily(),
+            width_, height_)) {
+        Log(L"[VK Renderer] Frame Generation available — GPU cap: %s, max frames: %u\n",
+            frameGen_->GetGPUCapability() == FrameGenGPUCap::MultiFrame ? L"MultiFrame" : L"SingleFrame",
+            frameGen_->GetMaxFramesToGenerate());
+
+        // Auto-enable with configured frame count
+        uint32_t frames = cfg->frameGenCount;
+        if (frames < 1) frames = 1;
+        if (frames > frameGen_->GetMaxFramesToGenerate())
+            frames = frameGen_->GetMaxFramesToGenerate();
+
+        FrameGenMode mode = cfg->frameGenAuto ? FrameGenMode::Auto : FrameGenMode::On;
+        if (!frameGen_->SetOptions(mode, frames)) {
+            Log(L"[VK Renderer] Frame Generation SetOptions failed\n");
+        }
+    } else {
+        delete frameGen_;
+        frameGen_ = nullptr;
+        Log(L"[VK Renderer] Frame Generation not available on this GPU\n");
+    }
+}
+
+void Renderer::ShutdownFrameGen() {
+    if (frameGen_) {
+        frameGen_->Shutdown();
+        delete frameGen_;
+        frameGen_ = nullptr;
+    }
+}
+
 void Renderer::ShutdownNRD() {
     if (!nrdInitialized_) return;
     VkDevice device = context_->GetDevice();
@@ -4273,6 +4349,7 @@ void Renderer::Shutdown() {
     ShutdownExposureResolve();
     ShutdownHybridGBuffer();
     ShutdownNRD();
+    ShutdownFrameGen();
     ShutdownDLSS();
     if (nirc_) { nirc_->Shutdown(); delete nirc_; nirc_ = nullptr; }
 

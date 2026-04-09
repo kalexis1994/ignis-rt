@@ -778,6 +778,9 @@ IGNIS_API void ignis_set_int(const char* key, int value) {
     else if (strcmp(key, "dlss_enabled") == 0)      cfg->dlssEnabled = (value != 0);
     else if (strcmp(key, "dlss_quality") == 0)      cfg->dlssQualityMode = value;
     else if (strcmp(key, "dlss_rr_enabled") == 0)   cfg->dlssRREnabled = (value != 0);
+    else if (strcmp(key, "frame_gen_enabled") == 0) cfg->frameGenEnabled = (value != 0);
+    else if (strcmp(key, "frame_gen_count") == 0)   cfg->frameGenCount = (value < 1 ? 1 : (value > 3 ? 3 : (uint32_t)value));
+    else if (strcmp(key, "frame_gen_auto") == 0)    cfg->frameGenAuto = (value != 0);
     else if (strcmp(key, "nrd_enabled") == 0)       cfg->nrdEnabled = (value != 0);
     else if (strcmp(key, "nrd_atrous_iterations") == 0) cfg->nrdAtrousIterations = (value < 2 ? 2 : (value > 8 ? 8 : value));
     else if (strcmp(key, "nrd_anti_firefly") == 0)  cfg->nrdAntiFirefly = (value != 0);
@@ -825,6 +828,12 @@ IGNIS_API int ignis_get_int(const char* key) {
 
     // Actual DLSS quality mode used (may differ from requested if GPU doesn't support it)
     if (strcmp(key, "dlss_quality_actual") == 0) return g_renderer ? g_renderer->GetActualDLSSQuality() : 0;
+
+    // Frame Generation queries
+    if (strcmp(key, "frame_gen_active") == 0)    return g_renderer ? (g_renderer->IsFrameGenActive() ? 1 : 0) : 0;
+    if (strcmp(key, "frame_gen_available") == 0) return g_renderer ? (g_renderer->IsFrameGenAvailable() ? 1 : 0) : 0;
+    if (strcmp(key, "frame_gen_gpu_cap") == 0)   return g_renderer ? (int)g_renderer->GetFrameGenGPUCap() : 0;
+    if (strcmp(key, "frame_gen_max_frames") == 0) return g_renderer ? (int)g_renderer->GetFrameGenMaxFrames() : 0;
 
     return 0;
 }

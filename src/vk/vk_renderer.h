@@ -7,6 +7,7 @@
 #include <vulkan/vulkan.h>
 #include "vk_accel_structure.h"
 #include "../../include/dlss_ngx.h"
+#include "../../include/sl_frame_gen.h"
 
 namespace acpt {
 namespace vk {
@@ -99,6 +100,10 @@ public:
 
     bool IsDLSSActive() const { return dlssActive_; }
     bool IsDLSSRRActive() const { return dlssRRActive_; }
+    bool IsFrameGenActive() const { return frameGen_ && frameGen_->IsActive(); }
+    bool IsFrameGenAvailable() const { return frameGen_ && frameGen_->IsAvailable(); }
+    FrameGenGPUCap GetFrameGenGPUCap() const { return frameGen_ ? frameGen_->GetGPUCapability() : FrameGenGPUCap::Unsupported; }
+    uint32_t GetFrameGenMaxFrames() const { return frameGen_ ? frameGen_->GetMaxFramesToGenerate() : 0; }
     bool IsHybridGBufferReady() const { return hybridGBufferRendered_; }
     void GetRenderResolution(uint32_t* w, uint32_t* h) const { *w = renderWidth_; *h = renderHeight_; }
     void GetDisplayResolution(uint32_t* w, uint32_t* h) const { *w = width_; *h = height_; }
@@ -187,6 +192,11 @@ private:
 
     uint32_t width_ = 0;
     uint32_t height_ = 0;
+
+    // Frame Generation (Streamline)
+    SLFrameGen* frameGen_ = nullptr;
+    void InitFrameGen();
+    void ShutdownFrameGen();
 
     // DLSS upscaling
     DLSS_NGX* dlss_ = nullptr;

@@ -172,6 +172,31 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         default=True,
     )
 
+    # -- Frame Generation (Streamline — RTX 40xx+) --
+    frame_gen_enabled: BoolProperty(
+        name="Frame Generation",
+        description="DLSS Frame Generation — generates extra frames for higher FPS (requires RTX 40xx+)",
+        default=False,
+        update=_tag_redraw,
+    )
+    frame_gen_count: EnumProperty(
+        name="Generated Frames",
+        description="Number of AI-generated frames per rendered frame",
+        items=[
+            ('1', "1 Frame (2x)", "Generate 1 extra frame — doubles effective FPS (RTX 40xx+)"),
+            ('2', "2 Frames (3x)", "Generate 2 extra frames — triples effective FPS (RTX 50xx only)"),
+            ('3', "3 Frames (4x)", "Generate 3 extra frames — quadruples effective FPS (RTX 50xx only)"),
+        ],
+        default='1',
+        update=_tag_redraw,
+    )
+    frame_gen_auto: BoolProperty(
+        name="Dynamic MFG",
+        description="Automatically adjust frame count to match display refresh rate (DLSS 4.5, RTX 50xx)",
+        default=False,
+        update=_tag_redraw,
+    )
+
     # -- Performance --
     hybrid_rasterization: BoolProperty(
         name="Hybrid Rasterization",
@@ -348,6 +373,48 @@ class IGNIS_PT_dlss(bpy.types.Panel):
         layout.prop(props, "dlss_quality")
 
 
+class IGNIS_PT_frame_gen(bpy.types.Panel):
+    bl_label = "Frame Generation"
+    bl_idname = "IGNIS_PT_frame_gen"
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = "render"
+    COMPAT_ENGINES = {'IGNIS_RT'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.engine in cls.COMPAT_ENGINES
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.ignis_rt
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        layout.prop(props, "frame_gen_enabled")
+
+        if props.frame_gen_enabled:
+            # Query GPU capability from the DLL
+            try:
+                from . import engine
+                gpu_cap = engine._dll_query_int("frame_gen_gpu_cap") if hasattr(engine, '_dll_query_int') else 0
+                max_frames = engine._dll_query_int("frame_gen_max_frames") if hasattr(engine, '_dll_query_int') else 0
+            except Exception:
+                gpu_cap = 0
+                max_frames = 0
+
+            if gpu_cap == 0:
+                layout.label(text="Requires RTX 40xx or newer GPU", icon='ERROR')
+            else:
+                layout.prop(props, "frame_gen_count")
+                if gpu_cap >= 2:  # MultiFrame (RTX 50xx)
+                    layout.prop(props, "frame_gen_auto")
+                else:
+                    # RTX 40xx — only 1 frame supported
+                    if int(props.frame_gen_count) > 1:
+                        layout.label(text="Multi-frame requires RTX 50xx", icon='INFO')
+
+
 class IGNIS_PT_color(bpy.types.Panel):
     bl_label = "Color"
     bl_idname = "IGNIS_PT_color"
@@ -488,6 +555,7 @@ def register():
     bpy.utils.register_class(IGNIS_OT_reload_shaders)
     bpy.utils.register_class(IGNIS_PT_sampling)
     bpy.utils.register_class(IGNIS_PT_dlss)
+    bpy.utils.register_class(IGNIS_PT_frame_gen)
     bpy.utils.register_class(IGNIS_PT_color)
     bpy.utils.register_class(IGNIS_PT_performance)
     bpy.utils.register_class(IGNIS_PT_advanced)
@@ -553,6 +621,7 @@ def unregister():
     bpy.utils.unregister_class(IGNIS_PT_advanced)
     bpy.utils.unregister_class(IGNIS_PT_performance)
     bpy.utils.unregister_class(IGNIS_PT_color)
+    bpy.utils.unregister_class(IGNIS_PT_frame_gen)
     bpy.utils.unregister_class(IGNIS_PT_dlss)
     bpy.utils.unregister_class(IGNIS_PT_sampling)
     bpy.utils.unregister_class(IGNIS_OT_reload_shaders)

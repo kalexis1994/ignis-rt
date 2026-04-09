@@ -47,13 +47,40 @@ jobs:
           echo "--- NGX SDK layout ---"
           find vendor/ngx_sdk -type f | head -20
 
-      # ── Build ignis_rt.dll (DLSS only, no NRD — using Ray Reconstruction) ──
+      # ── Streamline SDK (Frame Generation + Reflex) ────────────
+      # Binaries are only in GitHub Release zips, not in the git repo
+      - name: Download Streamline SDK (v2.10.3 — DLSS-G Frame Generation + Reflex)
+        shell: bash
+        run: |
+          SL_VER="v2.10.3"
+          SL_URL="https://github.com/NVIDIA-RTX/Streamline/releases/download/${SL_VER}/streamline-sdk-${SL_VER}.zip"
+          echo "Downloading Streamline SDK ${SL_VER}..."
+          curl -L -o streamline-sdk.zip "$SL_URL"
+          mkdir -p vendor/_sl_tmp
+          7z x streamline-sdk.zip -ovendor/_sl_tmp -y
+          # The zip may contain a root folder — flatten to vendor/Streamline
+          if [ -d "vendor/_sl_tmp/streamline-sdk-${SL_VER}" ]; then
+            mv "vendor/_sl_tmp/streamline-sdk-${SL_VER}" vendor/Streamline
+          else
+            mv vendor/_sl_tmp vendor/Streamline
+          fi
+          rm -rf vendor/_sl_tmp
+          echo "--- Streamline SDK contents ---"
+          ls vendor/Streamline/include/sl.h
+          ls vendor/Streamline/lib/x64/sl.interposer.lib
+          ls -lh vendor/Streamline/bin/x64/sl.interposer.dll
+          ls -lh vendor/Streamline/bin/x64/sl.dlss_g.dll
+          ls -lh vendor/Streamline/bin/x64/sl.reflex.dll
+
+      # ── Build ignis_rt.dll ─────────────────────────────────────
       - name: Configure CMake
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
             -DIGNIS_USE_NRD=OFF `
             -DIGNIS_USE_DLSS=ON `
-            -DIGNIS_NGX_ROOT="${{ github.workspace }}/vendor/ngx_sdk"
+            -DIGNIS_USE_STREAMLINE=ON `
+            -DIGNIS_NGX_ROOT="${{ github.workspace }}/vendor/ngx_sdk" `
+            -DIGNIS_STREAMLINE_ROOT="${{ github.workspace }}/vendor/Streamline"
 
       - name: Build
         run: cmake --build build --config Release
@@ -76,6 +103,13 @@ jobs:
           # DLSS runtime DLLs (from NVIDIA repo — redistribution allowed)
           cp vendor/DLSS/lib/Windows_x86_64/rel/nvngx_dlss.dll  staging/ignis_rt/lib/
           cp vendor/DLSS/lib/Windows_x86_64/rel/nvngx_dlssd.dll staging/ignis_rt/lib/
+
+          # Streamline runtime DLLs (Frame Generation + Reflex — NVIDIA signed binaries)
+          cp vendor/Streamline/bin/x64/sl.interposer.dll staging/ignis_rt/lib/
+          cp vendor/Streamline/bin/x64/sl.common.dll     staging/ignis_rt/lib/
+          cp vendor/Streamline/bin/x64/sl.dlss_g.dll     staging/ignis_rt/lib/
+          cp vendor/Streamline/bin/x64/sl.reflex.dll     staging/ignis_rt/lib/
+          cp vendor/Streamline/bin/x64/sl.pcl.dll        staging/ignis_rt/lib/
 
           # Compiled shaders + LUT files
           cp shaders/*.spv staging/ignis_rt/shaders/

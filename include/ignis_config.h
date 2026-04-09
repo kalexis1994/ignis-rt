@@ -89,6 +89,11 @@ struct PathTracerConfig {
     int   dlssQualityMode    = 0;       // maps to DLSSQualityMode enum
     bool  dlssRREnabled      = false;   // Use Ray Reconstruction when available (replaces NRD)
 
+    // Frame Generation (Streamline SDK — requires RTX 40xx+)
+    bool  frameGenEnabled    = false;   // enable DLSS Frame Generation
+    uint32_t frameGenCount   = 1;       // frames to generate (1=RTX40, 1-3=RTX50)
+    bool  frameGenAuto       = false;   // dynamic MFG — auto-adjust to display refresh rate
+
     // Rain (kept for shader uniforms, but not driven by weather engine)
     bool  rainEnabled        = false;
     float rainIntensity      = 0.0f;

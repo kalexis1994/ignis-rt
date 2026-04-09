@@ -578,6 +578,14 @@ def _on_depsgraph_update(scene, depsgraph=None):
                     area.tag_redraw()
 
 
+def _dll_query_int(key):
+    """Query an integer value from the native DLL (safe to call from UI panels)."""
+    try:
+        return dll_wrapper.get_int(key) if dll_wrapper else 0
+    except Exception:
+        return 0
+
+
 def _ignis_shutdown():
     global _ignis_initialized, _ignis_width, _ignis_height
     global _ignis_blas_handles, _ignis_float_buffer, _ignis_byte_buffer
@@ -705,6 +713,12 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             if props.use_wavefront:
                 dll_wrapper.set_int("use_wavefront", 1)
                 _log(f" Wavefront path tracing enabled")
+            # Frame Generation
+            if hasattr(props, 'frame_gen_enabled') and props.frame_gen_enabled:
+                dll_wrapper.set_int("frame_gen_enabled", 1)
+                dll_wrapper.set_int("frame_gen_count", int(props.frame_gen_count))
+                dll_wrapper.set_int("frame_gen_auto", 1 if props.frame_gen_auto else 0)
+                _log(f" Frame Generation enabled (count={props.frame_gen_count}, auto={props.frame_gen_auto})")
         except Exception:
             pass
 

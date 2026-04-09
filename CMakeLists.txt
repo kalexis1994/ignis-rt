@@ -9,10 +9,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ============================================================================
 option(IGNIS_USE_NRD   "Enable NRD denoiser"       OFF)
 option(IGNIS_USE_DLSS  "Enable NVIDIA DLSS"         OFF)
+option(IGNIS_USE_STREAMLINE "Enable NVIDIA Streamline (Frame Generation + Reflex)" OFF)
 option(IGNIS_ENABLE_VALIDATION "Enable Vulkan validation layers in debug builds" OFF)
 
 set(IGNIS_NRD_ROOT "" CACHE PATH "Path to NVIDIA NRD root directory")
 set(IGNIS_NGX_ROOT "" CACHE PATH "Path to NVIDIA NGX SDK (headers + lib)")
+set(IGNIS_STREAMLINE_ROOT "" CACHE PATH "Path to NVIDIA Streamline SDK root")
 
 # ============================================================================
 # Find Vulkan
@@ -84,6 +86,15 @@ else()
     list(APPEND IGNIS_CORE_SOURCES src/dlss_stub.cpp)
 endif()
 
+# ============================================================================
+# Optional: Streamline (Frame Generation + Reflex)
+# ============================================================================
+if(IGNIS_USE_STREAMLINE)
+    list(APPEND IGNIS_CORE_SOURCES src/sl_frame_gen.cpp)
+else()
+    list(APPEND IGNIS_CORE_SOURCES src/sl_frame_gen_stub.cpp)
+endif()
+
 
 # ============================================================================
 # Target: ignis_rt.dll
@@ -141,6 +152,19 @@ if(IGNIS_USE_DLSS)
         endif()
     else()
         message(WARNING "NGX SDK not found — set IGNIS_NGX_ROOT")
+    endif()
+endif()
+if(IGNIS_USE_STREAMLINE)
+    target_compile_definitions(ignis_rt PRIVATE ACPT_HAVE_STREAMLINE)
+    set(_sl_root "${IGNIS_STREAMLINE_ROOT}")
+    if(NOT _sl_root STREQUAL "" AND EXISTS "${_sl_root}/include/sl.h")
+        message(STATUS "Using Streamline SDK at ${_sl_root}")
+        target_include_directories(ignis_rt PRIVATE "${_sl_root}/include")
+        if(EXISTS "${_sl_root}/lib/x64/sl.interposer.lib")
+            target_link_libraries(ignis_rt PRIVATE "${_sl_root}/lib/x64/sl.interposer.lib")
+        endif()
+    else()
+        message(WARNING "Streamline SDK not found — set IGNIS_STREAMLINE_ROOT")
     endif()
 endif()
 if(IGNIS_ENABLE_VALIDATION)
