@@ -4,12 +4,64 @@ Metadata is in blender_manifest.toml (Blender Extension System).
 """
 
 import os
+import re
 import bpy
 import bpy.utils.previews
+import gpu
 from bpy.props import (
     BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty, IntProperty, StringProperty,
 )
 from . import engine
+
+
+def _detect_gpu_info():
+    """Detect GPU info using Blender's gpu.platform API (no DLL needed)."""
+    try:
+        name = gpu.platform.renderer_get()       # "NVIDIA GeForce RTX 4060 Laptop GPU"
+        vendor = gpu.platform.vendor_get()        # "NVIDIA Corporation"
+        version = gpu.platform.version_get()      # "4.6.0 NVIDIA 572.83"
+        dev_type = gpu.platform.device_type_get() # "NVIDIA"
+        backend = gpu.platform.backend_type_get() # "OPENGL" or "VULKAN"
+    except Exception:
+        return {"name": "Unknown", "vendor": "", "driver": "", "is_nvidia": False,
+                "generation": None, "rtx_series": 0, "fg_cap": 0, "fg_max": 0}
+
+    # Parse driver version from version string (e.g. "4.6.0 NVIDIA 572.83")
+    driver = ""
+    dm = re.search(r'NVIDIA\s+([\d.]+)', version)
+    if dm:
+        driver = dm.group(1)
+
+    info = {
+        "name": name,
+        "vendor": vendor,
+        "driver": driver,
+        "backend": backend,
+        "is_nvidia": dev_type == "NVIDIA",
+        "generation": None,
+        "rtx_series": 0,
+        "fg_cap": 0,   # 0=unsupported, 1=single frame (40xx), 2=multi frame (50xx)
+        "fg_max": 0,
+    }
+
+    if not info["is_nvidia"]:
+        return info
+
+    # Detect RTX generation from product name
+    m = re.search(r'RTX\s*(\d)0(\d)0', name.upper())
+    if m:
+        gen = int(m.group(1))
+        series_map = {2: "Turing", 3: "Ampere", 4: "Ada Lovelace", 5: "Blackwell"}
+        info["generation"] = series_map.get(gen, f"Gen {gen}")
+        info["rtx_series"] = gen * 1000
+        if gen >= 5:
+            info["fg_cap"] = 2
+            info["fg_max"] = 3
+        elif gen >= 4:
+            info["fg_cap"] = 1
+            info["fg_max"] = 1
+
+    return info
 
 # Custom icon collection
 _icon_previews = None
@@ -338,7 +390,6 @@ class IGNIS_PT_gpu_info(bpy.types.Panel):
     bl_space_type = 'PROPERTIES'
     bl_region_type = 'WINDOW'
     bl_context = "render"
-    bl_options = {'DEFAULT_CLOSED'}
     COMPAT_ENGINES = {'IGNIS_RT'}
 
     @classmethod
@@ -347,44 +398,42 @@ class IGNIS_PT_gpu_info(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        from . import engine
+        try:
+            from . import engine
 
-        gpu_name = engine._dll_query_string("gpu_name")
-        gpu_arch = engine._dll_query_string("gpu_arch")
-        vendor_id = engine._dll_query_int("gpu_vendor_id")
-        device_id = engine._dll_query_int("gpu_device_id")
-        driver_ver = engine._dll_query_int("gpu_driver_version")
-        fg_cap = engine._dll_query_int("frame_gen_gpu_cap")
-        fg_cap_str = engine._dll_query_string("frame_gen_cap_str")
-        fg_active = engine._dll_query_int("frame_gen_active")
+            gpu_name = engine._dll_query_string("gpu_name")
+            gpu_arch = engine._dll_query_string("gpu_arch")
+            vendor_id = engine._dll_query_int("gpu_vendor_id")
+            device_id = engine._dll_query_int("gpu_device_id")
+            driver_ver = engine._dll_query_int("gpu_driver_version")
+            fg_cap = engine._dll_query_int("frame_gen_gpu_cap")
+            fg_cap_str = engine._dll_query_string("frame_gen_cap_str")
+            fg_active = engine._dll_query_int("frame_gen_active")
 
-        if not gpu_name or gpu_name == "Not initialized":
-            layout.label(text="Renderer not initialized", icon='INFO')
-            return
+            if not gpu_name or gpu_name == "Not initialized":
+                layout.label(text="Waiting for renderer...", icon='INFO')
+                return
 
-        col = layout.column(align=True)
-        col.label(text=f"GPU: {gpu_name}", icon='GPU')
-        col.label(text=f"Architecture: {gpu_arch}")
+            col = layout.column(align=True)
+            col.label(text=gpu_name, icon='DESKTOP')
+            col.label(text=f"Arch: {gpu_arch}")
 
-        # NVIDIA driver version decode: major.minor from packed uint32
-        if vendor_id == 0x10DE and driver_ver > 0:
-            nv_major = (driver_ver >> 22) & 0x3FF
-            nv_minor = (driver_ver >> 14) & 0xFF
-            col.label(text=f"Driver: {nv_major}.{nv_minor}")
+            if vendor_id == 0x10DE and driver_ver > 0:
+                nv_major = (driver_ver >> 22) & 0x3FF
+                nv_minor = (driver_ver >> 14) & 0xFF
+                col.label(text=f"Driver: {nv_major}.{nv_minor}")
 
-        col.label(text=f"Device ID: 0x{device_id:04X}")
+            col.label(text=f"Device ID: 0x{device_id:04X}")
 
-        layout.separator()
+            layout.separator()
 
-        # Frame Generation capability
-        if fg_cap == 0:
-            layout.label(text="Frame Generation: Not supported", icon='CANCEL')
-        elif fg_cap == 1:
-            icon = 'CHECKMARK' if fg_active else 'DOT'
-            layout.label(text=f"Frame Generation: {fg_cap_str}", icon=icon)
-        elif fg_cap >= 2:
-            icon = 'CHECKMARK' if fg_active else 'DOT'
-            layout.label(text=f"Frame Generation: {fg_cap_str}", icon=icon)
+            if fg_cap == 0:
+                layout.label(text="Frame Gen: Not supported", icon='X')
+            elif fg_cap >= 1:
+                icon = 'PLAY' if fg_active else 'PAUSE'
+                layout.label(text=f"Frame Gen: {fg_cap_str}", icon=icon)
+        except Exception as e:
+            layout.label(text=f"Error: {e}", icon='ERROR')
 
 
 class IGNIS_PT_sampling(bpy.types.Panel):
@@ -404,6 +453,24 @@ class IGNIS_PT_sampling(bpy.types.Panel):
         props = context.scene.ignis_rt
         layout.use_property_split = True
         layout.use_property_decorate = False
+
+        # GPU Info (via Blender gpu.platform — always available, no DLL needed)
+        info = _detect_gpu_info()
+        box = layout.box()
+        col = box.column(align=True)
+        col.label(text=info["name"], icon='DESKTOP')
+        if info["generation"]:
+            col.label(text=f"Arch: {info['generation']} (RTX {info['rtx_series']})")
+        if info["driver"]:
+            col.label(text=f"Driver: {info['driver']}")
+        if info["fg_cap"] == 0:
+            col.label(text="Frame Gen: Not supported")
+        elif info["fg_cap"] == 1:
+            col.label(text="Frame Gen: Supported (1 frame)")
+        elif info["fg_cap"] >= 2:
+            col.label(text="Frame Gen: Multi-frame supported")
+
+        layout.separator()
         layout.prop(props, "max_bounces")
         layout.prop(props, "samples_per_pixel")
 
@@ -427,6 +494,23 @@ class IGNIS_PT_dlss(bpy.types.Panel):
         layout.use_property_decorate = False
         layout.prop(props, "dlss_quality")
 
+        # Frame Generation (via gpu.platform detection — no DLL needed)
+        info = _detect_gpu_info()
+        fg_cap = info["fg_cap"]
+
+        layout.separator()
+        layout.label(text="Frame Generation")
+        if fg_cap == 0:
+            layout.label(text="Not supported (requires RTX 40xx+)", icon='INFO')
+        else:
+            layout.prop(props, "frame_gen_enabled")
+            if props.frame_gen_enabled:
+                layout.prop(props, "frame_gen_count")
+                if fg_cap >= 2:
+                    layout.prop(props, "frame_gen_auto")
+                elif int(props.frame_gen_count) > 1:
+                    layout.label(text="Multi-frame requires RTX 50xx", icon='INFO')
+
 
 class IGNIS_PT_frame_gen(bpy.types.Panel):
     bl_label = "Frame Generation"
@@ -446,11 +530,14 @@ class IGNIS_PT_frame_gen(bpy.types.Panel):
         layout.use_property_split = True
         layout.use_property_decorate = False
 
-        from . import engine
-        gpu_cap = engine._dll_query_int("frame_gen_gpu_cap")
+        try:
+            from . import engine
+            gpu_cap = engine._dll_query_int("frame_gen_gpu_cap")
+        except Exception:
+            gpu_cap = 0
 
         if gpu_cap == 0:
-            layout.label(text="Not supported on this GPU (requires RTX 40xx+)", icon='CANCEL')
+            layout.label(text="Not supported on this GPU (requires RTX 40xx+)", icon='X')
             return
 
         layout.prop(props, "frame_gen_enabled")
@@ -460,7 +547,6 @@ class IGNIS_PT_frame_gen(bpy.types.Panel):
             if gpu_cap >= 2:  # MultiFrame (RTX 50xx)
                 layout.prop(props, "frame_gen_auto")
             else:
-                # RTX 40xx — only 1 frame supported
                 if int(props.frame_gen_count) > 1:
                     layout.label(text="Multi-frame requires RTX 50xx", icon='INFO')
 
@@ -603,10 +689,12 @@ def register():
     bpy.utils.register_class(IGNIS_OT_set_fps_position)
     bpy.utils.register_class(IGNIS_OT_reload_scene)
     bpy.utils.register_class(IGNIS_OT_reload_shaders)
-    bpy.utils.register_class(IGNIS_PT_gpu_info)
-    bpy.utils.register_class(IGNIS_PT_sampling)
-    bpy.utils.register_class(IGNIS_PT_dlss)
-    bpy.utils.register_class(IGNIS_PT_frame_gen)
+    for cls in [IGNIS_PT_gpu_info, IGNIS_PT_sampling, IGNIS_PT_dlss, IGNIS_PT_frame_gen]:
+        try:
+            bpy.utils.register_class(cls)
+            print(f"[ignis_rt] Registered panel: {cls.bl_idname}")
+        except Exception as e:
+            print(f"[ignis_rt] FAILED to register {cls.bl_idname}: {e}")
     bpy.utils.register_class(IGNIS_PT_color)
     bpy.utils.register_class(IGNIS_PT_performance)
     bpy.utils.register_class(IGNIS_PT_advanced)

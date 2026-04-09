@@ -58,8 +58,12 @@ def load():
         print("[ignis_rt] ERROR: ignis_rt.dll not found in lib/ subfolder")
         return False
 
-    # Add DLL directory so dependent DLLs (vulkan-1.dll etc.) can be found
+    # Add DLL directory to process PATH so Windows can find implicit dependencies
+    # (sl.interposer.dll, nvngx_dlss.dll, vulkan-1.dll, etc.) when loading ignis_rt.dll
     dll_dir = os.path.dirname(path)
+    env_path = os.environ.get("PATH", "")
+    if dll_dir.lower() not in env_path.lower():
+        os.environ["PATH"] = dll_dir + os.pathsep + env_path
     if hasattr(os, "add_dll_directory"):
         os.add_dll_directory(dll_dir)
 
@@ -67,6 +71,16 @@ def load():
         _lib = ctypes.CDLL(path)
     except OSError as e:
         print(f"[ignis_rt] ERROR: Failed to load DLL: {e}")
+        # Diagnose: try loading each dependency individually
+        print(f"[ignis_rt] Diagnosing dependencies in {dll_dir}:")
+        for f in sorted(os.listdir(dll_dir)):
+            if f.lower().endswith(".dll") and f.lower() != "ignis_rt.dll":
+                dep_path = os.path.join(dll_dir, f)
+                try:
+                    ctypes.CDLL(dep_path)
+                    print(f"[ignis_rt]   OK: {f}")
+                except OSError as dep_e:
+                    print(f"[ignis_rt]   FAIL: {f} -> {dep_e}")
         return False
 
     # ------------------------------------------------------------------

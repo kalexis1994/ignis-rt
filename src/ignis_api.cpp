@@ -837,8 +837,25 @@ IGNIS_API int ignis_get_int(const char* key) {
     // Frame Generation queries
     if (strcmp(key, "frame_gen_active") == 0)    return g_renderer ? (g_renderer->IsFrameGenActive() ? 1 : 0) : 0;
     if (strcmp(key, "frame_gen_available") == 0) return g_renderer ? (g_renderer->IsFrameGenAvailable() ? 1 : 0) : 0;
-    if (strcmp(key, "frame_gen_gpu_cap") == 0)   return g_renderer ? (int)g_renderer->GetFrameGenGPUCap() : 0;
-    if (strcmp(key, "frame_gen_max_frames") == 0) return g_renderer ? (int)g_renderer->GetFrameGenMaxFrames() : 0;
+    if (strcmp(key, "frame_gen_gpu_cap") == 0) {
+        // Detect directly from device ID (bypass renderer member that may not be set)
+        if (!g_renderer) return 0;
+        uint32_t vid = g_renderer->GetGPUVendorID();
+        uint32_t did = g_renderer->GetGPUDeviceID();
+        if (vid != 0x10DE) return 0;
+        if (did >= 0x2900) return 2; // MultiFrame
+        if (did >= 0x2600) return 1; // SingleFrame
+        return 0;
+    }
+    if (strcmp(key, "frame_gen_max_frames") == 0) {
+        if (!g_renderer) return 0;
+        uint32_t vid = g_renderer->GetGPUVendorID();
+        uint32_t did = g_renderer->GetGPUDeviceID();
+        if (vid != 0x10DE) return 0;
+        if (did >= 0x2900) return 3;
+        if (did >= 0x2600) return 1;
+        return 0;
+    }
 
     return 0;
 }
