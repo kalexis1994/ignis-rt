@@ -3442,12 +3442,14 @@ class _NodeVmCompiler:
                 return True
         return False
 
-    def compile(self, principled_node, surface_node=None, emission_node=None):
+    def compile(self, principled_node, surface_node=None, emission_node=None, group_node=None):
         """Compile shader tree into VM bytecode. VM is the SINGLE AUTHORITY.
 
         If surface_node is a Mix Shader, compiles BOTH branches and blends
         per-pixel using OP_MIX_REG. Otherwise compiles the single Principled.
         If emission_node is set (from Add Shader), compiles its Color as emission.
+        If group_node is set, Principled lives inside a Group node — set context
+        so GROUP_INPUT can cross the boundary to external inputs.
         """
         if principled_node is None and surface_node is None:
             return None
@@ -3458,7 +3460,12 @@ class _NodeVmCompiler:
 
         if principled_node is None:
             return None
+        # Set Group context BEFORE compiling so GROUP_INPUT can resolve external inputs
+        if group_node:
+            self._group_context = group_node
         result = self._compile_principled(principled_node)
+        if group_node:
+            self._group_context = None
 
         # Add Shader emission: compile the separate Emission node's Color
         if emission_node and emission_node.type == 'EMISSION':
@@ -3861,17 +3868,19 @@ class _NodeVmCompiler:
         return self.instructions if self.instructions else None
 
 
-def _compile_node_vm(principled_node, register_image_fn, surface_node=None, emission_node=None):
+def _compile_node_vm(principled_node, register_image_fn, surface_node=None, emission_node=None, group_node=None):
     """Compile a shader tree into VM bytecode. VM is the SINGLE AUTHORITY.
 
     If surface_node is a Mix Shader, compiles BOTH branches and blends per-pixel.
     Otherwise compiles the single Principled BSDF.
     If emission_node is set (from Add Shader), compiles its Color as emission.
+    If group_node is set, the Principled lives inside a Group node.
 
     Returns a list of instruction tuples [(x,y,z,w), ...] or None if no VM needed.
     """
     compiler = _NodeVmCompiler(register_image_fn)
-    return compiler.compile(principled_node, surface_node=surface_node, emission_node=emission_node)
+    return compiler.compile(principled_node, surface_node=surface_node,
+                            emission_node=emission_node, group_node=group_node)
 
 
 # Now fix the ColorRamp data format issue.
@@ -6052,6 +6061,7 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
 
             # ALWAYS resolve from Material Output first (correct shader chain)
             principled_node = None
+            _principled_group_node = None  # GROUP node containing the Principled (for VM cross-boundary)
             _mix_shader_resolved = False  # When True, don't overwrite blended props
             _original_surface_node = None  # Preserved for VM Mix Shader compilation
             _add_shader_emission_node = None  # Emission node from Add Shader (for VM)
@@ -6129,18 +6139,22 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                         if s_inp and s_inp.is_linked:
                             s_node = s_inp.links[0].from_node
                             p_node = None
+                            g_node = None  # GROUP node if Principled is inside a Group
                             if s_node.type == 'BSDF_PRINCIPLED':
                                 p_node = s_node
                             elif s_node.type == 'GROUP':
                                 p_node = _find_principled_in_group(s_node)
+                                if p_node:
+                                    g_node = s_node
                             if p_node:
                                 # Count linked inputs as complexity score
                                 _complexity = sum(1 for inp in p_node.inputs if inp.is_linked)
-                                _candidates.append((p_node, _complexity))
+                                _candidates.append((p_node, _complexity, g_node))
                     # Pick the most complex candidate (most linked inputs)
                     if _candidates:
                         _candidates.sort(key=lambda x: x[1], reverse=True)
                         principled_node = _candidates[0][0]
+                        _principled_group_node = _candidates[0][2]  # may be None
                     break
                 elif surface_node.type == 'ADD_SHADER':
                     # Add Shader: find the Principled BSDF and Emission in either input
@@ -6169,6 +6183,7 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                     if proxy:
                         if proxy.type == 'BSDF_PRINCIPLED':
                             principled_node = proxy
+                            _principled_group_node = surface_node  # GROUP context for VM cross-boundary
                             break
                         props = _extract_shader_props(proxy, _register_image)
                         base_color = props['base_color']
@@ -6445,7 +6460,8 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         _vm_surface = _original_surface_node if _mix_shader_resolved else None
         _vm_emission = _add_shader_emission_node
         if principled_node is not None or _vm_surface is not None:
-            vm_code = _compile_node_vm(principled_node, _register_image, surface_node=_vm_surface, emission_node=_vm_emission)
+            vm_code = _compile_node_vm(principled_node, _register_image, surface_node=_vm_surface,
+                                       emission_node=_vm_emission, group_node=_principled_group_node)
             if vm_code:
                 mat_key_name = mat.name if mat else "?"
                 print(f"[ignis-vm] '{mat_key_name}': compiled {len(vm_code)} instructions")

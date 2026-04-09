@@ -2147,6 +2147,8 @@ void main() {
         float specWeight = (F.r + F.g + F.b) / 3.0;
 
         float diffuseWeight = (1.0 - metallic) * (1.0 - transmission);
+        float dielectricSpecWeight = (1.0 - metallic) * (1.0 - transmission);
+        float metalSpecWeight = metallic;
         float nonGlassCompensation = (glassProb > 0.01) ? 1.0 / max(1.0 - glassProb, 0.5) : 1.0;
         bool chooseDiffuse = (diffuseWeight > 0.001) ? (rand01() > specWeight) : false;
 
@@ -2184,11 +2186,18 @@ void main() {
                 return;
             }
             float NdotL = max(dot(N, rayDir), 0.0);
+            float NdotH = max(dot(N, H), 0.0);
             float VdotH = max(dot(V, H), 0.0);
-            vec3 Fw = fresnelSchlick(VdotH, F0);
+            // Cycles-accurate metallic-dielectric lobe separation (commit 2c069d0):
+            // Separate Fresnel weighting for dielectric and metallic components
+            float f0_die = (ior - 1.0) / (ior + 1.0);
+            f0_die = f0_die * f0_die;
+            vec3 dielectricF0 = vec3(f0_die * specularLevel * 2.0);
+            vec3 dielectricFw = fresnelSchlick(VdotH, dielectricF0) * dielectricSpecWeight;
+            vec3 metalFw = fresnelSchlick(VdotH, baseColor) * metalSpecWeight;
             float G2 = SmithG2(NdotL, NdotV, alpha2);
             float G1 = SmithG1(NdotV, alpha2);
-            throughput *= (Fw / max(specWeight, 0.001)) * (G2 / max(G1, 0.001)) * nonGlassCompensation;
+            throughput *= (dielectricFw + metalFw) * (G2 / max(G1, 0.001)) * nonGlassCompensation;
             isDiffusePath = false;
         }
         rayOrigin = worldPos + N * 0.002;
