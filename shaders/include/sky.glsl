@@ -43,7 +43,15 @@ vec3 proceduralSky(vec3 dir, vec3 sunDirL, vec3 ambColor, vec3 sunTint) {
 
 vec3 evaluateSky(vec3 dir) {
     float sunIntensity = cam.sunLight.w;
-    if (sunIntensity <= 0.0) return vec3(0.0);
+
+    // World background color (from Blender's World → Background node)
+    // Packed in windParams.zw (R, G) and rainParams.w (B)
+    vec3 worldBg = vec3(cam.windParams.z, cam.windParams.w, cam.rainParams.w);
+
+    if (sunIntensity <= 0.0) {
+        // No sun light — use world background color as uniform environment
+        return max(worldBg, vec3(0.0));
+    }
 
     vec3 sunDir = normalize(cam.sunLight.xyz);
     vec3 ambColor = cam.ambientLight.rgb;

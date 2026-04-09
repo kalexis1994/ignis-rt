@@ -4012,8 +4012,8 @@ def _pack_gpu_material(
     transparent_prob=0.0,
     uv_scale_x=1.0,
     uv_scale_y=1.0,
-    color_value=1.0,
-    color_saturation=1.0,
+    color_value=0.0,       # coat_weight (0 = no coat, 1 = full clearcoat)
+    color_saturation=1.0,  # also used as coat_roughness (0.03 default)
     node_vm_code=None,
     volume_density=0.0,
     volume_anisotropy=0.0,
@@ -5029,6 +5029,12 @@ def _extract_shader_props(node, register_image_fn):
         spec_inp = node.inputs.get('Specular IOR Level') or node.inputs.get('Specular')
         if spec_inp:
             props['specular_level'] = float(spec_inp.default_value)
+        coat_w_inp = node.inputs.get('Coat Weight') or node.inputs.get('Coat')
+        if coat_w_inp:
+            props['coat_weight'] = float(coat_w_inp.default_value)
+        coat_r_inp = node.inputs.get('Coat Roughness')
+        if coat_r_inp:
+            props['coat_roughness'] = float(coat_r_inp.default_value)
     elif node.type == 'BSDF_HAIR':
         props['hair_material'] = True
         props['specular_level'] = 0.5
@@ -5724,7 +5730,7 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         transparent_prob = 0.0
         uv_scale_x = 1.0
         uv_scale_y = 1.0
-        color_value = 1.0
+        color_value = 0.0  # coat_weight default (0 = no coat)
         color_saturation = 1.0
         flags = 0
         alpha_test = False
@@ -6121,6 +6127,8 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                     if 'specular_level' in props: specular_level = props['specular_level']
                     if 'hair_shift' in props: hair_shift = props['hair_shift']
                     if 'hair_radial_roughness' in props: hair_radial_roughness = props['hair_radial_roughness']
+                    if 'coat_weight' in props: color_value = props['coat_weight']
+                    if 'coat_roughness' in props: color_saturation = props['coat_roughness']
                     if props.get('hair_material', False): flags |= _MAT_FLAG_HAIR
                     _mix_shader_resolved = True
                     import os
