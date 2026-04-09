@@ -1258,10 +1258,10 @@ void main() {
                     // Trace shadow ray (simple: opaque + terminate on first hit)
                     vec3 sOrigin = worldPos + N * shadowBias;
                     bool sOccluded = false;
-                    for (int skip = 0; skip < 3; skip++) {
+                    for (int skip = 0; skip < 8; skip++) {
                         rayQueryEXT srq;
                         rayQueryInitializeEXT(srq, topLevelAS,
-                            gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                            gl_RayFlagsOpaqueEXT,  // NO TerminateOnFirstHit: need closest hit for glass skip
                             0xFF, sOrigin, 0.0, sampleDir, 10000.0);
                         while (rayQueryProceedEXT(srq)) {}
                         if (rayQueryGetIntersectionTypeEXT(srq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
@@ -1277,10 +1277,42 @@ void main() {
                             sMI = sPM.m[sPId];
                         }
                         Material sM = materialBuffer.materials[sMI];
-                        if ((sM.flags & 6u) != 0u || (sM.flags & (1u|MAT_FLAG_LIGHTPATH_TRANSPARENT)) != 0u || sM.multB > 0.0) {
+                        // Glass/volume: always pass through
+                        if ((sM.flags & 6u) != 0u) {
                             sOrigin += sampleDir * (sT + 0.003);
                             continue;
                         }
+                        // Lightpath transparent / stochastic passthrough: always pass through
+                        if ((sM.flags & MAT_FLAG_LIGHTPATH_TRANSPARENT) != 0u || sM.multB > 0.0) {
+                            sOrigin += sampleDir * (sT + 0.003);
+                            continue;
+                        }
+                        // Alpha-tested: only pass through if actually transparent
+                        if ((sM.flags & 1u) != 0u && sM.multG < 0.999) {
+                            // Quick alpha check — sample texture if available
+                            bool alphaTransparent = false;
+                            if (sG.uvBufferAddress != 0u) {
+                                Indices sIdx = Indices(sG.indexBufferAddress);
+                                UVs sUV = UVs(sG.uvBufferAddress);
+                                uint si0 = sIdx.i[sPId*3+0], si1 = sIdx.i[sPId*3+1], si2 = sIdx.i[sPId*3+2];
+                                vec2 sBary2 = rayQueryGetIntersectionBarycentricsEXT(srq, true);
+                                vec3 sBary = vec3(1.0-sBary2.x-sBary2.y, sBary2.x, sBary2.y);
+                                vec2 sHitUV = vec2(sUV.uv[si0*2], 1.0-sUV.uv[si0*2+1]) * sBary.x
+                                            + vec2(sUV.uv[si1*2], 1.0-sUV.uv[si1*2+1]) * sBary.y
+                                            + vec2(sUV.uv[si2*2], 1.0-sUV.uv[si2*2+1]) * sBary.z;
+                                float sAlpha = 1.0;
+                                if (sM.diffuseTexIndex != 0xFFFFFFFFu)
+                                    sAlpha = texture(textures[nonuniformEXT(sM.diffuseTexIndex)], sHitUV).a * sM.multG;
+                                else if (sM.detailTexIndex != 0xFFFFFFFFu)
+                                    sAlpha = texture(textures[nonuniformEXT(sM.detailTexIndex)], sHitUV).a * sM.multG;
+                                alphaTransparent = (sAlpha < 0.999 && rand01() > sAlpha);
+                            }
+                            if (alphaTransparent) {
+                                sOrigin += sampleDir * (sT + 0.003);
+                                continue;
+                            }
+                        }
+                        // Opaque hit
                         sOccluded = true;
                         closestShadowDist = min(closestShadowDist, sT);
                         break;
@@ -1456,7 +1488,7 @@ void main() {
             vec3 fSO = worldPos + N * shadowBias;
             bool fOcc = false;
             vec3 fSF = vec3(1.0);
-            for (int fs = 0; fs < 4; fs++) {
+            for (int fs = 0; fs < 8; fs++) {
                 rayQueryEXT fsrq;
                 rayQueryInitializeEXT(fsrq, topLevelAS, gl_RayFlagsOpaqueEXT,
                     0xFF, fSO, 0.0, fL, fD - 0.004);
@@ -1470,8 +1502,26 @@ void main() {
                 if (fGeo.primMaterialBufferAddress != 0u) { PrimMaterials fPM = PrimMaterials(fGeo.primMaterialBufferAddress); fMI = fPM.m[fPI]; }
                 Material fMat = materialBuffer.materials[fMI];
                 if ((fMat.flags & 6u) != 0u) { fSO += fL*(fHT+0.004); continue; }
-                bool fTr = (fMat.flags & (1u|MAT_FLAG_LIGHTPATH_TRANSPARENT)) != 0u || fMat.multB > 0.0;
-                if (fTr) { fSO += fL*(fHT+0.002); continue; }
+                if ((fMat.flags & MAT_FLAG_LIGHTPATH_TRANSPARENT) != 0u || fMat.multB > 0.0) { fSO += fL*(fHT+0.002); continue; }
+                // Alpha-tested: check actual alpha before skipping
+                if ((fMat.flags & 1u) != 0u && fMat.multG < 0.999) {
+                    vec2 fBary2 = rayQueryGetIntersectionBarycentricsEXT(fsrq, true);
+                    bool fAlphaSkip = false;
+                    if (fGeo.uvBufferAddress != 0u) {
+                        Indices fIdx2 = Indices(fGeo.indexBufferAddress);
+                        UVs fUV2 = UVs(fGeo.uvBufferAddress);
+                        uint fi0=fIdx2.i[fPI*3],fi1=fIdx2.i[fPI*3+1],fi2=fIdx2.i[fPI*3+2];
+                        vec3 fB=vec3(1.0-fBary2.x-fBary2.y,fBary2.x,fBary2.y);
+                        vec2 fHUV=vec2(fUV2.uv[fi0*2],1.0-fUV2.uv[fi0*2+1])*fB.x
+                                 +vec2(fUV2.uv[fi1*2],1.0-fUV2.uv[fi1*2+1])*fB.y
+                                 +vec2(fUV2.uv[fi2*2],1.0-fUV2.uv[fi2*2+1])*fB.z;
+                        float fA=1.0;
+                        if(fMat.diffuseTexIndex!=0xFFFFFFFFu) fA=texture(textures[nonuniformEXT(fMat.diffuseTexIndex)],fHUV).a*fMat.multG;
+                        else if(fMat.detailTexIndex!=0xFFFFFFFFu) fA=texture(textures[nonuniformEXT(fMat.detailTexIndex)],fHUV).a*fMat.multG;
+                        fAlphaSkip=(fA<0.999 && rand01()>fA);
+                    }
+                    if (fAlphaSkip) { fSO += fL*(fHT+0.002); continue; }
+                }
                 fOcc = true; break;
             }
 
@@ -1506,26 +1556,33 @@ void main() {
     }
 
     // ---- NEE: Point/spot/area lights (fallback when ReSTIR skipped) ----
-    uint neeStart = 0u;
-    uint neeEnd = min(cam.lightCount, 32u);
+    // Independent random light selection (not contiguous block) so every light
+    // has equal probability of being sampled — fixes missing shadows from specific lights
+    uint neeLightIndices[4];
+    uint neeLightCount = min(cam.lightCount, 32u);
     float neeScale = 1.0;
+    bool neeUseRandomSet = false;
     bool hairFastPrimary = isHairSurface && (bounce == 0u);
     if (!skipLocalNEE && !restirDone) {
         if ((bounce >= 2u || hairFastPrimary) && cam.lightCount > 1u) {
-            // Bounce 2+ or hair primary: sample 1 random light (cheap)
-            uint randIdx = min(uint(rand01() * float(cam.lightCount)), cam.lightCount - 1u);
-            neeStart = randIdx;
-            neeEnd = randIdx + 1u;
+            // Bounce 2+ or hair primary: 1 random light
+            neeLightIndices[0] = min(uint(rand01() * float(cam.lightCount)), cam.lightCount - 1u);
+            neeLightCount = 1u;
             neeScale = float(cam.lightCount);
+            neeUseRandomSet = true;
         } else if (cam.lightCount > 4u) {
-            uint randIdx = min(uint(rand01() * float(cam.lightCount)), cam.lightCount - 1u);
-            neeStart = randIdx;
-            neeEnd = min(randIdx + 4u, cam.lightCount);
-            neeScale = float(cam.lightCount) / float(min(4u, cam.lightCount - randIdx));
+            // 4 INDEPENDENT random lights (not contiguous block)
+            for (uint ri = 0u; ri < 4u; ri++) {
+                neeLightIndices[ri] = min(uint(rand01() * float(cam.lightCount)), cam.lightCount - 1u);
+            }
+            neeLightCount = 4u;
+            neeScale = float(cam.lightCount) / 4.0;
+            neeUseRandomSet = true;
         }
     }
     if (!skipLocalNEE) {
-        for (uint li = neeStart; li < neeEnd; li++) {
+        for (uint lii = 0u; lii < neeLightCount; lii++) {
+            uint li = neeUseRandomSet ? neeLightIndices[lii] : lii;
             vec4 lightPosRange = cam.lights[li * 4u];
             vec4 lightColInt   = cam.lights[li * 4u + 1u];
             vec4 lightDirSizeX = cam.lights[li * 4u + 2u];

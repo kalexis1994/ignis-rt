@@ -139,7 +139,7 @@ void main() {
     for (int shadowIter = 0; shadowIter < 8; shadowIter++) {
         rayQueryEXT rq;
         rayQueryInitializeEXT(rq, topLevelAS,
-            gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+            gl_RayFlagsOpaqueEXT,  // NO TerminateOnFirstHit: need closest hit for glass skip
             0xFF, shadowOrigin, 0.0, dir, maxDist);
         while (rayQueryProceedEXT(rq)) {}
 
