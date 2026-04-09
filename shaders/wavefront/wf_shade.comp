@@ -1217,7 +1217,7 @@ void main() {
     // - Hair bounce 0: still gets sun + stochastic lights (but fewer, via neeScale)
     bool hairFastSecondary = isHairSurface && (bounce > 0u);
     bool skipSunNEE = (bounce >= 2u && maxT < 0.01) || hairFastSecondary;
-    bool skipLocalNEE = (bounce >= 2u) || hairFastSecondary;
+    bool skipLocalNEE = (bounce >= pc.maxBounces && maxT < 0.01) || hairFastSecondary;
 
     // Glass/transmission surfaces don't scatter light — skip NEE entirely
     if (isGlass) skipSunNEE = true;
@@ -1792,16 +1792,10 @@ void main() {
         }
     }
 
-    // ---- Ambient (bounce 0 only) ----
-    if (bounce == 0u) {
-        float ambientMax = cam.ptParams1.y;
-        vec3 ambientColor = cam.ambientLight.rgb * cam.ambientLight.w;
-        float NdotUp = max(dot(N, vec3(0, 1, 0)), 0.0);
-        vec3 ambient = baseColor * ambientColor * NdotUp * ambientMax * (1.0 - metallic) * throughput;
-        atomicAddFloat(rBase+0, ambient.x);
-        atomicAddFloat(rBase+1, ambient.y);
-        atomicAddFloat(rBase+2, ambient.z);
-    }
+    // ---- Ambient (disabled — indirect sky lighting handles this via bounces) ----
+    // Previously: fake NdotUp ambient on bounce 0 without occlusion.
+    // This caused flat lighting on shadow-facing surfaces. Real GI from
+    // sky/environment via NEE + bounce paths is physically correct.
 
     // ---- SHARC update: accumulate direct lighting + guide bins + backpropagation ----
     // NVIDIA official: directLighting must be PRE-THROUGHPUT (just the local illumination).
