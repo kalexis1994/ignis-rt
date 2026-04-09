@@ -44,7 +44,7 @@ layout(binding = 2, set = 0) uniform CameraProperties {
 } cam;
 
 // Wavefront buffers (set 1)
-layout(binding = 0, set = 1, scalar) buffer PathStateBuffer { float pathData[]; } pathStates;
+#include "../include/pathstate.glsl"
 layout(binding = 1, set = 1, scalar) buffer HitResultBuffer { float hitData[]; } hitResults;
 layout(binding = 3, set = 1, scalar) buffer PixelRadianceBuffer { float radData[]; } pixelRadiance;
 layout(binding = 5, set = 1, scalar) buffer CountersBuffer {
@@ -92,12 +92,11 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= counters.activeRayCount) return;
 
-    // Read PathState (12 floats)
-    uint base = idx * 12u;
-    vec3 origin = vec3(pathStates.pathData[base+0], pathStates.pathData[base+1], pathStates.pathData[base+2]);
-    uint pixelIndex = floatBitsToUint(pathStates.pathData[base+3]);
-    vec3 dir = vec3(pathStates.pathData[base+4], pathStates.pathData[base+5], pathStates.pathData[base+6]);
-    uint flags = floatBitsToUint(pathStates.pathData[base+11]);
+    // Read PathState
+    vec3 origin = psReadOrigin(idx);
+    uint pixelIndex = psReadPixelIndex(idx);
+    vec3 dir = psReadDirection(idx);
+    uint flags = psReadFlags(idx);
 
     // Skip terminated paths
     if ((flags & 0x20u) != 0u) return;
@@ -113,7 +112,7 @@ void main() {
 
     if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
         // Sky miss — accumulate sky radiance and terminate
-        vec3 throughput = vec3(pathStates.pathData[base+8], pathStates.pathData[base+9], pathStates.pathData[base+10]);
+        vec3 throughput = psReadThroughput(idx);
         vec3 skyColor = evaluateSkyHDRI(dir) * throughput;
         uint bounce = flags & 0xFu;
         float giIntensity = cam.ptParams0.y;
@@ -139,7 +138,7 @@ void main() {
         }
 
         // Mark terminated
-        pathStates.pathData[base+11] = uintBitsToFloat(flags | 0x20u);
+        psTerminate(idx, flags);
 
         // Write empty hit
         hitResults.hitData[hBase+6] = uintBitsToFloat(0u); // hitType = miss

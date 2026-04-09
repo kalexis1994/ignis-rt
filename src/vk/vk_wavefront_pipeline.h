@@ -43,9 +43,19 @@ private:
     uint32_t maxPixels_ = 0;
     uint32_t frameIndex_ = 0;
 
-    // Wavefront SSBO buffers (PathState is double-buffered to avoid read/write race)
-    VkBuffer pathStateBuffer_[2] = {};                 // PathState[] ping-pong
-    VkDeviceMemory pathStateMemory_[2] = {};
+    // Wavefront SSBO buffers — PathState SoA (double-buffered per field)
+    // originDir: origin.xyz + direction.xyz = 24 bytes/path
+    // pixelRng:  pixelIndex + rngState = 8 bytes/path
+    // throughput: throughput.xyz = 12 bytes/path
+    // flags:     flags = 4 bytes/path
+    VkBuffer originDirBuffer_[2] = {};
+    VkDeviceMemory originDirMemory_[2] = {};
+    VkBuffer pixelRngBuffer_[2] = {};
+    VkDeviceMemory pixelRngMemory_[2] = {};
+    VkBuffer throughputBuffer_[2] = {};
+    VkDeviceMemory throughputMemory_[2] = {};
+    VkBuffer flagsBuffer_[2] = {};
+    VkDeviceMemory flagsMemory_[2] = {};
     uint32_t pathStateCurrent_ = 0;                    // index of current read buffer
     VkBuffer hitResultBuffer_ = VK_NULL_HANDLE;        // HitResult[]
     VkDeviceMemory hitResultMemory_ = VK_NULL_HANDLE;
@@ -63,8 +73,9 @@ private:
     VkDeviceMemory sharcStateMemory_ = VK_NULL_HANDLE;
 
     // Descriptor sets for ping-pong (2 sets, no host updates during recording)
-    // Set A: binding 0 = buffer[0] (read), binding 7 = buffer[1] (write)
-    // Set B: binding 0 = buffer[1] (read), binding 7 = buffer[0] (write)
+    // SoA bindings: 0=originDir(R), 7=originDir(W), 9=pixelRng(R), 10=pixelRng(W),
+    //               11=throughput(R), 12=throughput(W), 13=flags(R), 14=flags(W)
+    // Plus: 1=hitResult, 2=shadowRay, 3=pixelRadiance, 4=primaryGBuf, 5=counters, 6=indirect, 8=sharc
     VkDescriptorSetLayout wfDescSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool wfDescPool_ = VK_NULL_HANDLE;
     VkDescriptorSet wfDescSet_[2] = {};  // [0] = A, [1] = B

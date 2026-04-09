@@ -91,7 +91,7 @@ layout(buffer_reference, scalar) buffer PrimMaterials { uint m[]; };
 const uint MAT_FLAG_LIGHTPATH_TRANSPARENT = 256u;
 
 // Wavefront buffers (set 1)
-layout(binding = 0, set = 1, scalar) buffer PathStateBuffer { float pathData[]; } pathStates;
+#include "../include/pathstate.glsl"
 layout(binding = 2, set = 1, scalar) buffer ShadowRayBuffer { float shadowData[]; } shadowRays;
 layout(binding = 3, set = 1, scalar) buffer PixelRadianceBuffer { uint radDataU[]; } pixelRadiance;
 layout(binding = 5, set = 1, scalar) buffer CountersBuffer {
@@ -223,8 +223,7 @@ void main() {
     radiance *= shadowFilter;
     if (radiance.x <= 0.0 && radiance.y <= 0.0 && radiance.z <= 0.0) return;
 
-    uint pBase = pathIndex * 12u;
-    uint pixelIndex = floatBitsToUint(pathStates.pathData[pBase+3]);
+    uint pixelIndex = psReadPixelIndex(pathIndex);
     uint rBase = pixelIndex * 8u;
 
     if (channel == 0u) {

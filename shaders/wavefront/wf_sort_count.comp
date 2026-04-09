@@ -1,10 +1,11 @@
 #version 460
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 256) in;
 
 // Wavefront buffers (set 1)
-layout(binding = 7, set = 1, scalar) buffer PathStateWriteBuffer { float nextPathData[]; } nextPathStates;
+#include "../include/pathstate.glsl"
 layout(binding = 5, set = 1, scalar) buffer CountersBuffer {
     uint activeRayCount;
     uint shadowRayCount;
@@ -22,8 +23,7 @@ void main() {
     if (idx >= counters.activeRayCount) return;
 
     // Read flags from the WRITE buffer (K2 output)
-    uint nBase = idx * 12u;
-    uint flags = floatBitsToUint(nextPathStates.nextPathData[nBase + 11u]);
+    uint flags = psWriteReadFlags(idx);
 
     // Extract material category from bits [12:14]
     uint category = (flags >> 12u) & 0x7u;

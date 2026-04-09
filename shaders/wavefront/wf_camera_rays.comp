@@ -42,11 +42,8 @@ layout(binding = 2, set = 0) uniform CameraProperties {
 layout(binding = 12, set = 0) uniform sampler2D blueNoiseTexture;
 
 // Wavefront buffers (set 1)
-layout(binding = 0, set = 1, scalar) buffer PathStateBuffer {
-    // PathState: origin(vec3), pixelIndex(uint), direction(vec3), rngState(uint),
-    //            throughput(vec3), flags(uint) = 48 bytes = 12 floats
-    float pathData[];
-} pathStates;
+#define PATHSTATE_WRITE_TO_READ  // K0 writes to READ buffer (first kernel)
+#include "../include/pathstate.glsl"
 
 layout(binding = 5, set = 1, scalar) buffer CountersBuffer {
     uint activeRayCount;
@@ -161,23 +158,8 @@ void main() {
         rayDir = normalize((cam.viewInverse * vec4(camDirDOF, 0.0)).xyz);
     }
 
-    // Write PathState (48 bytes = 12 floats per path)
-    uint base = idx * 12u;
-    // origin.xyz + pixelIndex
-    pathStates.pathData[base + 0] = rayOrigin.x;
-    pathStates.pathData[base + 1] = rayOrigin.y;
-    pathStates.pathData[base + 2] = rayOrigin.z;
-    pathStates.pathData[base + 3] = uintBitsToFloat(idx);
-    // direction.xyz + rngState
-    pathStates.pathData[base + 4] = rayDir.x;
-    pathStates.pathData[base + 5] = rayDir.y;
-    pathStates.pathData[base + 6] = rayDir.z;
-    pathStates.pathData[base + 7] = uintBitsToFloat(rngState);
-    // throughput.xyz + flags
-    pathStates.pathData[base + 8] = 1.0;
-    pathStates.pathData[base + 9] = 1.0;
-    pathStates.pathData[base + 10] = 1.0;
-    pathStates.pathData[base + 11] = uintBitsToFloat(0u); // bounce=0, no flags
+    // Write PathState via helpers
+    psInitAll(idx, rayOrigin, idx, rayDir, rngState, vec3(1.0), 0u);
 
     // First thread sets counter
     if (idx == 0u) {

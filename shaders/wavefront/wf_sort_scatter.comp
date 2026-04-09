@@ -1,13 +1,11 @@
 #version 460
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 256) in;
 
 // Wavefront buffers (set 1)
-// binding 0 = READ buffer (destination for sorted paths)
-// binding 7 = WRITE buffer (source: K2 output, unsorted)
-layout(binding = 0, set = 1, scalar) buffer PathStateReadBuffer { float pathData[]; } pathStates;
-layout(binding = 7, set = 1, scalar) buffer PathStateWriteBuffer { float nextPathData[]; } nextPathStates;
+#include "../include/pathstate.glsl"
 layout(binding = 5, set = 1, scalar) buffer CountersBuffer {
     uint activeRayCount;
     uint shadowRayCount;
@@ -24,19 +22,15 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= counters.activeRayCount) return;
 
-    // Read from WRITE buffer (K2 output)
-    uint srcBase = idx * 12u;
-    uint flags = floatBitsToUint(nextPathStates.nextPathData[srcBase + 11u]);
+    // Read flags from WRITE buffer (K2 output)
+    uint flags = psWriteReadFlags(idx);
     uint category = (flags >> 12u) & 0x7u;
     if (category > 4u) category = 0u;
 
     // Compute destination index: bin offset + atomic local index
     uint localIdx = atomicAdd(counters.sortBinCount[category], 1u);
     uint destIdx = counters.sortBinOffset[category] + localIdx;
-    uint dstBase = destIdx * 12u;
 
-    // Copy all 12 floats (48 bytes) of PathState
-    for (uint i = 0u; i < 12u; i++) {
-        pathStates.pathData[dstBase + i] = nextPathStates.nextPathData[srcBase + i];
-    }
+    // Copy full PathState from WRITE → READ buffer
+    psCopyWriteToRead(idx, destIdx);
 }

@@ -129,9 +129,13 @@ void WavefrontPipeline::Shutdown() {
     if (wfDescPool_) { vkDestroyDescriptorPool(device, wfDescPool_, nullptr); wfDescPool_ = VK_NULL_HANDLE; }
     if (wfDescSetLayout_) { vkDestroyDescriptorSetLayout(device, wfDescSetLayout_, nullptr); wfDescSetLayout_ = VK_NULL_HANDLE; }
 
-    // Destroy buffers
-    DestroySSBO(device, pathStateBuffer_[0], pathStateMemory_[0]);
-    DestroySSBO(device, pathStateBuffer_[1], pathStateMemory_[1]);
+    // Destroy SoA PathState buffers
+    for (int i = 0; i < 2; i++) {
+        DestroySSBO(device, originDirBuffer_[i], originDirMemory_[i]);
+        DestroySSBO(device, pixelRngBuffer_[i], pixelRngMemory_[i]);
+        DestroySSBO(device, throughputBuffer_[i], throughputMemory_[i]);
+        DestroySSBO(device, flagsBuffer_[i], flagsMemory_[i]);
+    }
     DestroySSBO(device, hitResultBuffer_, hitResultMemory_);
     DestroySSBO(device, shadowRayBuffer_, shadowRayMemory_);
     DestroySSBO(device, pixelRadianceBuffer_, pixelRadianceMemory_);
@@ -147,9 +151,13 @@ bool WavefrontPipeline::CreateBuffers(uint32_t pixelCount) {
     VkDevice device = context_->GetDevice();
     VkPhysicalDevice physDevice = context_->GetPhysicalDevice();
 
-    // PathState: 48 bytes per pixel, double-buffered (ping-pong)
-    if (!CreateSSBO(device, physDevice, pixelCount * 48, &pathStateBuffer_[0], &pathStateMemory_[0])) return false;
-    if (!CreateSSBO(device, physDevice, pixelCount * 48, &pathStateBuffer_[1], &pathStateMemory_[1])) return false;
+    // PathState SoA — 4 field buffers, each double-buffered (48 bytes/path total)
+    for (int i = 0; i < 2; i++) {
+        if (!CreateSSBO(device, physDevice, pixelCount * 24, &originDirBuffer_[i], &originDirMemory_[i])) return false;     // 6 floats
+        if (!CreateSSBO(device, physDevice, pixelCount * 8,  &pixelRngBuffer_[i], &pixelRngMemory_[i])) return false;       // 2 uints
+        if (!CreateSSBO(device, physDevice, pixelCount * 12, &throughputBuffer_[i], &throughputMemory_[i])) return false;    // 3 floats
+        if (!CreateSSBO(device, physDevice, pixelCount * 4,  &flagsBuffer_[i], &flagsMemory_[i])) return false;             // 1 uint
+    }
 
     // HitResult: 80 bytes per pixel (20 floats: 8 base + 12 objToWorld)
     if (!CreateSSBO(device, physDevice, pixelCount * 80, &hitResultBuffer_, &hitResultMemory_)) return false;
@@ -199,18 +207,18 @@ bool WavefrontPipeline::CreateBuffers(uint32_t pixelCount) {
 bool WavefrontPipeline::CreateDescriptorSet() {
     VkDevice device = context_->GetDevice();
 
-    // Descriptor set 1 layout: 9 SSBOs for wavefront buffers
-    // binding 0: PathState read (current bounce)
-    // binding 1: HitResult
-    // binding 2: ShadowRay
-    // binding 3: PixelRadiance
-    // binding 4: PrimaryGBuffer
-    // binding 5: Counters
-    // binding 6: IndirectDispatch
-    // binding 7: PathState write (next bounce)
-    // binding 8: SharcState (per-pixel, persists across bounces)
-    VkDescriptorSetLayoutBinding bindings[9] = {};
-    for (int i = 0; i < 9; i++) {
+    // Descriptor set 1 layout: 15 SSBOs for wavefront buffers (SoA PathState)
+    // binding 0:  originDir READ       binding 7:  originDir WRITE
+    // binding 1:  HitResult            binding 8:  SharcState
+    // binding 2:  ShadowRay            binding 9:  pixelRng READ
+    // binding 3:  PixelRadiance        binding 10: pixelRng WRITE
+    // binding 4:  PrimaryGBuffer       binding 11: throughput READ
+    // binding 5:  Counters             binding 12: throughput WRITE
+    // binding 6:  IndirectDispatch     binding 13: flags READ
+    //                                  binding 14: flags WRITE
+    constexpr int NUM_BINDINGS = 15;
+    VkDescriptorSetLayoutBinding bindings[NUM_BINDINGS] = {};
+    for (int i = 0; i < NUM_BINDINGS; i++) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1;
@@ -219,13 +227,13 @@ bool WavefrontPipeline::CreateDescriptorSet() {
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 9;
+    layoutInfo.bindingCount = NUM_BINDINGS;
     layoutInfo.pBindings = bindings;
 
     if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &wfDescSetLayout_) != VK_SUCCESS) return false;
 
-    // Pool — 2 sets × 9 SSBOs = 18 descriptors
-    VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 18};
+    // Pool — 2 sets × 15 SSBOs = 30 descriptors
+    VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NUM_BINDINGS * 2};
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.maxSets = 2;
@@ -234,7 +242,6 @@ bool WavefrontPipeline::CreateDescriptorSet() {
 
     if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &wfDescPool_) != VK_SUCCESS) return false;
 
-    // Allocate 2 descriptor sets (ping-pong A and B)
     VkDescriptorSetLayout layouts[2] = { wfDescSetLayout_, wfDescSetLayout_ };
     VkDescriptorSetAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -245,22 +252,32 @@ bool WavefrontPipeline::CreateDescriptorSet() {
     if (vkAllocateDescriptorSets(device, &allocInfo, wfDescSet_) != VK_SUCCESS) return false;
 
     // Write descriptors for BOTH sets at init time (never updated during recording)
-    // Set A: binding 0 = buffer[0] (read), binding 7 = buffer[1] (write)
-    // Set B: binding 0 = buffer[1] (read), binding 7 = buffer[0] (write)
+    // Ping-pong: setIdx=0 reads from [0], writes to [1]; setIdx=1 reads from [1], writes to [0]
     for (int setIdx = 0; setIdx < 2; setIdx++) {
-        VkBuffer readBuf  = pathStateBuffer_[setIdx];      // 0 for A, 1 for B
-        VkBuffer writeBuf = pathStateBuffer_[1 - setIdx];  // 1 for A, 0 for B
+        int r = setIdx;       // read index
+        int w = 1 - setIdx;   // write index
 
-        VkBuffer buffers[9] = {
-            readBuf, hitResultBuffer_, shadowRayBuffer_,
-            pixelRadianceBuffer_, primaryGBufBuffer_, countersBuffer_,
-            indirectDispatchBuffer_, writeBuf,
-            sharcStateBuffer_   // binding 8: same buffer in both sets (indexed by pixelIndex)
+        VkBuffer buffers[NUM_BINDINGS] = {
+            originDirBuffer_[r],           // 0:  originDir READ
+            hitResultBuffer_,              // 1:  HitResult
+            shadowRayBuffer_,              // 2:  ShadowRay
+            pixelRadianceBuffer_,          // 3:  PixelRadiance
+            primaryGBufBuffer_,            // 4:  PrimaryGBuffer
+            countersBuffer_,               // 5:  Counters
+            indirectDispatchBuffer_,        // 6:  IndirectDispatch
+            originDirBuffer_[w],           // 7:  originDir WRITE
+            sharcStateBuffer_,             // 8:  SharcState
+            pixelRngBuffer_[r],            // 9:  pixelRng READ
+            pixelRngBuffer_[w],            // 10: pixelRng WRITE
+            throughputBuffer_[r],          // 11: throughput READ
+            throughputBuffer_[w],          // 12: throughput WRITE
+            flagsBuffer_[r],              // 13: flags READ
+            flagsBuffer_[w],              // 14: flags WRITE
         };
 
-        VkDescriptorBufferInfo bufInfos[9] = {};
-        VkWriteDescriptorSet writes[9] = {};
-        for (int i = 0; i < 9; i++) {
+        VkDescriptorBufferInfo bufInfos[NUM_BINDINGS] = {};
+        VkWriteDescriptorSet writes[NUM_BINDINGS] = {};
+        for (int i = 0; i < NUM_BINDINGS; i++) {
             bufInfos[i].buffer = buffers[i];
             bufInfos[i].range = VK_WHOLE_SIZE;
 
@@ -272,7 +289,7 @@ bool WavefrontPipeline::CreateDescriptorSet() {
             writes[i].pBufferInfo = &bufInfos[i];
         }
 
-        vkUpdateDescriptorSets(device, 9, writes, 0, nullptr);
+        vkUpdateDescriptorSets(device, NUM_BINDINGS, writes, 0, nullptr);
     }
 
     return true;
