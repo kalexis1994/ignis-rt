@@ -2125,13 +2125,9 @@ void main() {
         float f0_d = (ior - 1.0) / (ior + 1.0);
         f0_d = f0_d * f0_d;
         vec3 F0 = mix(vec3(f0_d * specularLevel * 2.0), baseColor, metallic);
-        // Lobe selection weight: use GGX directional albedo (Eo * avgF0) instead of
-        // pointwise Fresnel. This matches Cycles' closure_albedo-based sampling weight
-        // and produces more specular paths at low SPP for visible glossy reflections.
         float alpha2 = roughness * roughness;
-        float Eo_sel = approxGGXAlbedo(NdotV, alpha2);
-        float avgF0 = (F0.r + F0.g + F0.b) / 3.0;
-        float specWeight = clamp(Eo_sel * avgF0 + (1.0 - Eo_sel) * avgF0 * 0.5, avgF0, 0.5);
+        vec3 F = fresnelGeneralized(NdotV, F0, ior, metallic);
+        float specWeight = (F.r + F.g + F.b) / 3.0;
 
         float diffuseWeight = (1.0 - metallic) * (1.0 - transmission);
         float dielectricSpecWeight = (1.0 - metallic) * (1.0 - transmission);

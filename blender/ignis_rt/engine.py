@@ -1351,9 +1351,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                     c = hdri["bg_color"]
                     s = hdri["bg_strength"]
                     dll_wrapper.set_int("hdri_tex_index", -1)
-                    dll_wrapper.set_float("world_bg_r", c[0] * s)
-                    dll_wrapper.set_float("world_bg_g", c[1] * s)
-                    dll_wrapper.set_float("world_bg_b", c[2] * s)
+                    bg_scale = s * 0.15
+                    dll_wrapper.set_float("world_bg_r", c[0] * bg_scale)
+                    dll_wrapper.set_float("world_bg_g", c[1] * bg_scale)
+                    dll_wrapper.set_float("world_bg_b", c[2] * bg_scale)
                     _log(f"Stage FINALIZE: World background color=({c[0]:.3f},{c[1]:.3f},{c[2]:.3f}) strength={s:.2f}")
                 else:
                     dll_wrapper.set_int("hdri_tex_index", -1)
@@ -2292,9 +2293,10 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                             ws = wnode.inputs.get('Strength')
                             if wc and ws:
                                 s = float(ws.default_value)
-                                dll_wrapper.set_float("world_bg_r", float(wc.default_value[0]) * s)
-                                dll_wrapper.set_float("world_bg_g", float(wc.default_value[1]) * s)
-                                dll_wrapper.set_float("world_bg_b", float(wc.default_value[2]) * s)
+                                bg_s = s * 0.15
+                                dll_wrapper.set_float("world_bg_r", float(wc.default_value[0]) * bg_s)
+                                dll_wrapper.set_float("world_bg_g", float(wc.default_value[1]) * bg_s)
+                                dll_wrapper.set_float("world_bg_b", float(wc.default_value[2]) * bg_s)
                             break
             except Exception:
                 pass

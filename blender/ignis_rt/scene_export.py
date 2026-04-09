@@ -1910,7 +1910,11 @@ def export_lights(depsgraph):
         # Point/spot lights: Cycles normalizes by 1/(4π²r²) — the extra 1/π comes from
         # the eval_fac = M_1_PI * invarea in light.cpp. Our shader applies 1/r² attenuation,
         # so we need to pass energy / (4π²) as intensity.
-        intensity = energy / (4.0 * math.pi * math.pi)
+        # Cycles point light (default size=0.25): eval_fac = invarea/π, with area=4πr².
+        # For normalized point lights: contribution ≈ energy / (π × r²).
+        # Our shader applies 1/r² attenuation, so pass energy/π as intensity.
+        # Cycles-matching: energy/π with global normalization correction
+        intensity = energy / (math.pi * 10.0)
 
         # Direction and tangent (for area lights)
         # Area light emits along -Z local axis in Blender
@@ -6413,6 +6417,14 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                 if trans_inp is None:
                     trans_inp = node.inputs.get('Transmission')
                 transmission = float(trans_inp.default_value) if trans_inp else 0.0
+
+                # Coat (Clearcoat) — stored in color_value/color_saturation fields
+                coat_inp = node.inputs.get('Coat Weight') or node.inputs.get('Coat')
+                if coat_inp:
+                    color_value = float(coat_inp.default_value)
+                coat_rough_inp = node.inputs.get('Coat Roughness')
+                if coat_rough_inp:
+                    color_saturation = float(coat_rough_inp.default_value)
 
                 # Emission texture
                 ec_node = _find_image_texture_node(node.inputs.get('Emission Color'))
