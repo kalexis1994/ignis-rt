@@ -4099,6 +4099,8 @@ def _pack_gpu_material(
     hair_radial_roughness=0.3,
     sss_weight=0.0,
     sss_radius=(1.0, 0.2, 0.1),
+    sheen_weight=0.0,
+    sheen_roughness=0.5,
 ):
     """Pack one material into 1180 bytes matching GPUMaterial."""
     base = _GPU_MATERIAL_BASE.pack(
@@ -4123,7 +4125,7 @@ def _pack_gpu_material(
         # SSS params encoded as uint bits (maskTexIndex, detailR/G/BTexIndex)
         # + 2 unused slots (detailATexIndex, detailNMTexIndex)
         _floatBits(sss_weight), _floatBits(sss_radius[0]), _floatBits(sss_radius[1]),
-        _floatBits(sss_radius[2]), _NO_TEX, _NO_TEX,
+        _floatBits(sss_radius[2]), _floatBits(sheen_weight), _floatBits(sheen_roughness),
         # multR=transmission, multG=alpha, multB=transparentProb, rest unused
         transmission, alpha, transparent_prob, uv_scale_x, uv_scale_y, color_value, color_saturation,
         # sunSpecular/sunSpecularEXP are reused for extra per-material scalars.
@@ -5833,6 +5835,9 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         color_saturation = 1.0
         sss_weight = 0.0
         sss_radius = (1.0, 0.2, 0.1)  # default Blender SSS radius (reddish)
+        sheen_weight = 0.0
+        sheen_roughness = 0.5
+        sheen_tint = (1.0, 1.0, 1.0)
         flags = 0
         alpha_test = False
         alpha_ref = 0.5
@@ -6536,6 +6541,18 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                     sss_scale = float(sss_scale_inp.default_value)
                     sss_radius = (sss_radius[0] * sss_scale, sss_radius[1] * sss_scale, sss_radius[2] * sss_scale)
 
+                # Sheen
+                sheen_inp = node.inputs.get('Sheen Weight') or node.inputs.get('Sheen')
+                if sheen_inp:
+                    sheen_weight = float(sheen_inp.default_value)
+                sheen_rough_inp = node.inputs.get('Sheen Roughness')
+                if sheen_rough_inp:
+                    sheen_roughness = float(sheen_rough_inp.default_value)
+                sheen_tint_inp = node.inputs.get('Sheen Tint')
+                if sheen_tint_inp:
+                    st = sheen_tint_inp.default_value
+                    sheen_tint = (float(st[0]), float(st[1]), float(st[2]))
+
                 # Emission texture
                 ec_node = _find_image_texture_node(node.inputs.get('Emission Color'))
                 if ec_node and ec_node.image:
@@ -6719,6 +6736,8 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
             color_saturation=color_saturation,
             sss_weight=sss_weight,
             sss_radius=sss_radius,
+            sheen_weight=sheen_weight,
+            sheen_roughness=sheen_roughness,
             node_vm_code=vm_code,
             volume_density=volume_density,
             volume_anisotropy=volume_anisotropy,

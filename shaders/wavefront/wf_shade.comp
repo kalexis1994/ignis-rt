@@ -483,6 +483,10 @@ void main() {
     float coatWeight = clamp(mat.detailNMMult, 0.0, 1.0);     // 0 = no coat
     float coatRoughness = clamp(mat.detailNMMultV, 0.01, 1.0); // coat surface roughness
     const float coatIOR = 1.5;  // standard coat IOR (lacquer/varnish)
+    // Sheen (fabric/velvet edge-brightening)
+    float sheenWeight = clamp(uintBitsToFloat(mat.detailATexIndex), 0.0, 1.0);
+    float sheenRoughness = clamp(uintBitsToFloat(mat.detailNMTexIndex), 0.01, 1.0);
+    vec3 sheenTint = vec3(1.0);  // tint applied via baseColor in evaluateSheen
     // SSS (subsurface scattering) — Barré-Brisebois translucency approximation
     float sssWeight = uintBitsToFloat(mat.maskTexIndex);         // 0 = no SSS
     vec3 sssRadius = vec3(
@@ -1232,7 +1236,7 @@ void main() {
                 specContrib = vec3(0.0);
             } else {
                 evaluateCookTorrance(N, V, sunDir, baseColor, roughness, metallic, specularLevel, ior, transmission,
-                                     diffContrib, specContrib, coatWeight, coatRoughness, coatIOR);
+                                     diffContrib, specContrib, coatWeight, coatRoughness, coatIOR, sheenWeight, sheenTint, sheenRoughness);
             }
 
             if (bounce == 0u) {
@@ -1589,7 +1593,7 @@ void main() {
                 vec3 fRad = fCI.rgb * fCI.w * fAtt * fSA;
 
                 vec3 fDC, fSC;
-                evaluateCookTorrance(N, V, fL, baseColor, roughness, metallic, specularLevel, ior, transmission, fDC, fSC, coatWeight, coatRoughness, coatIOR);
+                evaluateCookTorrance(N, V, fL, baseColor, roughness, metallic, specularLevel, ior, transmission, fDC, fSC, coatWeight, coatRoughness, coatIOR, sheenWeight, sheenTint, sheenRoughness);
                 vec3 fDiffR = fDC * fRad * W * throughput * fSF;
                 vec3 fSpecR = fSC * fRad * W * throughput * fSF;
                 // RTXPT: DenoiserRadianceClampK = 8.0
@@ -1743,7 +1747,7 @@ void main() {
                     hairShift, max(ior, 1.01), hairV);
                 specC = vec3(0.0);
             } else {
-                evaluateCookTorrance(N, V, brdfL, baseColor, roughness, metallic, specularLevel, ior, transmission, diffC, specC, coatWeight, coatRoughness, coatIOR);
+                evaluateCookTorrance(N, V, brdfL, baseColor, roughness, metallic, specularLevel, ior, transmission, diffC, specC, coatWeight, coatRoughness, coatIOR, sheenWeight, sheenTint, sheenRoughness);
             }
 
             vec3 lightRadiance = lightColor * lightInt * attenuation;
@@ -1786,7 +1790,7 @@ void main() {
                     eSpecC = vec3(0.0);
                 } else {
                     evaluateCookTorrance(N, V, eDir, baseColor, roughness, metallic, specularLevel, ior, transmission,
-                                         eDiffC, eSpecC, coatWeight, coatRoughness, coatIOR);
+                                         eDiffC, eSpecC, coatWeight, coatRoughness, coatIOR, sheenWeight, sheenTint, sheenRoughness);
                 }
 
                 // Geometric term
@@ -1843,7 +1847,7 @@ void main() {
             } else {
                 evaluateCookTorrance(N, V, envDir, baseColor, roughness, metallic,
                                      specularLevel, ior, transmission,
-                                     eDiffC, eSpecC, coatWeight, coatRoughness, coatIOR);
+                                     eDiffC, eSpecC, coatWeight, coatRoughness, coatIOR, sheenWeight, sheenTint, sheenRoughness);
             }
 
             // Cosine-weighted pdf = NdotL / PI

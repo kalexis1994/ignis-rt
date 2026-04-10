@@ -121,6 +121,45 @@ vec3 evaluateSSS(
 }
 
 // ============================================================
+// Sheen — edge-brightening for fabric/velvet materials
+// Simplified LTC approximation: Fresnel-like rim lighting
+// ============================================================
+
+vec3 evaluateSheen(
+    vec3 N, vec3 V, vec3 L,
+    float sheenWeight, vec3 sheenTint, float sheenRoughness,
+    out float sheenAlbedo  // for attenuating lower layers
+) {
+    if (sheenWeight <= 0.001) {
+        sheenAlbedo = 0.0;
+        return vec3(0.0);
+    }
+
+    float NdotL = max(dot(N, L), 0.0);
+    float NdotV = max(dot(N, V), 0.001);
+    if (NdotL <= 0.0) {
+        sheenAlbedo = 0.0;
+        return vec3(0.0);
+    }
+
+    // Sheen intensity peaks at grazing angles (fabric rim lighting)
+    // Roughness controls the width: low roughness = narrow rim, high = broad
+    float exponent = mix(5.0, 1.5, sheenRoughness);  // 5.0 (sharp) to 1.5 (broad)
+    float sheenFresnel = pow(1.0 - NdotV, exponent);
+
+    // Sheen BRDF: Fresnel rim * cosine-weighted * energy-conserving normalization
+    // The (exponent+1)/(2*PI) factor normalizes the hemisphere integral
+    float normalization = (exponent + 1.0) / (2.0 * PI);
+    vec3 sheen = sheenWeight * sheenTint * sheenFresnel * normalization * NdotL;
+
+    // Albedo estimate for layer attenuation (average reflectivity of sheen)
+    // Approximation: integral of pow(1-cos, exp) * cos over hemisphere
+    sheenAlbedo = sheenWeight * 2.0 / (exponent + 2.0);
+
+    return sheen;
+}
+
+// ============================================================
 // Coat (Clearcoat) Layer — dielectric GGX on top of base BRDF
 // ============================================================
 void evaluateCoatLayer(
@@ -157,7 +196,8 @@ void evaluateCookTorrance(
     vec3 N, vec3 V, vec3 L, vec3 baseColor, float roughness, float metallic, float specularLevel,
     float ior, float transmission,
     out vec3 diffuseContrib, out vec3 specularContrib,
-    float coatWeight, float coatRoughness, float coatIOR
+    float coatWeight, float coatRoughness, float coatIOR,
+    float sheenWeight, vec3 sheenTint, float sheenRoughness
 ) {
     float NdotL = max(dot(N, L), 0.0);
     float NdotV = max(dot(N, V), 0.001);
@@ -204,6 +244,15 @@ void evaluateCookTorrance(
         diffuseContrib = diff * NdotL;
         specularContrib = spec * NdotL;
 
+        // Sheen layer (first — attenuates coat and base)
+        if (sheenWeight > 0.001) {
+            float sheenAlb;
+            vec3 sheenContrib = evaluateSheen(N, V, L, sheenWeight, sheenTint, sheenRoughness, sheenAlb);
+            float sheenAtten = 1.0 - sheenAlb;
+            diffuseContrib *= sheenAtten;
+            specularContrib = specularContrib * sheenAtten + sheenContrib;
+        }
+
         // Coat layer attenuation + contribution
         if (coatWeight > 0.001) {
             vec3 coatSpec; float baseAtten;
@@ -236,6 +285,15 @@ void evaluateCookTorrance(
 
     diffuseContrib = diff * NdotL;
     specularContrib = spec * NdotL;
+
+    // Sheen layer
+    if (sheenWeight > 0.001) {
+        float sheenAlb;
+        vec3 sheenContrib = evaluateSheen(N, V, L, sheenWeight, sheenTint, sheenRoughness, sheenAlb);
+        float sheenAtten = 1.0 - sheenAlb;
+        diffuseContrib *= sheenAtten;
+        specularContrib = specularContrib * sheenAtten + sheenContrib;
+    }
 
     // Coat layer attenuation + contribution
     if (coatWeight > 0.001) {
