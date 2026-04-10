@@ -483,6 +483,14 @@ void main() {
     float coatWeight = clamp(mat.detailNMMult, 0.0, 1.0);     // 0 = no coat
     float coatRoughness = clamp(mat.detailNMMultV, 0.01, 1.0); // coat surface roughness
     const float coatIOR = 1.5;  // standard coat IOR (lacquer/varnish)
+    // SSS (subsurface scattering) — Barré-Brisebois translucency approximation
+    float sssWeight = uintBitsToFloat(mat.maskTexIndex);         // 0 = no SSS
+    vec3 sssRadius = vec3(
+        uintBitsToFloat(mat.detailRTexIndex),
+        uintBitsToFloat(mat.detailGTexIndex),
+        uintBitsToFloat(mat.detailBTexIndex)
+    );
+    sssWeight = clamp(sssWeight, 0.0, 1.0);
     float hairShift = ((mat.flags & MAT_FLAG_HAIR) != 0u) ? mat.sunSpecular : 0.035;
     float hairRadialRoughness = ((mat.flags & MAT_FLAG_HAIR) != 0u) ?
                                 clamp(mat.sunSpecularEXP, 0.01, 1.0) : roughness;
@@ -1375,6 +1383,18 @@ void main() {
         }
     }
 
+    // ---- SSS: Subsurface translucency for sun light ----
+    if (sssWeight > 0.001 && !isGlass && sunIntensity > 0.0 && !skipSunNEE) {
+        vec3 V = -rayDir;
+        vec3 sunRadSSS = cam.skyLight.rgb * sunIntensity;
+        vec3 sssContrib = evaluateSSS(N, V, sunDir, baseColor, sssWeight, sssRadius, 1.0);
+        sssContrib *= sunRadSSS * throughput;
+        if (bounce > 0u) sssContrib *= cam.ptParams0.y;
+        // SSS translucency: trace shadow ray from BACK side (light passing through)
+        appendShadowRay(worldPos - N * shadowBias, sunDir, 10000.0, idx, sssContrib,
+                        0u); // diffuse channel
+    }
+
     // ---- ReSTIR DI: Reservoir-based light sampling (bounce 0 only) ----
     bool restirDone = false;
     bool restirEnabled = (cam.lightPad2 & 2u) != 0u;
@@ -1732,6 +1752,15 @@ void main() {
 
             appendShadowRay(worldPos + N * shadowBias, shadowDir, sampleDist - 0.004, idx, contrib,
                             isDiffusePath ? 0u : 1u);
+
+            // SSS translucency for local lights
+            if (sssWeight > 0.001 && !isGlass) {
+                vec3 sssC = evaluateSSS(N, V, L, baseColor, sssWeight, sssRadius, attenuation);
+                vec3 sssContrib = sssC * lightColor * lightInt * throughput * neeScale;
+                if (bounce > 0u) sssContrib *= cam.ptParams0.y;
+                appendShadowRay(worldPos - N * shadowBias, shadowDir, sampleDist - 0.004, idx, sssContrib,
+                                0u);
+            }
         }
     }
 

@@ -84,6 +84,43 @@ float approxGGXAlbedo(float NdotX, float alpha) {
 // Cook-Torrance BRDF Evaluation (for NEE / direct light)
 // Includes Kulla-Conty multi-scatter energy compensation to match Cycles.
 // ============================================================
+// SSS (Subsurface Scattering) — Barré-Brisebois translucency approximation
+// Light passing through thin/translucent surfaces (skin, wax, leaves)
+// ============================================================
+
+// Evaluate SSS translucency contribution for a given light
+// Returns the translucency color to add to the diffuse radiance
+vec3 evaluateSSS(
+    vec3 N, vec3 V, vec3 L,
+    vec3 baseColor, float sssWeight, vec3 sssRadius,
+    float lightAtten  // light attenuation (1/r² etc.)
+) {
+    if (sssWeight <= 0.001) return vec3(0.0);
+
+    // Barré-Brisebois translucency model (GDC 2011, DICE/Frostbite)
+    // Parameters tuned for general-purpose SSS (skin, wax, marble)
+    const float distortion = 0.2;   // normal distortion of light vector
+    const float power = 12.0;       // sharpness of back-translucency highlight
+    const float scale = 1.0;        // direct translucency intensity
+    const float ambient = 0.1;      // omnidirectional scattering baseline
+    const float thickness = 0.5;    // uniform thickness (no baked map)
+
+    // Distorted back-light vector (light entering from behind)
+    vec3 vLTLight = L + N * distortion;
+    float fLTDot = pow(clamp(dot(V, -vLTLight), 0.0, 1.0), power) * scale;
+
+    // Combine direct + ambient, modulate by thickness
+    float fLT = lightAtten * (fLTDot + ambient) * thickness;
+
+    // Per-channel SSS radius modulates the translucency color
+    // Larger radius = more scattering = brighter contribution
+    // Normalize radius so that default (1,0.2,0.1) produces reddish glow
+    vec3 sssColor = baseColor * normalize(max(sssRadius, vec3(0.001)));
+
+    return sssColor * fLT * sssWeight;
+}
+
+// ============================================================
 // Coat (Clearcoat) Layer — dielectric GGX on top of base BRDF
 // ============================================================
 void evaluateCoatLayer(

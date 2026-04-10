@@ -4097,6 +4097,8 @@ def _pack_gpu_material(
     volume_ext=None,
     hair_shift=0.035,
     hair_radial_roughness=0.3,
+    sss_weight=0.0,
+    sss_radius=(1.0, 0.2, 0.1),
 ):
     """Pack one material into 1180 bytes matching GPUMaterial."""
     base = _GPU_MATERIAL_BASE.pack(
@@ -4118,8 +4120,10 @@ def _pack_gpu_material(
         alpha_ref,          # alphaRef
         100,                # shaderType = SHADER_BLENDER_PBR
         emission_strength,  # fresnelMaxLevel
-        # Multilayer tex indices (6x NO_TEX)
-        _NO_TEX, _NO_TEX, _NO_TEX, _NO_TEX, _NO_TEX, _NO_TEX,
+        # SSS params encoded as uint bits (maskTexIndex, detailR/G/BTexIndex)
+        # + 2 unused slots (detailATexIndex, detailNMTexIndex)
+        _floatBits(sss_weight), _floatBits(sss_radius[0]), _floatBits(sss_radius[1]),
+        _floatBits(sss_radius[2]), _NO_TEX, _NO_TEX,
         # multR=transmission, multG=alpha, multB=transparentProb, rest unused
         transmission, alpha, transparent_prob, uv_scale_x, uv_scale_y, color_value, color_saturation,
         # sunSpecular/sunSpecularEXP are reused for extra per-material scalars.
@@ -5827,6 +5831,8 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         uv_scale_y = 1.0
         color_value = 0.0  # coat_weight default (0 = no coat)
         color_saturation = 1.0
+        sss_weight = 0.0
+        sss_radius = (1.0, 0.2, 0.1)  # default Blender SSS radius (reddish)
         flags = 0
         alpha_test = False
         alpha_ref = 0.5
@@ -6517,6 +6523,19 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                 if coat_rough_inp:
                     color_saturation = float(coat_rough_inp.default_value)
 
+                # Subsurface Scattering
+                sss_inp = node.inputs.get('Subsurface Weight') or node.inputs.get('Subsurface')
+                if sss_inp:
+                    sss_weight = float(sss_inp.default_value)
+                sss_rad_inp = node.inputs.get('Subsurface Radius')
+                if sss_rad_inp:
+                    sr = sss_rad_inp.default_value
+                    sss_radius = (float(sr[0]), float(sr[1]), float(sr[2]))
+                sss_scale_inp = node.inputs.get('Subsurface Scale')
+                if sss_scale_inp:
+                    sss_scale = float(sss_scale_inp.default_value)
+                    sss_radius = (sss_radius[0] * sss_scale, sss_radius[1] * sss_scale, sss_radius[2] * sss_scale)
+
                 # Emission texture
                 ec_node = _find_image_texture_node(node.inputs.get('Emission Color'))
                 if ec_node and ec_node.image:
@@ -6698,6 +6717,8 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
             uv_scale_y=uv_scale_y,
             color_value=color_value,
             color_saturation=color_saturation,
+            sss_weight=sss_weight,
+            sss_radius=sss_radius,
             node_vm_code=vm_code,
             volume_density=volume_density,
             volume_anisotropy=volume_anisotropy,
