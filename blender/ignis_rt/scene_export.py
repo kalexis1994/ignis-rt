@@ -4103,6 +4103,8 @@ def _pack_gpu_material(
     sheen_roughness=0.5,
     anisotropic_factor=0.0,
     anisotropic_rotation=0.0,
+    specular_tint=(1.0, 1.0, 1.0),
+    diffuse_roughness=0.0,
 ):
     """Pack one material into 1180 bytes matching GPUMaterial."""
     base = _GPU_MATERIAL_BASE.pack(
@@ -4165,6 +4167,19 @@ def _pack_gpu_material(
         for i, instr in enumerate(node_vm_code[:128]):
             for j in range(4):
                 vm_uints[4 + i * 4 + j] = instr[j] if j < len(instr) else 0
+
+    # Non-volume: pack specular_tint and diffuse_roughness into nodeVmPad[0..1]
+    if not (volume_noise_scale > 0.0 or volume_density > 0.0):
+        # Specular Tint: R11G11B10 unorm packed into nodeVmPad[0]
+        st_r = int(max(0.0, min(1.0, specular_tint[0])) * 2047.0 + 0.5)
+        st_g = int(max(0.0, min(1.0, specular_tint[1])) * 2047.0 + 0.5)
+        st_b = int(max(0.0, min(1.0, specular_tint[2])) * 1023.0 + 0.5)
+        is_default_tint = (abs(specular_tint[0] - 1.0) < 0.01 and
+                           abs(specular_tint[1] - 1.0) < 0.01 and
+                           abs(specular_tint[2] - 1.0) < 0.01)
+        vm_uints[1] = 0 if is_default_tint else (st_r | (st_g << 11) | (st_b << 22))
+        # Diffuse Roughness: float bits in nodeVmPad[1]
+        vm_uints[2] = _floatBits(diffuse_roughness)
 
     # Volume noise parameters packed into nodeVmPad[0..2] + nodeVmCode[0..1]
     # Volume-only materials have no VM code, so we reuse those slots.
@@ -5842,6 +5857,8 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         sheen_tint = (1.0, 1.0, 1.0)
         anisotropic_factor = 0.0
         anisotropic_rotation = 0.0
+        specular_tint = (1.0, 1.0, 1.0)
+        diffuse_roughness = 0.0
         flags = 0
         alpha_test = False
         alpha_ref = 0.5
@@ -6565,6 +6582,17 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                 if aniso_rot_inp:
                     anisotropic_rotation = float(aniso_rot_inp.default_value)
 
+                # Specular Tint
+                spec_tint_inp = node.inputs.get('Specular Tint')
+                if spec_tint_inp:
+                    st = spec_tint_inp.default_value
+                    specular_tint = (float(st[0]), float(st[1]), float(st[2]))
+
+                # Diffuse Roughness (Oren-Nayar)
+                diff_rough_inp = node.inputs.get('Diffuse Roughness')
+                if diff_rough_inp:
+                    diffuse_roughness = float(diff_rough_inp.default_value)
+
                 # Emission texture
                 ec_node = _find_image_texture_node(node.inputs.get('Emission Color'))
                 if ec_node and ec_node.image:
@@ -6752,6 +6780,8 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
             sheen_roughness=sheen_roughness,
             anisotropic_factor=anisotropic_factor,
             anisotropic_rotation=anisotropic_rotation,
+            specular_tint=specular_tint,
+            diffuse_roughness=diffuse_roughness,
             node_vm_code=vm_code,
             volume_density=volume_density,
             volume_anisotropy=volume_anisotropy,

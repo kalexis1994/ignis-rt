@@ -225,7 +225,8 @@ void evaluateCookTorrance(
     out vec3 diffuseContrib, out vec3 specularContrib,
     float coatWeight, float coatRoughness, float coatIOR,
     float sheenWeight, vec3 sheenTint, float sheenRoughness,
-    float anisotropic, vec3 anisoT, vec3 anisoB
+    float anisotropic, vec3 anisoT, vec3 anisoB,
+    vec3 specularTint, float diffuseRoughness
 ) {
     float NdotL = max(dot(N, L), 0.0);
     float NdotV = max(dot(N, V), 0.001);
@@ -250,7 +251,7 @@ void evaluateCookTorrance(
     // F0 from IOR for dielectrics, baseColor for metals
     float f0_dielectric = (ior - 1.0) / (ior + 1.0);
     f0_dielectric = f0_dielectric * f0_dielectric;
-    vec3 dielectricF0 = vec3(f0_dielectric * specularLevel * 2.0);
+    vec3 dielectricF0 = vec3(f0_dielectric * specularLevel * 2.0) * specularTint;
 
     // GGX D and G: anisotropic when anisotropic > 0, isotropic otherwise
     float D, G;
@@ -284,7 +285,21 @@ void evaluateCookTorrance(
         float specAlbedo = mix(Eo * f0_dielectric * specularLevel * 2.0,
                                Eo * (F0.r + F0.g + F0.b) / 3.0, metallic);
         vec3 kd = vec3(1.0 - specAlbedo) * (1.0 - metallic);
-        vec3 diff = kd * baseColor * INV_PI;
+        vec3 diff;
+        if (diffuseRoughness > 0.001) {
+            // Oren-Nayar diffuse (Cycles-matching for rough surfaces)
+            float sigma2 = diffuseRoughness * diffuseRoughness;
+            float A_on = 1.0 - 0.5 * sigma2 / (sigma2 + 0.33);
+            float B_on = 0.45 * sigma2 / (sigma2 + 0.09);
+            float sinThetaI = sqrt(max(1.0 - NdotL * NdotL, 0.0));
+            float sinThetaO = sqrt(max(1.0 - NdotV * NdotV, 0.0));
+            float maxCos = max(0.0, dot(normalize(L - N * NdotL), normalize(V - N * NdotV)));
+            float sinAlpha = max(sinThetaI, sinThetaO);
+            float tanBeta = min(sinThetaI, sinThetaO) / max(min(NdotL, NdotV), 0.001);
+            diff = kd * baseColor * INV_PI * (A_on + B_on * maxCos * sinAlpha * tanBeta);
+        } else {
+            diff = kd * baseColor * INV_PI;
+        }
         diffuseContrib = diff * NdotL;
         specularContrib = spec * NdotL;
 
