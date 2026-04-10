@@ -58,6 +58,33 @@ float GGX_D(float NdotH, float alpha) {
     return a2 / (PI * denom * denom);
 }
 
+// Anisotropic GGX D (Cycles bsdf_aniso_D)
+// H must be in tangent space (x=tangent, y=bitangent, z=normal)
+float GGX_D_aniso(vec3 H_local, float alpha_x, float alpha_y) {
+    vec3 Hs = H_local / vec3(alpha_x, alpha_y, 1.0);
+    float lenSq = dot(Hs, Hs);
+    return INV_PI / (alpha_x * alpha_y * lenSq * lenSq);
+}
+
+// Anisotropic Smith Lambda (Cycles bsdf_aniso_lambda for GGX)
+float SmithLambda_aniso(vec3 V_local, float alpha_x, float alpha_y) {
+    float sqrAlphaTanN = (alpha_x * alpha_x * V_local.x * V_local.x +
+                          alpha_y * alpha_y * V_local.y * V_local.y) /
+                         max(V_local.z * V_local.z, 1e-8);
+    return 0.5 * (-1.0 + sqrt(1.0 + sqrAlphaTanN));
+}
+
+// Anisotropic Smith G2 (height-correlated)
+float SmithG2_aniso(vec3 L_local, vec3 V_local, float alpha_x, float alpha_y) {
+    return 1.0 / (1.0 + SmithLambda_aniso(L_local, alpha_x, alpha_y) +
+                         SmithLambda_aniso(V_local, alpha_x, alpha_y));
+}
+
+// Anisotropic Smith G1
+float SmithG1_aniso(vec3 V_local, float alpha_x, float alpha_y) {
+    return 1.0 / (1.0 + SmithLambda_aniso(V_local, alpha_x, alpha_y));
+}
+
 // Smith G1 (height-correlated)
 float SmithG1(float NdotV, float alpha) {
     float a2 = alpha * alpha;
@@ -197,7 +224,8 @@ void evaluateCookTorrance(
     float ior, float transmission,
     out vec3 diffuseContrib, out vec3 specularContrib,
     float coatWeight, float coatRoughness, float coatIOR,
-    float sheenWeight, vec3 sheenTint, float sheenRoughness
+    float sheenWeight, vec3 sheenTint, float sheenRoughness,
+    float anisotropic, vec3 anisoT, vec3 anisoB
 ) {
     float NdotL = max(dot(N, L), 0.0);
     float NdotV = max(dot(N, V), 0.001);
@@ -214,12 +242,28 @@ void evaluateCookTorrance(
 
     float alpha = roughness * roughness;
 
+    // Anisotropic alpha (Cycles formula)
+    float aspect = sqrt(max(1.0 - anisotropic * 0.9, 0.01));
+    float alpha_x = alpha / aspect;
+    float alpha_y = alpha * aspect;
+
     // F0 from IOR for dielectrics, baseColor for metals
     float f0_dielectric = (ior - 1.0) / (ior + 1.0);
     f0_dielectric = f0_dielectric * f0_dielectric;
     vec3 dielectricF0 = vec3(f0_dielectric * specularLevel * 2.0);
-    float D = GGX_D(NdotH, alpha);
-    float G = SmithG2(NdotL, NdotV, alpha);
+
+    // GGX D and G: anisotropic when anisotropic > 0, isotropic otherwise
+    float D, G;
+    if (anisotropic > 0.001) {
+        vec3 H_local = vec3(dot(H, anisoT), dot(H, anisoB), dot(H, N));
+        vec3 L_local = vec3(dot(L, anisoT), dot(L, anisoB), dot(L, N));
+        vec3 V_local = vec3(dot(V, anisoT), dot(V, anisoB), dot(V, N));
+        D = GGX_D_aniso(H_local, alpha_x, alpha_y);
+        G = SmithG2_aniso(L_local, V_local, alpha_x, alpha_y);
+    } else {
+        D = GGX_D(NdotH, alpha);
+        G = SmithG2(NdotL, NdotV, alpha);
+    }
     float specDenom = max(4.0 * NdotV * NdotL, 0.001);
 
     // Multi-scatter GGX energy compensation (Kulla-Conty 2017, analytical approx).

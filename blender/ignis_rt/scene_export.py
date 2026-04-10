@@ -4101,6 +4101,8 @@ def _pack_gpu_material(
     sss_radius=(1.0, 0.2, 0.1),
     sheen_weight=0.0,
     sheen_roughness=0.5,
+    anisotropic_factor=0.0,
+    anisotropic_rotation=0.0,
 ):
     """Pack one material into 1180 bytes matching GPUMaterial."""
     base = _GPU_MATERIAL_BASE.pack(
@@ -4109,8 +4111,8 @@ def _pack_gpu_material(
         normal_tex,         # normalTexIndex
         orm_tex,            # mapsTexIndex (ORM)
         emission_tex,       # detailTexIndex → emission texture
-        # normalDetailTexIndex + ksAmbient/ksDiffuse/ksSpecular
-        _NO_TEX,
+        # normalDetailTexIndex (reused for anisotropic_factor as float bits)
+        _floatBits(anisotropic_factor) if anisotropic_factor > 0.001 else _NO_TEX,
         base_color[0], base_color[1], base_color[2],
         # ksSpecularEXP (= roughness), emissive RGB
         roughness,
@@ -5838,6 +5840,8 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
         sheen_weight = 0.0
         sheen_roughness = 0.5
         sheen_tint = (1.0, 1.0, 1.0)
+        anisotropic_factor = 0.0
+        anisotropic_rotation = 0.0
         flags = 0
         alpha_test = False
         alpha_ref = 0.5
@@ -6553,6 +6557,14 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                     st = sheen_tint_inp.default_value
                     sheen_tint = (float(st[0]), float(st[1]), float(st[2]))
 
+                # Anisotropic
+                aniso_inp = node.inputs.get('Anisotropic')
+                if aniso_inp:
+                    anisotropic_factor = float(aniso_inp.default_value)
+                aniso_rot_inp = node.inputs.get('Anisotropic Rotation')
+                if aniso_rot_inp:
+                    anisotropic_rotation = float(aniso_rot_inp.default_value)
+
                 # Emission texture
                 ec_node = _find_image_texture_node(node.inputs.get('Emission Color'))
                 if ec_node and ec_node.image:
@@ -6738,6 +6750,8 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
             sss_radius=sss_radius,
             sheen_weight=sheen_weight,
             sheen_roughness=sheen_roughness,
+            anisotropic_factor=anisotropic_factor,
+            anisotropic_rotation=anisotropic_rotation,
             node_vm_code=vm_code,
             volume_density=volume_density,
             volume_anisotropy=volume_anisotropy,

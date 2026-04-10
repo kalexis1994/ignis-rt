@@ -486,7 +486,11 @@ void main() {
     // Sheen (fabric/velvet edge-brightening)
     float sheenWeight = clamp(uintBitsToFloat(mat.detailATexIndex), 0.0, 1.0);
     float sheenRoughness = clamp(uintBitsToFloat(mat.detailNMTexIndex), 0.01, 1.0);
-    vec3 sheenTint = vec3(1.0);  // tint applied via baseColor in evaluateSheen
+    vec3 sheenTint = vec3(1.0);
+    // Anisotropic (brushed metal, hair) — packed in normalDetailTexIndex as 2x float16
+    uint anisoPacked = mat.normalDetailTexIndex;
+    float anisotropicFactor = (anisoPacked != 0xFFFFFFFFu) ? clamp(uintBitsToFloat(anisoPacked), 0.0, 1.0) : 0.0;
+    float anisotropicRotation = 0.0;  // rotation packed separately if needed
     // SSS (subsurface scattering) — Barré-Brisebois translucency approximation
     float sssWeight = uintBitsToFloat(mat.maskTexIndex);         // 0 = no SSS
     vec3 sssRadius = vec3(
@@ -636,6 +640,18 @@ void main() {
     if (NdotV_check < 0.01) {
         float blend = clamp(-NdotV_check * 50.0 + 0.5, 0.0, 1.0);
         N = normalize(mix(N, gN, blend));
+    }
+
+    // Anisotropic tangent frame (from triangle UVs, optionally rotated)
+    vec3 anisoT = normalize(triDPdu);
+    vec3 anisoB = normalize(cross(N, anisoT));
+    anisoT = cross(anisoB, N);  // re-orthogonalize
+    if (anisotropicRotation > 0.001) {
+        float rotAngle = anisotropicRotation * 2.0 * PI;
+        float cr = cos(rotAngle), sr = sin(rotAngle);
+        vec3 newT = cr * anisoT + sr * anisoB;
+        anisoB = -sr * anisoT + cr * anisoB;
+        anisoT = newT;
     }
 
     // Stochastic alpha test with INLINE re-trace (matching monolithic):
@@ -1236,7 +1252,7 @@ void main() {
                 specContrib = vec3(0.0);
             } else {
                 evaluateCookTorrance(N, V, sunDir, baseColor, roughness, metallic, specularLevel, ior, transmission,
-                                     diffContrib, specContrib, coatWeight, coatRoughness, coatIOR, sheenWeight, sheenTint, sheenRoughness);
+                                     diffContrib, specContrib, coatWeight, coatRoughness, coatIOR, sheenWeight, sheenTint, sheenRoughness, anisotropicFactor, anisoT, anisoB);
             }
 
             if (bounce == 0u) {
@@ -1593,7 +1609,7 @@ void main() {
                 vec3 fRad = fCI.rgb * fCI.w * fAtt * fSA;
 
                 vec3 fDC, fSC;
-                evaluateCookTorrance(N, V, fL, baseColor, roughness, metallic, specularLevel, ior, transmission, fDC, fSC, coatWeight, coatRoughness, coatIOR, sheenWeight, sheenTint, sheenRoughness);
+                evaluateCookTorrance(N, V, fL, baseColor, roughness, metallic, specularLevel, ior, transmission, fDC, fSC, coatWeight, coatRoughness, coatIOR, sheenWeight, sheenTint, sheenRoughness, anisotropicFactor, anisoT, anisoB);
                 vec3 fDiffR = fDC * fRad * W * throughput * fSF;
                 vec3 fSpecR = fSC * fRad * W * throughput * fSF;
                 // RTXPT: DenoiserRadianceClampK = 8.0
@@ -1747,7 +1763,7 @@ void main() {
                     hairShift, max(ior, 1.01), hairV);
                 specC = vec3(0.0);
             } else {
-                evaluateCookTorrance(N, V, brdfL, baseColor, roughness, metallic, specularLevel, ior, transmission, diffC, specC, coatWeight, coatRoughness, coatIOR, sheenWeight, sheenTint, sheenRoughness);
+                evaluateCookTorrance(N, V, brdfL, baseColor, roughness, metallic, specularLevel, ior, transmission, diffC, specC, coatWeight, coatRoughness, coatIOR, sheenWeight, sheenTint, sheenRoughness, anisotropicFactor, anisoT, anisoB);
             }
 
             vec3 lightRadiance = lightColor * lightInt * attenuation;
@@ -1790,7 +1806,7 @@ void main() {
                     eSpecC = vec3(0.0);
                 } else {
                     evaluateCookTorrance(N, V, eDir, baseColor, roughness, metallic, specularLevel, ior, transmission,
-                                         eDiffC, eSpecC, coatWeight, coatRoughness, coatIOR, sheenWeight, sheenTint, sheenRoughness);
+                                         eDiffC, eSpecC, coatWeight, coatRoughness, coatIOR, sheenWeight, sheenTint, sheenRoughness, anisotropicFactor, anisoT, anisoB);
                 }
 
                 // Geometric term
@@ -1847,7 +1863,7 @@ void main() {
             } else {
                 evaluateCookTorrance(N, V, envDir, baseColor, roughness, metallic,
                                      specularLevel, ior, transmission,
-                                     eDiffC, eSpecC, coatWeight, coatRoughness, coatIOR, sheenWeight, sheenTint, sheenRoughness);
+                                     eDiffC, eSpecC, coatWeight, coatRoughness, coatIOR, sheenWeight, sheenTint, sheenRoughness, anisotropicFactor, anisoT, anisoB);
             }
 
             // Cosine-weighted pdf = NdotL / PI
@@ -2270,9 +2286,14 @@ void main() {
             }
             isDiffusePath = true;
         } else {
-            // Specular
+            // Specular (anisotropic when anisotropicFactor > 0)
             float alpha2 = roughness * roughness;
-            vec3 H = sampleGGX_VNDF(rand2(), V, N, alpha2);
+            float anisoAspect = sqrt(max(1.0 - anisotropicFactor * 0.9, 0.01));
+            float spec_alpha_x = alpha2 / anisoAspect;
+            float spec_alpha_y = alpha2 * anisoAspect;
+            vec3 H = (anisotropicFactor > 0.001)
+                ? sampleGGX_VNDF_aniso(rand2(), V, anisoT, anisoB, N, spec_alpha_x, spec_alpha_y)
+                : sampleGGX_VNDF(rand2(), V, N, alpha2);
             rayDir = reflect(-V, H);
             if (dot(rayDir, N) <= 0.0) {
                 psTerminate(idx, flags);
@@ -2288,8 +2309,16 @@ void main() {
             vec3 dielectricF0 = vec3(f0_die * specularLevel * 2.0);
             vec3 dielectricFw = fresnelGeneralized(VdotH, dielectricF0, ior, 0.0) * dielectricSpecWeight;
             vec3 metalFw = fresnelGeneralized(VdotH, baseColor, ior, 1.0) * metalSpecWeight;
-            float G2 = SmithG2(NdotL, NdotV, alpha2);
-            float G1 = SmithG1(NdotV, alpha2);
+            float G2, G1;
+            if (anisotropicFactor > 0.001) {
+                vec3 L_local = vec3(dot(rayDir, anisoT), dot(rayDir, anisoB), dot(rayDir, N));
+                vec3 V_local = vec3(dot(V, anisoT), dot(V, anisoB), dot(V, N));
+                G2 = SmithG2_aniso(L_local, V_local, spec_alpha_x, spec_alpha_y);
+                G1 = SmithG1_aniso(V_local, spec_alpha_x, spec_alpha_y);
+            } else {
+                G2 = SmithG2(NdotL, NdotV, alpha2);
+                G1 = SmithG1(NdotV, alpha2);
+            }
             throughput *= (dielectricFw + metalFw) * (G2 / max(G1, 0.001)) * nonGlassCompensation;
             isDiffusePath = false;
         }
