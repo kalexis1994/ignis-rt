@@ -95,6 +95,7 @@ const uint OP_TEX_MAGIC      = 0x91u;  // R[dst] = magic(R[srcA].xyz, distortion
 const uint OP_TEX_BRICK       = 0x92u;  // R[dst] = brick(R[srcA].xyz, scale, mortarSize)
 const uint OP_NOISE_BUMP      = 0x93u;  // R[dst] = noiseBump(R[srcA].xyz, scale, detail, roughness) → .xy=gradient, .z=height
 const uint OP_LOAD_VERTEX_COLOR = 0x94u;  // R[dst] = vertexColor (per-vertex color attribute)
+const uint OP_TEX_BUMP        = 0x96u;  // R[dst] = texBump(R[srcA].xy=UV, texIdx=imm_z) → .xy=gradient via finite differences
 const uint OP_OBJECT_RANDOM    = 0x95u;  // R[dst].x = hash(instanceId) — per-instance random [0,1]
 
 // Load immediate / special
@@ -185,11 +186,12 @@ struct NodeVmResult {
     vec2  bumpGradient;
     float bumpStrength;
     float bumpDistance;
+    float bumpDet;      // |det| from UV→world mapping (0 for noise bump)
     bool  hasBump;
 };
 
 // ── VM Execution ──
-NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 normal, vec4 vertexColor, uint instanceId, vec3 localPos) {
+NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 normal, vec4 vertexColor, uint instanceId, vec3 localPos, vec3 dPdu, vec3 dPdv) {
     NodeVmResult result;
     result.baseColor = vec3(0.8);
     result.roughness = 0.5;
@@ -213,6 +215,7 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, ve
     result.bumpGradient = vec2(0.0);
     result.bumpStrength = 0.0;
     result.bumpDistance = 1.0;
+    result.bumpDet = 0.0;
     result.hasBump = false;
 
     uint header = materialBuffer.materials[matIdx].nodeVmHeader;
@@ -558,6 +561,45 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, ve
             vec3 b = brickTexture(R[srcA].xyz, scale, mortarSize, col1, col2, mortarCol);
             R[dst] = vec4(b, 1.0);
         }
+        else if (opcode == OP_TEX_BUMP) {
+            // Texture-based bump matching Cycles' svm_node_set_bump:
+            // Uses triangle UV differentials for correct world-space gradient scaling.
+            // imm_z = texture index, R[srcA].xy = UV (or hitUV if srcA=0)
+            vec2 bumpUV = (srcA != 0u) ? R[srcA].xy : uv;
+            uint texBumpIdx = instr.z;
+            ivec2 bumpTexDim = textureSize(textures[nonuniformEXT(texBumpIdx)], 0);
+            float bumpTexelSize = 1.0 / float(max(bumpTexDim.x, bumpTexDim.y));
+
+            // Sample luminance at 3 UV points (center, +du, +dv)
+            const vec3 bumpLumW = vec3(0.2126, 0.7152, 0.0722);
+            float hc = dot(texture(textures[nonuniformEXT(texBumpIdx)], bumpUV).rgb, bumpLumW);
+            float hx = dot(texture(textures[nonuniformEXT(texBumpIdx)], bumpUV + vec2(bumpTexelSize, 0)).rgb, bumpLumW);
+            float hy = dot(texture(textures[nonuniformEXT(texBumpIdx)], bumpUV + vec2(0, bumpTexelSize)).rgb, bumpLumW);
+
+            // Cycles formula: surfgrad = (h_x - h_c) * Rx + (h_y - h_c) * Ry
+            // where Rx = cross(dPdy, N), Ry = cross(N, dPdx), det = dot(dPdx, Rx)
+            // dPdu/dPdv passed from shade shader (computed from triangle vertices)
+            // Convert UV-space texel offset to world-space differential
+            vec3 dPdx = dPdu * bumpTexelSize;
+            vec3 dPdy = dPdv * bumpTexelSize;
+
+            // Cycles-matching cross products for bump basis
+            vec3 Rx = cross(dPdy, normal);
+            vec3 Ry = cross(normal, dPdx);
+            float det = dot(dPdx, Rx);
+
+            // Surface gradient in world space (Cycles formula)
+            vec3 sg = (hx - hc) * Rx + (hy - hc) * Ry;
+
+            // Output: gradient.xy in tangent space for OP_OUTPUT_BUMP
+            // Project world-space gradient onto tangent/bitangent
+            vec3 Tn = normalize(dPdu);
+            vec3 Bn = normalize(dPdv - Tn * dot(dPdv, Tn));
+            float sgLen = length(sg);
+            float sgSign = sign(det);
+            // Pass magnitude and det sign so OP_OUTPUT_BUMP can reconstruct
+            R[dst] = vec4(sgSign * dot(sg, Tn), sgSign * dot(sg, Bn), abs(det), hc);
+        }
         else if (opcode == OP_NOISE_BUMP) {
             // Evaluate noise at 3 positions for finite-difference gradient
             float scale = uintBitsToFloat(instr.y);
@@ -757,6 +799,7 @@ NodeVmResult executeNodeVm(uint matIdx, vec2 uv, vec3 worldPos, vec3 viewDir, ve
                 result.bumpGradient = R[srcA].xy;
                 result.bumpStrength = uintBitsToFloat(instr.y);
                 result.bumpDistance = uintBitsToFloat(instr.z);
+                result.bumpDet = R[srcA].z;  // |det| from OP_TEX_BUMP (0 for noise bump)
                 result.hasBump = true;
             }
         }

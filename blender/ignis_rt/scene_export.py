@@ -2418,6 +2418,7 @@ _OP_COLOR_BURN      = 0x2E
 _OP_SOFT_LIGHT      = 0x2F
 _OP_LINEAR_LIGHT    = 0x90
 _OP_NOISE_BUMP      = 0x93
+_OP_TEX_BUMP        = 0x96
 _OP_LOAD_VERTEX_COLOR = 0x94
 _OP_OBJECT_RANDOM   = 0x95
 _OP_OUTPUT_BUMP     = 0xF8
@@ -3728,24 +3729,39 @@ class _NodeVmCompiler:
         self._emit(_OP_MIX_REG, color_mix, srcA=color_a, srcB=color_b, imm_y=fac_reg & 0x1F)
         self._emit(_OP_OUTPUT_COLOR, srcA=color_mix)
 
-        # Compile and blend Roughness (Diffuse BSDF defaults to 1.0 in PBR)
-        _rough_default_a = 1.0 if (p1 and p1.type == 'BSDF_DIFFUSE') else 0.5
-        _rough_default_b = 1.0 if (p2 and p2.type == 'BSDF_DIFFUSE') else 0.5
-        rough_a = self._compile_principled_scalar_ctx(p1, 'Roughness', _rough_default_a, g1)
-        rough_b = self._compile_principled_scalar_ctx(p2, 'Roughness', _rough_default_b, g2)
-        rough_mix = self._alloc_reg()
-        self._emit(_OP_MIX_REG, rough_mix, srcA=rough_a, srcB=rough_b, imm_y=fac_reg & 0x1F)
-        self._emit(_OP_OUTPUT_ROUGH, srcA=rough_mix)
+        # Mix(Diffuse, Glossy) special case: use Glossy roughness directly
+        # and mix factor as specular level (Diffuse has no specular)
+        _is_dg_mix = (
+            (p1 and p1.type == 'BSDF_DIFFUSE' and p2 and p2.type == 'BSDF_GLOSSY') or
+            (p1 and p1.type == 'BSDF_GLOSSY' and p2 and p2.type == 'BSDF_DIFFUSE')
+        )
+        if _is_dg_mix:
+            # Roughness = Glossy BSDF's roughness (not blended with Diffuse's 1.0)
+            _glossy = p2 if (p2 and p2.type == 'BSDF_GLOSSY') else p1
+            _glossy_ctx = g2 if (p2 and p2.type == 'BSDF_GLOSSY') else g1
+            rough_out = self._compile_principled_scalar_ctx(_glossy, 'Roughness', 0.5, _glossy_ctx)
+            self._emit(_OP_OUTPUT_ROUGH, srcA=rough_out)
+            # Metallic = 0 (dielectric specular, not metallic)
+            metal_zero = self._alloc_reg()
+            self._emit(_OP_LOAD_SCALAR, metal_zero, imm_y=_floatBits(0.0))
+            self._emit(_OP_OUTPUT_METAL, srcA=metal_zero)
+        else:
+            # General blend of roughness and metallic
+            _rough_default_a = 1.0 if (p1 and p1.type == 'BSDF_DIFFUSE') else 0.5
+            _rough_default_b = 1.0 if (p2 and p2.type == 'BSDF_DIFFUSE') else 0.5
+            rough_a = self._compile_principled_scalar_ctx(p1, 'Roughness', _rough_default_a, g1)
+            rough_b = self._compile_principled_scalar_ctx(p2, 'Roughness', _rough_default_b, g2)
+            rough_mix = self._alloc_reg()
+            self._emit(_OP_MIX_REG, rough_mix, srcA=rough_a, srcB=rough_b, imm_y=fac_reg & 0x1F)
+            self._emit(_OP_OUTPUT_ROUGH, srcA=rough_mix)
 
-        # Compile and blend Metallic
-        # Diffuse BSDF = metallic 0.0, Glossy BSDF = metallic 1.0
-        _metal_default_a = 1.0 if (p1 and p1.type == 'BSDF_GLOSSY') else 0.0
-        _metal_default_b = 1.0 if (p2 and p2.type == 'BSDF_GLOSSY') else 0.0
-        metal_a = self._compile_principled_scalar_ctx(p1, 'Metallic', _metal_default_a, g1)
-        metal_b = self._compile_principled_scalar_ctx(p2, 'Metallic', _metal_default_b, g2)
-        metal_mix = self._alloc_reg()
-        self._emit(_OP_MIX_REG, metal_mix, srcA=metal_a, srcB=metal_b, imm_y=fac_reg & 0x1F)
-        self._emit(_OP_OUTPUT_METAL, srcA=metal_mix)
+            _metal_default_a = 1.0 if (p1 and p1.type == 'BSDF_GLOSSY') else 0.0
+            _metal_default_b = 1.0 if (p2 and p2.type == 'BSDF_GLOSSY') else 0.0
+            metal_a = self._compile_principled_scalar_ctx(p1, 'Metallic', _metal_default_a, g1)
+            metal_b = self._compile_principled_scalar_ctx(p2, 'Metallic', _metal_default_b, g2)
+            metal_mix = self._alloc_reg()
+            self._emit(_OP_MIX_REG, metal_mix, srcA=metal_a, srcB=metal_b, imm_y=fac_reg & 0x1F)
+            self._emit(_OP_OUTPUT_METAL, srcA=metal_mix)
 
         # Bump: use from whichever shader has it
         for p in (p1, p2):
@@ -3755,18 +3771,37 @@ class _NodeVmCompiler:
                 if norm_node.type == 'BUMP':
                     height_inp = norm_node.inputs.get('Height')
                     if height_inp and height_inp.is_linked:
+                        str_inp = norm_node.inputs.get('Strength')
+                        bstr = float(str_inp.default_value) if str_inp else 1.0
+                        dist_inp = norm_node.inputs.get('Distance')
+                        bdist = float(dist_inp.default_value) if dist_inp else 1.0
                         h_node = height_inp.links[0].from_node
-                        if h_node.type == 'TEX_NOISE' and not _find_image_texture_node(height_inp):
+
+                        # Image Texture bump (direct or through ColorRamp/nodes)
+                        tex_node = _find_image_texture_node(height_inp)
+                        if tex_node and tex_node.image:
+                            tex_idx = self.register_image(tex_node.image)
+                            uv_reg = self._alloc_reg()
+                            # Try to get UV from the texture's Vector input
+                            v_inp = tex_node.inputs.get('Vector')
+                            if v_inp and v_inp.is_linked:
+                                uv_reg = self._compile_uv_chain(v_inp)
+                            else:
+                                uv_reg = 0  # srcA=0 → shader uses hitUV
+                            grad_reg = self._alloc_reg()
+                            self._emit(_OP_TEX_BUMP, grad_reg, srcA=uv_reg, imm_z=tex_idx)
+                            self._emit(_OP_OUTPUT_BUMP, srcA=grad_reg,
+                                       imm_y=_floatBits(bstr), imm_z=_floatBits(bdist))
+                            break
+
+                        # Procedural noise bump
+                        if h_node.type == 'TEX_NOISE':
                             s_inp = h_node.inputs.get('Scale')
                             scale = float(s_inp.default_value) if s_inp and not s_inp.is_linked else 5.0
                             d_inp = h_node.inputs.get('Detail')
                             detail = float(d_inp.default_value) if d_inp and not d_inp.is_linked else 2.0
                             r_inp = h_node.inputs.get('Roughness')
                             rough = float(r_inp.default_value) if r_inp and not r_inp.is_linked else 0.5
-                            str_inp = norm_node.inputs.get('Strength')
-                            bstr = float(str_inp.default_value) if str_inp else 1.0
-                            dist_inp = norm_node.inputs.get('Distance')
-                            bdist = float(dist_inp.default_value) if dist_inp else 1.0
                             pos_reg = self._alloc_reg()
                             v_inp = h_node.inputs.get('Vector')
                             if v_inp and v_inp.is_linked:
@@ -3828,7 +3863,7 @@ class _NodeVmCompiler:
             reg = self._compile_node(alpha_inp)
             self._emit(_OP_OUTPUT_ALPHA, srcA=reg)
 
-        # ── 7. Compile procedural bump (Bump node with procedural height input) ──
+        # ── 7. Compile bump (procedural noise OR image texture) ──
         norm_inp = principled_node.inputs.get('Normal')
         if norm_inp and norm_inp.is_linked:
             norm_node = norm_inp.links[0].from_node
@@ -3836,8 +3871,28 @@ class _NodeVmCompiler:
                 height_inp = norm_node.inputs.get('Height')
                 if height_inp and height_inp.is_linked:
                     height_node = height_inp.links[0].from_node
-                    # Check if height comes from a procedural texture (not Image Texture)
-                    if height_node.type == 'TEX_NOISE' and not _find_image_texture_node(height_inp):
+
+                    # Image Texture bump (direct or through ColorRamp/nodes)
+                    _bump_tex_node = _find_image_texture_node(height_inp)
+                    if _bump_tex_node and _bump_tex_node.image:
+                        _bump_tex_idx = self.register_image(_bump_tex_node.image)
+                        _bump_str_inp = norm_node.inputs.get('Strength')
+                        _bump_str = float(_bump_str_inp.default_value) if _bump_str_inp else 1.0
+                        _bump_dist_inp = norm_node.inputs.get('Distance')
+                        _bump_dist = float(_bump_dist_inp.default_value) if _bump_dist_inp else 1.0
+                        _bump_uv_reg = self._alloc_reg()
+                        _bv_inp = _bump_tex_node.inputs.get('Vector')
+                        if _bv_inp and _bv_inp.is_linked:
+                            _bump_uv_reg = self._compile_uv_chain(_bv_inp)
+                        else:
+                            _bump_uv_reg = 0  # srcA=0 → shader uses hitUV
+                        _bump_grad_reg = self._alloc_reg()
+                        self._emit(_OP_TEX_BUMP, _bump_grad_reg, srcA=_bump_uv_reg, imm_z=_bump_tex_idx)
+                        self._emit(_OP_OUTPUT_BUMP, srcA=_bump_grad_reg,
+                                   imm_y=_floatBits(_bump_str), imm_z=_floatBits(_bump_dist))
+
+                    # Procedural noise bump
+                    elif height_node.type == 'TEX_NOISE':
                         # Get noise parameters
                         scale_inp = height_node.inputs.get('Scale')
                         scale = float(scale_inp.default_value) if scale_inp and not scale_inp.is_linked else 5.0
@@ -5473,9 +5528,42 @@ def _resolve_mix_shader(mix_node, register_image_fn):
         result['flags'] = result.get('flags', 0) | 2
         return result
 
-    # Blend properties by mix factor
-    # Specular level: Diffuse BSDF has NO specular (0), Glossy/Principled have specular (0.5)
-    # Blend proportionally so Mix(0.02, Diffuse, Glossy) gives specular_level=0.01 not 0.5
+    # Special case: Mix(Diffuse, Glossy) — common pattern for adding subtle reflection
+    # to a diffuse surface. In Cycles this runs two separate closures; we approximate
+    # as a Principled-like material: diffuse base + specular controlled by mix factor.
+    is_diffuse_glossy_mix = (
+        (s1_type == 'BSDF_DIFFUSE' and s2_type == 'BSDF_GLOSSY') or
+        (s1_type == 'BSDF_GLOSSY' and s2_type == 'BSDF_DIFFUSE')
+    )
+    if is_diffuse_glossy_mix:
+        diffuse_props = p1 if s1_type == 'BSDF_DIFFUSE' else p2
+        glossy_props = p1 if s1_type == 'BSDF_GLOSSY' else p2
+        glossy_fac = fac if s2_type == 'BSDF_GLOSSY' else (1.0 - fac)
+        blended = {
+            'base_color': diffuse_props['base_color'],
+            'roughness': glossy_props['roughness'],  # specular roughness from Glossy
+            'metallic': 0.0,  # not metallic — dielectric specular
+            'emission': diffuse_props['emission'],
+            'emission_strength': diffuse_props['emission_strength'],
+            'transmission': 0.0,
+            'ior': 1.5,
+            'transparent_prob': blended_tp,
+            'specular_level': glossy_fac,  # mix factor = how much specular
+            'hair_shift': 0.035,
+            'hair_radial_roughness': glossy_props['roughness'],
+            'hair_material': False,
+            'diffuse_tex': diffuse_props['diffuse_tex'],
+            'emission_tex': diffuse_props.get('emission_tex', _NO_TEX),
+            'normal_tex': diffuse_props.get('normal_tex', _NO_TEX) if diffuse_props.get('normal_tex', _NO_TEX) != _NO_TEX else glossy_props.get('normal_tex', _NO_TEX),
+            'normal_strength': diffuse_props.get('normal_strength', 1.0) if diffuse_props.get('normal_tex', _NO_TEX) != _NO_TEX else glossy_props.get('normal_strength', 1.0),
+        }
+        if blended_tp > 0.0:
+            blended['flags'] = diffuse_props.get('flags', 0) | glossy_props.get('flags', 0) | 2
+        if lightpath_transparent:
+            blended['flags'] = blended.get('flags', 0) | _MAT_FLAG_LIGHTPATH_TRANSPARENT
+        return blended
+
+    # General blend: merge properties by mix factor
     spec1 = p1.get('specular_level', 0.0 if s1_type == 'BSDF_DIFFUSE' else 0.5)
     spec2 = p2.get('specular_level', 0.0 if s2_type == 'BSDF_DIFFUSE' else 0.5)
 
@@ -5496,6 +5584,9 @@ def _resolve_mix_shader(mix_node, register_image_fn):
         # Texture: prefer the dominant shader's texture
         'diffuse_tex': p1['diffuse_tex'] if fac <= 0.5 else p2['diffuse_tex'],
         'emission_tex': p1['emission_tex'] if p1['emission_tex'] != _NO_TEX else p2['emission_tex'],
+        # Normal/bump: use whichever side has one
+        'normal_tex': p1.get('normal_tex', _NO_TEX) if p1.get('normal_tex', _NO_TEX) != _NO_TEX else p2.get('normal_tex', _NO_TEX),
+        'normal_strength': p1.get('normal_strength', 1.0) if p1.get('normal_tex', _NO_TEX) != _NO_TEX else p2.get('normal_strength', 1.0),
     }
     if blended_tp > 0.0:
         blended['flags'] = p1.get('flags', 0) | p2.get('flags', 0) | 2
