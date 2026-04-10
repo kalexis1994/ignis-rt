@@ -1,64 +1,108 @@
 // ============================================================
 // light_tree.glsl — Light tree traversal for importance-based light sampling
+// Binary BVH with orientation cones (Cycles/Estevez-Kulla matching)
 // Requires: lightTreeNodes SSBO at binding 27, cam UBO
 // ============================================================
 
 #ifndef LIGHT_TREE_GLSL
 #define LIGHT_TREE_GLSL
 
-// GPU light tree node (32 bytes = 2 vec4s)
+// GPU light tree node (64 bytes = 16 floats = 4 vec4s)
 // Matches LightTreeNode in light_tree.h
 struct LTNode {
     vec3 bboxMin;
     float energy;
     vec3 bboxMax;
     uint childOrFirst;  // inner: left child idx, leaf: first emitter idx
-    vec3 coneAxis;
+    vec3 coneAxis;      // orientation cone axis (normalized)
     uint countAndFlags; // 0 = inner node, >0 = leaf emitter count
+    float theta_o;      // orientation cone half-angle
+    float theta_e;      // emission spread angle
 };
 
-// Read a node from the SSBO (8 floats per node)
+// Read a node from the SSBO (16 floats per node)
 LTNode readLTNode(uint idx) {
     LTNode n;
-    uint base = idx * 8u;
+    uint base = idx * 16u;
     n.bboxMin = vec3(lightTreeData.d[base+0], lightTreeData.d[base+1], lightTreeData.d[base+2]);
     n.energy = lightTreeData.d[base+3];
     n.bboxMax = vec3(lightTreeData.d[base+4], lightTreeData.d[base+5], lightTreeData.d[base+6]);
     n.childOrFirst = floatBitsToUint(lightTreeData.d[base+7]);
-    // coneAxis and countAndFlags in next 8 floats
     n.coneAxis = vec3(lightTreeData.d[base+8], lightTreeData.d[base+9], lightTreeData.d[base+10]);
     n.countAndFlags = floatBitsToUint(lightTreeData.d[base+11]);
+    n.theta_o = lightTreeData.d[base+12];
+    n.theta_e = lightTreeData.d[base+13];
     return n;
 }
 
-// Compute importance of a node for a shading point
-float lightTreeImportance(LTNode node, vec3 worldPos, vec3 N) {
+// Compute importance of a node for a shading point (Cycles-matching)
+// Uses distance, incidence angle bounds, and orientation cone visibility
+float lightTreeImportance(LTNode node, vec3 P, vec3 N, bool hasTrans) {
     if (node.energy <= 0.0) return 0.0;
 
     // Distance to closest point on AABB
-    vec3 closest = clamp(worldPos, node.bboxMin, node.bboxMax);
-    float dist = max(length(closest - worldPos), 0.01);
+    vec3 closest = clamp(P, node.bboxMin, node.bboxMax);
+    float dist = max(length(closest - P), 0.01);
 
-    // Geometric importance: energy / distance²
-    float importance = node.energy / (dist * dist);
+    // Bounding sphere for angular extent
+    vec3 centroid = 0.5 * (node.bboxMin + node.bboxMax);
+    vec3 toCenter = centroid - P;
+    float distCenterSq = dot(toCenter, toCenter);
+    vec3 halfExt = node.bboxMax - centroid;
+    float radiusSq = dot(halfExt, halfExt);
 
-    // Angular importance: bias toward lights facing the surface
-    vec3 toNode = normalize((node.bboxMin + node.bboxMax) * 0.5 - worldPos);
-    float cosAngle = max(dot(N, toNode), 0.0);
-    importance *= (cosAngle * 0.8 + 0.2);  // soft angular falloff, never zero
+    // cos(theta_u): angular radius of bounding sphere from P
+    float cosTheta_u = (distCenterSq <= radiusSq) ? -1.0
+        : sqrt(max(1.0 - radiusSq / distCenterSq, 0.0));
+    float sinTheta_u = sqrt(max(1.0 - cosTheta_u * cosTheta_u, 0.0));
 
-    return importance;
+    // Incidence angle (N dot direction-to-cluster)
+    vec3 dir = normalize(toCenter);
+    float cosTheta_i = hasTrans ? abs(dot(N, dir)) : dot(N, dir);
+    float sinTheta_i = sqrt(max(1.0 - cosTheta_i * cosTheta_i, 0.0));
+
+    // Minimum incidence angle (tighten by bounding sphere angular size)
+    float cosMinIncidence;
+    if (cosTheta_i >= cosTheta_u) {
+        cosMinIncidence = 1.0;
+    } else {
+        cosMinIncidence = cosTheta_i * cosTheta_u + sinTheta_i * sinTheta_u;
+    }
+    if (!hasTrans && cosMinIncidence < 0.0) return 0.0;
+    cosMinIncidence = abs(cosMinIncidence);
+
+    // Outgoing angle (orientation cone visibility)
+    float cosTheta = dot(node.coneAxis, -dir);
+    float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+    float cosThetaMinusU = cosTheta * cosTheta_u + sinTheta * sinTheta_u;
+
+    float cosTheta_o = cos(node.theta_o);
+    float sinTheta_o = sin(node.theta_o);
+
+    float cosMinOutgoing;
+    if (cosTheta >= cosTheta_u || cosThetaMinusU >= cosTheta_o) {
+        cosMinOutgoing = 1.0;
+    } else if (node.theta_o + node.theta_e > PI ||
+               cosThetaMinusU > cos(node.theta_o + node.theta_e)) {
+        cosMinOutgoing = cosThetaMinusU * cosTheta_o
+            + sqrt(max(1.0 - cosThetaMinusU * cosThetaMinusU, 0.0)) * sinTheta_o;
+        cosMinOutgoing = max(cosMinOutgoing, 0.0);
+    } else {
+        return 0.0; // cluster entirely facing away
+    }
+
+    return cosMinIncidence * node.energy * cosMinOutgoing / (dist * dist);
 }
 
 // Sample a light from the tree. Returns emitter index and PDF.
-// maxEmitters = total number of emitters in the light array
-int lightTreeSample(vec3 worldPos, vec3 N, uint nodeCount, out float pdf) {
+int lightTreeSample(vec3 P, vec3 N, bool hasTrans, uint nodeCount, out float pdf) {
     pdf = 1.0;
     if (nodeCount == 0u) return -1;
 
     uint nodeIdx = 0u;
+    float rng = rand01();
 
-    // Traverse tree top-down
+    // Traverse tree top-down (max ~20 levels for 1M lights)
     for (int depth = 0; depth < 32; depth++) {
         LTNode node = readLTNode(nodeIdx);
 
@@ -66,9 +110,7 @@ int lightTreeSample(vec3 worldPos, vec3 N, uint nodeCount, out float pdf) {
         if (node.countAndFlags > 0u) {
             uint count = node.countAndFlags;
             uint first = node.childOrFirst;
-
-            // Uniform sampling within leaf (could use importance-weighted reservoir)
-            uint selected = first + uint(rand01() * float(count));
+            uint selected = first + uint(rng * float(count));
             if (selected >= first + count) selected = first + count - 1u;
             pdf *= 1.0 / float(count);
             return int(selected);
@@ -81,25 +123,23 @@ int lightTreeSample(vec3 worldPos, vec3 N, uint nodeCount, out float pdf) {
         LTNode leftNode = readLTNode(leftIdx);
         LTNode rightNode = readLTNode(rightIdx);
 
-        float leftImp = lightTreeImportance(leftNode, worldPos, N);
-        float rightImp = lightTreeImportance(rightNode, worldPos, N);
+        float leftImp = lightTreeImportance(leftNode, P, N, hasTrans);
+        float rightImp = lightTreeImportance(rightNode, P, N, hasTrans);
 
         float totalImp = leftImp + rightImp;
-        if (totalImp <= 0.0) {
-            // Fallback: 50/50
-            totalImp = 1.0;
-            leftImp = 0.5;
-        }
+        if (totalImp <= 0.0) return -1; // no visible lights
 
         float leftProb = leftImp / totalImp;
 
-        // Probabilistic descent
-        if (rand01() < leftProb) {
+        // Probabilistic descent with random number reuse (Cycles pattern)
+        if (rng < leftProb) {
             nodeIdx = leftIdx;
             pdf *= leftProb;
+            rng = rng / max(leftProb, 1e-8);
         } else {
             nodeIdx = rightIdx;
             pdf *= (1.0 - leftProb);
+            rng = (rng - leftProb) / max(1.0 - leftProb, 1e-8);
         }
     }
 

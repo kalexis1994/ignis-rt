@@ -7,7 +7,7 @@
 
 namespace acpt {
 
-// GPU-side light tree node (48 bytes = 12 floats = 3 vec4s)
+// GPU-side light tree node (64 bytes = 16 floats = 4 vec4s)
 struct LightTreeNode {
     float bboxMin[3];      // AABB min
     float energy;          // total energy of subtree
@@ -15,6 +15,9 @@ struct LightTreeNode {
     uint32_t childOrFirst; // inner: left child index, leaf: first emitter index
     float coneAxis[3];     // orientation cone axis (normalized)
     uint32_t countAndFlags;// bits [0:15] = emitter count (0 = inner), bits [16:31] = reserved
+    float theta_o;         // orientation cone half-angle (bounds emitter normals)
+    float theta_e;         // emission spread beyond cone (PI for isotropic point lights)
+    float pad[2];          // padding to 64 bytes
 };
 
 // CPU-side emitter for building the tree

@@ -122,15 +122,52 @@ std::vector<LightTreeNode> BuildLightTree(std::vector<LightEmitter>& emitters) {
         gn.bboxMax[0] = bn.bboxMax[0]; gn.bboxMax[1] = bn.bboxMax[1]; gn.bboxMax[2] = bn.bboxMax[2];
         gn.energy = bn.energy;
 
-        // Cone axis = centroid direction (simplified — full impl uses normal cones)
-        float len = sqrtf(bn.centroid[0]*bn.centroid[0] + bn.centroid[1]*bn.centroid[1] + bn.centroid[2]*bn.centroid[2]);
-        if (len > 0.001f) {
-            gn.coneAxis[0] = bn.centroid[0] / len;
-            gn.coneAxis[1] = bn.centroid[1] / len;
-            gn.coneAxis[2] = bn.centroid[2] / len;
-        } else {
-            gn.coneAxis[0] = 0; gn.coneAxis[1] = 1; gn.coneAxis[2] = 0;
+        // Compute orientation cone from emitter directions
+        // The cone axis is the average emission direction, theta_o bounds the spread
+        float axisSum[3] = {0, 0, 0};
+        float maxAngle = 0.0f;
+        bool hasDirectional = false;
+        for (int e = bn.firstEmitter; e < bn.firstEmitter + bn.count; e++) {
+            float dx = emitters[e].direction[0];
+            float dy = emitters[e].direction[1];
+            float dz = emitters[e].direction[2];
+            float dLen = sqrtf(dx*dx + dy*dy + dz*dz);
+            if (dLen > 0.001f) {
+                axisSum[0] += dx / dLen;
+                axisSum[1] += dy / dLen;
+                axisSum[2] += dz / dLen;
+                hasDirectional = true;
+            }
         }
+
+        float aLen = sqrtf(axisSum[0]*axisSum[0] + axisSum[1]*axisSum[1] + axisSum[2]*axisSum[2]);
+        if (hasDirectional && aLen > 0.001f) {
+            gn.coneAxis[0] = axisSum[0] / aLen;
+            gn.coneAxis[1] = axisSum[1] / aLen;
+            gn.coneAxis[2] = axisSum[2] / aLen;
+
+            // theta_o = max angle between cone axis and any emitter direction
+            for (int e = bn.firstEmitter; e < bn.firstEmitter + bn.count; e++) {
+                float dx = emitters[e].direction[0];
+                float dy = emitters[e].direction[1];
+                float dz = emitters[e].direction[2];
+                float dLen2 = sqrtf(dx*dx + dy*dy + dz*dz);
+                if (dLen2 > 0.001f) {
+                    float cosA = (dx*gn.coneAxis[0] + dy*gn.coneAxis[1] + dz*gn.coneAxis[2]) / dLen2;
+                    float angle = acosf(std::max(-1.0f, std::min(1.0f, cosA)));
+                    maxAngle = std::max(maxAngle, angle);
+                }
+            }
+            gn.theta_o = maxAngle;
+            // theta_e: area/spot lights have limited emission angle, point lights are isotropic
+            gn.theta_e = 3.14159f; // conservative: assume full hemisphere
+        } else {
+            // Isotropic emitters (point lights) — no preferred direction
+            gn.coneAxis[0] = 0; gn.coneAxis[1] = 1; gn.coneAxis[2] = 0;
+            gn.theta_o = 3.14159f;  // full sphere
+            gn.theta_e = 3.14159f;
+        }
+        gn.pad[0] = gn.pad[1] = 0.0f;
 
         bool isLeaf = (bn.leftChild == -1);
         if (isLeaf) {
