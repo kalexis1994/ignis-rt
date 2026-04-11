@@ -43,6 +43,11 @@ layout(binding = 2, set = 0) uniform CameraProperties {
     float sharcWarmupFactor;
 } cam;
 
+// Hybrid G-buffer (rasterized primary visibility — bindings 35-37, set 0)
+layout(binding = 35, set = 0, r32ui) uniform readonly uimage2D hybridPrimIdImg;
+layout(binding = 36, set = 0, rg32ui) uniform readonly uimage2D hybridInstanceInfoImg;
+layout(binding = 37, set = 0, r32f) uniform readonly image2D hybridDepthImg;
+
 // Wavefront buffers (set 1)
 #include "../include/pathstate.glsl"
 layout(binding = 1, set = 1, scalar) buffer HitResultBuffer { float hitData[]; } hitResults;
@@ -101,10 +106,27 @@ void main() {
     // Skip terminated paths
     if ((flags & 0x20u) != 0u) return;
 
+    uint bounce = flags & 0xFu;
+    bool hybridRasterMode = (cam.lightPad2 & 4u) != 0u;
+
+    // Hybrid rasterization: use rasterized depth as tMax hint for bounce 0.
+    // Instead of converting view-depth to ray distance (fragile at grazing
+    // angles), use a generous conservative bound: the view-space depth is
+    // always <= ray distance, so multiplying by a safety factor guarantees
+    // the hit is within range while still culling most of the BVH.
+    float tMax = 10000.0;
+    if (hybridRasterMode && bounce == 0u) {
+        ivec2 pixel = ivec2(pixelIndex % pc.width, pixelIndex / pc.width);
+        float hDepth = imageLoad(hybridDepthImg, pixel).r;
+        if (hDepth > 0.01 && hDepth < 9990.0) {
+            tMax = hDepth * 4.0 + 2.0;
+        }
+    }
+
     // Trace ray
     rayQueryEXT rq;
     rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT,
-                          0xFF, origin, MIN_HIT_DIST, dir, 10000.0);
+                          0xFF, origin, MIN_HIT_DIST, dir, tMax);
     while (rayQueryProceedEXT(rq)) {}
 
     // Write HitResult (20 floats: 8 base + 12 objToWorld)
