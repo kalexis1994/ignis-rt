@@ -153,6 +153,9 @@ void main() {
         vec2 prevNDC = prevClip.xy / prevClip.w;
         vec2 prevUV = vec2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
         vec2 motionVector = prevUV - currUV;
+        // Note: MVs must be pure geometric motion WITHOUT jitter.
+        // DLSS receives jitter offsets separately (InJitterOffsetX/Y)
+        // and handles sub-pixel alignment internally.
         float mvZ = (cam.viewPrev * vec4(prevWorldPos, 1.0)).z - primaryViewZ;
         imageStore(motionVectorsImg, pixel, vec4(motionVector, mvZ, 0));
 
