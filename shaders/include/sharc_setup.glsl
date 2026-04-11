@@ -163,37 +163,44 @@ void SharcUpdateMiss(SharcGridParams grid, SharcState state, vec3 skyRadiance, u
 
 bool SharcUpdateHit(SharcGridParams grid, inout SharcState state,
                     vec3 worldPos, vec3 normal,
-                    vec3 directLighting, float random, uint capacity) {
+                    vec3 directLighting, float random, uint capacity,
+                    float hitDist) {
+    // Per NVIDIA docs: skip update if segment is shorter than voxel size
+    uint level = sharcGetLevel(worldPos, grid);
+    float voxelSize = sharcVoxelSize(level, grid);
+    if (hitDist < voxelSize && state.pathLength > 0u) return true;
+
     uint64_t key = sharcHashKey(worldPos, normal, grid);
     uint slot = sharcInsert(key, capacity);
     if (slot == 0xFFFFFFFFu) return true;  // bucket full, continue tracing
 
-    vec3 radiance = directLighting;
+    // Write direct lighting to this voxel
+    sharcAccumulate(slot, directLighting, vec3(1.0));
 
-    // Check if we can early-out (cache already has good data)
+    // Backpropagate direct lighting to all previous vertices in the path
+    for (uint i = 0u; i < state.pathLength; i++) {
+        sharcAccumulate(state.cacheIndices[i], directLighting, state.sampleWeights[i]);
+    }
+
+    // Check if we can early-out using cached resolved data.
+    // Per NVIDIA docs: early-out is valid when cache has enough samples.
+    // Reduced probability (25%) to maintain sample diversity.
     if (state.pathLength >= 1u) {
         uint rOff = sharcResolvedOffset(slot, capacity);
-        float sampleNum = uintBitsToFloat(_sharcResolved.data[rOff + 3u]);
-        if (sampleNum > float(SHARC_SAMPLE_THRESHOLD) && random < 0.5) {
-            radiance = vec3(
+        uint sampleMeta = _sharcResolved.data[rOff + 3u];
+        float sampleNum = float(sampleMeta & 0xFFFFu);
+        if (sampleNum > 8.0 && random < 0.25) {
+            vec3 cached = vec3(
                 uintBitsToFloat(_sharcResolved.data[rOff + 0u]),
                 uintBitsToFloat(_sharcResolved.data[rOff + 1u]),
                 uintBitsToFloat(_sharcResolved.data[rOff + 2u])
             );
-            // Backpropagate to previous vertices
+            // Backpropagate cached radiance (includes future bounces) to prior vertices
             for (uint i = 0u; i < state.pathLength; i++) {
-                sharcAccumulate(state.cacheIndices[i], radiance, state.sampleWeights[i]);
+                sharcAccumulate(state.cacheIndices[i], cached, state.sampleWeights[i]);
             }
-            return false;  // stop tracing
+            return false;  // stop tracing — cached data used
         }
-    }
-
-    // Write direct lighting to this voxel
-    sharcAccumulate(slot, directLighting, vec3(1.0));
-
-    // Backpropagate to all previous vertices in the path
-    for (uint i = 0u; i < state.pathLength; i++) {
-        sharcAccumulate(state.cacheIndices[i], radiance, state.sampleWeights[i]);
     }
 
     // Shift path history and add current vertex
@@ -202,7 +209,7 @@ bool SharcUpdateHit(SharcGridParams grid, inout SharcState state,
         state.sampleWeights[i] = state.sampleWeights[i - 1u];
     }
     state.cacheIndices[0] = slot;
-    state.sampleWeights[0] = vec3(1.0);
+    state.sampleWeights[0] = vec3(1.0);  // reset to 1.0 — throughput applied by caller
     state.pathLength = min(state.pathLength + 1u, SHARC_PROPAGATION_DEPTH - 1u);
 
     return true;  // continue tracing

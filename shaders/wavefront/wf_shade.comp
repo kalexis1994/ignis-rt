@@ -809,9 +809,26 @@ void main() {
     }
 
     // ---- SHARC cache query (bounce 1+): early-out with cached GI ----
+    // Per NVIDIA docs: check segment length > voxel size before querying cache.
+    // Short segments produce unreliable voxel lookups.
     if (sharcEnabled && bounce >= 1u) {
+        uint sharcLevel = sharcGetLevel(worldPos, sharcGrid);
+        float voxelSize = sharcVoxelSize(sharcLevel, sharcGrid);
+        bool segmentValid = (hitT > voxelSize);
+
+        // Specular cone spread check: only use cache if the specular lobe
+        // is wider than the voxel. Prevents blocky artifacts on glossy surfaces.
+        // cone spread = 2 * hitT * sqrt(0.5 * alpha^2 / (1 - alpha^2))
+        bool specularSafe = true;
+        if (roughness < 0.5) {
+            float alpha2 = roughness * roughness;
+            float coneSpread = 2.0 * hitT * sqrt(0.5 * alpha2 / max(1.0 - alpha2, 0.01));
+            specularSafe = (coneSpread > voxelSize) || isDiffusePath;
+        }
+
         vec3 cachedRadiance;
-        if (SharcGetCachedRadiance(sharcGrid, worldPos, N, sharcCapacity, cachedRadiance)) {
+        if (segmentValid && specularSafe &&
+            SharcGetCachedRadiance(sharcGrid, worldPos, N, sharcCapacity, cachedRadiance)) {
             cachedRadiance *= cam.ptParams0.y; // giIntensity
             uint rBase = pixelIndex * 8u;
             vec3 contrib = cachedRadiance * throughput;
@@ -1962,21 +1979,15 @@ void main() {
             }
         }
 
-        // Guide bin accumulation: record light direction
-        float directLum = dot(directLighting, vec3(0.2126, 0.7152, 0.0722));
-        if (directLum > 0.001) {
-            uint64_t guideKey = sharcHashKey(worldPos, N, sharcGrid);
-            uint guideSlot = sharcInsert(guideKey, sharcCapacity);
-            if (guideSlot != 0xFFFFFFFFu) {
-                guideAccumulate(guideSlot, -rayDir, directLum, sharcCapacity);
-            }
-        }
-
         // SharcUpdateHit: insert/update cache, possibly early-out
         // directLighting is PRE-throughput; throughput applied via SharcSetThroughput
-        float sharcRandom = rand01();  // standard 50% resampling (warmup burst disabled)
+        float sharcRandom = rand01();
         bool continueTracing = SharcUpdateHit(sharcGrid, state,
-            worldPos, N, directLighting, sharcRandom, sharcCapacity);
+            worldPos, N, directLighting, sharcRandom, sharcCapacity, hitT);
+
+        // Per NVIDIA docs: set throughput THEN reset weights to 1.0
+        // SetThroughput multiplies existing weights; the 1.0 in sampleWeights[0]
+        // (set by SharcUpdateHit) ensures correct weighting for THIS vertex.
         SharcSetThroughput(state, throughput);
         storeSharcState(pixelIndex, state);
 
@@ -2316,28 +2327,10 @@ void main() {
         bool chooseDiffuse = (diffuseWeight > 0.001) ? (rand01() > specWeight) : false;
 
         if (chooseDiffuse && metallic < 1.0) {
-            // Diffuse — with SHARC path guiding for bounce 1+
-            bool useGuide = false;
-            if (sharcEnabled && bounce >= 1u) {
-                uint64_t guideKey = sharcHashKey(worldPos, N, sharcGrid);
-                uint guideSlot = sharcFind(guideKey, sharcCapacity);
-                if (guideSlot != 0xFFFFFFFFu) {
-                    float guidePdf;
-                    vec3 guideDir = guideSampleDirection(guideSlot, N, rand01(), rand01(),
-                                                         sharcCapacity, guidePdf);
-                    if (guidePdf > 0.0 && dot(guideDir, N) > 0.0) {
-                        rayDir = guideDir;
-                        float cosinePdf = max(dot(rayDir, N), 0.0) * INV_PI;
-                        float misWeight = guideMISWeight(cosinePdf, guidePdf, 0.5);
-                        throughput *= baseColor * (1.0 - metallic) * nonGlassCompensation * misWeight;
-                        useGuide = true;
-                    }
-                }
-            }
-            if (!useGuide) {
-                rayDir = sampleCosineHemisphere(rand2(), N);
-                throughput *= baseColor * (1.0 - metallic) * nonGlassCompensation;
-            }
+            // Diffuse — cosine hemisphere sampling
+            // (SHARC 6-bin path guiding removed: too coarse to help, adds overhead)
+            rayDir = sampleCosineHemisphere(rand2(), N);
+            throughput *= baseColor * (1.0 - metallic) * nonGlassCompensation;
             isDiffusePath = true;
         } else {
             // Specular (anisotropic when anisotropicFactor > 0)
