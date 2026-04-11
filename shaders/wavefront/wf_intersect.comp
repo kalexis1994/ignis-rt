@@ -43,10 +43,37 @@ layout(binding = 2, set = 0) uniform CameraProperties {
     float sharcWarmupFactor;
 } cam;
 
+// Geometry metadata for buffer-reference vertex/index access
+struct GeometryMetadata {
+    uint64_t vertexBufferAddress;
+    uint64_t indexBufferAddress;
+    uint64_t normalBufferAddress;
+    uint64_t uvBufferAddress;
+    uint64_t primMaterialBufferAddress;
+    uint64_t bitangentBufferAddress;
+    uint64_t primYBoundsAddress;
+    uint64_t colorBufferAddress;
+    uint vertexCount;
+    uint indexCount;
+};
+
+layout(binding = 3, set = 0, scalar) buffer GeometryMetadataBuffer {
+    GeometryMetadata geometries[];
+} geometryMetadata;
+
 // Hybrid G-buffer (rasterized primary visibility — bindings 35-37, set 0)
 layout(binding = 35, set = 0, r32ui) uniform readonly uimage2D hybridPrimIdImg;
 layout(binding = 36, set = 0, rg32ui) uniform readonly uimage2D hybridInstanceInfoImg;
 layout(binding = 37, set = 0, r32f) uniform readonly image2D hybridDepthImg;
+
+// Current-frame instance transforms (binding 51, set 0) — 3x4 row-major per instance
+layout(binding = 51, set = 0, std430) buffer CurrTransformBuf {
+    vec4 data[];
+} currTransforms;
+
+// Buffer references for vertex/index access
+layout(buffer_reference, scalar) buffer Vertices { float v[]; };
+layout(buffer_reference, scalar) buffer Indices { uint i[]; };
 
 // Wavefront buffers (set 1)
 #include "../include/pathstate.glsl"
@@ -93,6 +120,24 @@ vec3 evaluateSkyHDRI(vec3 dir) {
     return evaluateSky(dir);
 }
 
+// Compute barycentrics analytically from hit point and triangle vertices
+vec2 computeBarycentrics(vec3 hitPos, vec3 v0, vec3 v1, vec3 v2) {
+    vec3 e1 = v1 - v0;
+    vec3 e2 = v2 - v0;
+    vec3 ep = hitPos - v0;
+    float d11 = dot(e1, e1);
+    float d12 = dot(e1, e2);
+    float d22 = dot(e2, e2);
+    float dp1 = dot(ep, e1);
+    float dp2 = dot(ep, e2);
+    float denom = d11 * d22 - d12 * d12;
+    if (abs(denom) < 1e-12) return vec2(1.0/3.0);
+    float inv = 1.0 / denom;
+    float u = (d22 * dp1 - d12 * dp2) * inv;
+    float v = (d11 * dp2 - d12 * dp1) * inv;
+    return vec2(u, v);
+}
+
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= counters.activeRayCount) return;
@@ -109,49 +154,113 @@ void main() {
     uint bounce = flags & 0xFu;
     bool hybridRasterMode = (cam.lightPad2 & 4u) != 0u;
 
-    // Hybrid rasterization: use rasterized depth as tMax hint for bounce 0.
-    // Instead of converting view-depth to ray distance (fragile at grazing
-    // angles), use a generous conservative bound: the view-space depth is
-    // always <= ray distance, so multiplying by a safety factor guarantees
-    // the hit is within range while still culling most of the BVH.
-    float tMax = 10000.0;
+    // Write HitResult (20 floats: 8 base + 12 objToWorld)
+    uint hBase = idx * 20u;
+
+    // ── Hybrid rasterization: skip ray trace for bounce 0 ──
+    // Read the rasterized G-buffer (primitiveID, instance, depth) and
+    // compute barycentrics analytically from the triangle vertices.
+    // Eliminates 100% of primary ray TLAS traversal cost.
     if (hybridRasterMode && bounce == 0u) {
         ivec2 pixel = ivec2(pixelIndex % pc.width, pixelIndex / pc.width);
         float hDepth = imageLoad(hybridDepthImg, pixel).r;
+
         if (hDepth > 0.01 && hDepth < 9990.0) {
-            tMax = hDepth * 4.0 + 2.0;
+            uint hPrimId = imageLoad(hybridPrimIdImg, pixel).r;
+            uvec2 hInstInfo = imageLoad(hybridInstanceInfoImg, pixel).rg;
+            uint hInstanceIndex = hInstInfo.x;
+            uint hBlasIndex = hInstInfo.y;
+
+            // Read current-frame instance transform (3x4 row-major)
+            uint tBase = hInstanceIndex * 3u;
+            vec4 row0 = currTransforms.data[tBase + 0u];
+            vec4 row1 = currTransforms.data[tBase + 1u];
+            vec4 row2 = currTransforms.data[tBase + 2u];
+
+            // Build objToWorld matrix
+            mat4x3 objToWorld;
+            objToWorld[0] = vec3(row0.x, row1.x, row2.x);
+            objToWorld[1] = vec3(row0.y, row1.y, row2.y);
+            objToWorld[2] = vec3(row0.z, row1.z, row2.z);
+            objToWorld[3] = vec3(row0.w, row1.w, row2.w);
+
+            // Load triangle vertices from BLAS via buffer device address
+            GeometryMetadata geo = geometryMetadata.geometries[hBlasIndex];
+            Indices indices = Indices(geo.indexBufferAddress);
+            Vertices vertices = Vertices(geo.vertexBufferAddress);
+
+            uint i0 = indices.i[hPrimId * 3u + 0u];
+            uint i1 = indices.i[hPrimId * 3u + 1u];
+            uint i2 = indices.i[hPrimId * 3u + 2u];
+
+            vec3 lp0 = vec3(vertices.v[i0*3u+0u], vertices.v[i0*3u+1u], vertices.v[i0*3u+2u]);
+            vec3 lp1 = vec3(vertices.v[i1*3u+0u], vertices.v[i1*3u+1u], vertices.v[i1*3u+2u]);
+            vec3 lp2 = vec3(vertices.v[i2*3u+0u], vertices.v[i2*3u+1u], vertices.v[i2*3u+2u]);
+
+            // Transform to world space
+            vec3 wp0 = objToWorld * vec4(lp0, 1.0);
+            vec3 wp1 = objToWorld * vec4(lp1, 1.0);
+            vec3 wp2 = objToWorld * vec4(lp2, 1.0);
+
+            // Compute hitT from ray-plane intersection for precision
+            vec3 triNormal = cross(wp1 - wp0, wp2 - wp0);
+            float hitT;
+            float denom = dot(triNormal, dir);
+            if (abs(denom) > 1e-8) {
+                hitT = dot(wp0 - origin, triNormal) / denom;
+            } else {
+                // Degenerate — fallback to depth estimate
+                hitT = hDepth;
+            }
+            hitT = max(hitT, MIN_HIT_DIST);
+
+            // Compute world-space hit point and barycentrics
+            vec3 hitPos = origin + dir * hitT;
+            vec2 bary2 = computeBarycentrics(hitPos, wp0, wp1, wp2);
+
+            // Write hit result — identical format to ray query path
+            hitResults.hitData[hBase+0] = hitT;
+            hitResults.hitData[hBase+1] = uintBitsToFloat(hBlasIndex);
+            hitResults.hitData[hBase+2] = intBitsToFloat(int(hInstanceIndex));
+            hitResults.hitData[hBase+3] = intBitsToFloat(int(hPrimId));
+            hitResults.hitData[hBase+4] = bary2.x;
+            hitResults.hitData[hBase+5] = bary2.y;
+            hitResults.hitData[hBase+6] = uintBitsToFloat(1u); // hitType = hit
+            hitResults.hitData[hBase+7] = 0.0;
+            // objToWorld (row-major → column-major storage matching ray query output)
+            hitResults.hitData[hBase+8]  = objToWorld[0][0]; hitResults.hitData[hBase+9]  = objToWorld[1][0];
+            hitResults.hitData[hBase+10] = objToWorld[2][0]; hitResults.hitData[hBase+11] = objToWorld[3][0];
+            hitResults.hitData[hBase+12] = objToWorld[0][1]; hitResults.hitData[hBase+13] = objToWorld[1][1];
+            hitResults.hitData[hBase+14] = objToWorld[2][1]; hitResults.hitData[hBase+15] = objToWorld[3][1];
+            hitResults.hitData[hBase+16] = objToWorld[0][2]; hitResults.hitData[hBase+17] = objToWorld[1][2];
+            hitResults.hitData[hBase+18] = objToWorld[2][2]; hitResults.hitData[hBase+19] = objToWorld[3][2];
+            return;  // ← SKIP ray query entirely
         }
+        // hDepth invalid (sky pixel) — fall through to ray trace
     }
 
-    // Trace ray
+    // ── Standard ray query path (bounce 1+ or hybrid fallback) ──
     rayQueryEXT rq;
     rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT,
-                          0xFF, origin, MIN_HIT_DIST, dir, tMax);
+                          0xFF, origin, MIN_HIT_DIST, dir, 10000.0);
     while (rayQueryProceedEXT(rq)) {}
-
-    // Write HitResult (20 floats: 8 base + 12 objToWorld)
-    uint hBase = idx * 20u;
 
     if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
         // Sky miss — accumulate sky radiance and terminate
         vec3 throughput = psReadThroughput(idx);
         vec3 skyColor = evaluateSkyHDRI(dir) * throughput;
-        uint bounce = flags & 0xFu;
+        uint bncMiss = flags & 0xFu;
         bool isDiffuse = (flags & 0x10u) != 0u;
         float giIntensity = cam.ptParams0.y;
 
-        // MIS: halve diffuse BSDF-miss sky contribution (other half from env NEE in K2)
-        if (bounce > 0u && isDiffuse) skyColor *= 0.5;
+        if (bncMiss > 0u && isDiffuse) skyColor *= 0.5;
 
-        // Accumulate into PixelRadiance (8 floats per pixel)
         uint rBase = pixelIndex * 8u;
-        if (bounce == 0u) {
-            // Bounce 0 sky goes to diffuse (totalRadiance in original)
+        if (bncMiss == 0u) {
             pixelRadiance.radData[rBase+0] += skyColor.x;
             pixelRadiance.radData[rBase+1] += skyColor.y;
             pixelRadiance.radData[rBase+2] += skyColor.z;
         } else {
-            bool isDiffuse = (flags & 0x10u) != 0u;
             if (isDiffuse) {
                 pixelRadiance.radData[rBase+0] += skyColor.x * giIntensity;
                 pixelRadiance.radData[rBase+1] += skyColor.y * giIntensity;
@@ -163,11 +272,8 @@ void main() {
             }
         }
 
-        // Mark terminated
         psTerminate(idx, flags);
-
-        // Write empty hit
-        hitResults.hitData[hBase+6] = uintBitsToFloat(0u); // hitType = miss
+        hitResults.hitData[hBase+6] = uintBitsToFloat(0u);
         return;
     }
 
@@ -185,9 +291,8 @@ void main() {
     hitResults.hitData[hBase+3] = intBitsToFloat(primitiveId);
     hitResults.hitData[hBase+4] = bary2.x;
     hitResults.hitData[hBase+5] = bary2.y;
-    hitResults.hitData[hBase+6] = uintBitsToFloat(1u); // hitType = hit
-    hitResults.hitData[hBase+7] = 0.0; // pad
-    // objToWorld 3x4 matrix (12 floats) — row-major storage
+    hitResults.hitData[hBase+6] = uintBitsToFloat(1u);
+    hitResults.hitData[hBase+7] = 0.0;
     hitResults.hitData[hBase+8]  = objToWorld[0][0]; hitResults.hitData[hBase+9]  = objToWorld[1][0];
     hitResults.hitData[hBase+10] = objToWorld[2][0]; hitResults.hitData[hBase+11] = objToWorld[3][0];
     hitResults.hitData[hBase+12] = objToWorld[0][1]; hitResults.hitData[hBase+13] = objToWorld[1][1];

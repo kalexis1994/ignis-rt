@@ -1268,7 +1268,7 @@ bool RTPipeline::CreateDescriptorSetLayout() {
 
     // bindings 49-50: GI Reservoir SSBOs for ReSTIR GI (wavefront temporal reuse)
     // Separate from DI reservoirs (24-25) so both can run simultaneously
-    bindings.resize(51);
+    bindings.resize(52);
     for (uint32_t i = 49; i <= 50; i++) {
         bindings[i] = {};
         bindings[i].binding = i;
@@ -1276,6 +1276,13 @@ bool RTPipeline::CreateDescriptorSetLayout() {
         bindings[i].descriptorCount = 1;
         bindings[i].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
     }
+
+    // binding 51: current-frame instance transforms (for hybrid raster → ray skip)
+    bindings[51] = {};
+    bindings[51].binding = 51;
+    bindings[51].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[51].descriptorCount = 1;
+    bindings[51].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
 
     // Binding flags for partially bound descriptors
     std::vector<VkDescriptorBindingFlags> bindingFlags(bindings.size(), VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
@@ -1825,8 +1832,20 @@ bool RTPipeline::CreateDescriptorSet() {
     w28.dstBinding = 28;
     w28.descriptorCount = 1;
     w28.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    w28.pBufferInfo = &geomInfo;  // reuse dummy buffer
+    w28.pBufferInfo = &geomInfo;
     writes.push_back(w28);
+
+    // binding 51: currTransforms SSBO (dummy)
+    {
+        VkWriteDescriptorSet wr{};
+        wr.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr.dstSet = descriptorSet_;
+        wr.dstBinding = 51;
+        wr.descriptorCount = 1;
+        wr.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        wr.pBufferInfo = &geomInfo;
+        writes.push_back(wr);
+    }
 
     // Dummy image info for R8_UNORM storage images (confidence/reactive masks)
     VkDescriptorImageInfo dummyImageR8Info{};
@@ -2329,6 +2348,58 @@ void RTPipeline::UpdatePrevTransforms(const float* transforms, uint32_t instance
     write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     write.dstSet = descriptorSet_;
     write.dstBinding = 28;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &bufInfoDesc;
+
+    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+}
+
+void RTPipeline::UpdateCurrTransforms(const float* transforms, uint32_t instanceCount) {
+    if (!transforms || instanceCount == 0) return;
+
+    VkDevice device = context_->GetDevice();
+    VkDeviceSize bufSize = instanceCount * 12 * sizeof(float);
+
+    if (instanceCount > currTransformsCapacity_) {
+        if (currTransformsBuffer_) {
+            if (currTransformsMapped_) { vkUnmapMemory(device, currTransformsMemory_); currTransformsMapped_ = nullptr; }
+            vkDestroyBuffer(device, currTransformsBuffer_, nullptr);
+            currTransformsBuffer_ = VK_NULL_HANDLE;
+        }
+        if (currTransformsMemory_) { vkFreeMemory(device, currTransformsMemory_, nullptr); currTransformsMemory_ = VK_NULL_HANDLE; }
+
+        VkBufferCreateInfo bufInfo{};
+        bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufInfo.size = bufSize;
+        bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        vkCreateBuffer(device, &bufInfo, nullptr, &currTransformsBuffer_);
+
+        VkMemoryRequirements memReqs;
+        vkGetBufferMemoryRequirements(device, currTransformsBuffer_, &memReqs);
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memReqs.size;
+        allocInfo.memoryTypeIndex = context_->FindMemoryType(memReqs.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        vkAllocateMemory(device, &allocInfo, nullptr, &currTransformsMemory_);
+        vkBindBufferMemory(device, currTransformsBuffer_, currTransformsMemory_, 0);
+        vkMapMemory(device, currTransformsMemory_, 0, bufSize, 0, &currTransformsMapped_);
+        currTransformsCapacity_ = instanceCount;
+    }
+
+    memcpy(currTransformsMapped_, transforms, bufSize);
+
+    VkDescriptorBufferInfo bufInfoDesc{};
+    bufInfoDesc.buffer = currTransformsBuffer_;
+    bufInfoDesc.offset = 0;
+    bufInfoDesc.range = bufSize;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = descriptorSet_;
+    write.dstBinding = 51;
     write.descriptorCount = 1;
     write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     write.pBufferInfo = &bufInfoDesc;

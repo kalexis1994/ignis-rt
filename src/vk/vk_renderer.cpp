@@ -1378,6 +1378,7 @@ void Renderer::RenderFrameRT() {
     // prev == curr and the shader outputs zero motion vectors (no ghosting).
     if (rtPipeline_ && instanceTransformCount_ > 0) {
         rtPipeline_->UpdatePrevTransforms(prevInstanceTransforms_.data(), instanceTransformCount_);
+        rtPipeline_->UpdateCurrTransforms(currInstanceTransforms_.data(), instanceTransformCount_);
     }
 
     bool diagFlush = false;  // Set true to flush GPU between stages for crash isolation

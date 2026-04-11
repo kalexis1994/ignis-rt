@@ -179,6 +179,9 @@ public:
     // Per-instance previous transforms (binding 28)
     void UpdatePrevTransforms(const float* transforms, uint32_t instanceCount);
 
+    // Per-instance current transforms (binding 51) — for hybrid raster primary ray skip
+    void UpdateCurrTransforms(const float* transforms, uint32_t instanceCount);
+
     // Emissive triangle buffer for MIS (binding 26)
     void UpdateEmissiveTriangleBuffer(const float* data, uint32_t triangleCount);
 
@@ -394,6 +397,11 @@ private:
     VkDeviceMemory prevTransformsMemory_ = VK_NULL_HANDLE;
     void* prevTransformsMapped_ = nullptr;
     uint32_t prevTransformsCapacity_ = 0;
+
+    VkBuffer currTransformsBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory currTransformsMemory_ = VK_NULL_HANDLE;
+    void* currTransformsMapped_ = nullptr;
+    uint32_t currTransformsCapacity_ = 0;
 
     // Function pointers
     PFN_vkCreateRayTracingPipelinesKHR vkCreateRayTracingPipelinesKHR_ = nullptr;
