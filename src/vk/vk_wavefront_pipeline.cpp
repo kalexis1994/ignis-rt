@@ -297,8 +297,8 @@ bool WavefrontPipeline::CreateBuffers(uint32_t pixelCount) {
     // PixelRadiance: 32 bytes per pixel
     if (!CreateSSBO(device, physDevice, pixelCount * 32, &pixelRadianceBuffer_, &pixelRadianceMemory_)) return false;
 
-    // PrimaryGBuffer: 64 bytes per pixel
-    if (!CreateSSBO(device, physDevice, pixelCount * 64, &primaryGBufBuffer_, &primaryGBufMemory_)) return false;
+    // PrimaryGBuffer: 96 bytes per pixel (16 base floats + 8 PSR floats = 24 floats)
+    if (!CreateSSBO(device, physDevice, pixelCount * 96, &primaryGBufBuffer_, &primaryGBufMemory_)) return false;
 
     // Counters: 64 bytes (16 base + 20 sort bin counts + 20 sort bin offsets + 8 pad)
     if (!CreateSSBO(device, physDevice, 64, &countersBuffer_, &countersMemory_)) return false;

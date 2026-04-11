@@ -568,6 +568,20 @@ void main() {
         // Store secondary hitDist — K5 will use max(secondary, primary) for diffuse hitT
         // Encode as negative to distinguish from primary (K5 checks sign)
         pixelRadiance.radDataU[rBaseHit+3] = floatBitsToUint(-hitT);
+
+        // PSR: if primary surface was specular (bit 6), store the reflected
+        // surface position so output kernel can compute specular motion vectors
+        // from the object being reflected, not the mirror surface.
+        if ((flags & 0x40u) != 0u) {
+            uint gBase = pixelIndex * 24u;
+            primaryGBuf.gbufData[gBase+16] = worldPos.x;
+            primaryGBuf.gbufData[gBase+17] = worldPos.y;
+            primaryGBuf.gbufData[gBase+18] = worldPos.z;
+            primaryGBuf.gbufData[gBase+19] = localPos.x;
+            primaryGBuf.gbufData[gBase+20] = localPos.y;
+            primaryGBuf.gbufData[gBase+21] = localPos.z;
+            primaryGBuf.gbufData[gBase+22] = uintBitsToFloat(uint(instanceId));
+        }
     }
 
     // Penumbra tracking for NRD SIGMA / DLSS RR (written at bounce 0 sun NEE)
@@ -984,7 +998,7 @@ void main() {
 
         // Write G-buffer for volume surface (bounce 0)
         if (bounce == 0u && pc.sampleIdx == 0u) {
-            uint gBase = pixelIndex * 16u;
+            uint gBase = pixelIndex * 24u;
             primaryGBuf.gbufData[gBase+0] = N.x;
             primaryGBuf.gbufData[gBase+1] = N.y;
             primaryGBuf.gbufData[gBase+2] = N.z;
@@ -1064,7 +1078,7 @@ void main() {
     // Early glass returns before here, so this only fires for non-glass or
     // the resolved surface behind glass (last surface at bounce 0 wins).
     if (bounce == 0u && pc.sampleIdx == 0u) {
-        uint gBase = pixelIndex * 16u;
+        uint gBase = pixelIndex * 24u;
         primaryGBuf.gbufData[gBase+0] = N.x;
         primaryGBuf.gbufData[gBase+1] = N.y;
         primaryGBuf.gbufData[gBase+2] = N.z;
@@ -1096,9 +1110,21 @@ void main() {
         // Store hitDist in pixel radiance (bounce 0 only, no contention)
         pixelRadiance.radDataU[rBase+3] = floatBitsToUint(hitT);
 
-        // Store penumbra + NdotL in G-buffer for NRD SIGMA shadow denoising
-        // Uses last 2 floats of PrimaryGBuffer (customIndex, metallic, penumbra, primaryNdotL)
-        // These get updated again AFTER sun NEE runs, so we init here
+        // Initialize PSR slots to invalid (filled by bounce 1 if specular)
+        primaryGBuf.gbufData[gBase+16] = 0.0;  // psrWorldPos.x
+        primaryGBuf.gbufData[gBase+17] = 0.0;
+        primaryGBuf.gbufData[gBase+18] = 0.0;
+        primaryGBuf.gbufData[gBase+19] = 0.0;  // psrLocalPos.x
+        primaryGBuf.gbufData[gBase+20] = 0.0;
+        primaryGBuf.gbufData[gBase+21] = 0.0;
+        primaryGBuf.gbufData[gBase+22] = uintBitsToFloat(0xFFFFFFFFu);  // psrInstanceId = invalid
+        primaryGBuf.gbufData[gBase+23] = uintBitsToFloat(floatBitsToUint(roughness));  // primaryRoughness for PSR threshold
+
+        // Mark specular for PSR: if roughness < threshold, bounce 1 will
+        // write reflected surface data for specular motion vectors
+        if (roughness < 0.4) {
+            flags |= 0x40u;  // bit 6 = primaryWasSpecular
+        }
     }
 
     // ---- Glass/thin transmission detection ----
@@ -2373,7 +2399,7 @@ void main() {
                 newSample.M = 0.0;
 
                 // Read primary surface data for target PDF
-                uint gBase = pixelIndex * 16u;
+                uint gBase = pixelIndex * 24u;
                 vec3 primaryN = vec3(primaryGBuf.gbufData[gBase+0],
                                      primaryGBuf.gbufData[gBase+1],
                                      primaryGBuf.gbufData[gBase+2]);
@@ -2393,7 +2419,7 @@ void main() {
 
         if (bounce == 0u && pc.sampleIdx == 0u) {
             // Temporal reuse: apply previous frame's GI reservoir
-            uint gBase = pixelIndex * 16u;
+            uint gBase = pixelIndex * 24u;
             vec3 primaryN = N;
             vec3 primaryPos = worldPos;
 

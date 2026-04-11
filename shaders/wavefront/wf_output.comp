@@ -111,8 +111,17 @@ void main() {
                          uintBitsToFloat(pixelRadiance.radDataU[rBase+5]),
                          uintBitsToFloat(pixelRadiance.radDataU[rBase+6])) * sppInv;
 
-    // Read primary G-buffer (16 floats per pixel, written by K2)
-    uint gBase = pixelIndex * 16u;
+    // Firefly suppression — clamp outlier samples that cause bright splotches.
+    // NRD had built-in anti-firefly; with DLSS RR only, we clamp here.
+    const float FIREFLY_MAX = 100.0;
+    diffuse = min(diffuse, vec3(FIREFLY_MAX));
+    specular = min(specular, vec3(FIREFLY_MAX));
+    // NaN guard — replace with zero (NaN propagation causes black pixels)
+    if (any(isnan(diffuse)))  diffuse  = vec3(0.0);
+    if (any(isnan(specular))) specular = vec3(0.0);
+
+    // Read primary G-buffer (24 floats per pixel, written by K2)
+    uint gBase = pixelIndex * 24u;
     vec3 primaryNormal = vec3(primaryGBuf.gbufData[gBase+0],
                                primaryGBuf.gbufData[gBase+1],
                                primaryGBuf.gbufData[gBase+2]);
@@ -171,8 +180,43 @@ void main() {
         float ndcZ = clamp(clipPos.z / clipPos.w, 0.0, 1.0);
         imageStore(dlssDepthImg, pixel, vec4(ndcZ, 0, 0, 0));
 
-        // Specular MV (same as regular MV for wavefront — no PSR tracking yet)
-        imageStore(specularMVImg, pixel, vec4(motionVector, 0, 0));
+        // Specular MV — use PSR (Primary Surface Replacement) when available.
+        // For specular surfaces (roughness < 0.4), wf_shade stores the reflected
+        // surface's worldPos/localPos/instanceId at gbuf offsets 16-22.
+        // Motion vectors computed from the reflected object track the actual
+        // visual content in reflections, eliminating ghosting during camera motion.
+        vec3 psrWorldPos = vec3(primaryGBuf.gbufData[gBase+16],
+                                 primaryGBuf.gbufData[gBase+17],
+                                 primaryGBuf.gbufData[gBase+18]);
+        uint psrInstanceId = floatBitsToUint(primaryGBuf.gbufData[gBase+22]);
+        bool hasPSR = (psrInstanceId != 0xFFFFFFFFu) && (primaryRoughness < 0.4);
+
+        if (hasPSR) {
+            // Compute specular MV from reflected surface
+            vec3 psrLocalPos = vec3(primaryGBuf.gbufData[gBase+19],
+                                     primaryGBuf.gbufData[gBase+20],
+                                     primaryGBuf.gbufData[gBase+21]);
+            uint psrTBase = psrInstanceId * 3u;
+            vec4 psrPrevRow0 = prevTransforms.data[psrTBase + 0u];
+            vec4 psrPrevRow1 = prevTransforms.data[psrTBase + 1u];
+            vec4 psrPrevRow2 = prevTransforms.data[psrTBase + 2u];
+            vec4 psrLP = vec4(psrLocalPos, 1.0);
+            vec3 psrPrevWorldPos = vec3(dot(psrPrevRow0, psrLP),
+                                         dot(psrPrevRow1, psrLP),
+                                         dot(psrPrevRow2, psrLP));
+
+            vec4 psrCurrClip = cam.proj * cam.view * vec4(psrWorldPos, 1.0);
+            vec2 psrCurrNDC = psrCurrClip.xy / psrCurrClip.w;
+            vec2 psrCurrUV = vec2(psrCurrNDC.x * 0.5 + 0.5, 0.5 - psrCurrNDC.y * 0.5);
+            vec4 psrPrevClip = cam.projPrev * cam.viewPrev * vec4(psrPrevWorldPos, 1.0);
+            vec2 psrPrevNDC = psrPrevClip.xy / psrPrevClip.w;
+            vec2 psrPrevUV = vec2(psrPrevNDC.x * 0.5 + 0.5, 0.5 - psrPrevNDC.y * 0.5);
+            vec2 specMV = psrPrevUV - psrCurrUV;
+            imageStore(specularMVImg, pixel, vec4(specMV, 0, 0));
+        } else {
+            // Non-specular or no PSR data: use regular geometric MV
+            imageStore(specularMVImg, pixel, vec4(motionVector, 0, 0));
+        }
 
         // Specular albedo (EnvBRDFApprox) for DLSS Ray Reconstruction
         float primaryMetallic = uintBitsToFloat(pixelRadiance.radDataU[rBase+7]);
