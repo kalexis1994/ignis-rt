@@ -491,15 +491,6 @@ def _export_particle_hair(eval_obj, particle_system, depsgraph):
 
     S = all_keys.shape[0]  # total strands
 
-    import os
-    try:
-        with open(os.path.join(os.path.expanduser("~"), "ignis-rt.log"), "a") as _lf:
-            _lf.write(f"[ignis-hair] '{eval_obj.name}': {n_parents} parents + "
-                      f"{S - n_parents} children = {S} strands, "
-                      f"root_r={root_radius:.5f} tip_f={tip_factor:.2f}\n")
-    except Exception:
-        pass
-
     # ── Vectorized ribbon geometry for ALL strands at once ──
     K = n_keys
 
@@ -653,19 +644,6 @@ def export_meshes(depsgraph):
             _walk_layer_collections(child, hidden)
     try:
         _walk_layer_collections(depsgraph.view_layer.layer_collection)
-    except Exception as _e:
-        import os
-        with open(os.path.join(os.path.expanduser("~"), "ignis-rt.log"), "a") as _lf:
-            _lf.write(f"[ignis-export] ERROR walking layer_collections: {_e}\n")
-
-    # Log what we found
-    import os
-    try:
-        with open(os.path.join(os.path.expanduser("~"), "ignis-rt.log"), "a") as _lf:
-            _lf.write(f"[ignis-export] Hidden by collection: {len(hidden_by_collection)} objects\n")
-            if hidden_by_collection:
-                for name in sorted(hidden_by_collection)[:10]:
-                    _lf.write(f"  hidden: '{name}'\n")
     except Exception:
         pass
 
@@ -725,46 +703,44 @@ def export_meshes(depsgraph):
                 continue
 
             tri_count = len(mesh.loop_triangles)
-            raw_vert_count = tri_count * 3
+            n_loops = len(mesh.loops)
 
-            # Loop indices (which mesh.loops form each triangle)
-            tri_loops = np.empty(raw_vert_count, dtype=np.int32)
+            # ── Index buffer: tri_loops indexes into mesh.loops ──
+            # Each loop is a unique polygon corner with its own normal/UV/color.
+            # Using loops as vertices avoids O(N log N) deduplication entirely.
+            tri_loops = np.empty(tri_count * 3, dtype=np.int32)
             mesh.loop_triangles.foreach_get("loops", tri_loops)
+            indices = tri_loops.astype(np.uint32)
 
-            # Vertex indices (which mesh.vertices form each triangle)
-            tri_verts = np.empty(raw_vert_count, dtype=np.int32)
-            mesh.loop_triangles.foreach_get("vertices", tri_verts)
+            # ── Vertex buffer: one GPU vertex per loop ──
+            # Positions: loop → vertex_index → mesh.vertices[].co
+            loop_vert_indices = np.empty(n_loops, dtype=np.int32)
+            mesh.loops.foreach_get("vertex_index", loop_vert_indices)
 
-            # --- All vertex positions (local space, Blender Z-up) ---
             all_positions = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
             mesh.vertices.foreach_get("co", all_positions)
             all_positions = all_positions.reshape(-1, 3)
+            positions = all_positions[loop_vert_indices]  # (n_loops, 3)
 
-            # --- Per-corner normals ---
-            all_loop_normals = np.empty(len(mesh.loops) * 3, dtype=np.float32)
+            # Normals: per-corner, directly from loops
+            all_loop_normals = np.empty(n_loops * 3, dtype=np.float32)
             try:
                 mesh.corner_normals.foreach_get("vector", all_loop_normals)
             except (AttributeError, RuntimeError):
                 mesh.calc_normals_split()
                 mesh.loops.foreach_get("normal", all_loop_normals)
-            all_loop_normals = all_loop_normals.reshape(-1, 3)
+            normals = all_loop_normals.reshape(-1, 3)  # (n_loops, 3)
 
-            # Unroll per triangle corner (positions stay in Blender local space;
-            # TLAS transform handles Z-up → Y-up conversion)
-            positions = all_positions[tri_verts]       # (raw_vert_count, 3)
-            normals = all_loop_normals[tri_loops]      # (raw_vert_count, 3)
-
-            # UVs
-            uvs = np.zeros((raw_vert_count, 2), dtype=np.float32)
+            # UVs: per-corner, directly from loops
+            uvs = np.zeros((n_loops, 2), dtype=np.float32)
             if mesh.uv_layers.active is not None:
                 uv_data = mesh.uv_layers.active.data
                 all_loop_uvs = np.empty(len(uv_data) * 2, dtype=np.float32)
                 uv_data.foreach_get("uv", all_loop_uvs)
-                all_loop_uvs = all_loop_uvs.reshape(-1, 2)
-                uvs = all_loop_uvs[tri_loops]
+                uvs = all_loop_uvs.reshape(-1, 2)  # (n_loops, 2)
 
-            # Vertex Colors
-            vcols = np.ones((raw_vert_count, 4), dtype=np.float32)  # default white RGBA
+            # Vertex Colors: per-corner or per-point
+            vcols = np.ones((n_loops, 4), dtype=np.float32)  # default white RGBA
             _has_vcols = False
             if mesh.color_attributes and len(mesh.color_attributes) > 0:
                 try:
@@ -774,58 +750,17 @@ def export_meshes(depsgraph):
                     if color_attr.domain == 'CORNER':
                         all_colors = np.empty(len(color_attr.data) * 4, dtype=np.float32)
                         color_attr.data.foreach_get("color", all_colors)
-                        all_colors = all_colors.reshape(-1, 4)
-                        vcols = all_colors[tri_loops]
+                        vcols = all_colors.reshape(-1, 4)  # (n_loops, 4) — 1:1 with loops
                     elif color_attr.domain == 'POINT':
                         all_colors = np.empty(len(color_attr.data) * 4, dtype=np.float32)
                         color_attr.data.foreach_get("color", all_colors)
                         all_colors = all_colors.reshape(-1, 4)
-                        # Map point colors to triangle corners via vertex indices
-                        tri_verts = mesh.loops  # loop -> vertex mapping
-                        loop_to_vert = np.empty(len(tri_verts), dtype=np.int32)
-                        tri_verts.foreach_get("vertex_index", loop_to_vert)
-                        vcols = all_colors[loop_to_vert[tri_loops]]
+                        vcols = all_colors[loop_vert_indices]  # map point → loop via vertex_index
                     _has_vcols = True
-                    import os as _os_vc2
-                    try:
-                        avg = vcols.mean(axis=0)
-                        with open(_os_vc2.path.join(_os_vc2.path.expanduser("~"), "ignis-rt.log"), "a") as _f:
-                            _f.write(f"[ignis-vcol] '{obj.name}' mesh '{mesh.name}': HAS vertex colors — avg=({avg[0]:.3f},{avg[1]:.3f},{avg[2]:.3f},{avg[3]:.3f})\n")
-                    except: pass
                 except Exception:
                     pass  # Keep default white
-            if not _has_vcols:
-                import os as _os_vc
-                try:
-                    with open(_os_vc.path.join(_os_vc.path.expanduser("~"), "ignis-rt.log"), "a") as _f:
-                        _f.write(f"[ignis-vcol] '{obj.name}' mesh '{mesh.name}': NO vertex colors — using white default\n")
-                except: pass
 
-            # ---- Vertex deduplication ----
-            # Skip dedup for large meshes (>50K tris) — np.unique is O(N log N)
-            # and takes seconds on multi-million triangle meshes
-            DEDUP_THRESHOLD = 500000
-            if tri_count <= DEDUP_THRESHOLD:
-                combined = np.ascontiguousarray(
-                    np.hstack([positions, normals, uvs, vcols]), dtype=np.float32)  # pos(3)+norm(3)+uv(2)+color(4)=12
-                void_dt = np.dtype((np.void, combined.dtype.itemsize * combined.shape[1]))
-                _, unique_idx, inverse = np.unique(
-                    combined.view(void_dt).ravel(),
-                    return_index=True, return_inverse=True)
-                dedup_pos = combined[unique_idx, :3]
-                dedup_nrm = combined[unique_idx, 3:6]
-                dedup_uvs = combined[unique_idx, 6:8]
-                dedup_vcols = combined[unique_idx, 8:12]
-                dedup_indices = inverse.astype(np.uint32)
-                dedup_vert_count = len(unique_idx)
-            else:
-                # Large mesh: use raw unrolled vertices (no dedup, more VRAM but instant)
-                dedup_pos = positions
-                dedup_nrm = normals
-                dedup_uvs = uvs
-                dedup_vcols = vcols
-                dedup_indices = np.arange(raw_vert_count, dtype=np.uint32)
-                dedup_vert_count = raw_vert_count
+            vertex_count = n_loops
 
             # Per-triangle material indices
             tri_mat_indices = np.empty(tri_count, dtype=np.int32)
@@ -833,15 +768,15 @@ def export_meshes(depsgraph):
 
             unique_meshes[mesh_key] = {
                 "name": mesh_key,
-                "positions": np.ascontiguousarray(dedup_pos.flatten(), dtype=np.float32),
-                "normals": np.ascontiguousarray(dedup_nrm.flatten(), dtype=np.float32),
-                "uvs": np.ascontiguousarray(dedup_uvs.flatten(), dtype=np.float32),
-                "vcols": np.ascontiguousarray(dedup_vcols.flatten(), dtype=np.float32),
-                "indices": np.ascontiguousarray(dedup_indices, dtype=np.uint32),
-                "vertex_count": dedup_vert_count,
-                "index_count": len(dedup_indices),
+                "positions": np.ascontiguousarray(positions.flatten(), dtype=np.float32),
+                "normals": np.ascontiguousarray(normals.flatten(), dtype=np.float32),
+                "uvs": np.ascontiguousarray(uvs.flatten(), dtype=np.float32),
+                "vcols": np.ascontiguousarray(vcols.flatten(), dtype=np.float32),
+                "indices": np.ascontiguousarray(indices, dtype=np.uint32),
+                "vertex_count": vertex_count,
+                "index_count": len(indices),
                 "tri_count": tri_count,
-                "raw_vert_count": raw_vert_count,
+                "raw_vert_count": tri_count * 3,
                 "tri_material_indices": tri_mat_indices,
             }
             eval_obj.to_mesh_clear()
@@ -905,51 +840,6 @@ def export_meshes(depsgraph):
                     "hide_viewport": obj.hide_viewport,
                     "visible_camera": getattr(obj, 'visible_camera', '?'),
                 })
-                import os
-                try:
-                    with open(os.path.join(os.path.expanduser("~"), "ignis-rt.log"), "a") as _lf:
-                        _lf.write(f"[ignis-export] Hair '{hair_key}': {hair_mesh['tri_count']} tris from {len(ps.particles)} strands\n")
-                        _lf.flush()
-                except Exception:
-                    pass
-
-    # Dump ALL instances to file for ghost mesh diagnosis
-    import os
-    try:
-        _dump_path = os.path.join(os.path.expanduser("~"), "ignis-instances.txt")
-        with open(_dump_path, "w") as _df:
-            _df.write(f"Total: {len(unique_meshes)} meshes, {len(instances)} instances\n\n")
-            for idx, inst in enumerate(instances):
-                t = inst["transform_3x4"]
-                _df.write(f"[{idx:3d}] mesh='{inst['mesh_key']}' "
-                          f"hide_vp={inst.get('hide_viewport',False)} hide_r={inst.get('hide_render',False)} "
-                          f"vis_cam={inst.get('visible_camera','?')} "
-                          f"pos=({t[3]:.2f}, {t[7]:.2f}, {t[11]:.2f})\n")
-    except Exception:
-        pass
-
-    # Log instance stats + check for duplicate transforms (ghost mesh diagnosis)
-    import os
-    _log_path = os.path.join(os.path.expanduser("~"), "ignis-rt.log")
-    try:
-        from collections import Counter
-        key_counts = Counter(i["mesh_key"] for i in instances)
-        dupes = {k: v for k, v in key_counts.items() if v > 1}
-        if dupes:
-            with open(_log_path, "a") as _lf:
-                _lf.write(f"[ignis-export] Instanced objects ({len(dupes)} unique, {sum(dupes.values())} instances):\n")
-                for k, v in sorted(dupes.items(), key=lambda x: -x[1])[:10]:
-                    _lf.write(f"  '{k}' x{v}\n")
-                # Log transforms for instanced "Small Windows" or similar
-                for k in list(dupes.keys())[:3]:
-                    _lf.write(f"  Transforms for '{k}':\n")
-                    for inst in instances:
-                        if inst["mesh_key"] == k:
-                            t = inst["transform_3x4"]
-                            _lf.write(f"    pos=({t[3]:.2f}, {t[7]:.2f}, {t[11]:.2f})\n")
-                _lf.flush()
-    except Exception:
-        pass
 
     return unique_meshes, instances, obj_to_mesh_key, hidden_by_collection
 
@@ -1573,26 +1463,14 @@ def export_world_hdri(depsgraph):
 
     # Check if we need to bake the World node tree
     _needs_bake = _world_needs_baking(world)
-    import os as _wos
-    try:
-        with open(_wos.path.join(_wos.path.expanduser("~"), "ignis-rt.log"), "a") as _wf:
-            _node_types = [n.type for n in world.node_tree.nodes] if world.node_tree else []
-            _wf.write(f"[ignis-world] World='{world.name}' needs_bake={_needs_bake} nodes={_node_types}\n")
-    except Exception:
-        pass
 
     if _needs_bake:
         try:
             result = _bake_world_to_hdri(world, resolution=1024)
             if result:
                 return result
-        except Exception as e:
-            try:
-                with open(_wos.path.join(_wos.path.expanduser("~"), "ignis-rt.log"), "a") as _wf:
-                    import traceback
-                    _wf.write(f"[ignis-world] Bake FAILED: {e}\n{traceback.format_exc()}\n")
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     # ── Simple path: find TEX_ENVIRONMENT directly ──
     bg_node = None
@@ -3073,11 +2951,6 @@ class _NodeVmCompiler:
         if from_node.type in ('ATTRIBUTE', 'VERTEX_COLOR'):
             attr_name = getattr(from_node, 'attribute_name', '')
             attr_type = getattr(from_node, 'attribute_type', 'GEOMETRY')
-            import os as _os_attr
-            try:
-                with open(_os_attr.path.join(_os_attr.path.expanduser("~"), "ignis-rt.log"), "a") as _f:
-                    _f.write(f"[ignis-attr] '{from_node.name}': type={attr_type} name='{attr_name}'\n")
-            except: pass
             self._emit(_OP_LOAD_VERTEX_COLOR, dst)
             self.node_reg_cache[node_id] = dst
             return dst
@@ -6220,13 +6093,6 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                 _original_surface_node = surface_node
             # Debug: log what Material Output points to
             import os as _os2
-            try:
-                with open(_os2.path.join(_os2.path.expanduser("~"), "ignis-rt.log"), "a") as _f:
-                    _stype = surface_node.type if surface_node else "None"
-                    _sname = surface_node.name if surface_node else "N/A"
-                    _f.write(f"[ignis-chain] '{mat.name}': MatOutput->Surface = {_stype} ({_sname})\n")
-            except: pass
-
             # Follow chain from Material Output → Surface
             _follow_depth = 0
             while surface_node is not None and _follow_depth < 8:
@@ -6258,13 +6124,6 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
                     if 'coat_roughness' in props: color_saturation = props['coat_roughness']
                     if props.get('hair_material', False): flags |= _MAT_FLAG_HAIR
                     _mix_shader_resolved = True
-                    import os
-                    try:
-                        with open(os.path.join(os.path.expanduser("~"), "ignis-rt.log"), "a") as _f:
-                            _f.write(f"[ignis-mix] '{mat.name}': Mix Shader resolved — "
-                                     f"color=({base_color[0]:.3f},{base_color[1]:.3f},{base_color[2]:.3f}) "
-                                     f"rough={roughness:.2f} metal={metallic:.2f} spec={specular_level:.4f} tp={transparent_prob:.2f}\n")
-                    except: pass
                     # Find the BEST Principled BSDF for VM compilation.
                     # Prefer the shader with linked inputs (textures/nodes) over
                     # simple constants, since the VM adds value for per-pixel evaluation.
@@ -6650,48 +6509,6 @@ def export_materials(depsgraph, hidden_objects=None, existing_mapping=None):
             vm_code = _compile_node_vm(principled_node, _register_image, surface_node=_vm_surface,
                                        emission_node=_vm_emission, group_node=_principled_group_node)
             if vm_code:
-                mat_key_name = mat.name if mat else "?"
-                print(f"[ignis-vm] '{mat_key_name}': compiled {len(vm_code)} instructions")
-                # Dump VM instructions + Group internals for debugging
-                import os as _os3
-                try:
-                    _opnames = {0x01:'SAMPLE_TEX',0x10:'UV_TRANSFORM',0x11:'UV_ROTATE',
-                        0x20:'MIX',0x21:'MIX_REG',0x22:'MULTIPLY',0x2B:'HUE_SAT',
-                        0x41:'MATH_ADD',0x42:'MATH_MUL',0x49:'MATH_SUB',
-                        0x60:'LOAD_CONST',0x61:'LOAD_SCALAR',
-                        0x62:'LOAD_WORLD_POS',0x80:'TEX_NOISE',0x93:'NOISE_BUMP',
-                        0x95:'OBJECT_RANDOM',
-                        0xEF:'OUTPUT_UV',0xF0:'OUTPUT_COLOR',0xF1:'OUTPUT_ROUGH',
-                        0xF2:'OUTPUT_METAL',0xF3:'OUTPUT_EMISSION',0xF4:'OUTPUT_ALPHA',
-                        0xF8:'OUTPUT_BUMP'}
-                    with open(_os3.path.join(_os3.path.expanduser("~"), "ignis-rt.log"), "a") as _f:
-                        _f.write(f"[ignis-vm-dump] '{mat_key_name}' ({len(vm_code)} instrs):\n")
-                        for _i, _instr in enumerate(vm_code):
-                            _op = _instr[0] & 0xFF
-                            _opn = _opnames.get(_op, f'0x{_op:02X}')
-                            _dst = (_instr[0] >> 8) & 0x1F
-                            _srcA = (_instr[0] >> 16) & 0x1F
-                            _f.write(f"  [{_i:2d}] {_opn} dst=R[{_dst}] srcA=R[{_srcA}]\n")
-                        # Dump Group internal tree if Mix Shader
-                        if _vm_surface and _vm_surface.type == 'MIX_SHADER':
-                            for si in (1, 2):
-                                sinp = _vm_surface.inputs[si] if len(_vm_surface.inputs) > si else None
-                                if sinp and sinp.is_linked:
-                                    sn = sinp.links[0].from_node
-                                    if sn.type == 'GROUP' and sn.node_tree:
-                                        _f.write(f"  [Group '{sn.name}' internal tree]:\n")
-                                        for gn in sn.node_tree.nodes:
-                                            _f.write(f"    {gn.type}: '{gn.name}'\n")
-                                            for gi in gn.inputs:
-                                                lnk = f" <- {gi.links[0].from_node.name}:{gi.links[0].from_socket.name}" if gi.is_linked else ""
-                                                gv = ""
-                                                if not gi.is_linked:
-                                                    try:
-                                                        v = gi.default_value
-                                                        gv = f" = {v:.4f}" if not hasattr(v, '__len__') else f" = ({','.join(f'{x:.3f}' for x in v)})"
-                                                    except: pass
-                                                _f.write(f"      in: '{gi.name}'{gv}{lnk}\n")
-                except: pass
                 # Only disable legacy UV scale when VM emits UV transforms
                 # (OP_OUTPUT_UV = 0xEF). Otherwise legacy scale is still needed.
                 if any((instr[0] & 0xFF) == 0xEF for instr in vm_code):

@@ -61,7 +61,8 @@ class AccelStructureBuilder {
 public:
     bool Initialize(Context* context);
     void Shutdown();
-    void ClearBLAS();  // Destroy all BLAS for full scene reload
+    void ClearBLAS();   // Destroy all BLAS for full scene reload
+    void FreeBLAS(int blasIndex);  // Free a single BLAS slot (keeps vector index valid)
 
     // Build BLAS from vertex/index data
     // Returns BLAS index (-1 on failure)
@@ -173,6 +174,37 @@ private:
         VkDeviceSize totalSize = 0;
     };
     std::unordered_map<int, DeformStaging> deformStagings_;
+
+    // ── Batch BLAS building ──
+    // Stages mesh data on CPU, then builds all BLAS in minimal GPU submits.
+public:
+    struct QueuedMeshData {
+        AccelBuffer vertexStaging, indexStaging;
+        AccelBuffer normalStaging, uvStaging, colorStaging;
+        AccelBuffer vertexBuf, indexBuf;
+        AccelBuffer normalBuf, uvBuf, colorBuf;
+        uint32_t vertexCount = 0, indexCount = 0;
+        bool hasNormals = false, hasUVs = false, hasColors = false;
+        float minY = 0.0f, maxY = 0.0f;
+        int blasIndex = -1;  // pre-assigned slot in blasList_
+    };
+
+    // Queue a mesh for batch building (CPU-side staging only, no GPU submit).
+    // Includes attribute data (normals, uvs, colors) in the same batch.
+    // Returns pre-assigned BLAS index (-1 on failure).
+    int QueueBLAS(const float* vertices, uint32_t vertexCount,
+                  const uint32_t* indices, uint32_t indexCount,
+                  const float* normals = nullptr, const float* uvs = nullptr,
+                  const float* colors = nullptr);
+
+    // Flush all queued BLAS: DMA + build + compact in minimal GPU submits.
+    // Returns number of successfully built BLAS.
+    int FlushBLASBatch();
+
+    size_t GetQueuedCount() const { return queuedMeshes_.size(); }
+
+private:
+    std::vector<QueuedMeshData> queuedMeshes_;
 };
 
 } // namespace vk

@@ -122,6 +122,21 @@ def load():
     ]
     _lib.ignis_upload_mesh_primitive_materials.restype = c_bool
 
+    # Batch mesh upload (queue all meshes, flush builds in minimal GPU submits)
+    _lib.ignis_queue_mesh.argtypes = [
+        POINTER(c_float), c_uint32,        # vertices, vertexCount
+        POINTER(c_uint32), c_uint32,       # indices, indexCount
+        POINTER(c_float), POINTER(c_float),# normals, uvs
+        c_uint32, POINTER(c_float),        # attrVertexCount, colors
+    ]
+    _lib.ignis_queue_mesh.restype = c_int
+
+    _lib.ignis_flush_mesh_batch.argtypes = []
+    _lib.ignis_flush_mesh_batch.restype = c_int
+
+    _lib.ignis_free_blas.argtypes = [c_int]
+    _lib.ignis_free_blas.restype = None
+
     # ------------------------------------------------------------------
     # Materials
     # ------------------------------------------------------------------
@@ -452,6 +467,35 @@ def upload_mesh_primitive_materials(blas_handle: int, material_ids, primitive_co
         c_int(blas_handle),
         m.ctypes.data_as(POINTER(c_uint32)),
         c_uint32(primitive_count))
+
+
+def queue_mesh(vertices, vertex_count: int, indices, index_count: int,
+               normals, uvs, colors=None) -> int:
+    """Queue mesh + attributes for batch GPU upload. Returns pre-assigned BLAS handle."""
+    v = _np_f32(vertices)
+    i = _np_u32(indices)
+    n = _np_f32(normals)
+    u = _np_f32(uvs)
+    c_ptr = None
+    if colors is not None:
+        c = _np_f32(colors)
+        c_ptr = c.ctypes.data_as(POINTER(c_float))
+    return _lib.ignis_queue_mesh(
+        v.ctypes.data_as(POINTER(c_float)), c_uint32(vertex_count),
+        i.ctypes.data_as(POINTER(c_uint32)), c_uint32(index_count),
+        n.ctypes.data_as(POINTER(c_float)),
+        u.ctypes.data_as(POINTER(c_float)),
+        c_uint32(vertex_count), c_ptr)
+
+
+def flush_mesh_batch() -> int:
+    """Flush all queued meshes: DMA + BLAS build in minimal GPU submits. Returns success count."""
+    return _lib.ignis_flush_mesh_batch()
+
+
+def free_blas(blas_handle: int):
+    """Free a single BLAS slot (GPU resources released, vector index preserved)."""
+    _lib.ignis_free_blas(c_int(blas_handle))
 
 
 def upload_emissive_triangles(data, count: int):

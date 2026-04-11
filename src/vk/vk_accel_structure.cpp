@@ -75,10 +75,12 @@ void AccelStructureBuilder::ClearBLAS() {
         DestroyAccelBuffer(blas.indexBuf);
         DestroyAccelBuffer(blas.normalBuf);
         DestroyAccelBuffer(blas.uvBuf);
+        DestroyAccelBuffer(blas.colorBuf);
         DestroyAccelBuffer(blas.primMaterialBuf);
         DestroyAccelBuffer(blas.primYBoundsBuf);
     }
     blasList_.clear();
+    queuedMeshes_.clear();
 
     // Destroy geometry buffers
     for (auto& gb : geometryBuffers_) {
@@ -90,7 +92,29 @@ void AccelStructureBuilder::ClearBLAS() {
     }
     geometryBuffers_.clear();
 
-    Log(L"[VK AccelStruct] Shutdown\n");
+    Log(L"[VK AccelStruct] ClearBLAS: all BLAS destroyed\n");
+}
+
+void AccelStructureBuilder::FreeBLAS(int blasIndex) {
+    if (blasIndex < 0 || blasIndex >= (int)blasList_.size()) return;
+    if (!context_) return;
+    VkDevice device = context_->GetDevice();
+
+    auto& blas = blasList_[blasIndex];
+    if (blas.handle != VK_NULL_HANDLE && vkDestroyAccelerationStructureKHR_) {
+        vkDestroyAccelerationStructureKHR_(device, blas.handle, nullptr);
+    }
+    DestroyAccelBuffer(blas.buffer);
+    DestroyAccelBuffer(blas.vertexBuf);
+    DestroyAccelBuffer(blas.indexBuf);
+    DestroyAccelBuffer(blas.normalBuf);
+    DestroyAccelBuffer(blas.uvBuf);
+    DestroyAccelBuffer(blas.colorBuf);
+    DestroyAccelBuffer(blas.primMaterialBuf);
+    DestroyAccelBuffer(blas.primYBoundsBuf);
+    blas = {};  // Reset to empty slot (handle = VK_NULL_HANDLE, built = false)
+
+    Log(L"[VK AccelStruct] BLAS[%d] freed\n", blasIndex);
 }
 
 AccelBuffer AccelStructureBuilder::CreateAccelBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
@@ -605,8 +629,6 @@ bool AccelStructureBuilder::UploadBLASAttributes(int blasIndex, const float* nor
         blas.colorBuf = uploadBuffer(colors, vertexCount * 4 * sizeof(float));  // RGBA per vertex
     }
 
-    Log(L"[VK AccelStruct] BLAS[%d] attributes uploaded: normals=%s uvs=%s colors=%s (%u verts)\n",
-        blasIndex, normals ? L"yes" : L"no", uvs ? L"yes" : L"no", colors ? L"yes" : L"no", vertexCount);
     return true;
 }
 
@@ -697,7 +719,6 @@ bool AccelStructureBuilder::UploadBLASPrimitiveMaterials(int blasIndex, const ui
     DestroyAccelBuffer(blas.primMaterialBuf);
     blas.primMaterialBuf = gpu;
 
-    Log(L"[VK AccelStruct] BLAS[%d] primitive materials uploaded (%u triangles)\n", blasIndex, primitiveCount);
     return true;
 }
 
@@ -739,7 +760,6 @@ bool AccelStructureBuilder::UploadBLASPrimitiveYBounds(int blasIndex, const floa
     DestroyAccelBuffer(blas.primYBoundsBuf);
     blas.primYBoundsBuf = gpu;
 
-    Log(L"[VK AccelStruct] BLAS[%d] Y bounds uploaded (%u triangles)\n", blasIndex, primitiveCount);
     return true;
 }
 
@@ -1459,6 +1479,417 @@ bool AccelStructureBuilder::CommitBLASDeform(int blasIndex) {
     blas.built = true;
 
     return true;
+}
+
+// ============================================================================
+// Batch BLAS building — minimal GPU submits for N meshes
+// ============================================================================
+
+int AccelStructureBuilder::QueueBLAS(const float* vertices, uint32_t vertexCount,
+                                      const uint32_t* indices, uint32_t indexCount,
+                                      const float* normals, const float* uvs,
+                                      const float* colors) {
+    if (!vertices || vertexCount == 0 || !indices || indexCount == 0) return -1;
+
+    VkDevice device = context_->GetDevice();
+    QueuedMeshData q{};
+    q.vertexCount = vertexCount;
+    q.indexCount = indexCount;
+    q.hasNormals = (normals != nullptr);
+    q.hasUVs = (uvs != nullptr);
+    q.hasColors = (colors != nullptr);
+
+    // Compute Y bounds on CPU
+    q.minY = vertices[1];
+    q.maxY = vertices[1];
+    for (uint32_t v = 1; v < vertexCount; v++) {
+        float y = vertices[v * 3 + 1];
+        if (y < q.minY) q.minY = y;
+        if (y > q.maxY) q.maxY = y;
+    }
+
+    // Helper: allocate staging + GPU buffer, memcpy data to staging
+    auto stageBuffer = [&](const void* data, VkDeviceSize size,
+                           VkBufferUsageFlags gpuUsage,
+                           AccelBuffer& staging, AccelBuffer& gpu) -> bool {
+        staging = CreateAccelBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        gpu = CreateAccelBuffer(size, gpuUsage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (!staging.buffer || !gpu.buffer) return false;
+        void* mapped;
+        vkMapMemory(device, staging.memory, 0, size, 0, &mapped);
+        memcpy(mapped, data, size);
+        vkUnmapMemory(device, staging.memory);
+        return true;
+    };
+
+    VkBufferUsageFlags vtxUsage =
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    VkBufferUsageFlags idxUsage =
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+    VkBufferUsageFlags attrUsage =
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+
+    // Stage vertex + index data
+    if (!stageBuffer(vertices, vertexCount * 3 * sizeof(float), vtxUsage,
+                     q.vertexStaging, q.vertexBuf) ||
+        !stageBuffer(indices, indexCount * sizeof(uint32_t), idxUsage,
+                     q.indexStaging, q.indexBuf)) {
+        DestroyAccelBuffer(q.vertexStaging); DestroyAccelBuffer(q.vertexBuf);
+        DestroyAccelBuffer(q.indexStaging);  DestroyAccelBuffer(q.indexBuf);
+        return -1;
+    }
+
+    // Stage attribute data
+    if (normals) {
+        if (!stageBuffer(normals, vertexCount * 3 * sizeof(float), attrUsage,
+                         q.normalStaging, q.normalBuf)) {
+            q.hasNormals = false;
+        }
+    }
+    if (uvs) {
+        if (!stageBuffer(uvs, vertexCount * 2 * sizeof(float), attrUsage,
+                         q.uvStaging, q.uvBuf)) {
+            q.hasUVs = false;
+        }
+    }
+    if (colors) {
+        if (!stageBuffer(colors, vertexCount * 4 * sizeof(float), attrUsage,
+                         q.colorStaging, q.colorBuf)) {
+            q.hasColors = false;
+        }
+    }
+
+    // Reserve BLAS slot (empty, filled by FlushBLASBatch)
+    BLAS blasEntry{};
+    blasEntry.built = false;
+    q.blasIndex = (int)blasList_.size();
+    blasList_.push_back(blasEntry);
+
+    queuedMeshes_.push_back(std::move(q));
+
+    return q.blasIndex;
+}
+
+int AccelStructureBuilder::FlushBLASBatch() {
+    if (queuedMeshes_.empty()) return 0;
+
+    VkDevice device = context_->GetDevice();
+    const size_t count = queuedMeshes_.size();
+    Log(L"[VK AccelStruct] FlushBLASBatch: %zu meshes\n", count);
+
+    // ── Phase 1: DMA all staging → GPU in one command buffer ──
+    {
+        VkCommandBuffer cmd = context_->BeginSingleTimeCommands();
+        for (auto& q : queuedMeshes_) {
+            VkBufferCopy copy{};
+            copy.size = q.vertexCount * 3 * sizeof(float);
+            vkCmdCopyBuffer(cmd, q.vertexStaging.buffer, q.vertexBuf.buffer, 1, &copy);
+            copy.size = q.indexCount * sizeof(uint32_t);
+            vkCmdCopyBuffer(cmd, q.indexStaging.buffer, q.indexBuf.buffer, 1, &copy);
+            if (q.hasNormals) {
+                copy.size = q.vertexCount * 3 * sizeof(float);
+                vkCmdCopyBuffer(cmd, q.normalStaging.buffer, q.normalBuf.buffer, 1, &copy);
+            }
+            if (q.hasUVs) {
+                copy.size = q.vertexCount * 2 * sizeof(float);
+                vkCmdCopyBuffer(cmd, q.uvStaging.buffer, q.uvBuf.buffer, 1, &copy);
+            }
+            if (q.hasColors) {
+                copy.size = q.vertexCount * 4 * sizeof(float);
+                vkCmdCopyBuffer(cmd, q.colorStaging.buffer, q.colorBuf.buffer, 1, &copy);
+            }
+        }
+        VkMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0,
+            1, &barrier, 0, nullptr, 0, nullptr);
+        context_->EndSingleTimeCommands(cmd);
+    }
+
+    // Destroy staging buffers (DMA is complete)
+    for (auto& q : queuedMeshes_) {
+        DestroyAccelBuffer(q.vertexStaging);
+        DestroyAccelBuffer(q.indexStaging);
+        DestroyAccelBuffer(q.normalStaging);
+        DestroyAccelBuffer(q.uvStaging);
+        DestroyAccelBuffer(q.colorStaging);
+    }
+
+    Log(L"[VK AccelStruct] FlushBLASBatch: DMA complete\n");
+
+    // ── Phase 2: Create AS objects + scratch buffers (CPU-side) ──
+    bool canCompact = vkCmdCopyAccelerationStructureKHR_ &&
+                      vkCmdWriteAccelerationStructuresPropertiesKHR_;
+
+    struct BuildData {
+        VkAccelerationStructureGeometryTrianglesDataKHR triangles;
+        VkAccelerationStructureGeometryKHR geometry;
+        VkAccelerationStructureBuildGeometryInfoKHR buildInfo;
+        VkAccelerationStructureBuildRangeInfoKHR rangeInfo;
+        VkAccelerationStructureBuildSizesInfoKHR sizeInfo;
+        AccelBuffer asBuf;
+        AccelBuffer scratchBuf;
+        VkAccelerationStructureKHR handle = VK_NULL_HANDLE;
+        uint32_t primitiveCount;
+        bool valid = false;
+    };
+    std::vector<BuildData> builds(count);
+
+    for (size_t i = 0; i < count; i++) {
+        auto& q = queuedMeshes_[i];
+        auto& b = builds[i];
+
+        b.triangles = {};
+        b.triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+        b.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        b.triangles.vertexData.deviceAddress = q.vertexBuf.deviceAddress;
+        b.triangles.vertexStride = 3 * sizeof(float);
+        b.triangles.maxVertex = q.vertexCount - 1;
+        b.triangles.indexType = VK_INDEX_TYPE_UINT32;
+        b.triangles.indexData.deviceAddress = q.indexBuf.deviceAddress;
+
+        b.geometry = {};
+        b.geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+        b.geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        b.geometry.flags = 0;
+        b.geometry.geometry.triangles = b.triangles;
+
+        b.primitiveCount = q.indexCount / 3;
+
+        b.buildInfo = {};
+        b.buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+        b.buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        b.buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+        if (canCompact)
+            b.buildInfo.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR;
+        b.buildInfo.geometryCount = 1;
+        b.buildInfo.pGeometries = &b.geometry;
+
+        b.sizeInfo = {};
+        b.sizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+        vkGetAccelerationStructureBuildSizesKHR_(device,
+            VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+            &b.buildInfo, &b.primitiveCount, &b.sizeInfo);
+
+        b.asBuf = CreateAccelBuffer(b.sizeInfo.accelerationStructureSize,
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (!b.asBuf.buffer) continue;
+
+        VkAccelerationStructureCreateInfoKHR asCreateInfo{};
+        asCreateInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+        asCreateInfo.buffer = b.asBuf.buffer;
+        asCreateInfo.size = b.sizeInfo.accelerationStructureSize;
+        asCreateInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        if (vkCreateAccelerationStructureKHR_(device, &asCreateInfo, nullptr, &b.handle) != VK_SUCCESS) {
+            DestroyAccelBuffer(b.asBuf);
+            continue;
+        }
+
+        b.scratchBuf = CreateAccelBuffer(b.sizeInfo.buildScratchSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (!b.scratchBuf.buffer) {
+            vkDestroyAccelerationStructureKHR_(device, b.handle, nullptr);
+            DestroyAccelBuffer(b.asBuf);
+            b.handle = VK_NULL_HANDLE;
+            continue;
+        }
+
+        b.buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+        b.buildInfo.dstAccelerationStructure = b.handle;
+        b.buildInfo.scratchData.deviceAddress = b.scratchBuf.deviceAddress;
+
+        b.rangeInfo = {};
+        b.rangeInfo.primitiveCount = b.primitiveCount;
+
+        b.valid = true;
+    }
+
+    // ── Phase 3: Build all BLAS in batches of 32 (one submit per batch) ──
+    const size_t BATCH_SIZE = 32;
+    for (size_t start = 0; start < count; start += BATCH_SIZE) {
+        size_t end = std::min(start + BATCH_SIZE, count);
+
+        // Collect valid builds in this batch
+        std::vector<VkAccelerationStructureBuildGeometryInfoKHR> batchInfos;
+        std::vector<const VkAccelerationStructureBuildRangeInfoKHR*> batchRanges;
+        for (size_t j = start; j < end; j++) {
+            if (!builds[j].valid) continue;
+            batchInfos.push_back(builds[j].buildInfo);
+            batchRanges.push_back(&builds[j].rangeInfo);
+        }
+
+        if (!batchInfos.empty()) {
+            VkCommandBuffer cmd = context_->BeginSingleTimeCommands();
+            vkCmdBuildAccelerationStructuresKHR_(cmd, (uint32_t)batchInfos.size(),
+                batchInfos.data(), batchRanges.data());
+            context_->EndSingleTimeCommands(cmd);
+        }
+
+        // Free scratch for this batch (build complete)
+        for (size_t j = start; j < end; j++) {
+            DestroyAccelBuffer(builds[j].scratchBuf);
+        }
+    }
+
+    Log(L"[VK AccelStruct] FlushBLASBatch: %zu BLAS built\n", count);
+
+    // ── Phase 4: Batch compaction ──
+    if (canCompact) {
+        std::vector<VkAccelerationStructureKHR> compactHandles;
+        std::vector<size_t> compactIndices;
+        for (size_t i = 0; i < count; i++) {
+            if (builds[i].valid) {
+                compactHandles.push_back(builds[i].handle);
+                compactIndices.push_back(i);
+            }
+        }
+
+        if (!compactHandles.empty()) {
+            uint32_t queryCount = (uint32_t)compactHandles.size();
+            VkQueryPoolCreateInfo queryPoolInfo{};
+            queryPoolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+            queryPoolInfo.queryType = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR;
+            queryPoolInfo.queryCount = queryCount;
+
+            VkQueryPool queryPool;
+            if (vkCreateQueryPool(device, &queryPoolInfo, nullptr, &queryPool) == VK_SUCCESS) {
+                vkResetQueryPool(device, queryPool, 0, queryCount);
+
+                VkCommandBuffer cmd = context_->BeginSingleTimeCommands();
+                vkCmdWriteAccelerationStructuresPropertiesKHR_(cmd,
+                    queryCount, compactHandles.data(),
+                    VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR, queryPool, 0);
+                context_->EndSingleTimeCommands(cmd);
+
+                std::vector<VkDeviceSize> compactedSizes(queryCount);
+                vkGetQueryPoolResults(device, queryPool, 0, queryCount,
+                    queryCount * sizeof(VkDeviceSize), compactedSizes.data(),
+                    sizeof(VkDeviceSize), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                vkDestroyQueryPool(device, queryPool, nullptr);
+
+                // Prepare compacted copies
+                struct CompactSwap {
+                    size_t buildIdx;
+                    VkAccelerationStructureKHR newHandle;
+                    AccelBuffer newBuf;
+                };
+                std::vector<CompactSwap> swaps;
+                VkDeviceSize totalSaved = 0;
+
+                cmd = context_->BeginSingleTimeCommands();
+                bool anyCompacted = false;
+                for (uint32_t qi = 0; qi < queryCount; qi++) {
+                    size_t bi = compactIndices[qi];
+                    auto& b = builds[bi];
+                    if (compactedSizes[qi] == 0 || compactedSizes[qi] >= b.sizeInfo.accelerationStructureSize)
+                        continue;
+
+                    AccelBuffer compactBuf = CreateAccelBuffer(compactedSizes[qi],
+                        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+                        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                    if (!compactBuf.buffer) continue;
+
+                    VkAccelerationStructureCreateInfoKHR compCI{};
+                    compCI.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+                    compCI.buffer = compactBuf.buffer;
+                    compCI.size = compactedSizes[qi];
+                    compCI.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+
+                    VkAccelerationStructureKHR compactBlas;
+                    if (vkCreateAccelerationStructureKHR_(device, &compCI, nullptr, &compactBlas) == VK_SUCCESS) {
+                        VkCopyAccelerationStructureInfoKHR copyInfo{};
+                        copyInfo.sType = VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR;
+                        copyInfo.src = b.handle;
+                        copyInfo.dst = compactBlas;
+                        copyInfo.mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR;
+                        vkCmdCopyAccelerationStructureKHR_(cmd, &copyInfo);
+
+                        swaps.push_back({bi, compactBlas, compactBuf});
+                        totalSaved += b.sizeInfo.accelerationStructureSize - compactedSizes[qi];
+                        anyCompacted = true;
+                    } else {
+                        DestroyAccelBuffer(compactBuf);
+                    }
+                }
+
+                if (anyCompacted) {
+                    context_->EndSingleTimeCommands(cmd);
+                } else {
+                    vkEndCommandBuffer(cmd);
+                    vkFreeCommandBuffers(device, context_->GetCommandPool(), 1, &cmd);
+                }
+
+                // Swap: destroy originals, use compacted versions
+                for (auto& s : swaps) {
+                    auto& b = builds[s.buildIdx];
+                    vkDestroyAccelerationStructureKHR_(device, b.handle, nullptr);
+                    DestroyAccelBuffer(b.asBuf);
+                    b.handle = s.newHandle;
+                    b.asBuf = s.newBuf;
+                }
+
+                if (totalSaved > 0) {
+                    Log(L"[VK AccelStruct] FlushBLASBatch: compaction saved %.1f MB\n",
+                        totalSaved / (1024.0 * 1024.0));
+                }
+            }
+        }
+    }
+
+    // ── Phase 5: Store BLAS entries in blasList_ ──
+    int successCount = 0;
+    for (size_t i = 0; i < count; i++) {
+        auto& q = queuedMeshes_[i];
+        auto& b = builds[i];
+
+        auto& entry = blasList_[q.blasIndex];
+        if (!b.valid || b.handle == VK_NULL_HANDLE) {
+            // Failed — clean up GPU buffers
+            DestroyAccelBuffer(q.vertexBuf);
+            DestroyAccelBuffer(q.indexBuf);
+            DestroyAccelBuffer(q.normalBuf);
+            DestroyAccelBuffer(q.uvBuf);
+            DestroyAccelBuffer(q.colorBuf);
+            continue;
+        }
+
+        VkAccelerationStructureDeviceAddressInfoKHR addressInfo{};
+        addressInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
+        addressInfo.accelerationStructure = b.handle;
+        VkDeviceAddress blasAddr = vkGetAccelerationStructureDeviceAddressKHR_(device, &addressInfo);
+
+        entry.handle = b.handle;
+        entry.buffer = b.asBuf;
+        entry.deviceAddress = blasAddr;
+        entry.vertexCount = q.vertexCount;
+        entry.indexCount = q.indexCount;
+        entry.built = true;
+        entry.minY = q.minY;
+        entry.maxY = q.maxY;
+        entry.vertexBuf = q.vertexBuf;
+        entry.indexBuf = q.indexBuf;
+        entry.normalBuf = q.normalBuf;
+        entry.uvBuf = q.uvBuf;
+        entry.colorBuf = q.colorBuf;
+        successCount++;
+    }
+
+    queuedMeshes_.clear();
+    Log(L"[VK AccelStruct] FlushBLASBatch: %d/%zu BLAS ready\n", successCount, count);
+    return successCount;
 }
 
 } // namespace vk

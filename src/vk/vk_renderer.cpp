@@ -756,6 +756,22 @@ bool Renderer::UploadBLASAttributes(int blasIndex, const float* normals, const f
     return accelBuilder_->UploadBLASAttributes(blasIndex, normals, uvs, vertexCount, colors);
 }
 
+int Renderer::QueueBLAS(const float* vertices, uint32_t vertexCount,
+                         const uint32_t* indices, uint32_t indexCount,
+                         const float* normals, const float* uvs, const float* colors) {
+    if (!accelBuilder_) return -1;
+    return accelBuilder_->QueueBLAS(vertices, vertexCount, indices, indexCount, normals, uvs, colors);
+}
+
+int Renderer::FlushBLASBatch() {
+    if (!accelBuilder_) return 0;
+    return accelBuilder_->FlushBLASBatch();
+}
+
+void Renderer::FreeBLAS(int blasIndex) {
+    if (accelBuilder_) accelBuilder_->FreeBLAS(blasIndex);
+}
+
 bool Renderer::UploadBLASPrimitiveMaterials(int blasIndex, const uint32_t* materialIds, uint32_t primitiveCount) {
     if (!accelBuilder_) return false;
     return accelBuilder_->UploadBLASPrimitiveMaterials(blasIndex, materialIds, primitiveCount);

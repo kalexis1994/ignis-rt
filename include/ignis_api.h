@@ -32,6 +32,15 @@ IGNIS_API bool   ignis_upload_mesh_attributes(int blasHandle,
 IGNIS_API bool   ignis_upload_mesh_primitive_materials(int blasHandle,
                                                        const uint32_t* materialIds,
                                                        uint32_t primitiveCount);
+// Batch mesh upload: queue all meshes on CPU, then flush builds in minimal GPU submits.
+// QueueMesh stages vertex/index/attribute data and returns a pre-assigned BLAS handle.
+// FlushMeshBatch executes all DMA + BLAS builds in 3-4 GPU submits (vs N*5 without batching).
+IGNIS_API int    ignis_queue_mesh(const float* vertices, uint32_t vertexCount,
+                                  const uint32_t* indices, uint32_t indexCount,
+                                  const float* normals, const float* uvs,
+                                  uint32_t attrVertexCount, const float* colors);
+IGNIS_API int    ignis_flush_mesh_batch(void);
+IGNIS_API void   ignis_free_blas(int blasHandle);
 
 // Materials
 IGNIS_API void   ignis_upload_materials(const void* data, uint32_t count);

@@ -305,6 +305,26 @@ IGNIS_API bool ignis_upload_mesh_primitive_materials(int blasHandle,
     return g_renderer->UploadBLASPrimitiveMaterials(blasHandle, materialIds, primitiveCount);
 }
 
+IGNIS_API int ignis_queue_mesh(const float* vertices, uint32_t vertexCount,
+                                const uint32_t* indices, uint32_t indexCount,
+                                const float* normals, const float* uvs,
+                                uint32_t attrVertexCount, const float* colors) {
+    if (!g_renderer) return -1;
+    // attrVertexCount is passed for compatibility but we use the geometry vertexCount
+    // (they should always match — attributes are per-vertex)
+    (void)attrVertexCount;
+    return g_renderer->QueueBLAS(vertices, vertexCount, indices, indexCount, normals, uvs, colors);
+}
+
+IGNIS_API int ignis_flush_mesh_batch() {
+    if (!g_renderer) return 0;
+    return g_renderer->FlushBLASBatch();
+}
+
+IGNIS_API void ignis_free_blas(int blasHandle) {
+    if (g_renderer) g_renderer->FreeBLAS(blasHandle);
+}
+
 IGNIS_API void ignis_upload_materials(const void* data, uint32_t count) {
     std::lock_guard<std::recursive_mutex> lock(g_rendererMutex);
     if (g_renderer) g_renderer->UploadMaterialBuffer(data, count);
