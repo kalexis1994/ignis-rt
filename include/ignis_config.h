@@ -137,6 +137,7 @@ struct PathTracerConfig {
 
     // ReSTIR DI (reservoir-based light sampling)
     bool  restirDI           = false;
+    bool  restirGI           = false;   // ReSTIR GI: temporal reuse of indirect lighting
     bool  materialSort       = false;  // GPU material sorting for wavefront (helps mixed-material scenes)
     bool  sharcEnabled       = false;  // SHARC radiance cache (GI caching, can cause slowdown on large scenes)
 

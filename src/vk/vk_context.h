@@ -35,6 +35,11 @@ public:
     // Ray tracing support
     bool IsRayQuerySupported() const { return rayQuerySupported_; }
 
+    // GPU generation detection (matches frame-gen branch pattern)
+    // RTX series: 2000=Turing, 3000=Ampere, 4000=Ada, 5000=Blackwell
+    uint32_t GetRTXSeries() const { return rtxSeries_; }
+    bool IsHardwareSERCapable() const { return rtxSeries_ >= 4000; }
+
     uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
 
     // One-shot command buffer helpers
@@ -72,6 +77,7 @@ private:
     uint32_t graphicsQueueFamily_ = 0;
     uint32_t presentQueueFamily_ = 0;
     bool rayQuerySupported_ = false;
+    uint32_t rtxSeries_ = 0;  // 2000=Turing, 3000=Ampere, 4000=Ada, 5000=Blackwell
 };
 
 } // namespace vk

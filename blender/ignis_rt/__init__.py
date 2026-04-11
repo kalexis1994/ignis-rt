@@ -187,6 +187,12 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         default=False,
         update=_tag_redraw,
     )
+    restir_gi: BoolProperty(
+        name="ReSTIR GI",
+        description="Temporal reuse of indirect lighting. Reduces GI noise by reusing bounce samples across frames",
+        default=True,
+        update=_tag_redraw,
+    )
     material_sort: BoolProperty(
         name="Material Sort",
         description="GPU material sorting for wavefront. Improves FPS in scenes with mixed materials (glass+hair+volume). Slight overhead for uniform scenes",
@@ -434,6 +440,7 @@ class IGNIS_PT_advanced(bpy.types.Panel):
         layout.use_property_decorate = False
         layout.prop(props, "hybrid_rasterization")
         layout.prop(props, "restir_di")
+        layout.prop(props, "restir_gi")
         layout.prop(props, "material_sort")
         layout.prop(props, "sharc_enabled")
         # layout.prop(props, "use_wavefront")  # TODO: not ready yet

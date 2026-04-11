@@ -93,6 +93,22 @@ private:
     VkPipeline pipelineSortPrefix_ = VK_NULL_HANDLE;  // material sort phase 2
     VkPipeline pipelineSortScatter_ = VK_NULL_HANDLE; // material sort phase 3
 
+    // RT pipeline for K2 (shade) — enables hardware SER via reorderThreadNV
+    VkPipeline pipelineK2RT_ = VK_NULL_HANDLE;
+    VkPipelineLayout pipelineLayoutRT_ = VK_NULL_HANDLE;
+    VkBuffer sbtK2Buffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory sbtK2Memory_ = VK_NULL_HANDLE;
+    VkStridedDeviceAddressRegionKHR sbtK2RaygenRegion_{};
+    VkStridedDeviceAddressRegionKHR sbtK2MissRegion_{};
+    VkStridedDeviceAddressRegionKHR sbtK2HitRegion_{};
+    VkStridedDeviceAddressRegionKHR sbtK2CallableRegion_{};
+    PFN_vkCreateRayTracingPipelinesKHR vkCreateRayTracingPipelinesKHR_ = nullptr;
+    PFN_vkGetRayTracingShaderGroupHandlesKHR vkGetRayTracingShaderGroupHandlesKHR_ = nullptr;
+    PFN_vkCmdTraceRaysKHR vkCmdTraceRaysKHR_ = nullptr;
+    PFN_vkGetBufferDeviceAddressKHR vkGetBufferDeviceAddressKHR_ = nullptr;
+    bool serAvailable_ = false;
+    bool CreateK2RTPipeline();
+
     static constexpr uint32_t WORKGROUP_SIZE = 256;
     static constexpr uint32_t MAX_SHADOW_RAYS_PER_PATH = 10; // sun + 8 lights + emissive
 };

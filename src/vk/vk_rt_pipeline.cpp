@@ -387,6 +387,102 @@ void RTPipeline::DestroyGIReservoirBuffers() {
     giReservoirCreated_ = false;
 }
 
+bool RTPipeline::CreateGIWfReservoirBuffers(uint32_t width, uint32_t height) {
+    if (giWfReservoirCreated_) return true;
+    VkDevice device = context_->GetDevice();
+    uint32_t pixelCount = width * height;
+    VkDeviceSize bufSize = (VkDeviceSize)pixelCount * GI_RESERVOIR_VEC4S_PER_PIXEL * 16;
+
+    for (int i = 0; i < 2; i++) {
+        VkBufferCreateInfo bufInfo{};
+        bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufInfo.size = bufSize;
+        bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        if (vkCreateBuffer(device, &bufInfo, nullptr, &giWfReservoirBuffer_[i]) != VK_SUCCESS) return false;
+
+        VkMemoryRequirements memReqs;
+        vkGetBufferMemoryRequirements(device, giWfReservoirBuffer_[i], &memReqs);
+
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memReqs.size;
+        allocInfo.memoryTypeIndex = context_->FindMemoryType(memReqs.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &giWfReservoirMemory_[i]) != VK_SUCCESS) return false;
+        vkBindBufferMemory(device, giWfReservoirBuffer_[i], giWfReservoirMemory_[i], 0);
+
+        VkCommandBuffer cmd = context_->BeginSingleTimeCommands();
+        vkCmdFillBuffer(cmd, giWfReservoirBuffer_[i], 0, bufSize, 0);
+        context_->EndSingleTimeCommands(cmd);
+    }
+
+    giWfReservoirCreated_ = true;
+
+    // Bind to 49=write(curr), 50=read(prev)
+    VkDescriptorBufferInfo currInfo{ giWfReservoirBuffer_[0], 0, bufSize };
+    VkDescriptorBufferInfo prevInfo{ giWfReservoirBuffer_[1], 0, bufSize };
+
+    VkWriteDescriptorSet writes[2] = {};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = descriptorSet_;
+    writes[0].dstBinding = 49;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[0].pBufferInfo = &currInfo;
+
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = descriptorSet_;
+    writes[1].dstBinding = 50;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[1].pBufferInfo = &prevInfo;
+
+    vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+    Log(L"[VK RTPipeline] GI wavefront reservoir buffers created (2x %.1f MiB)\n",
+        (float)bufSize / (1024.0f * 1024.0f));
+    return true;
+}
+
+void RTPipeline::DestroyGIWfReservoirBuffers() {
+    if (!giWfReservoirCreated_) return;
+    VkDevice device = context_->GetDevice();
+    for (int i = 0; i < 2; i++) {
+        if (giWfReservoirBuffer_[i]) { vkDestroyBuffer(device, giWfReservoirBuffer_[i], nullptr); giWfReservoirBuffer_[i] = VK_NULL_HANDLE; }
+        if (giWfReservoirMemory_[i]) { vkFreeMemory(device, giWfReservoirMemory_[i], nullptr); giWfReservoirMemory_[i] = VK_NULL_HANDLE; }
+    }
+    giWfReservoirCreated_ = false;
+}
+
+void RTPipeline::SwapGIWfReservoirBuffers() {
+    if (!giWfReservoirCreated_) return;
+    std::swap(giWfReservoirBuffer_[0], giWfReservoirBuffer_[1]);
+    std::swap(giWfReservoirMemory_[0], giWfReservoirMemory_[1]);
+
+    VkDevice device = context_->GetDevice();
+    VkDeviceSize bufSize = (VkDeviceSize)giReservoirPixelCount_ * GI_RESERVOIR_VEC4S_PER_PIXEL * 16;
+    VkDescriptorBufferInfo currInfo{ giWfReservoirBuffer_[0], 0, bufSize };
+    VkDescriptorBufferInfo prevInfo{ giWfReservoirBuffer_[1], 0, bufSize };
+
+    VkWriteDescriptorSet writes[2] = {};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = descriptorSet_;
+    writes[0].dstBinding = 49;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[0].pBufferInfo = &currInfo;
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = descriptorSet_;
+    writes[1].dstBinding = 50;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[1].pBufferInfo = &prevInfo;
+
+    vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+}
+
 void RTPipeline::SwapGIReservoirBuffers() {
     if (!giReservoirCreated_) return;
     std::swap(giReservoirBuffer_[0], giReservoirBuffer_[1]);
@@ -522,8 +618,9 @@ void RTPipeline::Shutdown() {
     // SHARC radiance cache buffers
     DestroySHARCBuffers();
 
-    // GI Reservoir buffers
+    // Reservoir buffers
     DestroyGIReservoirBuffers();
+    DestroyGIWfReservoirBuffers();
 
     // Shadow accumulation buffers
     DestroyShadowAccumBuffers();
@@ -692,8 +789,9 @@ bool RTPipeline::CreateGBuffers(uint32_t width, uint32_t height) {
     // Create Surfel GI cache buffers (experimental)
     CreateSurfelBuffers();
 
-    // Create GI reservoir buffers for ReSTIR (resolution-dependent)
-    CreateGIReservoirBuffers(width, height);
+    // Create reservoir buffers for ReSTIR (resolution-dependent)
+    CreateGIReservoirBuffers(width, height);   // DI on 24-25
+    CreateGIWfReservoirBuffers(width, height); // GI on 49-50
 
     // Update descriptor set with real G-buffer images
     VkDevice device = context_->GetDevice();
@@ -1168,6 +1266,17 @@ bool RTPipeline::CreateDescriptorSetLayout() {
         bindings[i].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
     }
 
+    // bindings 49-50: GI Reservoir SSBOs for ReSTIR GI (wavefront temporal reuse)
+    // Separate from DI reservoirs (24-25) so both can run simultaneously
+    bindings.resize(51);
+    for (uint32_t i = 49; i <= 50; i++) {
+        bindings[i] = {};
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+
     // Binding flags for partially bound descriptors
     std::vector<VkDescriptorBindingFlags> bindingFlags(bindings.size(), VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
 
@@ -1399,7 +1508,7 @@ bool RTPipeline::CreateDescriptorPool() {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 25},   // 13 base + 3 masks(29-31) + 1 hairV(34) + 3 hybrid(35-37) + padding
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},  // camera + NRC constants
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 21},  // 11 base + 5 NRC(38-42) + 5 NIRC(44-48)
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 23},  // 11 base + 5 NRC(38-42) + 5 NIRC(44-48) + 2 GI reservoir(49-50)
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1034},  // 1024 textures + 10 other samplers
     };
 

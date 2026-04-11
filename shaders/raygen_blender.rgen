@@ -7,7 +7,7 @@
 #extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_shader_atomic_int64 : require
 #extension GL_GOOGLE_include_directive : require
-#extension GL_NV_ray_tracing_invocation_reorder : enable
+#extension GL_NV_shader_invocation_reorder : enable
 #extension GL_ARB_shader_clock : enable
 
 // ============================================================
@@ -643,7 +643,7 @@ PBRHit evaluateBlenderMaterial(
     bool vmActive = vmInstrCount > 0u;
     NodeVmResult vm;
     if (vmActive) {
-        vm = executeNodeVm(matIdx, uv, worldPos, rayDir, geoNormal, vertexColor, uint(instanceId), localPos);
+        vm = executeNodeVm(matIdx, uv, worldPos, rayDir, geoNormal, vertexColor, uint(instanceId), localPos, vec3(1,0,0), vec3(0,1,0));
     } else {
         // Minimal init — only flags that are checked below
         vm.hasBaseColor = false;
@@ -1681,7 +1681,7 @@ void main() {
         // Shader Execution Reordering (SER): reorder threads by material ID
         // so threads evaluating the same material run together → less divergence
         // in Node VM execution. Hardware-accelerated on RTX 40+, software on 30.
-#ifdef GL_NV_ray_tracing_invocation_reorder
+#ifdef GL_NV_shader_invocation_reorder
         reorderThreadNV(matIdx, 16);  // 16 bits = up to 65536 materials
 #endif
 

@@ -1987,9 +1987,10 @@ void Renderer::RenderFrameRT() {
         prevInstanceTransforms_ = currInstanceTransforms_;
     }
 
-    // Swap GI reservoir ping-pong buffers (current → previous for next frame)
+    // Swap reservoir ping-pong buffers (current → previous for next frame)
     if (rtPipeline_ && rtPipeline_->HasGIReservoirBuffers()) {
-        rtPipeline_->SwapGIReservoirBuffers();
+        rtPipeline_->SwapGIReservoirBuffers();   // DI (24-25)
+        rtPipeline_->SwapGIWfReservoirBuffers(); // GI (49-50)
     }
 
     // Double-buffer swap: flip write/read indices so GL displays the completed frame

@@ -221,8 +221,9 @@ public:
     void SwapShadowAccumBuffers();
     bool HasShadowAccumBuffers() const { return shadowAccumCreated_; }
 
-    // GI Reservoir (ReSTIR) — swap ping-pong buffers each frame
+    // Reservoir (ReSTIR) — swap ping-pong buffers each frame
     void SwapGIReservoirBuffers();
+    void SwapGIWfReservoirBuffers();
     bool HasGIReservoirBuffers() const { return giReservoirCreated_; }
 
     // SHARC radiance cache accessors
@@ -310,7 +311,7 @@ private:
     bool CreateGBufferImage(GBufferImage& gb, VkFormat format, uint32_t width, uint32_t height, const char* name);
     void DestroyGBufferImage(GBufferImage& gb);
 
-    // GI Reservoir buffers for ReSTIR (bindings 24-25)
+    // DI Reservoir buffers for ReSTIR DI (bindings 24-25, used by wavefront DI)
     VkBuffer giReservoirBuffer_[2] = {};   // [0]=current write, [1]=previous read
     VkDeviceMemory giReservoirMemory_[2] = {};
     bool giReservoirCreated_ = false;
@@ -318,6 +319,13 @@ private:
     static constexpr uint32_t GI_RESERVOIR_VEC4S_PER_PIXEL = 3;  // 3 vec4s = 48 bytes
     bool CreateGIReservoirBuffers(uint32_t width, uint32_t height);
     void DestroyGIReservoirBuffers();
+
+    // GI Reservoir buffers for ReSTIR GI (bindings 49-50, wavefront indirect reuse)
+    VkBuffer giWfReservoirBuffer_[2] = {};  // [0]=current write, [1]=previous read
+    VkDeviceMemory giWfReservoirMemory_[2] = {};
+    bool giWfReservoirCreated_ = false;
+    bool CreateGIWfReservoirBuffers(uint32_t width, uint32_t height);
+    void DestroyGIWfReservoirBuffers();
 
     // SHARC radiance cache (NVIDIA official library)
     // 3 buffers: hashEntries (uint64), accumulation (uvec4), resolved (f16vec4+uint2)

@@ -171,10 +171,11 @@ if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
         gbuffer_hybrid.vert:gbuffer_hybrid.vert.spv
         gbuffer_hybrid.frag:gbuffer_hybrid.frag.spv
         hybrid.rgen:hybrid.rgen.spv
-        raygen_blender.rgen:raygen_blender.rgen.spv
+        # raygen_blender.rgen:raygen_blender.rgen.spv  # legacy monolithic — replaced by wavefront
         wavefront/wf_camera_rays.comp:wavefront/wf_camera_rays.comp.spv
         wavefront/wf_intersect.comp:wavefront/wf_intersect.comp.spv
         wavefront/wf_shade.comp:wavefront/wf_shade.comp.spv
+        wavefront/wf_shade.rgen:wavefront/wf_shade.rgen.spv
         wavefront/wf_shadow_accumulate.comp:wavefront/wf_shadow_accumulate.comp.spv
         wavefront/wf_compact.comp:wavefront/wf_compact.comp.spv
         wavefront/wf_output.comp:wavefront/wf_output.comp.spv

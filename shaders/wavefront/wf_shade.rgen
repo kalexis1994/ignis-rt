@@ -7,8 +7,7 @@
 #extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_shader_atomic_int64 : require
 #extension GL_GOOGLE_include_directive : require
-
-layout(local_size_x = 256) in;
+#extension GL_NV_shader_invocation_reorder : enable
 
 // Scene data (set 0)
 layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
@@ -266,7 +265,7 @@ void appendShadowRay(vec3 origin, vec3 dir, float maxDist, uint pathIdx,
 }
 
 void main() {
-    uint idx = gl_GlobalInvocationID.x;
+    uint idx = gl_LaunchIDEXT.x;
     if (idx >= counters.activeRayCount) return;
 
     // Read PathState
@@ -394,6 +393,13 @@ void main() {
         PrimMaterials primMats = PrimMaterials(geo.primMaterialBufferAddress);
         matIdx = primMats.m[primitiveId];
     }
+
+    // SER: reorder threads by material for coherent Node VM execution
+    // Hardware-accelerated on RTX 40+, software fallback on 30 series
+#ifdef GL_NV_shader_invocation_reorder
+    reorderThreadNV(matIdx, 16);
+#endif
+
     Material mat = materialBuffer.materials[matIdx];
 
     // Vertex colors
@@ -2351,9 +2357,7 @@ void main() {
 
         if (bounce == 1u) {
             // Capture: indirect hit as GI reservoir sample
-            // Use unshadowed emission + base illuminance as radiance proxy
             vec3 sampleRadiance = emission;
-            // Add unshadowed sun estimate if visible
             float sunInt = cam.sunLight.w;
             if (sunInt > 0.0) {
                 vec3 sunDir = normalize(cam.sunLight.xyz);
@@ -2372,7 +2376,6 @@ void main() {
                 newSample.weightSum = 0.0;
                 newSample.M = 0.0;
 
-                // Read primary surface data for target PDF
                 uint gBase = pixelIndex * 16u;
                 vec3 primaryN = vec3(primaryGBuf.gbufData[gBase+0],
                                      primaryGBuf.gbufData[gBase+1],
@@ -2392,25 +2395,14 @@ void main() {
         }
 
         if (bounce == 0u && pc.sampleIdx == 0u) {
-            // Temporal reuse: apply previous frame's GI reservoir
-            uint gBase = pixelIndex * 16u;
             vec3 primaryN = N;
             vec3 primaryPos = worldPos;
-
-            // Motion vector (same as output kernel uses)
-            vec3 localP = vec3(primaryGBuf.gbufData[gBase+12],
-                               primaryGBuf.gbufData[gBase+13],
-                               primaryGBuf.gbufData[gBase+14]);
-            // Use current frame localPos since gbuf might not be written yet at bounce 0
-            localP = localPos;
-            uint instIdPacked = floatBitsToUint(primaryGBuf.gbufData[gBase+15]);
-            uint instForMV = uint(instanceId);
 
             vec4 currClip = cam.proj * cam.view * vec4(worldPos, 1.0);
             vec2 currNDC = currClip.xy / currClip.w;
             vec2 currUV = vec2(currNDC.x * 0.5 + 0.5, 0.5 - currNDC.y * 0.5);
 
-            uint rBase3 = instForMV * 3u;
+            uint rBase3 = uint(instanceId) * 3u;
             vec4 rRow0 = prevTransforms.data[rBase3 + 0u];
             vec4 rRow1 = prevTransforms.data[rBase3 + 1u];
             vec4 rRow2 = prevTransforms.data[rBase3 + 2u];
@@ -2433,7 +2425,6 @@ void main() {
                     float W = reservoir.weightSum / (reservoir.M * finalPHat);
                     vec3 reusedGI = reservoir.radiance * finalPHat * W;
                     float blendWeight = clamp(reservoir.M / 10.0, 0.0, 0.5);
-                    // Add reused indirect lighting to pixel radiance (diffuse channel)
                     uint rBase = pixelIndex * 8u;
                     vec3 giContrib = reusedGI * blendWeight * 0.3;
                     atomicAddFloat(rBase + 0u, giContrib.r);

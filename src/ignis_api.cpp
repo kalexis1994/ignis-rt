@@ -532,7 +532,7 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
     cam.lightPad[1] = static_cast<uint32_t>(acpt::g_config.samplesPerPixel);
     bool hybridActive = cfg->hybridRasterization && g_renderer && g_renderer->IsHybridGBufferReady();
     bool nircActive = g_renderer && g_renderer->IsNircReady();
-    cam.lightPad[2] = (cfg->backfaceCulling ? 1u : 0u) | (cfg->restirDI ? 2u : 0u) | (hybridActive ? 4u : 0u) | (nircActive ? 16u : 0u);
+    cam.lightPad[2] = (cfg->backfaceCulling ? 1u : 0u) | (cfg->restirDI ? 2u : 0u) | (hybridActive ? 4u : 0u) | (cfg->restirGI ? 8u : 0u) | (nircActive ? 16u : 0u);
     // HDRI environment map: pack index and strength into windParams
     cam.windParams[0] = static_cast<float>(cfg->hdriTexIndex);  // -1 = no HDRI
     cam.windParams[1] = cfg->hdriStrength;
@@ -790,6 +790,7 @@ IGNIS_API void ignis_set_int(const char* key, int value) {
     else if (strcmp(key, "dof_blades") == 0)        cfg->dofBlades = value;
     else if (strcmp(key, "backface_culling") == 0) cfg->backfaceCulling = (value != 0);
     else if (strcmp(key, "restir_di") == 0)      cfg->restirDI = (value != 0);
+    else if (strcmp(key, "restir_gi") == 0)      cfg->restirGI = (value != 0);
     else if (strcmp(key, "material_sort") == 0) cfg->materialSort = (value != 0);
     else if (strcmp(key, "sharc_enabled") == 0) cfg->sharcEnabled = (value != 0);
     else if (strcmp(key, "hdri_tex_index") == 0)  cfg->hdriTexIndex = value;

@@ -3,6 +3,8 @@
 #include <vector>
 #include <algorithm>
 #include <cstring>
+#include <string>
+#include <regex>
 
 namespace acpt {
 namespace vk {
@@ -154,6 +156,24 @@ bool Context::PickPhysicalDevice() {
         Log(L"[VK Context] Selected device: %S\n", props.deviceName);
     }
 
+    // Detect RTX generation from GPU name (matches frame-gen branch pattern)
+    // Pattern: "RTX X0Y0" where X = generation digit (2=Turing, 3=Ampere, 4=Ada, 5=Blackwell)
+    {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(physicalDevice_, &props);
+        std::string name(props.deviceName);
+        std::regex rtxPattern("RTX\\s*(\\d)0\\d0", std::regex::icase);
+        std::smatch match;
+        if (std::regex_search(name, match, rtxPattern)) {
+            int gen = std::stoi(match[1].str());
+            rtxSeries_ = gen * 1000;
+            const char* archName = gen == 2 ? "Turing" : gen == 3 ? "Ampere" :
+                                   gen == 4 ? "Ada Lovelace" : gen == 5 ? "Blackwell" : "Unknown";
+            Log(L"[VK Context] RTX %u detected (%S) — SER hardware: %s\n",
+                rtxSeries_, archName, rtxSeries_ >= 4000 ? L"YES" : L"NO");
+        }
+    }
+
     return true;
 }
 
@@ -294,7 +314,7 @@ bool Context::CreateLogicalDevice() {
     VkPhysicalDeviceShaderAtomicInt64Features atomicInt64Features{};
     atomicInt64Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES;
     atomicInt64Features.shaderBufferInt64Atomics = VK_TRUE;
-    rtpFeatures.pNext = &atomicInt64Features;
+    bdaFeatures.pNext = &atomicInt64Features;
 
     // Shader clock feature (per-pixel timing)
     VkPhysicalDeviceShaderClockFeaturesKHR clockFeatures{};

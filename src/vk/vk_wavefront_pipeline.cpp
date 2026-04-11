@@ -125,6 +125,10 @@ void WavefrontPipeline::Shutdown() {
     destroyPipeline(pipelineSortPrefix_);
     destroyPipeline(pipelineSortScatter_);
 
+    destroyPipeline(pipelineK2RT_);
+    if (pipelineLayoutRT_) { vkDestroyPipelineLayout(device, pipelineLayoutRT_, nullptr); pipelineLayoutRT_ = VK_NULL_HANDLE; }
+    if (sbtK2Buffer_) { vkDestroyBuffer(device, sbtK2Buffer_, nullptr); sbtK2Buffer_ = VK_NULL_HANDLE; }
+    if (sbtK2Memory_) { vkFreeMemory(device, sbtK2Memory_, nullptr); sbtK2Memory_ = VK_NULL_HANDLE; }
     if (pipelineLayout_) { vkDestroyPipelineLayout(device, pipelineLayout_, nullptr); pipelineLayout_ = VK_NULL_HANDLE; }
     if (wfDescPool_) { vkDestroyDescriptorPool(device, wfDescPool_, nullptr); wfDescPool_ = VK_NULL_HANDLE; }
     if (wfDescSetLayout_) { vkDestroyDescriptorSetLayout(device, wfDescSetLayout_, nullptr); wfDescSetLayout_ = VK_NULL_HANDLE; }
@@ -145,6 +149,130 @@ void WavefrontPipeline::Shutdown() {
     DestroySSBO(device, sharcStateBuffer_, sharcStateMemory_);
 
     ready_ = false;
+}
+
+bool WavefrontPipeline::CreateK2RTPipeline() {
+    VkDevice device = context_->GetDevice();
+
+    // Load RT function pointers
+    vkCreateRayTracingPipelinesKHR_ = (PFN_vkCreateRayTracingPipelinesKHR)
+        vkGetDeviceProcAddr(device, "vkCreateRayTracingPipelinesKHR");
+    vkGetRayTracingShaderGroupHandlesKHR_ = (PFN_vkGetRayTracingShaderGroupHandlesKHR)
+        vkGetDeviceProcAddr(device, "vkGetRayTracingShaderGroupHandlesKHR");
+    vkCmdTraceRaysKHR_ = (PFN_vkCmdTraceRaysKHR)
+        vkGetDeviceProcAddr(device, "vkCmdTraceRaysKHR");
+    vkGetBufferDeviceAddressKHR_ = (PFN_vkGetBufferDeviceAddressKHR)
+        vkGetDeviceProcAddr(device, "vkGetBufferDeviceAddressKHR");
+
+    if (!vkCreateRayTracingPipelinesKHR_ || !vkGetRayTracingShaderGroupHandlesKHR_ ||
+        !vkCmdTraceRaysKHR_ || !vkGetBufferDeviceAddressKHR_) {
+        Log(L"[Wavefront] RT function pointers not available\n");
+        return false;
+    }
+
+    // Load raygen shader module
+    VkShaderModule raygenModule = VK_NULL_HANDLE;
+    if (!LoadComputeShader("shaders/wavefront/wf_shade.rgen.spv", &raygenModule)) {
+        Log(L"[Wavefront] wf_shade.rgen.spv not found (SER disabled)\n");
+        return false;
+    }
+
+    // Create RT pipeline (raygen only — uses ray queries, no closest hit/miss)
+    VkPipelineShaderStageCreateInfo stageInfo{};
+    stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stageInfo.stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    stageInfo.module = raygenModule;
+    stageInfo.pName = "main";
+
+    VkRayTracingShaderGroupCreateInfoKHR groupInfo{};
+    groupInfo.sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+    groupInfo.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    groupInfo.generalShader = 0;
+    groupInfo.closestHitShader = VK_SHADER_UNUSED_KHR;
+    groupInfo.anyHitShader = VK_SHADER_UNUSED_KHR;
+    groupInfo.intersectionShader = VK_SHADER_UNUSED_KHR;
+
+    VkRayTracingPipelineCreateInfoKHR pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
+    pipelineInfo.stageCount = 1;
+    pipelineInfo.pStages = &stageInfo;
+    pipelineInfo.groupCount = 1;
+    pipelineInfo.pGroups = &groupInfo;
+    pipelineInfo.maxPipelineRayRecursionDepth = 1;
+    pipelineInfo.layout = pipelineLayoutRT_;
+
+    VkResult result = vkCreateRayTracingPipelinesKHR_(device,
+        VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipelineK2RT_);
+
+    vkDestroyShaderModule(device, raygenModule, nullptr);
+
+    if (result != VK_SUCCESS) {
+        Log(L"[Wavefront] Failed to create K2 RT pipeline (result=%d)\n", result);
+        return false;
+    }
+
+    // Create SBT (raygen only)
+    VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtProps{};
+    rtProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
+    VkPhysicalDeviceProperties2 props2{};
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props2.pNext = &rtProps;
+    vkGetPhysicalDeviceProperties2(context_->GetPhysicalDevice(), &props2);
+
+    uint32_t handleSize = rtProps.shaderGroupHandleSize;
+    uint32_t handleAlignment = rtProps.shaderGroupHandleAlignment;
+    uint32_t baseAlignment = rtProps.shaderGroupBaseAlignment;
+    uint32_t handleSizeAligned = (handleSize + handleAlignment - 1) & ~(handleAlignment - 1);
+    uint32_t sbtSize = baseAlignment;
+
+    std::vector<uint8_t> handleData(handleSize);
+    vkGetRayTracingShaderGroupHandlesKHR_(device, pipelineK2RT_, 0, 1, handleSize, handleData.data());
+
+    VkBufferCreateInfo bufInfo{};
+    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufInfo.size = sbtSize;
+    bufInfo.usage = VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    if (vkCreateBuffer(device, &bufInfo, nullptr, &sbtK2Buffer_) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements memReqs;
+    vkGetBufferMemoryRequirements(device, sbtK2Buffer_, &memReqs);
+
+    VkMemoryAllocateFlagsInfo allocFlags{};
+    allocFlags.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+    allocFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.pNext = &allocFlags;
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = FindMemoryType(context_->GetPhysicalDevice(), memReqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &sbtK2Memory_) != VK_SUCCESS) return false;
+    vkBindBufferMemory(device, sbtK2Buffer_, sbtK2Memory_, 0);
+
+    void* mapped;
+    vkMapMemory(device, sbtK2Memory_, 0, sbtSize, 0, &mapped);
+    memset(mapped, 0, sbtSize);
+    memcpy(mapped, handleData.data(), handleSize);
+    vkUnmapMemory(device, sbtK2Memory_);
+
+    VkBufferDeviceAddressInfo addrInfo{};
+    addrInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+    addrInfo.buffer = sbtK2Buffer_;
+    VkDeviceAddress sbtAddress = vkGetBufferDeviceAddressKHR_(device, &addrInfo);
+
+    sbtK2RaygenRegion_.deviceAddress = sbtAddress;
+    sbtK2RaygenRegion_.stride = handleSizeAligned;
+    sbtK2RaygenRegion_.size = handleSizeAligned;
+    sbtK2MissRegion_ = {};
+    sbtK2HitRegion_ = {};
+    sbtK2CallableRegion_ = {};
+
+    Log(L"[Wavefront] K2 SBT created (handleSize=%u, aligned=%u)\n", handleSize, handleSizeAligned);
+    return true;
 }
 
 bool WavefrontPipeline::CreateBuffers(uint32_t pixelCount) {
@@ -222,7 +350,7 @@ bool WavefrontPipeline::CreateDescriptorSet() {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1;
-        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR;
     }
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -377,6 +505,34 @@ bool WavefrontPipeline::CreatePipelines() {
     }
 
     Log(L"[Wavefront] All compute pipelines created (K0-K5 + compact + sort)\n");
+
+    // RT pipeline layout for K2 (same descriptor sets, push constants for RAYGEN stage)
+    VkPushConstantRange pushRangeRT{};
+    pushRangeRT.stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    pushRangeRT.offset = 0;
+    pushRangeRT.size = 7 * sizeof(uint32_t);
+
+    VkPipelineLayoutCreateInfo layoutInfoRT{};
+    layoutInfoRT.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layoutInfoRT.setLayoutCount = 2;
+    layoutInfoRT.pSetLayouts = setLayouts;
+    layoutInfoRT.pushConstantRangeCount = 1;
+    layoutInfoRT.pPushConstantRanges = &pushRangeRT;
+
+    if (vkCreatePipelineLayout(device, &layoutInfoRT, nullptr, &pipelineLayoutRT_) != VK_SUCCESS) {
+        Log(L"[Wavefront] WARNING: Failed to create RT pipeline layout (SER disabled)\n");
+    }
+
+    // Attempt to create RT K2 pipeline for hardware SER
+    // Only enable on RTX 40+ (Ada) — RTX 30 has software SER which is slower than material sort
+    serAvailable_ = false;
+    if (pipelineLayoutRT_ && context_->IsHardwareSERCapable() && CreateK2RTPipeline()) {
+        serAvailable_ = true;
+        Log(L"[Wavefront] K2 RT pipeline created (hardware SER on RTX %u)\n", context_->GetRTXSeries());
+    } else {
+        Log(L"[Wavefront] K2 running as compute + material sort (RTX %u)\n", context_->GetRTXSeries());
+    }
+
     return true;
 }
 
@@ -463,19 +619,34 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
-        // K2: Shade + NEE + bounce setup (same descriptor set as K1)
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK2_);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
-            0, 2, setsBounce, 0, nullptr);
-        vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-        if (bounce == 0) {
-            vkCmdDispatch(cmd, groupsAll, 1, 1);
+        // K2: Shade + NEE + bounce setup
+        if (serAvailable_) {
+            // RT path: raygen shader with hardware SER (reorderThreadNV)
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipelineK2RT_);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipelineLayoutRT_,
+                0, 2, setsBounce, 0, nullptr);
+            vkCmdPushConstants(cmd, pipelineLayoutRT_, VK_SHADER_STAGE_RAYGEN_BIT_KHR, 0, sizeof(push), &push);
+            vkCmdTraceRaysKHR_(cmd,
+                &sbtK2RaygenRegion_, &sbtK2MissRegion_, &sbtK2HitRegion_, &sbtK2CallableRegion_,
+                totalPixels, 1, 1);
         } else {
-            vkCmdDispatchIndirect(cmd, indirectDispatchBuffer_, 0);
+            // Compute fallback (no SER)
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK2_);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+                0, 2, setsBounce, 0, nullptr);
+            vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            if (bounce == 0) {
+                vkCmdDispatch(cmd, groupsAll, 1, 1);
+            } else {
+                vkCmdDispatchIndirect(cmd, indirectDispatchBuffer_, 0);
+            }
         }
 
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        VkPipelineStageFlags k2DstStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        VkPipelineStageFlags k2SrcStage = serAvailable_
+            ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+            : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        vkCmdPipelineBarrier(cmd, k2SrcStage, k2DstStage, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 
         // Compact: write shadow dispatch args + swap counters + write active dispatch args
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineCompact_);
@@ -515,7 +686,7 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
         // After sort, paths are in READ buffer grouped by material category.
         // No ping-pong swap needed — sort places data directly in READ buffer.
         // Material sorting: only beneficial for scenes with mixed materials.
-        bool sortAvailable = materialSort_ && pipelineSortCount_ && pipelineSortPrefix_ && pipelineSortScatter_;
+        bool sortAvailable = materialSort_ && !serAvailable_ && pipelineSortCount_ && pipelineSortPrefix_ && pipelineSortScatter_;
         if (sortAvailable) {
             // Clear sort bin counts (5 uints at offset 16 in counters buffer)
             vkCmdFillBuffer(cmd, countersBuffer_, 16, 20, 0);

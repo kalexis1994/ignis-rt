@@ -2276,6 +2276,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         dll_wrapper.set_int("hybrid_rasterization", 1 if props.hybrid_rasterization else 0)
         dll_wrapper.set_int("backface_culling", 1 if props.backface_culling else 0)
         dll_wrapper.set_int("restir_di", 1 if props.restir_di else 0)
+        dll_wrapper.set_int("restir_gi", 1 if props.restir_gi else 0)
         dll_wrapper.set_int("material_sort", 1 if props.material_sort else 0)
         dll_wrapper.set_int("sharc_enabled", 1 if props.sharc_enabled else 0)
         dll_wrapper.set_int("debug_view", int(props.debug_view))
