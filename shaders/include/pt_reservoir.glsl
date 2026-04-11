@@ -30,6 +30,9 @@ struct PTReservoir {
     vec3  primaryNormal;
     float primaryRoughness;
     float age;
+    float partialJacobian;  // cached 1/(cos/dist^2) for Jacobian
+    float rcWiPdf;          // BRDF PDF at rcVertex
+    uint  pathLength;       // total path bounces
 };
 
 struct PTPathRecord {
@@ -57,7 +60,7 @@ PTReservoir ptEmptyReservoir() {
     r.weightSum = 0.0; r.M = 0.0; r.targetFunction = 0.0;
     r.rcBounceDepth = 0u; r.rngSeed = 0u; r.lightType = 0u; r.lightIndex = 0u;
     r.primaryPos = vec3(0); r.primaryNormal = vec3(0,1,0); r.primaryRoughness = 1.0;
-    r.age = 0.0;
+    r.age = 0.0; r.partialJacobian = 0.0; r.rcWiPdf = 0.0; r.pathLength = 0u;
     return r;
 }
 
@@ -83,7 +86,7 @@ float ptTargetPDF(PTReservoir r) {
     return max(dot(r.rcRadiance, vec3(0.2126, 0.7152, 0.0722)), 0.0);
 }
 
-PTReservoir ptCreateFromPathRecord(PTPathRecord pr) {
+PTReservoir ptCreateFromPathRecord(PTPathRecord pr, float cachedPartialJ, float rcPdf) {
     PTReservoir r = ptEmptyReservoir();
     if (!pr.rcValid) return r;
     r.rcVertexPos = pr.rcPos; r.rcVertexNormal = pr.rcNormal;
@@ -92,6 +95,8 @@ PTReservoir ptCreateFromPathRecord(PTPathRecord pr) {
     r.lightType = pr.lightType; r.lightIndex = pr.lightIndex;
     r.primaryPos = pr.primaryPos; r.primaryNormal = pr.primaryNormal;
     r.primaryRoughness = pr.primaryRoughness; r.age = 0.0;
+    r.partialJacobian = cachedPartialJ; r.rcWiPdf = rcPdf;
+    r.pathLength = pr.rcBounce + 1u;
     float pHat = ptTargetPDF(r);
     if (pHat > 0.001) { r.weightSum = 1.0; r.M = 1.0; r.targetFunction = pHat; }
     return r;
@@ -107,7 +112,8 @@ bool ptReservoirUpdate(inout PTReservoir r, PTReservoir cand, float weight, inou
         r.rngSeed = cand.rngSeed; r.lightType = cand.lightType; r.lightIndex = cand.lightIndex;
         r.primaryPos = cand.primaryPos; r.primaryNormal = cand.primaryNormal;
         r.primaryRoughness = cand.primaryRoughness; r.targetFunction = cand.targetFunction;
-        r.age = cand.age;
+        r.age = cand.age; r.partialJacobian = cand.partialJacobian;
+        r.rcWiPdf = cand.rcWiPdf; r.pathLength = cand.pathLength;
     }
     rng = fract(rng * 747.6513 + 0.3713);
     return sel;
@@ -136,13 +142,35 @@ bool ptSurfaceSimilar(vec3 n1, vec3 n2, float r1, float r2, vec3 p1, vec3 p2) {
     return true;
 }
 
-float ptJacobian(vec3 rcPos, vec3 rcN, vec3 recvNew, vec3 recvOrig) {
-    vec3 tN = recvNew - rcPos, tO = recvOrig - rcPos;
-    float dN = length(tN), dO = length(tO);
-    if (dN < 0.001 || dO < 0.001) return 0.0;
-    float cN = max(dot(rcN, tN/dN), 0.0), cO = max(dot(rcN, tO/dO), 1e-4);
-    float J = (cN * dO*dO) / (cO * dN*dN);
+float ptPartialJacobian(vec3 rcPos, vec3 rcNormal, vec3 receiverPos) {
+    vec3 v = receiverPos - rcPos;
+    float distSq = dot(v, v);
+    if (distSq < 1e-8) return 0.0;
+    return max(dot(rcNormal, v * inversesqrt(distSq)), 0.0) / distSq;
+}
+
+float ptJacobianCached(vec3 receiverNew, inout PTReservoir r) {
+    float newPartial = ptPartialJacobian(r.rcVertexPos, r.rcVertexNormal, receiverNew);
+    float J = newPartial * r.partialJacobian;
+    if (newPartial > 1e-8) r.partialJacobian = 1.0 / newPartial;
     return (isnan(J) || isinf(J)) ? 0.0 : clamp(J, 0.0, 100.0);
+}
+
+float ptJacobian(vec3 rcPos, vec3 rcN, vec3 recvNew, vec3 recvOrig) {
+    float pNew = ptPartialJacobian(rcPos, rcN, recvNew);
+    float pOrig = ptPartialJacobian(rcPos, rcN, recvOrig);
+    if (pOrig < 1e-8) return 0.0;
+    float J = pNew / pOrig;
+    return (isnan(J) || isinf(J)) ? 0.0 : clamp(J, 0.0, 100.0);
+}
+
+bool ptValidateInvertibility(vec3 shiftedPos, vec3 shiftedNormal,
+                              float shiftedRoughness, PTReservoir r) {
+    if (shiftedRoughness < 0.25) return false;
+    if (length(r.rcVertexPos - shiftedPos) < 0.1) return false;
+    vec3 toRC = normalize(r.rcVertexPos - shiftedPos);
+    if (dot(shiftedNormal, toRC) < 0.01) return false;
+    return true;
 }
 
 bool ptIsValidReconnection(float rPrev, float rCurr, vec3 pPrev, vec3 pCurr) {

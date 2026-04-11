@@ -63,6 +63,10 @@ layout(binding = 28, set = 0, std430) buffer PrevTransformBuf {
 layout(binding = 3, set = 1, scalar) buffer PixelRadianceBuffer { uint radDataU[]; } pixelRadiance;
 layout(binding = 4, set = 1, scalar) buffer PrimaryGBufBuffer { float gbufData[]; } primaryGBuf;
 
+// Stable Planes (set 1)
+layout(binding = 18, set = 1, std430) buffer SPHeaderBuf { uvec4 data[]; } spHeader;
+layout(binding = 19, set = 1, std430) buffer SPDataBuf   { vec4  data[]; } spData;
+
 layout(push_constant) uniform PushConst {
     uint width;
     uint height;
@@ -144,30 +148,85 @@ void main() {
     // viewZ < 0 for visible geometry (RH convention), 0 for sky (buffer cleared to 0)
     bool primaryHit = (primaryViewZ < -0.001);
 
-    // Write G-buffers for NRD
+    // ── Stable Planes FILL: override guide buffers for delta surfaces ──
+    // When BUILD found a non-delta surface behind glass/mirror, use its
+    // data (normal, depth, MVs) for DLSS RR instead of the glass surface.
+    // This gives the denoiser correct temporal reprojection through glass.
+    vec3 denoiserNormal = primaryNormal;
+    float denoiserRoughness = primaryRoughness;
+    float denoiserViewZ = primaryViewZ;
+    vec2 denoiserMV = vec2(0);
+    bool hasStablePlane = false;
+
     if (primaryHit) {
-        imageStore(normalRoughnessImg, pixel, NRD_PackNormalRoughness(primaryNormal, primaryRoughness));
-        imageStore(viewDepthImg, pixel, vec4(primaryViewZ, 0, 0, 0));
+        // Read dominant stable plane
+        uvec4 header = spHeader.data[pixelIndex];
+        uint dominantIdx = header.w & 3u;
+        uint dominantBranchID = (dominantIdx == 0u) ? header.x :
+                                 (dominantIdx == 1u) ? header.y : header.z;
 
-        // Motion vectors from previous-frame transforms
-        uint tBase = primaryInstanceId * 3u;
-        vec4 prevRow0 = prevTransforms.data[tBase + 0u];
-        vec4 prevRow1 = prevTransforms.data[tBase + 1u];
-        vec4 prevRow2 = prevTransforms.data[tBase + 2u];
-        vec4 lp = vec4(primaryLocalPos, 1.0);
-        vec3 prevWorldPos = vec3(dot(prevRow0, lp), dot(prevRow1, lp), dot(prevRow2, lp));
+        if (dominantBranchID > 1u) {  // >1 means we went through at least one delta scatter
+            // Read stable plane data
+            int spBase = int(pixelIndex) * 24 + int(dominantIdx) * 8;
+            vec3 spWorldPos = spData.data[spBase+0].xyz;
+            float spSceneLength = spData.data[spBase+0].w;
+            vec3 spNormal = vec3(0,1,0);
+            float spViewZ = 0.0;
+            float spRoughness = 1.0;
 
-        vec4 currClip = cam.proj * cam.view * vec4(primaryWorldPos, 1.0);
-        vec2 currNDC = currClip.xy / currClip.w;
-        vec2 currUV = vec2(currNDC.x * 0.5 + 0.5, 0.5 - currNDC.y * 0.5);
-        vec4 prevClip = cam.projPrev * cam.viewPrev * vec4(prevWorldPos, 1.0);
-        vec2 prevNDC = prevClip.xy / prevClip.w;
-        vec2 prevUV = vec2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
-        vec2 motionVector = prevUV - currUV;
-        // Note: MVs must be pure geometric motion WITHOUT jitter.
-        // DLSS receives jitter offsets separately (InJitterOffsetX/Y)
-        // and handles sub-pixel alignment internally.
-        float mvZ = (cam.viewPrev * vec4(prevWorldPos, 1.0)).z - primaryViewZ;
+            // Decode normal from oct-encoded
+            vec2 spNEnc = spData.data[spBase+3].xy;
+            if (spNEnc.x != 0.0 || spNEnc.y != 0.0) {
+                vec2 ne = spNEnc * 2.0 - 1.0;
+                spNormal = vec3(ne.x, ne.y, 1.0 - abs(ne.x) - abs(ne.y));
+                if (spNormal.z < 0.0) spNormal.xy = (1.0 - abs(spNormal.yx)) *
+                    vec2(spNormal.x >= 0.0 ? 1.0 : -1.0, spNormal.y >= 0.0 ? 1.0 : -1.0);
+                spNormal = normalize(spNormal);
+            }
+            spViewZ = spData.data[spBase+3].z;
+            spRoughness = spData.data[spBase+2].w;
+            vec2 spMV = spData.data[spBase+4].xy;
+
+            // Only use if the stable plane found a valid surface (viewZ < 0)
+            if (spViewZ < -0.001 && spSceneLength < 9999.0) {
+                denoiserNormal = spNormal;
+                denoiserRoughness = max(spRoughness, 0.01);
+                denoiserViewZ = spViewZ;
+                denoiserMV = spMV;
+                hasStablePlane = true;
+                // Also update primaryWorldPos for specular MV virtual position
+                primaryWorldPos = spWorldPos;
+            }
+        }
+    }
+
+    // Write G-buffers for DLSS RR
+    if (primaryHit) {
+        imageStore(normalRoughnessImg, pixel, NRD_PackNormalRoughness(denoiserNormal, denoiserRoughness));
+        imageStore(viewDepthImg, pixel, vec4(denoiserViewZ, 0, 0, 0));
+
+        // Motion vectors: use stable plane MVs if available, else compute from transforms
+        vec2 motionVector;
+        float mvZ;
+        if (hasStablePlane) {
+            motionVector = denoiserMV;
+            mvZ = 0.0;  // stable plane MVs already include depth component
+        } else {
+            uint tBase = primaryInstanceId * 3u;
+            vec4 prevRow0 = prevTransforms.data[tBase + 0u];
+            vec4 prevRow1 = prevTransforms.data[tBase + 1u];
+            vec4 prevRow2 = prevTransforms.data[tBase + 2u];
+            vec4 lp = vec4(primaryLocalPos, 1.0);
+            vec3 prevWorldPos = vec3(dot(prevRow0, lp), dot(prevRow1, lp), dot(prevRow2, lp));
+            vec4 currClip = cam.proj * cam.view * vec4(primaryWorldPos, 1.0);
+            vec2 currNDC = currClip.xy / currClip.w;
+            vec2 currUV = vec2(currNDC.x * 0.5 + 0.5, 0.5 - currNDC.y * 0.5);
+            vec4 prevClip = cam.projPrev * cam.viewPrev * vec4(prevWorldPos, 1.0);
+            vec2 prevNDC = prevClip.xy / prevClip.w;
+            vec2 prevUV = vec2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
+            motionVector = prevUV - currUV;
+            mvZ = (cam.viewPrev * vec4(prevWorldPos, 1.0)).z - primaryViewZ;
+        }
         imageStore(motionVectorsImg, pixel, vec4(motionVector, mvZ, 0));
 
         // Demodulate diffuse by albedo for NRD
@@ -177,8 +236,8 @@ void main() {
         imageStore(specularRadianceImg, pixel, NRD_PackRadiance(specular, hitDist));
         imageStore(albedoBufferImg, pixel, vec4(primaryAlbedo, 0.5));
 
-        // DLSS NDC depth
-        vec4 clipPos = cam.proj * vec4(0.0, 0.0, primaryViewZ, 1.0);
+        // DLSS NDC depth (use stable plane depth if available)
+        vec4 clipPos = cam.proj * vec4(0.0, 0.0, denoiserViewZ, 1.0);
         float ndcZ = clamp(clipPos.z / clipPos.w, 0.0, 1.0);
         imageStore(dlssDepthImg, pixel, vec4(ndcZ, 0, 0, 0));
 
@@ -233,7 +292,17 @@ void main() {
         // Penumbra: written by K2 inline sun shadow trace (not here)
         // Only write default if K2 didn't run (sky miss handled below)
         // Reactive, confidence:
-        float transformDelta = distance(primaryWorldPos, prevWorldPos);
+        // Compute prevWorldPos for reactive mask (needed regardless of stable planes)
+        vec3 prevWorldPosRM = primaryWorldPos;  // default: no motion
+        if (!hasStablePlane) {
+            uint tBaseRM = primaryInstanceId * 3u;
+            vec4 prRM0 = prevTransforms.data[tBaseRM + 0u];
+            vec4 prRM1 = prevTransforms.data[tBaseRM + 1u];
+            vec4 prRM2 = prevTransforms.data[tBaseRM + 2u];
+            vec4 lpRM = vec4(primaryLocalPos, 1.0);
+            prevWorldPosRM = vec3(dot(prRM0, lpRM), dot(prRM1, lpRM), dot(prRM2, lpRM));
+        }
+        float transformDelta = distance(primaryWorldPos, prevWorldPosRM);
         imageStore(reactiveMaskImg, pixel, vec4(clamp(transformDelta * 50.0, 0.0, 1.0)));
         float confidence = (transformDelta > 0.001) ? 0.3 : 1.0;
         imageStore(diffConfidenceImg, pixel, vec4(confidence));

@@ -1942,7 +1942,7 @@ void main() {
         // directLighting is PRE-throughput; throughput applied via SharcSetThroughput
         float sharcRandom = rand01();  // standard 50% resampling (warmup burst disabled)
         bool continueTracing = SharcUpdateHit(sharcGrid, state,
-            worldPos, N, directLighting, sharcRandom, sharcCapacity);
+            worldPos, N, directLighting, sharcRandom, sharcCapacity, hitT);
         SharcSetThroughput(state, throughput);
         storeSharcState(pixelIndex, state);
 
