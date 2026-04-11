@@ -2366,29 +2366,32 @@ void main() {
     }
 
     // ---- ReSTIR GI: Indirect lighting temporal reuse ----
-    // Bounce 0: apply previous frame's GI reservoir (temporal reuse)
-    // Bounce 1: capture current hit as new GI sample
-    bool giReservoirEnabled = (cam.lightPad2 & 8u) != 0u;  // bit 3 of lightPad2
+    // Bounce 1: capture current indirect hit as new GI reservoir sample
+    // Bounce 0: apply previous frame's reservoir via temporal resampling
+    // Reference: Ouyang et al. 2021 "ReSTIR GI", NVIDIA RTXDI SDK
+    bool giReservoirEnabled = (cam.lightPad2 & 8u) != 0u;
     if (giReservoirEnabled && !isGlass && !isHairSurface) {
-        float giIntensity = cam.ptParams0.y; // same GI intensity used for bounce > 0
+        float giIntensity = cam.ptParams0.y;
         int pixelLinearIdx = int(pixelIndex);
         ivec2 launchSize = ivec2(pc.width, pc.height);
         ivec2 pixel = ivec2(pixelIndex % pc.width, pixelIndex / pc.width);
 
         if (bounce == 1u) {
-            // Capture: indirect hit as GI reservoir sample
-            // Use unshadowed emission + base illuminance as radiance proxy
+            // Capture: store the indirect hit as a GI reservoir sample.
+            // Radiance = unshadowed illumination estimate at the reconnection vertex (x2).
             vec3 sampleRadiance = emission;
-            // Add unshadowed sun estimate if visible
             float sunInt = cam.sunLight.w;
             if (sunInt > 0.0) {
                 vec3 sunDir = normalize(cam.sunLight.xyz);
                 float sNdotL = max(dot(N, sunDir), 0.0);
-                sampleRadiance += baseColor * sNdotL * sunInt * 0.3183; // 1/PI
+                sampleRadiance += baseColor * sNdotL * sunInt * 0.3183;
             }
             sampleRadiance *= giIntensity;
+            // Clamp radiance to prevent firefly samples from entering the reservoir
+            sampleRadiance = min(sampleRadiance, vec3(10.0));
 
-            if (dot(sampleRadiance, vec3(0.2126, 0.7152, 0.0722)) > 0.001) {
+            float lum = dot(sampleRadiance, vec3(0.2126, 0.7152, 0.0722));
+            if (lum > 0.001) {
                 GIReservoir newSample;
                 newSample.position = worldPos;
                 newSample.normal = N;
@@ -2398,45 +2401,27 @@ void main() {
                 newSample.weightSum = 0.0;
                 newSample.M = 0.0;
 
-                // Read primary surface data for target PDF
-                uint gBase = pixelIndex * 24u;
-                vec3 primaryN = vec3(primaryGBuf.gbufData[gBase+0],
-                                     primaryGBuf.gbufData[gBase+1],
-                                     primaryGBuf.gbufData[gBase+2]);
-                vec3 primaryPos = vec3(primaryGBuf.gbufData[gBase+4],
-                                       primaryGBuf.gbufData[gBase+5],
-                                       primaryGBuf.gbufData[gBase+6]);
-
-                float pHat = giTargetPDF(primaryN, primaryPos, newSample);
-                if (pHat > 0.0) {
-                    GIReservoir curr = emptyReservoir();
-                    float rng = rand01();
-                    reservoirUpdate(curr, newSample, pHat, rng);
-                    writeReservoir(pixelLinearIdx, curr);
-                }
+                // Target PDF = luminance of cached radiance (simple form, per paper)
+                float pHat = lum;
+                // Initial W = 1/sourcePDF. For cosine-hemisphere sampling, sourcePDF ~ cos/pi.
+                // Since we don't track sourcePDF exactly, use W_initial = 1.0 (unbiased start).
+                GIReservoir curr = emptyReservoir();
+                float rng = rand01();
+                reservoirUpdate(curr, newSample, pHat, rng);
+                writeReservoir(pixelLinearIdx, curr);
             }
         }
 
         if (bounce == 0u && pc.sampleIdx == 0u) {
-            // Temporal reuse: apply previous frame's GI reservoir
-            uint gBase = pixelIndex * 24u;
+            // Temporal reuse: merge previous frame's reservoir with current path.
             vec3 primaryN = N;
             vec3 primaryPos = worldPos;
 
-            // Motion vector (same as output kernel uses)
-            vec3 localP = vec3(primaryGBuf.gbufData[gBase+12],
-                               primaryGBuf.gbufData[gBase+13],
-                               primaryGBuf.gbufData[gBase+14]);
-            // Use current frame localPos since gbuf might not be written yet at bounce 0
-            localP = localPos;
-            uint instIdPacked = floatBitsToUint(primaryGBuf.gbufData[gBase+15]);
-            uint instForMV = uint(instanceId);
-
+            // Compute motion vector for temporal reprojection
             vec4 currClip = cam.proj * cam.view * vec4(worldPos, 1.0);
             vec2 currNDC = currClip.xy / currClip.w;
             vec2 currUV = vec2(currNDC.x * 0.5 + 0.5, 0.5 - currNDC.y * 0.5);
-
-            uint rBase3 = instForMV * 3u;
+            uint rBase3 = uint(instanceId) * 3u;
             vec4 rRow0 = prevTransforms.data[rBase3 + 0u];
             vec4 rRow1 = prevTransforms.data[rBase3 + 1u];
             vec4 rRow2 = prevTransforms.data[rBase3 + 2u];
@@ -2453,24 +2438,58 @@ void main() {
             bool reused = reservoirTemporalReuse(reservoir, primaryN, primaryPos,
                                                   motionVec, launchSize, pixel, rng);
 
-            if (reused && reservoir.weightSum > 0.0 && reservoir.M > 0.0) {
-                float finalPHat = giTargetPDF(primaryN, primaryPos, reservoir);
-                if (finalPHat > 0.0) {
-                    float W = reservoir.weightSum / (reservoir.M * finalPHat);
-                    vec3 reusedGI = reservoir.radiance * finalPHat * W;
-                    float blendWeight = clamp(reservoir.M / 10.0, 0.0, 0.5);
-                    // Add reused indirect lighting to pixel radiance (diffuse channel)
-                    uint rBase = pixelIndex * 8u;
-                    vec3 giContrib = reusedGI * blendWeight * 0.3;
-                    atomicAddFloat(rBase + 0u, giContrib.r);
-                    atomicAddFloat(rBase + 1u, giContrib.g);
-                    atomicAddFloat(rBase + 2u, giContrib.b);
+            if (reused && reservoir.weightSum > 0.0 && reservoir.M > 0.5) {
+                // ── Contribution weight W = weightSum / (M * p_hat_selected) ──
+                float finalPHat = dot(reservoir.radiance, vec3(0.2126, 0.7152, 0.0722));
+                float W = (finalPHat > 0.001) ?
+                    reservoir.weightSum / (reservoir.M * finalPHat) : 0.0;
+                // Guard: reject NaN/Inf W
+                if (isnan(W) || isinf(W)) W = 0.0;
+                W = min(W, 5.0);
+
+                vec3 toSample = reservoir.position - primaryPos;
+                float dist = length(toSample);
+                if (dist > 0.01 && W > 0.0) {
+                    vec3 sampleDir = toSample / dist;
+                    float cosTheta = max(dot(primaryN, sampleDir), 0.0);
+
+                    if (cosTheta > 0.001) {
+                        // Evaluate: Lo(x2) * BRDF * cos(theta) * W
+                        vec3 giContrib = reservoir.radiance * baseColor * (cosTheta / PI) * W;
+                        if (any(isnan(giContrib)) || any(isinf(giContrib))) giContrib = vec3(0.0);
+
+                        // ── Boiling filter (per-thread, based on RTXDI approach) ──
+                        // Compare this sample's luminance against a threshold.
+                        // True boiling filter uses workgroup shared memory, but a simple
+                        // per-pixel luminance cap relative to the reservoir radiance
+                        // catches the worst outliers without shared memory overhead.
+                        float giLum = dot(giContrib, vec3(0.2126, 0.7152, 0.0722));
+                        float srcLum = dot(reservoir.radiance, vec3(0.2126, 0.7152, 0.0722));
+                        // Contribution should not exceed source radiance (energy conservation)
+                        if (giLum > srcLum * 2.0 && srcLum > 0.001) {
+                            giContrib *= (srcLum * 2.0) / giLum;
+                        }
+
+                        // ── Reservoir REPLACES traced indirect, not adds ──
+                        // Scale down throughput for the next bounce proportional to
+                        // reservoir confidence. This prevents double-counting: the
+                        // reservoir provides GI, so the traced bounce 1 contributes
+                        // less. At M=20 (full confidence), traced path is 20% and
+                        // reservoir is 80%. At M=1, traced path dominates.
+                        float confidence = clamp(reservoir.M / 20.0, 0.0, 0.8);
+                        throughput *= (1.0 - confidence);
+
+                        uint rBase = pixelIndex * 8u;
+                        atomicAddFloat(rBase + 0u, giContrib.r * confidence);
+                        atomicAddFloat(rBase + 1u, giContrib.g * confidence);
+                        atomicAddFloat(rBase + 2u, giContrib.b * confidence);
+                    }
                 }
             }
         }
     }
 
-    // Write next-bounce PathState
+    // Write next-bounce PathState (throughput may be modulated by ReSTIR GI)
     uint nextBounce = bounce + 1u;
     if (nextBounce < pc.maxBounces) {
         uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);

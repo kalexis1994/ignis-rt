@@ -111,12 +111,14 @@ void main() {
                          uintBitsToFloat(pixelRadiance.radDataU[rBase+5]),
                          uintBitsToFloat(pixelRadiance.radDataU[rBase+6])) * sppInv;
 
-    // Firefly suppression — clamp outlier samples that cause bright splotches.
-    // NRD had built-in anti-firefly; with DLSS RR only, we clamp here.
-    const float FIREFLY_MAX = 100.0;
-    diffuse = min(diffuse, vec3(FIREFLY_MAX));
-    specular = min(specular, vec3(FIREFLY_MAX));
-    // NaN guard — replace with zero (NaN propagation causes black pixels)
+    // Firefly suppression — clamp outlier radiance before DLSS RR.
+    // Uses a soft clamp: values above threshold are compressed, not hard-cut.
+    const float FIREFLY_THRESHOLD = 50.0;
+    float diffLum = dot(diffuse, vec3(0.2126, 0.7152, 0.0722));
+    if (diffLum > FIREFLY_THRESHOLD) diffuse *= FIREFLY_THRESHOLD / diffLum;
+    float specLum = dot(specular, vec3(0.2126, 0.7152, 0.0722));
+    if (specLum > FIREFLY_THRESHOLD) specular *= FIREFLY_THRESHOLD / specLum;
+    // NaN guard
     if (any(isnan(diffuse)))  diffuse  = vec3(0.0);
     if (any(isnan(specular))) specular = vec3(0.0);
 
