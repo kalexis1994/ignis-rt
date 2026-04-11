@@ -127,6 +127,7 @@ void WavefrontPipeline::Shutdown() {
     destroyPipeline(pipelinePTTemporal_);
     destroyPipeline(pipelinePTSpatial_);
     destroyPipeline(pipelinePTFinal_);
+    destroyPipeline(pipelineStablePlanes_);
 
     destroyPipeline(pipelineK2RT_);
     if (pipelineLayoutRT_) { vkDestroyPipelineLayout(device, pipelineLayoutRT_, nullptr); pipelineLayoutRT_ = VK_NULL_HANDLE; }
@@ -153,6 +154,8 @@ void WavefrontPipeline::Shutdown() {
     for (int i = 0; i < 2; i++)
         DestroySSBO(device, ptReservoirBuffer_[i], ptReservoirMemory_[i]);
     DestroySSBO(device, ptPathRecordBuffer_, ptPathRecordMemory_);
+    DestroySSBO(device, spHeaderBuffer_, spHeaderMemory_);
+    DestroySSBO(device, spDataBuffer_, spDataMemory_);
 
     ready_ = false;
 }
@@ -312,6 +315,10 @@ bool WavefrontPipeline::CreateBuffers(uint32_t pixelCount) {
     }
     if (!CreateSSBO(device, physDevice, pixelCount * 96, &ptPathRecordBuffer_, &ptPathRecordMemory_)) return false;
 
+    // Stable Planes: header (16 bytes/pixel) + data (24 vec4s = 384 bytes/pixel)
+    if (!CreateSSBO(device, physDevice, pixelCount * 16, &spHeaderBuffer_, &spHeaderMemory_)) return false;
+    if (!CreateSSBO(device, physDevice, pixelCount * 384, &spDataBuffer_, &spDataMemory_)) return false;
+
     // Counters: 64 bytes (16 base + 20 sort bin counts + 20 sort bin offsets + 8 pad)
     if (!CreateSSBO(device, physDevice, 64, &countersBuffer_, &countersMemory_)) return false;
 
@@ -356,8 +363,8 @@ bool WavefrontPipeline::CreateDescriptorSet() {
     // binding 5:  Counters             binding 12: throughput WRITE
     // binding 6:  IndirectDispatch     binding 13: flags READ
     //                                  binding 14: flags WRITE
-    // 15 original + 3 ReSTIR PT (15=ptResCurr, 16=ptResPrev, 17=ptPathRecord)
-    constexpr int NUM_BINDINGS = 18;
+    // 15 original + 3 ReSTIR PT + 2 Stable Planes
+    constexpr int NUM_BINDINGS = 20;
     VkDescriptorSetLayoutBinding bindings[NUM_BINDINGS] = {};
     for (int i = 0; i < NUM_BINDINGS; i++) {
         bindings[i].binding = i;
@@ -417,6 +424,8 @@ bool WavefrontPipeline::CreateDescriptorSet() {
             ptReservoirBuffer_[0],        // 15: PT reservoir current write
             ptReservoirBuffer_[1],        // 16: PT reservoir previous read
             ptPathRecordBuffer_,           // 17: PT path record
+            spHeaderBuffer_,               // 18: Stable Planes header
+            spDataBuffer_,                 // 19: Stable Planes data
         };
 
         VkDescriptorBufferInfo bufInfos[NUM_BINDINGS] = {};
@@ -529,6 +538,9 @@ bool WavefrontPipeline::CreatePipelines() {
     }
     if (!createCompute("shaders/wavefront/wf_pt_final.comp.spv", &pipelinePTFinal_)) {
         Log(L"[Wavefront] WARNING: PT final shader not found\n");
+    }
+    if (!createCompute("shaders/wavefront/wf_stable_planes.comp.spv", &pipelineStablePlanes_)) {
+        Log(L"[Wavefront] WARNING: Stable planes shader not found\n");
     }
 
     Log(L"[Wavefront] All compute pipelines created (K0-K5 + compact + sort + PT)\n");
@@ -767,7 +779,26 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
     uint32_t groupsX = (width + 7) / 8;
     uint32_t groupsY = (height + 7) / 8;
 
-    // ── ReSTIR PT passes (after bounce loop, before output) ──
+    // ── Stable Planes BUILD (after bounce loop, before PT and output) ──
+    if (pipelineStablePlanes_) {
+        VkDescriptorSet setsSP[2] = { sceneDescSet, wfDescSet_[0] };
+        struct SPPush { uint32_t width, height, frameIndex, pad; };
+        SPPush spPush = { width, height, frameIndex_, 0 };
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineStablePlanes_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+            0, 2, setsSP, 0, nullptr);
+        vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(spPush), &spPush);
+        vkCmdDispatch(cmd, groupsX, groupsY, 1);
+
+        VkMemoryBarrier spBarrier{};
+        spBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        spBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        spBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &spBarrier, 0, nullptr, 0, nullptr);
+    }
+
+    // ── ReSTIR PT passes (after stable planes, before output) ──
     bool ptActive = pipelinePTTemporal_ && pipelinePTSpatial_ && pipelinePTFinal_;
     if (ptActive) {
         VkDescriptorSet setsPT[2] = { sceneDescSet, wfDescSet_[0] };

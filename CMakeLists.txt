@@ -185,6 +185,7 @@ if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
         wavefront/wf_pt_temporal.comp:wavefront/wf_pt_temporal.comp.spv
         wavefront/wf_pt_spatial.comp:wavefront/wf_pt_spatial.comp.spv
         wavefront/wf_pt_final.comp:wavefront/wf_pt_final.comp.spv
+        wavefront/wf_stable_planes.comp:wavefront/wf_stable_planes.comp.spv
     )
 
     set(SPV_OUTPUTS "")

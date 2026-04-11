@@ -2382,53 +2382,72 @@ void main() {
     // (Old ReSTIR GI removed — replaced by ReSTIR PT pipeline:
     //  wf_pt_temporal.comp → wf_pt_spatial.comp → wf_pt_final.comp)
 
-    // ── ReSTIR PT: write path record at bounce 1 ──
-    // Bounce 1 hit is the reconnection vertex candidate. We check if both
-    // primary (bounce 0) and current surface are rough+distant enough for
-    // hybrid shift mapping. The path record is consumed by temporal/spatial
-    // resampling passes after the bounce loop.
-    if (ptEnabled && bounce == 1u && pc.sampleIdx == 0u && !isGlass && !isHairSurface) {
+    // ── ReSTIR PT: path record capture at ANY bounce (1+) ──
+    // Per RTXDI: walk the path, find the FIRST valid reconnection vertex.
+    // A reconnection vertex exists when consecutive surfaces are both rough
+    // (≥0.25) and far apart (>0.1). The first valid pair wins.
+    // RcVertexLength = bounce depth of the reconnection vertex.
+    //
+    // Bit 8 in flags = "PT reconnection already found for this path"
+    bool ptRcAlreadyFound = (flags & 0x100u) != 0u;
+
+    if (ptEnabled && bounce >= 1u && pc.sampleIdx == 0u && !isGlass && !isHairSurface && !ptRcAlreadyFound) {
+        // Previous surface data: for bounce 1, this is the primary surface.
+        // For bounce 2+, we'd need the previous bounce's surface. Since the
+        // wavefront pipeline doesn't persist per-bounce surface data, we
+        // approximate: for bounce 1 use primary G-buffer, for bounce 2+ use
+        // the path origin (rayOrigin) and the direction to infer the surface.
+        //
+        // Simplification: only use primary surface data for reconnection check.
+        // This means reconnection always measures against the primary, which is
+        // correct for RcVertexLength = 2 (the common case) and conservative for
+        // deeper bounces (requires both rough + far from primary).
         uint gBase = pixelIndex * 24u;
-        vec3 b0Pos = vec3(primaryGBuf.gbufData[gBase+4],
-                           primaryGBuf.gbufData[gBase+5],
-                           primaryGBuf.gbufData[gBase+6]);
-        vec3 b0Normal = vec3(primaryGBuf.gbufData[gBase+0],
-                              primaryGBuf.gbufData[gBase+1],
-                              primaryGBuf.gbufData[gBase+2]);
-        float b0Rough = primaryGBuf.gbufData[gBase+3];
+        vec3 prevPos = vec3(primaryGBuf.gbufData[gBase+4],
+                             primaryGBuf.gbufData[gBase+5],
+                             primaryGBuf.gbufData[gBase+6]);
+        vec3 prevNormal = vec3(primaryGBuf.gbufData[gBase+0],
+                                primaryGBuf.gbufData[gBase+1],
+                                primaryGBuf.gbufData[gBase+2]);
+        float prevRough = primaryGBuf.gbufData[gBase+3];
         uint b0InstId = floatBitsToUint(primaryGBuf.gbufData[gBase+15]);
 
-        // Reconnection vertex: current hit (bounce 1) if criteria met
-        bool rcValid = ptIsValidReconnection(b0Rough, roughness, b0Pos, worldPos);
+        // Check reconnection validity at this bounce
+        bool rcValid = ptIsValidReconnection(prevRough, roughness, prevPos, worldPos);
 
-        // Estimate radiance at reconnection vertex (emission + unshadowed sun)
-        vec3 rcRad = emission;
-        float sunInt = cam.sunLight.w;
-        if (sunInt > 0.0) {
-            vec3 sunDir = normalize(cam.sunLight.xyz);
-            float sNdL = max(dot(N, sunDir), 0.0);
-            rcRad += baseColor * sNdL * sunInt * 0.3183;
+        if (rcValid) {
+            // Estimate radiance at reconnection vertex
+            vec3 rcRad = emission;
+            float sunInt = cam.sunLight.w;
+            if (sunInt > 0.0) {
+                vec3 sunDir = normalize(cam.sunLight.xyz);
+                float sNdL = max(dot(N, sunDir), 0.0);
+                rcRad += baseColor * sNdL * sunInt * 0.3183;
+            }
+            rcRad = min(rcRad, vec3(20.0));
+            float pathLum = dot(rcRad * throughput, vec3(0.2126, 0.7152, 0.0722));
+
+            // Write path record with actual bounce depth as RcVertexLength
+            int pIdx = int(pixelIndex);
+            int pb = pIdx * 6;
+            ptPathRec.data[pb+0] = vec4(prevPos, prevRough);
+            uint savedRngSeed = floatBitsToUint(primaryGBuf.gbufData[gBase + 23]);
+            ptPathRec.data[pb+1] = vec4(ptOctEncode(prevNormal), uintBitsToFloat(b0InstId), uintBitsToFloat(savedRngSeed));
+            ptPathRec.data[pb+2] = vec4(worldPos, hitT);
+            ptPathRec.data[pb+3] = vec4(rcRad, pathLum);
+            // rcBounce = bounce+1 = RcVertexLength (depth of the rc vertex)
+            uint rcDepth = bounce + 1u;
+            ptPathRec.data[pb+4] = vec4(ptOctEncode(N), uintBitsToFloat(rcDepth), 1.0);
+            // Partial Jacobian + BRDF PDF
+            float pJ = ptPartialJacobian(worldPos, N, prevPos);
+            float cachedPJ = (pJ > 1e-8) ? 1.0 / pJ : 0.0;
+            vec3 toRC = normalize(worldPos - prevPos);
+            float rcPdf = max(dot(prevNormal, toRC), 0.0) / PI;
+            ptPathRec.data[pb+5] = vec4(uintBitsToFloat(0u), uintBitsToFloat(0u), cachedPJ, rcPdf);
+
+            // Mark that we found a reconnection vertex — don't overwrite in later bounces
+            flags |= 0x100u;
         }
-        rcRad = min(rcRad, vec3(20.0));  // prevent fireflies
-
-        // Total path luminance (for target PDF)
-        float pathLum = dot(rcRad * throughput, vec3(0.2126, 0.7152, 0.0722));
-
-        // Write path record
-        int pIdx = int(pixelIndex);
-        int pb = pIdx * 6;
-        ptPathRec.data[pb+0] = vec4(b0Pos, b0Rough);
-        uint savedRngSeed = floatBitsToUint(primaryGBuf.gbufData[gBase + 23]);
-        ptPathRec.data[pb+1] = vec4(ptOctEncode(b0Normal), uintBitsToFloat(b0InstId), uintBitsToFloat(savedRngSeed));
-        ptPathRec.data[pb+2] = vec4(worldPos, hitT);
-        ptPathRec.data[pb+3] = vec4(rcRad, pathLum);
-        ptPathRec.data[pb+4] = vec4(ptOctEncode(N), uintBitsToFloat(rcValid ? 2u : 0u), rcValid ? 1.0 : 0.0);
-        // Compute and cache partial Jacobian + BRDF PDF at rcVertex
-        float pJ = ptPartialJacobian(worldPos, N, b0Pos);
-        float cachedPJ = (pJ > 1e-8) ? 1.0 / pJ : 0.0;
-        vec3 toRC = normalize(worldPos - b0Pos);
-        float rcPdf = max(dot(b0Normal, toRC), 0.0) / PI;
-        ptPathRec.data[pb+5] = vec4(uintBitsToFloat(0u), uintBitsToFloat(0u), cachedPJ, rcPdf);
     }
 
     // Write next-bounce PathState (throughput may be modulated by ReSTIR GI)

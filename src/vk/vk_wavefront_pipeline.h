@@ -79,6 +79,12 @@ private:
     VkDeviceMemory ptPathRecordMemory_ = VK_NULL_HANDLE;
     uint32_t ptReservoirCurrent_ = 0;                  // ping-pong index
 
+    // Stable Planes buffers
+    VkBuffer spHeaderBuffer_ = VK_NULL_HANDLE;         // uvec4 per pixel (branchIDs + dominant)
+    VkDeviceMemory spHeaderMemory_ = VK_NULL_HANDLE;
+    VkBuffer spDataBuffer_ = VK_NULL_HANDLE;           // 24 vec4s per pixel (3 planes × 8 vec4s)
+    VkDeviceMemory spDataMemory_ = VK_NULL_HANDLE;
+
     // Descriptor sets for ping-pong (2 sets, no host updates during recording)
     // SoA bindings: 0=originDir(R), 7=originDir(W), 9=pixelRng(R), 10=pixelRng(W),
     //               11=throughput(R), 12=throughput(W), 13=flags(R), 14=flags(W)
@@ -104,6 +110,9 @@ private:
     VkPipeline pipelinePTTemporal_ = VK_NULL_HANDLE;
     VkPipeline pipelinePTSpatial_ = VK_NULL_HANDLE;
     VkPipeline pipelinePTFinal_ = VK_NULL_HANDLE;
+
+    // Stable Planes compute pipeline
+    VkPipeline pipelineStablePlanes_ = VK_NULL_HANDLE;
 
     // RT pipeline for K2 (shade) — enables hardware SER via reorderThreadNV
     VkPipeline pipelineK2RT_ = VK_NULL_HANDLE;

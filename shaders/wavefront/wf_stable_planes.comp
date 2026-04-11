@@ -1,0 +1,338 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// ============================================================
+// Stable Planes BUILD pass
+//
+// Deterministic delta tracing through glass/mirror chains.
+// Splits at glass into reflection + refraction planes.
+// Up to 3 planes per pixel (per RTXPT).
+//
+// No Russian Roulette, no stochastic sampling.
+// ============================================================
+
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+
+layout(binding = 2, set = 0) uniform CameraProperties {
+    mat4 viewInverse;
+    mat4 projInverse;
+    mat4 view;
+    mat4 proj;
+    mat4 viewPrev;
+    mat4 projPrev;
+    uvec4 parameters;
+    vec4 jitterData;
+    vec4 sunLight;
+    vec4 ambientLight;
+    vec4 skyLight;
+    vec4 ptParams0;
+    vec4 ptParams1;
+    vec4 windParams;
+    vec4 rainParams;
+    vec4 dofParams;
+    vec4 dofParams2;
+    ivec4 jitterPattern[8];
+    uint lightCount;
+    uint lightPad0, lightPad1, lightPad2;
+    vec4 lights[128];
+    uint64_t sharcHashEntriesAddr;
+    uint64_t sharcAccumulationAddr;
+    uint64_t sharcResolvedAddr;
+    uint sharcCapacity;
+    float sharcSceneScale;
+    float sharcRadianceScale;
+    float sharcWarmupFactor;
+} cam;
+
+struct GeometryMetadata {
+    uint64_t vertexBufferAddress;
+    uint64_t indexBufferAddress;
+    uint64_t normalBufferAddress;
+    uint64_t uvBufferAddress;
+    uint64_t primMaterialBufferAddress;
+    uint64_t bitangentBufferAddress;
+    uint64_t primYBoundsAddress;
+    uint64_t colorBufferAddress;
+    uint vertexCount;
+    uint indexCount;
+};
+
+layout(binding = 3, set = 0, scalar) buffer GeometryMetadataBuffer {
+    GeometryMetadata geometries[];
+} geometryMetadata;
+
+layout(binding = 4, set = 0, scalar) buffer MaterialBuffer {
+    uint matData[];
+} materialBuffer;
+
+layout(buffer_reference, scalar) buffer PrimMaterials { uint m[]; };
+
+// Stable plane storage (set 1)
+// binding 18: header (uvec4 per pixel)
+// binding 19: plane data (24 vec4s per pixel = 8 per plane × 3 planes)
+layout(binding = 18, set = 1, std430) buffer SPHeaderBuf  { uvec4 data[]; } spHeader;
+layout(binding = 19, set = 1, std430) buffer SPDataBuf    { vec4  data[]; } spData;
+
+// Primary G-buffer (for reading primary hit)
+layout(binding = 4, set = 1, scalar) buffer PrimaryGBufBuffer { float gbufData[]; } primaryGBuf;
+
+// Previous-frame transforms (for motion vectors)
+layout(binding = 28, set = 0, std430) buffer PrevTransformBuf { vec4 data[]; } prevTransforms;
+
+layout(push_constant) uniform PushConst {
+    uint width;
+    uint height;
+    uint frameIndex;
+    uint pad0;
+} pc;
+
+#include "../include/common.glsl"
+#include "../include/stable_planes.glsl"
+
+// Material constants
+const uint MAT_STRIDE = 551u;
+const uint MAT_OFFSET_MULTA = 29u;  // transmission
+const uint MAT_OFFSET_ROUGH = 8u;   // ksSpecularEXP (roughness for Principled)
+
+// Write one stable plane
+void writePlane(int pixelIdx, uint planeIdx, StablePlaneData sp) {
+    int base = pixelIdx * int(SP_PIXEL_STRIDE) + int(planeIdx * SP_DATA_STRIDE);
+    vec2 nEnc = spOctEncode(sp.normal);
+    spData.data[base+0] = vec4(sp.worldPos, sp.sceneLength);
+    spData.data[base+1] = vec4(sp.rayDir, sp.lastRayT);
+    spData.data[base+2] = vec4(sp.throughput, sp.roughness);
+    spData.data[base+3] = vec4(nEnc, sp.viewZ, 0.0);
+    spData.data[base+4] = vec4(sp.motionVector, 0.0, 0.0);
+    // Pack imageXform rows
+    spData.data[base+5] = vec4(sp.imageXform[0], 0.0);
+    spData.data[base+6] = vec4(sp.imageXform[1], 0.0);
+    spData.data[base+7] = vec4(sp.imageXform[2], 0.0);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(pc.width) || pixel.y >= int(pc.height)) return;
+
+    int pixelIdx = pixel.y * int(pc.width) + pixel.x;
+    uint gBase = uint(pixelIdx) * 24u;
+
+    // Initialize header: all planes invalid
+    spHeader.data[pixelIdx] = uvec4(0u);
+
+    // Initialize all 3 planes as empty
+    for (uint pi = 0u; pi < SP_MAX_PLANES; pi++) {
+        StablePlaneData empty = spEmptyPlane();
+        writePlane(pixelIdx, pi, empty);
+    }
+
+    // Read primary hit
+    float primaryViewZ = primaryGBuf.gbufData[gBase+7];
+    if (primaryViewZ > -0.001) return;  // sky
+
+    float primaryRoughness = primaryGBuf.gbufData[gBase+3];
+    // Only process delta surfaces (glass/mirror: roughness < 0.05)
+    if (primaryRoughness > 0.05) {
+        // Non-delta primary: plane 0 = primary surface itself (already in G-buffer)
+        StablePlaneData p0 = spEmptyPlane();
+        p0.worldPos = vec3(primaryGBuf.gbufData[gBase+4],
+                            primaryGBuf.gbufData[gBase+5],
+                            primaryGBuf.gbufData[gBase+6]);
+        p0.normal = vec3(primaryGBuf.gbufData[gBase+0],
+                          primaryGBuf.gbufData[gBase+1],
+                          primaryGBuf.gbufData[gBase+2]);
+        p0.roughness = primaryRoughness;
+        p0.viewZ = primaryViewZ;
+        p0.sceneLength = primaryGBuf.gbufData[gBase+11];
+        p0.throughput = vec3(1.0);
+        p0.valid = true;
+        writePlane(pixelIdx, 0u, p0);
+        spHeader.data[pixelIdx] = uvec4(1u, 0u, 0u, 0u);  // plane 0 branchID = 1 (camera)
+        return;
+    }
+
+    vec3 primaryPos = vec3(primaryGBuf.gbufData[gBase+4],
+                            primaryGBuf.gbufData[gBase+5],
+                            primaryGBuf.gbufData[gBase+6]);
+    vec3 primaryNormal = vec3(primaryGBuf.gbufData[gBase+0],
+                               primaryGBuf.gbufData[gBase+1],
+                               primaryGBuf.gbufData[gBase+2]);
+    vec3 camPos = (cam.viewInverse * vec4(0, 0, 0, 1)).xyz;
+    vec3 viewDir = normalize(primaryPos - camPos);
+    float primaryHitT = length(primaryPos - camPos);
+
+    // ── Delta trace with branching ──
+    // Stack-based exploration: process up to 3 planes
+    struct DeltaPath {
+        vec3  origin;
+        vec3  dir;
+        vec3  normal;
+        vec3  throughput;
+        float sceneLength;
+        uint  branchID;
+        mat3  imageXform;
+        uint  planeIdx;
+    };
+
+    // Initialize with primary surface
+    DeltaPath paths[3];
+    uint pathCount = 0u;
+    uint nextPlane = 0u;
+
+    // Check if primary is glass (has transmission)
+    uint primaryInstId = floatBitsToUint(primaryGBuf.gbufData[gBase+15]);
+    // We already know it's delta (roughness < 0.05). Trace reflection as default.
+    // If it's glass, also trace refraction.
+
+    // Reflection path
+    vec3 reflDir = reflect(viewDir, primaryNormal);
+    if (nextPlane < SP_MAX_PLANES) {
+        paths[pathCount].origin = primaryPos;
+        paths[pathCount].dir = reflDir;
+        paths[pathCount].normal = primaryNormal;
+        paths[pathCount].throughput = vec3(1.0); // Fresnel applied later
+        paths[pathCount].sceneLength = primaryHitT;
+        paths[pathCount].branchID = spAdvanceBranchID(1u, 1u); // lobe 1 = reflection
+        paths[pathCount].imageXform = spMirrorMatrix(primaryNormal);
+        paths[pathCount].planeIdx = nextPlane;
+        pathCount++; nextPlane++;
+    }
+
+    // Refraction path (if glass)
+    // Approximate: check transmission from material
+    // Since we don't have easy material access here, check roughness + the fact
+    // that glass was detected by primaryRoughness < 0.05. Assume glass has refraction.
+    float eta = 1.0 / 1.5;  // glass IOR ≈ 1.5
+    vec3 refrDir = refract(viewDir, primaryNormal, eta);
+    bool canRefract = dot(refrDir, refrDir) > 0.0001;
+    if (canRefract && nextPlane < SP_MAX_PLANES) {
+        paths[pathCount].origin = primaryPos;
+        paths[pathCount].dir = refrDir;
+        paths[pathCount].normal = -primaryNormal;  // inside surface
+        paths[pathCount].throughput = vec3(1.0);
+        paths[pathCount].sceneLength = primaryHitT;
+        paths[pathCount].branchID = spAdvanceBranchID(1u, 0u); // lobe 0 = transmission
+        paths[pathCount].imageXform = spRotateFromTo(refrDir, viewDir);
+        paths[pathCount].planeIdx = nextPlane;
+        pathCount++; nextPlane++;
+    }
+
+    // ── Trace each delta path until non-delta surface ──
+    const uint MAX_DELTA_BOUNCES = 6u;
+
+    for (uint pi = 0u; pi < pathCount; pi++) {
+        DeltaPath dp = paths[pi];
+        bool foundStable = false;
+
+        for (uint db = 0u; db < MAX_DELTA_BOUNCES; db++) {
+            vec3 traceOrigin = dp.origin + dp.normal * 0.002;
+
+            rayQueryEXT rq;
+            rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT,
+                                  0xFF, traceOrigin, 0.001, dp.dir, 10000.0);
+            while (rayQueryProceedEXT(rq)) {}
+
+            if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+                // Sky — write sky plane
+                StablePlaneData sp = spEmptyPlane();
+                sp.sceneLength = 99999.0;
+                sp.throughput = dp.throughput;
+                sp.rayDir = dp.dir;
+                sp.imageXform = dp.imageXform;
+                sp.valid = true;
+                writePlane(pixelIdx, dp.planeIdx, sp);
+                break;
+            }
+
+            float hitT = rayQueryGetIntersectionTEXT(rq, true);
+            dp.sceneLength += hitT;
+            vec3 hitPos = traceOrigin + dp.dir * hitT;
+
+            // Get hit surface properties
+            uint custIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+            int primId = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+            GeometryMetadata geo = geometryMetadata.geometries[custIdx];
+            uint matIdx = 0u;
+            if (geo.primMaterialBufferAddress != 0u) {
+                PrimMaterials pm = PrimMaterials(geo.primMaterialBufferAddress);
+                matIdx = pm.m[primId];
+            }
+
+            // Read roughness and transmission from material
+            uint matBase = matIdx * MAT_STRIDE;
+            float hitTransmission = uintBitsToFloat(materialBuffer.matData[matBase + MAT_OFFSET_MULTA]);
+            float hitRoughness = uintBitsToFloat(materialBuffer.matData[matBase + MAT_OFFSET_ROUGH]);
+
+            // Get hit normal
+            vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+            mat4x3 otw = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+            // Approximate geometric normal
+            vec3 hitNormal = normalize(cross(
+                vec3(otw[1][0]-otw[0][0], otw[1][1]-otw[0][1], otw[1][2]-otw[0][2]),
+                vec3(otw[2][0]-otw[0][0], otw[2][1]-otw[0][1], otw[2][2]-otw[0][2])));
+            if (dot(hitNormal, -dp.dir) < 0.0) hitNormal = -hitNormal;
+
+            bool isDelta = (hitTransmission > 0.5 && hitRoughness < 0.05) ||
+                           (hitRoughness < 0.02);
+
+            if (!isDelta) {
+                // ── Found stable surface for this plane ──
+                StablePlaneData sp = spEmptyPlane();
+                sp.worldPos = hitPos;
+                sp.sceneLength = dp.sceneLength;
+                sp.rayDir = dp.dir;
+                sp.lastRayT = hitT;
+                sp.throughput = dp.throughput;
+                sp.roughness = hitRoughness;
+                sp.normal = hitNormal;
+                vec4 stableView = cam.view * vec4(hitPos, 1.0);
+                sp.viewZ = stableView.z;
+                sp.imageXform = dp.imageXform;
+                sp.valid = true;
+
+                // Motion vector using virtual world position
+                vec3 virtualPos = camPos + viewDir * dp.sceneLength;
+                vec4 currClip = cam.proj * cam.view * vec4(virtualPos, 1.0);
+                vec2 currUV = vec2(currClip.x/currClip.w * 0.5 + 0.5,
+                                    0.5 - currClip.y/currClip.w * 0.5);
+                // Previous frame: assume same virtual position (camera motion only)
+                vec4 prevClip = cam.projPrev * cam.viewPrev * vec4(virtualPos, 1.0);
+                vec2 prevUV = vec2(prevClip.x/prevClip.w * 0.5 + 0.5,
+                                    0.5 - prevClip.y/prevClip.w * 0.5);
+                sp.motionVector = prevUV - currUV;
+
+                writePlane(pixelIdx, dp.planeIdx, sp);
+                foundStable = true;
+                break;
+            }
+
+            // Still delta — continue tracing
+            // Reflect for this iteration (simplified: always reflect for delta chain)
+            vec3 nextDir = reflect(dp.dir, hitNormal);
+            dp.imageXform = dp.imageXform * spMirrorMatrix(hitNormal);
+            dp.branchID = spAdvanceBranchID(dp.branchID, 1u);
+            dp.origin = hitPos;
+            dp.dir = nextDir;
+            dp.normal = hitNormal;
+        }
+    }
+
+    // Write header: branchIDs for each plane
+    uint dominantPlane = 0u;  // plane 0 is dominant by default
+    float firstHitLength = primaryHitT;
+    uint headerW = (floatBitsToUint(firstHitLength) & 0xFFFFFFFCu) | (dominantPlane & 3u);
+
+    spHeader.data[pixelIdx] = uvec4(
+        pathCount > 0u ? paths[0].branchID : 0u,
+        pathCount > 1u ? paths[1].branchID : 0u,
+        pathCount > 2u ? paths[2].branchID : 0u,
+        headerW
+    );
+}
