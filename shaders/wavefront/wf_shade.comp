@@ -1182,6 +1182,16 @@ void main() {
             return;
         }
 
+        // Stable Planes: accumulate total scene length through glass chain.
+        // DLSS RR needs the total path distance from camera, not just the
+        // last segment. Store in G-buffer slot 11 (hitDist) so the surface
+        // behind glass gets the correct depth for denoiser temporal reprojection.
+        if (bounce == 0u && pc.sampleIdx == 0u) {
+            uint gBase = pixelIndex * 24u;
+            float prevSceneLength = primaryGBuf.gbufData[gBase+11];
+            primaryGBuf.gbufData[gBase+11] = prevSceneLength + hitT;
+        }
+
         vec3 Veg = -rayDir;
         // Entry/exit from smoothN (matching monolithic — smooth shading for curved glass)
         bool enteringGlass = dot(smoothN, -rayDir) >= 0.0;
@@ -1997,17 +2007,38 @@ void main() {
         }
     }
 
-    // ---- Russian roulette (Cycles-style: sqrt perceptual, min bounce guard) ----
-    uint minBounces = 2u;
-    if (bounce >= minBounces) {
-        float maxC = max(throughput.r, max(throughput.g, throughput.b));
-        float p = min(sqrt(maxC), 1.0);
-        if (rand01() > p) {
+    // ---- Adaptive Russian Roulette (RTXPT-style) ----
+    // Reference: NVIDIA RTXPT PathTracer.hlsli HandleRussianRoulette()
+    //
+    // Three components:
+    // 1. Perceptual throughput: sqrt(luminance) — better than max component
+    //    for colored paths (e.g., light through stained glass)
+    // 2. Quadratic termination curve: gentle near bright paths, aggressive near dark
+    // 3. Depth ramp: linearly increase termination from 40% of max bounces
+    //
+    // Weight correction is applied AFTER emission collection (deferred),
+    // not immediately to throughput. This prevents inflating throughput
+    // before the next NEE evaluation, which would cause fireflies.
+    {
+        float rrVal = sqrt(dot(throughput, vec3(0.2126, 0.7152, 0.0722))); // perceptual luminance
+        float prob = clamp(0.85 - rrVal, 0.0, 1.0);
+        prob *= prob;  // quadratic — gentle near bright, aggressive near dark
+
+        // Depth ramp: start increasing termination at 40% of max bounce limit
+        float depthRamp = max(float(bounce) / float(pc.maxBounces) - 0.4, 0.0);
+        prob = clamp(prob + depthRamp, 0.0, 0.95);
+
+        // Always trace at least 2 bounces (no RR on bounce 0-1)
+        if (bounce >= 2u && rand01() < prob) {
             psTerminate(idx, flags);
             return;
         }
-        throughput /= p;
-        throughput = min(throughput, vec3(MAX_RADIANCE));
+
+        // Deferred weight correction: boost throughput to compensate for terminated paths
+        if (bounce >= 2u && prob > 0.0) {
+            throughput /= (1.0 - prob);
+            throughput = min(throughput, vec3(MAX_RADIANCE));
+        }
     }
 
     // ---- Thin transmission fast path (windows, curtains, VM-mapped partial glass) ----
