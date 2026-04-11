@@ -74,6 +74,21 @@ layout(binding = 51, set = 0, std430) buffer CurrTransformBuf {
 // Buffer references for vertex/index access
 layout(buffer_reference, scalar) buffer Vertices { float v[]; };
 layout(buffer_reference, scalar) buffer Indices { uint i[]; };
+layout(buffer_reference, scalar) buffer PrimMaterials { uint m[]; };
+
+// Material buffer (binding 4) — for glass/transparent detection in hybrid path
+layout(binding = 4, set = 0, scalar) buffer MaterialBuffer {
+    uint matData[];  // read as raw uints; we only need flags (offset 16) and multB/multA (offsets 28-29)
+} materialBuffer;
+
+// Material field offsets (in uint32 units within the GPUMaterial struct)
+// GPUMaterial = 2204 bytes = 551 uints (scalar layout, see vk_rt_pipeline.h)
+const uint MAT_OFFSET_FLAGS = 16u;    // uint flags
+const uint MAT_OFFSET_MULTB = 28u;    // float multB (transparent_prob / stochastic passthrough)
+const uint MAT_OFFSET_MULTA = 29u;    // float multA (transmission)
+const uint MAT_STRIDE = 551u;         // sizeof(GPUMaterial) / 4 = 2204 / 4
+const uint MAT_FLAG_ALPHA_TEST = 1u;
+const uint MAT_FLAG_LIGHTPATH_TRANSPARENT = 256u;
 
 // Wavefront buffers (set 1)
 #include "../include/pathstate.glsl"
@@ -171,6 +186,28 @@ void main() {
             uint hInstanceIndex = hInstInfo.x;
             uint hBlasIndex = hInstInfo.y;
 
+            // Check material: skip hybrid for glass/transparent surfaces
+            // (these need proper ray tracing for refraction/alpha handling)
+            GeometryMetadata geo = geometryMetadata.geometries[hBlasIndex];
+            uint matIdx = 0u;
+            if (geo.primMaterialBufferAddress != 0u) {
+                PrimMaterials primMats = PrimMaterials(geo.primMaterialBufferAddress);
+                matIdx = primMats.m[hPrimId];
+            }
+            uint matBase = matIdx * MAT_STRIDE;
+            uint matFlags = materialBuffer.matData[matBase + MAT_OFFSET_FLAGS];
+            float transparentProb = uintBitsToFloat(materialBuffer.matData[matBase + MAT_OFFSET_MULTB]);
+            float transmission = uintBitsToFloat(materialBuffer.matData[matBase + MAT_OFFSET_MULTA]);
+
+            bool isTransparent = transparentProb > 0.001 ||
+                                 transmission > 0.01 ||
+                                 (matFlags & MAT_FLAG_ALPHA_TEST) != 0u ||
+                                 (matFlags & MAT_FLAG_LIGHTPATH_TRANSPARENT) != 0u;
+
+            if (isTransparent) {
+                // Fall through to standard ray trace for glass/alpha surfaces
+            } else {
+
             // Read current-frame instance transform (3x4 row-major)
             uint tBase = hInstanceIndex * 3u;
             vec4 row0 = currTransforms.data[tBase + 0u];
@@ -218,6 +255,13 @@ void main() {
             vec3 hitPos = origin + dir * hitT;
             vec2 bary2 = computeBarycentrics(hitPos, wp0, wp1, wp2);
 
+            // Clamp barycentrics to valid range (precision tolerance)
+            bary2 = clamp(bary2, vec2(0.0), vec2(1.0));
+            if (bary2.x + bary2.y > 1.0) {
+                float scale = 1.0 / (bary2.x + bary2.y);
+                bary2 *= scale;
+            }
+
             // Write hit result — identical format to ray query path
             hitResults.hitData[hBase+0] = hitT;
             hitResults.hitData[hBase+1] = uintBitsToFloat(hBlasIndex);
@@ -235,8 +279,10 @@ void main() {
             hitResults.hitData[hBase+16] = objToWorld[0][2]; hitResults.hitData[hBase+17] = objToWorld[1][2];
             hitResults.hitData[hBase+18] = objToWorld[2][2]; hitResults.hitData[hBase+19] = objToWorld[3][2];
             return;  // ← SKIP ray query entirely
+
+            } // end else (!isTransparent)
         }
-        // hDepth invalid (sky pixel) — fall through to ray trace
+        // hDepth invalid, sky pixel, or transparent material — fall through to ray trace
     }
 
     // ── Standard ray query path (bounce 1+ or hybrid fallback) ──

@@ -4082,11 +4082,25 @@ void Renderer::RecordHybridGBufferPass(VkCommandBuffer cmd) {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, hybridPipeline_);
 
     // Build view*proj matrix for Vulkan rasterization.
+    // Apply the SAME sub-pixel jitter as the ray tracer so depths match exactly.
+    // Without this, the rasterizer's depth disagrees with the RT ray direction,
+    // causing black glitches at grazing angles.
     float viewProj[16];
     {
         float rasterProj[16];
         memcpy(rasterProj, lastProj_, sizeof(float) * 16);
         rasterProj[5] = -rasterProj[5]; // Flip Y for Vulkan clip space
+
+        // Jitter: shift projection by sub-pixel offset (Halton sequence from DLSS)
+        // proj[8] and proj[9] are the NDC-space X/Y offsets in column-major layout
+        // jitterX_/jitterY_ are in pixel space; convert to NDC: 2*jitter/resolution
+        if (renderWidth_ > 0 && renderHeight_ > 0) {
+            float jitterNDC_X =  2.0f * jitterX_ / (float)renderWidth_;
+            float jitterNDC_Y =  2.0f * jitterY_ / (float)renderHeight_;
+            rasterProj[8]  += jitterNDC_X;  // proj[2][0] in column-major
+            rasterProj[9]  += jitterNDC_Y;  // proj[2][1] in column-major
+        }
+
         for (int r = 0; r < 4; r++) {
             for (int c = 0; c < 4; c++) {
                 float sum = 0;
