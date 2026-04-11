@@ -1,4 +1,6 @@
 #version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_ray_query : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_GOOGLE_include_directive : require
@@ -6,6 +8,7 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 
 // Scene data (set 0)
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
 layout(binding = 2, set = 0) uniform CameraProperties {
     mat4 viewInverse;
     mat4 projInverse;
@@ -86,9 +89,11 @@ void main() {
         pr.rcBounce = floatBitsToUint(d4.z); pr.rcValid = (d4.w > 0.5);
         pr.lightType = floatBitsToUint(d5.x); pr.lightIndex = floatBitsToUint(d5.y);
     }
+    float cachedPJ = ptPathRec.data[pixelIdx * 6 + 5].z;
+    float rcPdf = ptPathRec.data[pixelIdx * 6 + 5].w;
 
     // Create initial reservoir from current frame's path
-    PTReservoir curr = ptCreateFromPathRecord(pr);
+    PTReservoir curr = ptCreateFromPathRecord(pr, cachedPJ, rcPdf);
 
     // ── Temporal resampling: reproject to previous frame ──
     if (curr.M > 0.0) {
@@ -135,34 +140,68 @@ void main() {
                 prev.primaryPos = ptResPrev.data[rb+4].xyz;
                 prev.primaryRoughness = ptResPrev.data[rb+4].w;
                 prev.primaryNormal = ptOctDecode(ptResPrev.data[rb+5].xy);
+                // New fields from slots 6-7
+                prev.partialJacobian = ptResPrev.data[rb+6].x;
+                prev.rcWiPdf = ptResPrev.data[rb+6].y;
+                prev.pathLength = floatBitsToUint(ptResPrev.data[rb+6].z);
             }
 
-            // Validate: surface similarity + age + non-empty
+            // Validate: surface similarity + age + non-empty + no NaN
             if (prev.M > 0.0 && prev.age < 30.0 &&
-                !any(isnan(prev.rcRadiance)) && !any(isinf(prev.rcRadiance))) {
+                !any(isnan(prev.rcRadiance)) && !any(isinf(prev.rcRadiance)) &&
+                ptSurfaceSimilar(pr.primaryNormal, prev.primaryNormal,
+                                  pr.primaryRoughness, prev.primaryRoughness,
+                                  pr.primaryPos, prev.primaryPos)) {
 
-                // Surface similarity check
-                if (ptSurfaceSimilar(pr.primaryNormal, prev.primaryNormal,
-                                      pr.primaryRoughness, prev.primaryRoughness,
-                                      pr.primaryPos, prev.primaryPos)) {
+                prev.M = min(prev.M, 20.0);
+                prev.age += 1.0;
+                prev.rcRadiance = min(prev.rcRadiance, vec3(20.0));
 
-                    // Clamp temporal M to prevent unbounded history
-                    prev.M = min(prev.M, 20.0);
-                    prev.age += 1.0;
-                    prev.rcRadiance = min(prev.rcRadiance, vec3(20.0));
+                // ── Jacobian: geometry term ratio between old and new receiver ──
+                // Per RTXDI: use cached partial Jacobian for efficiency
+                float J = 1.0;
+                if (prev.partialJacobian > 0.0) {
+                    J = ptJacobianCached(pr.primaryPos, prev);
+                } else {
+                    J = ptJacobian(prev.rcVertexPos, prev.rcVertexNormal,
+                                    pr.primaryPos, prev.primaryPos);
+                }
+                if (J < 0.001) J = 0.0;
 
-                    // Compute target PDF of previous sample at current surface
-                    float pHat = ptTargetPDF(prev);
+                // ── Invertibility: verify shift is valid in reverse direction ──
+                bool invertible = ptValidateInvertibility(
+                    pr.primaryPos, pr.primaryNormal, pr.primaryRoughness, prev);
 
-                    if (pHat > 0.001) {
-                        // RNG for reservoir update
-                        rngState = uint(pixelIdx) ^ pc.frameIndex * 747796405u;
-                        rngState = pcg(rngState);
-                        float rng = rand01();
-
-                        // Merge previous reservoir into current
-                        ptReservoirMerge(curr, prev, pHat, rng);
+                // ── Visibility: trace shadow ray from current surface to rcVertex ──
+                bool visible = true;
+                if (J > 0.0 && invertible) {
+                    vec3 toRC = prev.rcVertexPos - pr.primaryPos;
+                    float rcDist = length(toRC);
+                    if (rcDist > 0.01) {
+                        vec3 rcDir = toRC / rcDist;
+                        rayQueryEXT visRQ;
+                        rayQueryInitializeEXT(visRQ, topLevelAS,
+                            gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+                            0xFF, pr.primaryPos + pr.primaryNormal * 0.002,
+                            0.001, rcDir, rcDist - 0.01);
+                        while (rayQueryProceedEXT(visRQ)) {}
+                        visible = (rayQueryGetIntersectionTypeEXT(visRQ, true) ==
+                                   gl_RayQueryCommittedIntersectionNoneEXT);
                     }
+                }
+
+                float pHat = ptTargetPDF(prev);
+                // Zero out target if any validation failed
+                if (!invertible || !visible || J < 0.001) pHat = 0.0;
+
+                if (pHat > 0.001) {
+                    rngState = uint(pixelIdx) ^ pc.frameIndex * 747796405u;
+                    rngState = pcg(rngState);
+                    float rng = rand01();
+
+                    // Apply Jacobian to weight before merge
+                    prev.weightSum *= J;
+                    ptReservoirMerge(curr, prev, pHat, rng);
                 }
             }
         }
@@ -183,6 +222,8 @@ void main() {
                                      uintBitsToFloat(curr.lightIndex), curr.age);
         ptResCurr.data[rb+4] = vec4(curr.primaryPos, curr.primaryRoughness);
         ptResCurr.data[rb+5] = vec4(pN, 0.0, 0.0);
-        ptResCurr.data[rb+6] = vec4(0); ptResCurr.data[rb+7] = vec4(0);
+        ptResCurr.data[rb+6] = vec4(curr.partialJacobian, curr.rcWiPdf,
+                                     uintBitsToFloat(curr.pathLength), 0.0);
+        ptResCurr.data[rb+7] = vec4(0);
     }
 }
