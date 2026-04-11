@@ -534,7 +534,7 @@ bool TextureManager::UploadAll() {
     Log(L"[VK TextureMgr] Uploading %d textures to GPU...\n", toUpload);
 
     VkDevice device = context_->GetDevice();
-    const int BATCH_SIZE = 8;
+    const int BATCH_SIZE = 32;
     int totalUploaded = 0;
 
     while (totalUploaded < toUpload) {
@@ -691,7 +691,6 @@ bool TextureManager::UploadAll() {
             }
         }
 
-        Log(L"[VK TextureMgr] Batch uploaded: %d/%d textures\n", totalUploaded, toUpload);
     }
 
     Log(L"[VK TextureMgr] All %d textures uploaded to GPU\n", toUpload);

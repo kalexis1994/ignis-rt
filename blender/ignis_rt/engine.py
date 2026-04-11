@@ -1087,45 +1087,34 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             return False
 
         elif _load_stage == LOAD_MATERIALS:
-            # ── Stage 3: Materials + textures (chunked for smooth spinner) ──
-            # Sub-stage A: export materials from Blender (one-time)
-            if _load_materials_data is None:
-                _load_status = "Exporting materials..."
-                _load_progress = 0.50
-                try:
-                    _load_materials_data, _load_mat_name_to_index, _load_textures_list = \
-                        scene_export.export_materials(depsgraph, hidden_objects=_load_hidden)
-                    _log(f"Stage MATERIALS: exporting {len(_load_mat_name_to_index)} materials, "
-                         f"{len(_load_textures_list)} textures")
-                    _load_tex_idx = 0
-                    _load_tex_buffers = []
-                    if _load_textures_list:
-                        if _ignis_tex_manager is not None:
-                            dll_wrapper.destroy_texture_manager(_ignis_tex_manager)
-                            _ignis_tex_manager = None
-                        _ignis_tex_manager = dll_wrapper.create_texture_manager()
-                except Exception:
-                    _log_exception("LOAD_MATERIALS export")
-                    _load_stage = LOAD_IDLE
-                    return True
-                return False
+            # ── Stage 3: Materials + textures (all at once, no per-frame yield) ──
+            _load_status = "Exporting materials..."
+            _load_progress = 0.50
+            mat_t0 = time.perf_counter()
 
-            # Sub-stage B: extract + add textures one per frame
-            if hasattr(self, '_load_tex_idx_done') and self._load_tex_idx_done:
-                pass  # skip to material upload (no textures)
-            elif _load_textures_list and _ignis_tex_manager:
-                total_tex = len(_load_textures_list)
-                if _load_tex_idx < total_tex:
-                    ti = _load_tex_idx
-                    tex_info = _load_textures_list[ti]
-                    _load_status = f"Loading textures... {ti + 1}/{total_tex}"
-                    _load_progress = 0.50 + 0.15 * ((ti + 1) / max(total_tex, 1))
+            try:
+                _load_materials_data, _load_mat_name_to_index, _load_textures_list = \
+                    scene_export.export_materials(depsgraph, hidden_objects=_load_hidden)
+            except Exception:
+                _log_exception("LOAD_MATERIALS export")
+                _load_stage = LOAD_IDLE
+                return True
 
-                    # Extract pixel data from Blender (deferred from export_materials)
+            total_tex = len(_load_textures_list) if _load_textures_list else 0
+
+            if total_tex > 0:
+                if _ignis_tex_manager is not None:
+                    dll_wrapper.destroy_texture_manager(_ignis_tex_manager)
+                    _ignis_tex_manager = None
+                _ignis_tex_manager = dll_wrapper.create_texture_manager()
+
+                # Extract ALL texture bytes + add to manager (CPU-side, no GPU yet)
+                _load_status = f"Loading {total_tex} textures..."
+                _load_progress = 0.52
+                _load_tex_buffers = []
+                for tex_info in _load_textures_list:
                     scene_export.extract_texture_bytes(tex_info)
-
                     if tex_info["data"] is not None:
-                        pass  # texture ready for GPU upload
                         data_bytes = tex_info["data"]
                         data_np = np.frombuffer(data_bytes, dtype=np.uint8).copy()
                         _load_tex_buffers.append(data_np)
@@ -1139,43 +1128,12 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                             1, tex_dxgi,
                         )
 
-                    _load_tex_idx += 1
-                    if _load_tex_idx < total_tex:
-                        return False  # next texture next frame
-                # All textures added → transition to per-frame GPU upload
-                self._load_tex_idx_done = True
-                _load_stage = LOAD_TEX_UPLOAD
-                return False
-
-            # No textures — go straight to material upload
-            _load_status = "Uploading materials..."
-            _load_progress = 0.68
-            mat_count = max(len(_load_mat_name_to_index), 1)
-            dll_wrapper.upload_materials(_load_materials_data, mat_count)
-            _ignis_last_tex_names = tuple(t["name"] for t in _load_textures_list)
-            _log(f"Stage MATERIALS: {mat_count} mat, {len(_load_textures_list)} tex")
-            self._load_tex_idx_done = False
-            _load_stage = LOAD_MATIDS
-            return False
-
-        elif _load_stage == LOAD_TEX_UPLOAD:
-            # ── Stage 3b: Upload textures to GPU one-at-a-time (smooth spinner) ──
-            if _ignis_tex_manager:
-                pending = dll_wrapper.texture_manager_pending_count(_ignis_tex_manager)
-                total_tex = len(_load_textures_list) if _load_textures_list else 0
-                done_count = total_tex - pending
-
-                if pending > 0:
-                    _load_status = f"Uploading textures to GPU... {done_count + 1}/{total_tex}"
-                    _load_progress = 0.55 + 0.13 * ((done_count + 1) / max(total_tex, 1))
-                    dll_wrapper.texture_manager_upload_one(_ignis_tex_manager)
-                    return False  # next frame uploads next texture
-
-                # All uploaded — update descriptors
+                # Upload ALL textures to GPU in batch (UploadAll batches internally)
+                _load_status = f"Uploading {total_tex} textures to GPU..."
+                _load_progress = 0.60
+                dll_wrapper.texture_manager_upload_all(_ignis_tex_manager)
                 dll_wrapper.update_texture_descriptors(_ignis_tex_manager)
-                _log(f"  texture upload OK ({total_tex} textures)")
-
-            _load_tex_buffers = []
+                _load_tex_buffers = []
 
             # Upload material buffer
             _load_status = "Uploading materials..."
@@ -1183,9 +1141,11 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             mat_count = max(len(_load_mat_name_to_index), 1)
             dll_wrapper.upload_materials(_load_materials_data, mat_count)
             _ignis_last_tex_names = tuple(t["name"] for t in _load_textures_list)
-            _log(f"Stage MATERIALS: {mat_count} mat, {len(_load_textures_list)} tex")
-            self._load_tex_idx_done = False
+
+            mat_dt = time.perf_counter() - mat_t0
+            _log(f"Stage MATERIALS: {mat_count} mat, {total_tex} tex in {mat_dt:.2f}s")
             _load_stage = LOAD_MATIDS
+            self._load_yield = True
             return False
 
         elif _load_stage == LOAD_MATIDS:
