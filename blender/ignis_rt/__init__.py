@@ -188,8 +188,8 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         update=_tag_redraw,
     )
     restir_gi: BoolProperty(
-        name="ReSTIR GI",
-        description="Temporal reuse of indirect lighting. Reduces GI noise by reusing bounce samples across frames",
+        name="ReSTIR PT",
+        description="Path resampling for indirect lighting (ReSTIR PT). Reuses full paths across pixels and frames via hybrid shift mapping for dramatically less noise",
         default=True,
         update=_tag_redraw,
     )
