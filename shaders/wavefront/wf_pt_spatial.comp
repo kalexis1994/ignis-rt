@@ -1,4 +1,6 @@
 #version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_ray_query : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_GOOGLE_include_directive : require
@@ -39,6 +41,8 @@ layout(binding = 2, set = 0) uniform CameraProperties {
 // ReSTIR PT: read from current (after temporal), write back to current
 layout(binding = 15, set = 1, std430) buffer PTResCurrBuf { vec4 data[]; } ptResCurr;
 
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+
 // Primary G-buffer (for surface data at neighbor pixels)
 layout(binding = 4, set = 1, scalar) buffer PrimaryGBufBuffer { float gbufData[]; } primaryGBuf;
 
@@ -73,6 +77,9 @@ PTReservoir readReservoirAt(int idx) {
     r.primaryPos = ptResCurr.data[rb+4].xyz;
     r.primaryRoughness = ptResCurr.data[rb+4].w;
     r.primaryNormal = ptOctDecode(ptResCurr.data[rb+5].xy);
+    r.partialJacobian = ptResCurr.data[rb+6].x;
+    r.rcWiPdf = ptResCurr.data[rb+6].y;
+    r.pathLength = floatBitsToUint(ptResCurr.data[rb+6].z);
     return r;
 }
 
@@ -143,25 +150,39 @@ void main() {
         nRes.rcRadiance = min(nRes.rcRadiance, vec3(20.0));
         nRes.M = min(nRes.M, 500.0);  // spatial M-cap (per paper)
 
-        // Compute target PDF of neighbor's sample at my surface
         float pHat = ptTargetPDF(nRes);
         if (pHat < 0.001) continue;
 
-        // Jacobian correction for domain shift
-        float J = ptJacobian(nRes.rcVertexPos, nRes.rcVertexNormal, myPos, nRes.primaryPos);
+        // Jacobian: cached partial if available, otherwise compute fresh
+        float J = (nRes.partialJacobian > 0.0)
+            ? ptJacobianCached(myPos, nRes)
+            : ptJacobian(nRes.rcVertexPos, nRes.rcVertexNormal, myPos, nRes.primaryPos);
         if (J < 0.001) continue;
 
-        // Merge with Jacobian-weighted importance
-        float rng = rand01();
-        float mergeWeight = pHat * J;
-        nRes.targetFunction = pHat;
+        // Invertibility validation
+        if (!ptValidateInvertibility(myPos, myNormal, myRough, nRes)) continue;
 
-        // RIS combine
-        float w = mergeWeight * nRes.weightSum * nRes.M;
-        if (w <= 0.0 || isnan(w) || isinf(w)) continue;
-        float oldM = curr.M;
-        ptReservoirUpdate(curr, nRes, w, rng);
-        curr.M = oldM + nRes.M;
+        // Visibility: trace shadow ray from current surface to reconnection vertex
+        vec3 toRC = nRes.rcVertexPos - myPos;
+        float rcDist = length(toRC);
+        bool visible = true;
+        if (rcDist > 0.01) {
+            vec3 rcDir = toRC / rcDist;
+            rayQueryEXT visRQ;
+            rayQueryInitializeEXT(visRQ, topLevelAS,
+                gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+                0xFF, myPos + myNormal * 0.002,
+                0.001, rcDir, rcDist - 0.01);
+            while (rayQueryProceedEXT(visRQ)) {}
+            visible = (rayQueryGetIntersectionTypeEXT(visRQ, true) ==
+                       gl_RayQueryCommittedIntersectionNoneEXT);
+        }
+        if (!visible) continue;
+
+        // Apply Jacobian to weight and merge
+        nRes.weightSum *= J;
+        float rng = rand01();
+        ptReservoirMerge(curr, nRes, pHat, rng);
     }
 
     // Re-finalize after spatial combinations
@@ -179,6 +200,8 @@ void main() {
                                      uintBitsToFloat(curr.lightIndex), curr.age);
         ptResCurr.data[rb+4] = vec4(curr.primaryPos, curr.primaryRoughness);
         ptResCurr.data[rb+5] = vec4(pN, 0.0, 0.0);
-        ptResCurr.data[rb+6] = vec4(0); ptResCurr.data[rb+7] = vec4(0);
+        ptResCurr.data[rb+6] = vec4(curr.partialJacobian, curr.rcWiPdf,
+                                     uintBitsToFloat(curr.pathLength), 0.0);
+        ptResCurr.data[rb+7] = vec4(0);
     }
 }
