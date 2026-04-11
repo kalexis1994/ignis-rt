@@ -157,32 +157,106 @@ void main() {
                 prev.age += 1.0;
                 prev.rcRadiance = min(prev.rcRadiance, vec3(20.0));
 
-                // ── Jacobian: geometry term ratio between old and new receiver ──
-                // Per RTXDI: use cached partial Jacobian for efficiency
-                float J = 1.0;
-                if (prev.partialJacobian > 0.0) {
-                    J = ptJacobianCached(pr.primaryPos, prev);
-                } else {
-                    J = ptJacobian(prev.rcVertexPos, prev.rcVertexNormal,
-                                    pr.primaryPos, prev.primaryPos);
+                // ── Random Replay: re-trace prefix when RcVertexLength > 2 ──
+                // For RcVertexLength == 2: connect directly from primary surface.
+                // For RcVertexLength > 2: trace intermediate bounces using the
+                // stored RNG seed to regenerate the same BRDF sampling decisions,
+                // starting from the CURRENT pixel's primary surface.
+                vec3 shiftedReceiverPos = pr.primaryPos;
+                vec3 shiftedReceiverNormal = pr.primaryNormal;
+                float shiftedReceiverRoughness = pr.primaryRoughness;
+                bool replayValid = true;
+
+                if (prev.rcBounceDepth > 2u) {
+                    // Re-trace prefix: from primary surface, trace (rcBounceDepth-2)
+                    // bounces using the neighbor's RNG seed for BRDF sampling.
+                    uint replayRng = prev.rngSeed;
+                    vec3 replayOrigin = pr.primaryPos;
+                    vec3 replayDir;
+
+                    // Generate first bounce direction using replayed RNG
+                    // (cosine hemisphere from primary normal — matching wf_shade's diffuse sampling)
+                    replayRng = replayRng * 747796405u + 2891336453u;
+                    float u1 = float(replayRng) / 4294967295.0;
+                    replayRng = replayRng * 747796405u + 2891336453u;
+                    float u2 = float(replayRng) / 4294967295.0;
+                    // Cosine hemisphere sample
+                    float r_s = sqrt(u1);
+                    float phi = 6.28318 * u2;
+                    vec3 localDir = vec3(r_s * cos(phi), r_s * sin(phi), sqrt(max(1.0 - u1, 0.0)));
+                    // Build TBN from normal
+                    vec3 up = abs(pr.primaryNormal.y) < 0.999 ? vec3(0,1,0) : vec3(1,0,0);
+                    vec3 T = normalize(cross(up, pr.primaryNormal));
+                    vec3 B = cross(pr.primaryNormal, T);
+                    replayDir = T * localDir.x + B * localDir.y + pr.primaryNormal * localDir.z;
+
+                    // Trace intermediate bounces
+                    for (uint ri = 0u; ri < prev.rcBounceDepth - 2u; ri++) {
+                        rayQueryEXT rpRQ;
+                        rayQueryInitializeEXT(rpRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
+                            0xFF, replayOrigin + shiftedReceiverNormal * 0.002,
+                            0.001, replayDir, 10000.0);
+                        while (rayQueryProceedEXT(rpRQ)) {}
+
+                        if (rayQueryGetIntersectionTypeEXT(rpRQ, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+                            replayValid = false;
+                            break;
+                        }
+
+                        float rpHitT = rayQueryGetIntersectionTEXT(rpRQ, true);
+                        shiftedReceiverPos = replayOrigin + replayDir * rpHitT;
+                        // Approximate normal from geometric face normal
+                        mat4x3 rpOTW = rayQueryGetIntersectionObjectToWorldEXT(rpRQ, true);
+                        shiftedReceiverNormal = normalize(cross(
+                            rpOTW[1] - rpOTW[0], rpOTW[2] - rpOTW[0]));
+                        if (dot(shiftedReceiverNormal, -replayDir) < 0.0)
+                            shiftedReceiverNormal = -shiftedReceiverNormal;
+                        shiftedReceiverRoughness = 0.5; // approximate
+
+                        // Generate next direction for subsequent bounces
+                        replayRng = replayRng * 747796405u + 2891336453u;
+                        u1 = float(replayRng) / 4294967295.0;
+                        replayRng = replayRng * 747796405u + 2891336453u;
+                        u2 = float(replayRng) / 4294967295.0;
+                        r_s = sqrt(u1); phi = 6.28318 * u2;
+                        localDir = vec3(r_s * cos(phi), r_s * sin(phi), sqrt(max(1.0 - u1, 0.0)));
+                        up = abs(shiftedReceiverNormal.y) < 0.999 ? vec3(0,1,0) : vec3(1,0,0);
+                        T = normalize(cross(up, shiftedReceiverNormal));
+                        B = cross(shiftedReceiverNormal, T);
+                        replayDir = T * localDir.x + B * localDir.y + shiftedReceiverNormal * localDir.z;
+                        replayOrigin = shiftedReceiverPos;
+                    }
                 }
-                if (J < 0.001) J = 0.0;
 
-                // ── Invertibility: verify shift is valid in reverse direction ──
-                bool invertible = ptValidateInvertibility(
-                    pr.primaryPos, pr.primaryNormal, pr.primaryRoughness, prev);
+                // ── Jacobian: geometry term ratio at shifted receiver ──
+                float J = 1.0;
+                if (replayValid) {
+                    if (prev.partialJacobian > 0.0) {
+                        J = ptJacobianCached(shiftedReceiverPos, prev);
+                    } else {
+                        J = ptJacobian(prev.rcVertexPos, prev.rcVertexNormal,
+                                        shiftedReceiverPos, prev.primaryPos);
+                    }
+                    if (J < 0.001) J = 0.0;
+                } else {
+                    J = 0.0;
+                }
 
-                // ── Visibility: trace shadow ray from current surface to rcVertex ──
+                // ── Invertibility at shifted receiver ──
+                bool invertible = replayValid && ptValidateInvertibility(
+                    shiftedReceiverPos, shiftedReceiverNormal, shiftedReceiverRoughness, prev);
+
+                // ── Visibility: shadow ray from shifted receiver to rcVertex ──
                 bool visible = true;
                 if (J > 0.0 && invertible) {
-                    vec3 toRC = prev.rcVertexPos - pr.primaryPos;
+                    vec3 toRC = prev.rcVertexPos - shiftedReceiverPos;
                     float rcDist = length(toRC);
                     if (rcDist > 0.01) {
                         vec3 rcDir = toRC / rcDist;
                         rayQueryEXT visRQ;
                         rayQueryInitializeEXT(visRQ, topLevelAS,
                             gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
-                            0xFF, pr.primaryPos + pr.primaryNormal * 0.002,
+                            0xFF, shiftedReceiverPos + shiftedReceiverNormal * 0.002,
                             0.001, rcDir, rcDist - 0.01);
                         while (rayQueryProceedEXT(visRQ)) {}
                         visible = (rayQueryGetIntersectionTypeEXT(visRQ, true) ==
