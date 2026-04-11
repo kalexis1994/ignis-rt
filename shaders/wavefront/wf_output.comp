@@ -67,6 +67,9 @@ layout(binding = 4, set = 1, scalar) buffer PrimaryGBufBuffer { float gbufData[]
 layout(binding = 18, set = 1, std430) buffer SPHeaderBuf { uvec4 data[]; } spHeader;
 layout(binding = 19, set = 1, std430) buffer SPDataBuf   { vec4  data[]; } spData;
 
+// Secondary radiance buffer for glass plane decomposition
+layout(binding = 20, set = 1, scalar) buffer PixelRadianceAuxBuffer { uint radDataU[]; } pixelRadianceAux;
+
 layout(push_constant) uniform PushConst {
     uint width;
     uint height;
@@ -126,6 +129,21 @@ void main() {
     if (any(isnan(diffuse)))  diffuse  = vec3(0.0);
     if (any(isnan(specular))) specular = vec3(0.0);
 
+    // Read secondary plane radiance (for glass decomposition)
+    vec3 auxDiffuse = vec3(uintBitsToFloat(pixelRadianceAux.radDataU[rBase+0]),
+                           uintBitsToFloat(pixelRadianceAux.radDataU[rBase+1]),
+                           uintBitsToFloat(pixelRadianceAux.radDataU[rBase+2])) * sppInv;
+    vec3 auxSpecular = vec3(uintBitsToFloat(pixelRadianceAux.radDataU[rBase+4]),
+                            uintBitsToFloat(pixelRadianceAux.radDataU[rBase+5]),
+                            uintBitsToFloat(pixelRadianceAux.radDataU[rBase+6])) * sppInv;
+    // Firefly + NaN guard for aux
+    float auxDiffLum = dot(auxDiffuse, vec3(0.2126, 0.7152, 0.0722));
+    if (auxDiffLum > FIREFLY_THRESHOLD) auxDiffuse *= FIREFLY_THRESHOLD / auxDiffLum;
+    float auxSpecLum = dot(auxSpecular, vec3(0.2126, 0.7152, 0.0722));
+    if (auxSpecLum > FIREFLY_THRESHOLD) auxSpecular *= FIREFLY_THRESHOLD / auxSpecLum;
+    if (any(isnan(auxDiffuse)))  auxDiffuse  = vec3(0.0);
+    if (any(isnan(auxSpecular))) auxSpecular = vec3(0.0);
+
     // Read primary G-buffer (24 floats per pixel, written by K2)
     uint gBase = pixelIndex * 24u;
     vec3 primaryNormal = vec3(primaryGBuf.gbufData[gBase+0],
@@ -148,57 +166,19 @@ void main() {
     // viewZ < 0 for visible geometry (RH convention), 0 for sky (buffer cleared to 0)
     bool primaryHit = (primaryViewZ < -0.001);
 
-    // ── Stable Planes FILL: override guide buffers for delta surfaces ──
-    // When BUILD found a non-delta surface behind glass/mirror, use its
-    // data (normal, depth, MVs) for DLSS RR instead of the glass surface.
-    // This gives the denoiser correct temporal reprojection through glass.
+    // ── Guide buffers: use primary G-buffer directly ──
+    // Stable plane guide buffer override is disabled for now. The BUILD pass
+    // traces an unjittered ray that can disagree with the jittered path tracer
+    // about which surface is behind glass, causing temporal instability in DLSS-RR.
+    // Using the glass surface's own G-buffer data is "wrong" for denoising but
+    // CONSISTENT with the rendered content, which DLSS-RR handles better.
+    // The stable planes infrastructure (BUILD pass, radiance separation, Fresnel
+    // dominant plane) remains in place for future per-plane denoising.
     vec3 denoiserNormal = primaryNormal;
     float denoiserRoughness = primaryRoughness;
     float denoiserViewZ = primaryViewZ;
     vec2 denoiserMV = vec2(0);
     bool hasStablePlane = false;
-
-    if (primaryHit) {
-        // Read dominant stable plane
-        uvec4 header = spHeader.data[pixelIndex];
-        uint dominantIdx = header.w & 3u;
-        uint dominantBranchID = (dominantIdx == 0u) ? header.x :
-                                 (dominantIdx == 1u) ? header.y : header.z;
-
-        if (dominantBranchID > 1u) {  // >1 means we went through at least one delta scatter
-            // Read stable plane data
-            int spBase = int(pixelIndex) * 24 + int(dominantIdx) * 8;
-            vec3 spWorldPos = spData.data[spBase+0].xyz;
-            float spSceneLength = spData.data[spBase+0].w;
-            vec3 spNormal = vec3(0,1,0);
-            float spViewZ = 0.0;
-            float spRoughness = 1.0;
-
-            // Decode normal from oct-encoded
-            vec2 spNEnc = spData.data[spBase+3].xy;
-            if (spNEnc.x != 0.0 || spNEnc.y != 0.0) {
-                vec2 ne = spNEnc * 2.0 - 1.0;
-                spNormal = vec3(ne.x, ne.y, 1.0 - abs(ne.x) - abs(ne.y));
-                if (spNormal.z < 0.0) spNormal.xy = (1.0 - abs(spNormal.yx)) *
-                    vec2(spNormal.x >= 0.0 ? 1.0 : -1.0, spNormal.y >= 0.0 ? 1.0 : -1.0);
-                spNormal = normalize(spNormal);
-            }
-            spViewZ = spData.data[spBase+3].z;
-            spRoughness = spData.data[spBase+2].w;
-            vec2 spMV = spData.data[spBase+4].xy;
-
-            // Only use if the stable plane found a valid surface (viewZ < 0)
-            if (spViewZ < -0.001 && spSceneLength < 9999.0) {
-                denoiserNormal = spNormal;
-                denoiserRoughness = max(spRoughness, 0.01);
-                denoiserViewZ = spViewZ;
-                denoiserMV = spMV;
-                hasStablePlane = true;
-                // Also update primaryWorldPos for specular MV virtual position
-                primaryWorldPos = spWorldPos;
-            }
-        }
-    }
 
     // Write G-buffers for DLSS RR
     if (primaryHit) {
@@ -229,7 +209,7 @@ void main() {
         }
         imageStore(motionVectorsImg, pixel, vec4(motionVector, mvZ, 0));
 
-        // Demodulate diffuse by albedo for NRD
+        // Demodulate diffuse by albedo for NRD / DLSS-RR
         vec3 albedo = max(primaryAlbedo, vec3(0.01));
         vec3 demodDiffuse = diffuse / albedo;
         imageStore(diffuseRadianceImg, pixel, NRD_PackRadiance(demodDiffuse, diffHitDist));

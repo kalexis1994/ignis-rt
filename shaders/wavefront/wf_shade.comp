@@ -208,6 +208,16 @@ layout(binding = 15, set = 1, std430) buffer PTResCurrBuf  { vec4 data[]; } ptRe
 layout(binding = 16, set = 1, std430) buffer PTResPrevBuf  { vec4 data[]; } ptResPrev;
 layout(binding = 17, set = 1, std430) buffer PTPathBuf     { vec4 data[]; } ptPathRec;
 
+// Stable Planes (set 1, bindings 18-19) — for glass plane routing
+layout(binding = 18, set = 1, std430) buffer SPHeaderBuf   { uvec4 data[]; } spHeader;
+layout(binding = 19, set = 1, std430) buffer SPDataBuf     { vec4  data[]; } spData;
+
+// Secondary radiance buffer for glass decomposition (set 1, binding 20)
+layout(binding = 20, set = 1, scalar) buffer PixelRadianceAuxBuffer { uint radDataU[]; } pixelRadianceAux;
+
+// Glass plane decomposition flag — bit 16 in pathState flags
+const uint FLAG_SECONDARY_PLANE = 0x10000u;
+
 // SHARC state load/store (20 uints per pixel, indexed by pixelIndex)
 SharcState loadSharcState(uint pixelIndex) {
     uint base = pixelIndex * 20u;
@@ -239,6 +249,12 @@ void storeSharcState(uint pixelIndex, SharcState s) {
 vec3 cyclesPrincipledTransmissionTint(vec3 baseColor) {
     return sqrt(clamp(baseColor, vec3(0.0), vec3(1.0)));
 }
+
+// Thread-local flag for future per-plane radiance routing (currently disabled).
+// The radiance separation infrastructure is in place but disabled because the
+// stable plane guide buffer override is not active — without matching guide
+// buffers, separating radiance would not improve DLSS-RR quality.
+bool gIsSecondaryPlane = false;
 
 // Thread-safe float accumulation via uint CAS
 void atomicAddFloat(uint index, float value) {
@@ -289,6 +305,10 @@ void main() {
     uint bounce = flags & 0xFu;
     bool isDiffusePath = (flags & 0x10u) != 0u;
     uint glassBouncesPrev = (flags >> 8u) & 0xFu;  // glass bounces from previous iterations
+
+    // Glass plane decomposition: route radiance to secondary buffer if this path
+    // belongs to the non-dominant stable plane (set at first glass interaction)
+    gIsSecondaryPlane = (flags & FLAG_SECONDARY_PLANE) != 0u;
 
     // ── ReSTIR PT: capture RNG seed at bounce 0 for random replay ──
     bool ptEnabled = (cam.lightPad2 & 8u) != 0u;  // same bit as ReSTIR GI toggle
@@ -1062,7 +1082,7 @@ void main() {
         } else {
             volExit = entryPos + rayDir * (marchDist + 0.002);
         }
-        uint volFlags = bounce | (isDiffusePath ? 0x10u : 0u) | (flags & 0xFF00u) | matCatBits;
+        uint volFlags = bounce | (isDiffusePath ? 0x10u : 0u) | (flags & 0x1FF00u) | matCatBits;
         psWriteAll(nextIdx, volExit, pixelIndex, rayDir, rngState, throughput, volFlags);
         psTerminate(idx, flags);
         return;
@@ -1222,7 +1242,8 @@ void main() {
 
         float pTransmit = 1.0 - pReflect;
         vec3 newDir, newOrigin;
-        if (!canRefract || rand01() < pReflect) {
+        bool pathReflects = (!canRefract || rand01() < pReflect);
+        if (pathReflects) {
             newDir = reflect(rayDir, Hglass);
             newOrigin = worldPos + refractN * 0.001;
             throughput *= R / max(glassProb_pre * pReflect, 1e-4);
@@ -1232,9 +1253,20 @@ void main() {
             throughput *= T / max(glassProb_pre * pTransmit, 1e-4);
         }
 
+        // Glass plane decomposition: at the FIRST glass interaction, determine
+        // if this path belongs to the dominant or secondary stable plane.
+        // plane 0 = reflection, plane 1 = refraction (matching BUILD pass)
+        uint secondaryBit = flags & FLAG_SECONDARY_PLANE;  // preserve if already set
+        if (glassBouncesPrev == 0u && secondaryBit == 0u) {
+            uvec4 spH = spHeader.data[pixelIndex];
+            uint dominantPlaneIdx = spH.w & 3u;
+            uint pathPlaneIdx = pathReflects ? 0u : 1u;
+            if (pathPlaneIdx != dominantPlaneIdx) secondaryBit = FLAG_SECONDARY_PLANE;
+        }
+
         uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
         uint nBase = nextIdx * 12u;
-        uint glassFlags = bounce | ((glassBounces & 0xFu) << 8u) | matCatBits;
+        uint glassFlags = bounce | ((glassBounces & 0xFu) << 8u) | matCatBits | secondaryBit;
         psWriteAll(nextIdx, newOrigin, pixelIndex, newDir, rngState, throughput, glassFlags);
         psTerminate(idx, flags);
         return;
@@ -2069,7 +2101,7 @@ void main() {
             // Re-queue from the final position (past all thin/transparent layers)
             uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
             uint nBase = nextIdx * 12u;
-            uint thinFlags = bounce | (flags & 0xFF00u) | matCatBits;
+            uint thinFlags = bounce | (flags & 0x1FF00u) | matCatBits;
             psWriteAll(nextIdx, thinOrigin, pixelIndex, rayDir, rngState, throughput, thinFlags);
             psTerminate(idx, flags);
             return;
@@ -2088,7 +2120,7 @@ void main() {
             uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
             uint nBase = nextIdx * 12u;
             vec3 reflOrigin = worldPos + N * 0.001;
-            uint reflFlags = bounce | (flags & 0xFF00u) | matCatBits;
+            uint reflFlags = bounce | (flags & 0x1FF00u) | matCatBits;
             psWriteAll(nextIdx, reflOrigin, pixelIndex, newDir, rngState, throughput, reflFlags);
             psTerminate(idx, flags);
             return;
@@ -2113,7 +2145,7 @@ void main() {
         uint nBase = nextIdx * 12u;
         vec3 skipOrigin = worldPos + rayDir * 0.002;
         // Preserve bounce + glass counter, clear isDiffuse
-        uint tpFlags = bounce | (flags & 0xFF00u) | matCatBits;
+        uint tpFlags = bounce | (flags & 0x1FF00u) | matCatBits;
         psWriteAll(nextIdx, skipOrigin, pixelIndex, rayDir, rngState, throughput, tpFlags);
         psTerminate(idx, flags);
         return;
@@ -2124,7 +2156,7 @@ void main() {
         uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
         uint nBase = nextIdx * 12u;
         vec3 skipOrigin = worldPos + rayDir * 0.002;
-        uint lpFlags = bounce | (flags & 0xFF00u) | matCatBits;
+        uint lpFlags = bounce | (flags & 0x1FF00u) | matCatBits;
         psWriteAll(nextIdx, skipOrigin, pixelIndex, rayDir, rngState, throughput, lpFlags);
         psTerminate(idx, flags);
         return;
@@ -2186,7 +2218,8 @@ void main() {
         float avgT = dot(T, vec3(1.0/3.0));
         float pReflect = (!canRefract) ? 1.0 : avgR / max(avgR + avgT, 1e-6);
 
-        if (!canRefract || rand01() < pReflect) {
+        bool pathReflects2 = (!canRefract || rand01() < pReflect);
+        if (pathReflects2) {
             rayDir = reflect(rayDir, Hglass);
             rayOrigin = worldPos + refractN * 0.001;
             throughput *= R / max(glassProb * pReflect, 1e-4);
@@ -2196,11 +2229,20 @@ void main() {
             throughput *= T / max(glassProb * (1.0 - pReflect), 1e-4);
         }
 
+        // Glass plane decomposition (same logic as earlyGlassExit)
+        uint secondaryBit2 = flags & FLAG_SECONDARY_PLANE;
+        if (glassBouncesPrev == 0u && secondaryBit2 == 0u) {
+            uvec4 spH2 = spHeader.data[pixelIndex];
+            uint domIdx2 = spH2.w & 3u;
+            uint pathPlane2 = pathReflects2 ? 0u : 1u;
+            if (pathPlane2 != domIdx2) secondaryBit2 = FLAG_SECONDARY_PLANE;
+        }
+
         // Write PathState at SAME bounce (glass doesn't consume bounce budget)
         uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
         uint nBase = nextIdx * 12u;
-        // Same bounce, not diffuse, updated glass counter
-        uint glassFlags = bounce | ((glassBounces & 0xFu) << 8u) | matCatBits;
+        // Same bounce, not diffuse, updated glass counter + plane flag
+        uint glassFlags = bounce | ((glassBounces & 0xFu) << 8u) | matCatBits | secondaryBit2;
         psWriteAll(nextIdx, rayOrigin, pixelIndex, rayDir, rngState, throughput, glassFlags);
         psTerminate(idx, flags);
         return;
@@ -2301,7 +2343,7 @@ void main() {
                 if (nextBounce < pc.maxBounces) {
                     uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
                     uint nBase = nextIdx * 12u;
-                    uint newFlags = nextBounce | matCatBits;
+                    uint newFlags = nextBounce | matCatBits | (flags & FLAG_SECONDARY_PLANE);
                     psWriteAll(nextIdx, rayOrigin, pixelIndex, rayDir, rngState, throughput, newFlags);
                 }
                 psTerminate(idx, flags);
@@ -2448,7 +2490,7 @@ void main() {
     if (nextBounce < pc.maxBounces) {
         uint nextIdx = atomicAdd(counters.nextActiveRayCount, 1u);
         uint nBase = nextIdx * 12u;
-        uint newFlags = nextBounce | (isDiffusePath ? 0x10u : 0u) | matCatBits;
+        uint newFlags = nextBounce | (isDiffusePath ? 0x10u : 0u) | matCatBits | (flags & FLAG_SECONDARY_PLANE);
         psWriteAll(nextIdx, rayOrigin, pixelIndex, rayDir, rngState, throughput, newFlags);
     }
 

@@ -100,10 +100,15 @@ layout(binding = 5, set = 1, scalar) buffer CountersBuffer {
     uint nextActiveRayCount;
     uint pad0;
 } counters;
+layout(binding = 20, set = 1, scalar) buffer PixelRadianceAuxBuffer { uint radDataU[]; } pixelRadianceAux;
+
+const uint FLAG_SECONDARY_PLANE = 0x10000u;
 
 #include "../include/common.glsl"
 #include "../include/noise.glsl"
 #include "../include/volume_march.glsl"
+
+bool gIsSecondaryPlane = false;  // future use
 
 // Atomic float add via CAS
 void atomicAddFloat(uint index, float value) {
@@ -224,6 +229,8 @@ void main() {
     if (radiance.x <= 0.0 && radiance.y <= 0.0 && radiance.z <= 0.0) return;
 
     uint pixelIndex = psReadPixelIndex(pathIndex);
+    uint pathFlags = psReadFlags(pathIndex);
+    gIsSecondaryPlane = (pathFlags & FLAG_SECONDARY_PLANE) != 0u;
     uint rBase = pixelIndex * 8u;
 
     if (channel == 0u) {

@@ -147,6 +147,7 @@ void WavefrontPipeline::Shutdown() {
     DestroySSBO(device, hitResultBuffer_, hitResultMemory_);
     DestroySSBO(device, shadowRayBuffer_, shadowRayMemory_);
     DestroySSBO(device, pixelRadianceBuffer_, pixelRadianceMemory_);
+    DestroySSBO(device, pixelRadianceAuxBuffer_, pixelRadianceAuxMemory_);
     DestroySSBO(device, primaryGBufBuffer_, primaryGBufMemory_);
     DestroySSBO(device, countersBuffer_, countersMemory_);
     DestroySSBO(device, indirectDispatchBuffer_, indirectDispatchMemory_);
@@ -303,8 +304,10 @@ bool WavefrontPipeline::CreateBuffers(uint32_t pixelCount) {
     uint32_t maxShadowRays = pixelCount * MAX_SHADOW_RAYS_PER_PATH;
     if (!CreateSSBO(device, physDevice, maxShadowRays * 48, &shadowRayBuffer_, &shadowRayMemory_)) return false;
 
-    // PixelRadiance: 32 bytes per pixel
+    // PixelRadiance: 32 bytes per pixel (dominant plane)
     if (!CreateSSBO(device, physDevice, pixelCount * 32, &pixelRadianceBuffer_, &pixelRadianceMemory_)) return false;
+    // PixelRadianceAux: 32 bytes per pixel (secondary plane for glass decomposition)
+    if (!CreateSSBO(device, physDevice, pixelCount * 32, &pixelRadianceAuxBuffer_, &pixelRadianceAuxMemory_)) return false;
 
     // PrimaryGBuffer: 96 bytes per pixel (16 base floats + 8 PSR floats = 24 floats)
     if (!CreateSSBO(device, physDevice, pixelCount * 96, &primaryGBufBuffer_, &primaryGBufMemory_)) return false;
@@ -363,8 +366,8 @@ bool WavefrontPipeline::CreateDescriptorSet() {
     // binding 5:  Counters             binding 12: throughput WRITE
     // binding 6:  IndirectDispatch     binding 13: flags READ
     //                                  binding 14: flags WRITE
-    // 15 original + 3 ReSTIR PT + 2 Stable Planes
-    constexpr int NUM_BINDINGS = 20;
+    // 15 original + 3 ReSTIR PT + 2 Stable Planes + 1 PixelRadianceAux
+    constexpr int NUM_BINDINGS = 21;
     VkDescriptorSetLayoutBinding bindings[NUM_BINDINGS] = {};
     for (int i = 0; i < NUM_BINDINGS; i++) {
         bindings[i].binding = i;
@@ -426,6 +429,7 @@ bool WavefrontPipeline::CreateDescriptorSet() {
             ptPathRecordBuffer_,           // 17: PT path record
             spHeaderBuffer_,               // 18: Stable Planes header
             spDataBuffer_,                 // 19: Stable Planes data
+            pixelRadianceAuxBuffer_,       // 20: PixelRadianceAux (secondary glass plane)
         };
 
         VkDescriptorBufferInfo bufInfos[NUM_BINDINGS] = {};
@@ -602,8 +606,9 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
     // Set 1 (B): read=buffer[1], write=buffer[0]
     pathStateCurrent_ = 0;
 
-    // Clear pixel radiance, primary G-buffer, and SharcState (once per frame, before all SPP samples)
+    // Clear pixel radiance (both planes), primary G-buffer, and SharcState (once per frame, before all SPP samples)
     vkCmdFillBuffer(cmd, pixelRadianceBuffer_, 0, totalPixels * 32, 0);
+    vkCmdFillBuffer(cmd, pixelRadianceAuxBuffer_, 0, totalPixels * 32, 0);
     vkCmdFillBuffer(cmd, primaryGBufBuffer_, 0, totalPixels * 64, 0);
     vkCmdFillBuffer(cmd, sharcStateBuffer_, 0, totalPixels * 80, 0);  // pathLength=0 = initialized
 
@@ -686,6 +691,16 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
             ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
             : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
         vkCmdPipelineBarrier(cmd, k2SrcStage, k2DstStage, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+        // ── Stable Planes BUILD: currently disabled ──
+        // The BUILD pass traces an unjittered primary ray to find stable surfaces
+        // behind glass, but the unjittered path disagrees with the jittered path
+        // tracer — causing temporal instability when guide buffers are overridden.
+        // The infrastructure (buffers, shaders, descriptors) remains for future
+        // activation when a synchronization strategy is implemented (e.g., temporal
+        // smoothing of stable plane data, or making K2 also use unjittered paths
+        // for glass delta chains).
+        // BUILD pass dispatch will be re-enabled when guide buffer override is active.
 
         // Compact: write shadow dispatch args + swap counters + write active dispatch args
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineCompact_);
@@ -779,26 +794,9 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
     uint32_t groupsX = (width + 7) / 8;
     uint32_t groupsY = (height + 7) / 8;
 
-    // ── Stable Planes BUILD (after bounce loop, before PT and output) ──
-    if (pipelineStablePlanes_) {
-        VkDescriptorSet setsSP[2] = { sceneDescSet, wfDescSet_[0] };
-        struct SPPush { uint32_t width, height, frameIndex, pad; };
-        SPPush spPush = { width, height, frameIndex_, 0 };
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineStablePlanes_);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
-            0, 2, setsSP, 0, nullptr);
-        vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(spPush), &spPush);
-        vkCmdDispatch(cmd, groupsX, groupsY, 1);
+    // (Stable Planes BUILD now runs inline after first K2, inside the bounce loop)
 
-        VkMemoryBarrier spBarrier{};
-        spBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        spBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        spBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &spBarrier, 0, nullptr, 0, nullptr);
-    }
-
-    // ── ReSTIR PT passes (after stable planes, before output) ──
+    // ── ReSTIR PT passes (before output) ──
     bool ptActive = pipelinePTTemporal_ && pipelinePTSpatial_ && pipelinePTFinal_;
     if (ptActive) {
         VkDescriptorSet setsPT[2] = { sceneDescSet, wfDescSet_[0] };

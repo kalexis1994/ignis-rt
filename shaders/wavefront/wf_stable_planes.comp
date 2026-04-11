@@ -74,6 +74,9 @@ layout(binding = 4, set = 0, scalar) buffer MaterialBuffer {
 } materialBuffer;
 
 layout(buffer_reference, scalar) buffer PrimMaterials { uint m[]; };
+layout(buffer_reference, scalar) buffer Indices { uint i[]; };
+layout(buffer_reference, scalar) buffer Normals { float n[]; };
+layout(buffer_reference, scalar) buffer Vertices { float v[]; };
 
 // Stable plane storage (set 1)
 // binding 18: header (uvec4 per pixel)
@@ -101,6 +104,17 @@ layout(push_constant) uniform PushConst {
 const uint MAT_STRIDE = 551u;
 const uint MAT_OFFSET_MULTA = 29u;  // transmission
 const uint MAT_OFFSET_ROUGH = 8u;   // ksSpecularEXP (roughness for Principled)
+const uint MAT_OFFSET_IOR = 14u;    // detailUVMultiplier = IOR
+
+// Simple Fresnel for dielectric (exact, not Schlick)
+float spFresnelDielectric(float cosTheta, float eta) {
+    float g = eta * eta - 1.0 + cosTheta * cosTheta;
+    if (g < 0.0) return 1.0;  // total internal reflection
+    g = sqrt(g);
+    float a = (g - cosTheta) / (g + cosTheta);
+    float b = (cosTheta * (g + cosTheta) - 1.0) / (cosTheta * (g - cosTheta) + 1.0);
+    return 0.5 * a * a * (1.0 + b * b);
+}
 
 // Write one stable plane
 void writePlane(int pixelIdx, uint planeIdx, StablePlaneData sp) {
@@ -133,14 +147,28 @@ void main() {
         writePlane(pixelIdx, pi, empty);
     }
 
-    // Read primary hit
+    // ── Trace own UNJITTERED primary ray for temporal stability ──
+    // Do NOT use projInverse — it has Halton jitter baked into proj[2][0/1].
+    // Instead, construct the ray from camera vectors + FOV directly.
+    // proj[0][0] and proj[1][1] contain the focal length (NOT jittered).
+    vec3 camPos = cam.viewInverse[3].xyz;
+    vec3 camRight = cam.viewInverse[0].xyz;
+    vec3 camUp = cam.viewInverse[1].xyz;
+    vec3 camForward = -cam.viewInverse[2].xyz;
+    float tanHalfFovX = 1.0 / cam.proj[0][0];
+    float tanHalfFovY = 1.0 / cam.proj[1][1];
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(float(pc.width), float(pc.height));
+    float ndcX = uv.x * 2.0 - 1.0;
+    float ndcY = 1.0 - uv.y * 2.0;
+    vec3 viewDir = normalize(camForward + ndcX * tanHalfFovX * camRight + ndcY * tanHalfFovY * camUp);
+
+    // Quick check: if the G-buffer says sky or non-delta, skip this pixel early
     float primaryViewZ = primaryGBuf.gbufData[gBase+7];
     if (primaryViewZ > -0.001) return;  // sky
-
     float primaryRoughness = primaryGBuf.gbufData[gBase+3];
-    // Only process delta surfaces (glass/mirror: roughness < 0.05)
     if (primaryRoughness > 0.05) {
-        // Non-delta primary: plane 0 = primary surface itself (already in G-buffer)
+        // Non-delta primary: write plane 0 from G-buffer (already stable for opaque)
         StablePlaneData p0 = spEmptyPlane();
         p0.worldPos = vec3(primaryGBuf.gbufData[gBase+4],
                             primaryGBuf.gbufData[gBase+5],
@@ -154,22 +182,64 @@ void main() {
         p0.throughput = vec3(1.0);
         p0.valid = true;
         writePlane(pixelIdx, 0u, p0);
-        spHeader.data[pixelIdx] = uvec4(1u, 0u, 0u, 0u);  // plane 0 branchID = 1 (camera)
+        spHeader.data[pixelIdx] = uvec4(1u, 0u, 0u, 0u);
         return;
     }
 
-    vec3 primaryPos = vec3(primaryGBuf.gbufData[gBase+4],
-                            primaryGBuf.gbufData[gBase+5],
-                            primaryGBuf.gbufData[gBase+6]);
-    vec3 primaryNormal = vec3(primaryGBuf.gbufData[gBase+0],
-                               primaryGBuf.gbufData[gBase+1],
-                               primaryGBuf.gbufData[gBase+2]);
-    vec3 camPos = (cam.viewInverse * vec4(0, 0, 0, 1)).xyz;
-    vec3 viewDir = normalize(primaryPos - camPos);
-    float primaryHitT = length(primaryPos - camPos);
+    // Trace unjittered primary ray to find the glass surface deterministically
+    rayQueryEXT primaryRQ;
+    rayQueryInitializeEXT(primaryRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
+                          0xFF, camPos, 0.001, viewDir, 10000.0);
+    while (rayQueryProceedEXT(primaryRQ)) {}
+
+    if (rayQueryGetIntersectionTypeEXT(primaryRQ, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+        return;  // sky — no stable plane needed
+    }
+
+    float primaryHitT = rayQueryGetIntersectionTEXT(primaryRQ, true);
+    vec3 primaryPos = camPos + viewDir * primaryHitT;
+
+    // Read primary surface properties from the unjittered hit
+    uint primaryCustIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(primaryRQ, true);
+    int primaryPrimId = rayQueryGetIntersectionPrimitiveIndexEXT(primaryRQ, true);
+    GeometryMetadata primaryGeo = geometryMetadata.geometries[primaryCustIdx];
+    uint primaryMatIdx = 0u;
+    if (primaryGeo.primMaterialBufferAddress != 0u) {
+        PrimMaterials pPM = PrimMaterials(primaryGeo.primMaterialBufferAddress);
+        primaryMatIdx = pPM.m[primaryPrimId];
+    }
+    uint primaryMatBase = primaryMatIdx * MAT_STRIDE;
+    float unjitteredRoughness = uintBitsToFloat(materialBuffer.matData[primaryMatBase + MAT_OFFSET_ROUGH]);
+    float unjitteredTransmission = uintBitsToFloat(materialBuffer.matData[primaryMatBase + MAT_OFFSET_MULTA]);
+
+    // If unjittered hit is not delta, no stable planes needed
+    bool unjitteredIsDelta = (unjitteredTransmission > 0.5 && unjitteredRoughness < 0.05) ||
+                              (unjitteredRoughness < 0.02);
+    if (!unjitteredIsDelta) return;
+
+    // Get unjittered primary normal (interpolated)
+    vec2 primaryBary = rayQueryGetIntersectionBarycentricsEXT(primaryRQ, true);
+    mat4x3 primaryOTW = rayQueryGetIntersectionObjectToWorldEXT(primaryRQ, true);
+    vec3 primaryNormal;
+    if (primaryGeo.normalBufferAddress != 0u) {
+        Indices pIdx = Indices(primaryGeo.indexBufferAddress);
+        uint pi0 = pIdx.i[primaryPrimId*3+0];
+        uint pi1 = pIdx.i[primaryPrimId*3+1];
+        uint pi2 = pIdx.i[primaryPrimId*3+2];
+        Normals pNBuf = Normals(primaryGeo.normalBufferAddress);
+        vec3 pn0 = vec3(pNBuf.n[pi0*3+0], pNBuf.n[pi0*3+1], pNBuf.n[pi0*3+2]);
+        vec3 pn1 = vec3(pNBuf.n[pi1*3+0], pNBuf.n[pi1*3+1], pNBuf.n[pi1*3+2]);
+        vec3 pn2 = vec3(pNBuf.n[pi2*3+0], pNBuf.n[pi2*3+1], pNBuf.n[pi2*3+2]);
+        vec3 pLocalN = pn0 * (1.0 - primaryBary.x - primaryBary.y) + pn1 * primaryBary.x + pn2 * primaryBary.y;
+        primaryNormal = normalize(mat3(primaryOTW) * pLocalN);
+    } else {
+        vec3 e1 = vec3(primaryOTW[1][0]-primaryOTW[0][0], primaryOTW[1][1]-primaryOTW[0][1], primaryOTW[1][2]-primaryOTW[0][2]);
+        vec3 e2 = vec3(primaryOTW[2][0]-primaryOTW[0][0], primaryOTW[2][1]-primaryOTW[0][1], primaryOTW[2][2]-primaryOTW[0][2]);
+        primaryNormal = normalize(cross(e1, e2));
+    }
+    if (dot(primaryNormal, -viewDir) < 0.0) primaryNormal = -primaryNormal;
 
     // ── Delta trace with branching ──
-    // Stack-based exploration: process up to 3 planes
     struct DeltaPath {
         vec3  origin;
         vec3  dir;
@@ -181,23 +251,25 @@ void main() {
         uint  planeIdx;
     };
 
-    // Initialize with primary surface
     DeltaPath paths[3];
     uint pathCount = 0u;
     uint nextPlane = 0u;
 
-    // Check if primary is glass (has transmission)
-    uint primaryInstId = floatBitsToUint(primaryGBuf.gbufData[gBase+15]);
-    // We already know it's delta (roughness < 0.05). Trace reflection as default.
-    // If it's glass, also trace refraction.
+    // Read IOR from the exact material at the unjittered primary hit
+    float primaryIOR = max(uintBitsToFloat(materialBuffer.matData[primaryMatBase + MAT_OFFSET_IOR]), 1.01);
 
-    // Reflection path
+    // Compute Fresnel at primary surface to determine dominant plane
+    float cosPrimary = abs(dot(-viewDir, primaryNormal));
+    float eta = 1.0 / primaryIOR;
+    float F = spFresnelDielectric(cosPrimary, primaryIOR);
+
+    // Reflection path (plane 0)
     vec3 reflDir = reflect(viewDir, primaryNormal);
     if (nextPlane < SP_MAX_PLANES) {
         paths[pathCount].origin = primaryPos;
         paths[pathCount].dir = reflDir;
         paths[pathCount].normal = primaryNormal;
-        paths[pathCount].throughput = vec3(1.0); // Fresnel applied later
+        paths[pathCount].throughput = vec3(F);  // Fresnel-weighted
         paths[pathCount].sceneLength = primaryHitT;
         paths[pathCount].branchID = spAdvanceBranchID(1u, 1u); // lobe 1 = reflection
         paths[pathCount].imageXform = spMirrorMatrix(primaryNormal);
@@ -205,18 +277,14 @@ void main() {
         pathCount++; nextPlane++;
     }
 
-    // Refraction path (if glass)
-    // Approximate: check transmission from material
-    // Since we don't have easy material access here, check roughness + the fact
-    // that glass was detected by primaryRoughness < 0.05. Assume glass has refraction.
-    float eta = 1.0 / 1.5;  // glass IOR ≈ 1.5
+    // Refraction path (plane 1, if glass can refract)
     vec3 refrDir = refract(viewDir, primaryNormal, eta);
     bool canRefract = dot(refrDir, refrDir) > 0.0001;
     if (canRefract && nextPlane < SP_MAX_PLANES) {
         paths[pathCount].origin = primaryPos;
         paths[pathCount].dir = refrDir;
         paths[pathCount].normal = -primaryNormal;  // inside surface
-        paths[pathCount].throughput = vec3(1.0);
+        paths[pathCount].throughput = vec3(1.0 - F);  // Fresnel-weighted
         paths[pathCount].sceneLength = primaryHitT;
         paths[pathCount].branchID = spAdvanceBranchID(1u, 0u); // lobe 0 = transmission
         paths[pathCount].imageXform = spRotateFromTo(refrDir, viewDir);
@@ -225,14 +293,14 @@ void main() {
     }
 
     // ── Trace each delta path until non-delta surface ──
-    const uint MAX_DELTA_BOUNCES = 6u;
+    const uint MAX_DELTA_BOUNCES = 8u;
 
     for (uint pi = 0u; pi < pathCount; pi++) {
         DeltaPath dp = paths[pi];
         bool foundStable = false;
 
         for (uint db = 0u; db < MAX_DELTA_BOUNCES; db++) {
-            vec3 traceOrigin = dp.origin + dp.normal * 0.002;
+            vec3 traceOrigin = dp.origin + dp.normal * 0.0001;
 
             rayQueryEXT rq;
             rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT,
@@ -270,13 +338,30 @@ void main() {
             float hitTransmission = uintBitsToFloat(materialBuffer.matData[matBase + MAT_OFFSET_MULTA]);
             float hitRoughness = uintBitsToFloat(materialBuffer.matData[matBase + MAT_OFFSET_ROUGH]);
 
-            // Get hit normal
+            // Get hit normal — prefer interpolated shading normal for smooth surfaces
             vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
             mat4x3 otw = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
-            // Approximate geometric normal
-            vec3 hitNormal = normalize(cross(
-                vec3(otw[1][0]-otw[0][0], otw[1][1]-otw[0][1], otw[1][2]-otw[0][2]),
-                vec3(otw[2][0]-otw[0][0], otw[2][1]-otw[0][1], otw[2][2]-otw[0][2])));
+            vec3 hitNormal;
+            if (geo.normalBufferAddress != 0u) {
+                // Interpolated shading normal (smooth)
+                Indices idx = Indices(geo.indexBufferAddress);
+                uint i0 = idx.i[primId*3+0];
+                uint i1 = idx.i[primId*3+1];
+                uint i2 = idx.i[primId*3+2];
+                Normals nBuf = Normals(geo.normalBufferAddress);
+                vec3 n0 = vec3(nBuf.n[i0*3+0], nBuf.n[i0*3+1], nBuf.n[i0*3+2]);
+                vec3 n1 = vec3(nBuf.n[i1*3+0], nBuf.n[i1*3+1], nBuf.n[i1*3+2]);
+                vec3 n2 = vec3(nBuf.n[i2*3+0], nBuf.n[i2*3+1], nBuf.n[i2*3+2]);
+                vec3 localN = n0 * (1.0 - bary.x - bary.y) + n1 * bary.x + n2 * bary.y;
+                hitNormal = normalize(mat3(otw) * localN);
+            } else {
+                // Fallback: geometric normal from triangle edges
+                vec3 e1 = vec3(otw[1][0]-otw[0][0], otw[1][1]-otw[0][1], otw[1][2]-otw[0][2]);
+                vec3 e2 = vec3(otw[2][0]-otw[0][0], otw[2][1]-otw[0][1], otw[2][2]-otw[0][2]);
+                hitNormal = normalize(cross(e1, e2));
+            }
+            // Determine front/back face BEFORE flipping normal (for glass enter/exit)
+            bool hitFrontFace = rayQueryGetIntersectionFrontFaceEXT(rq, true);
             if (dot(hitNormal, -dp.dir) < 0.0) hitNormal = -hitNormal;
 
             bool isDelta = (hitTransmission > 0.5 && hitRoughness < 0.05) ||
@@ -292,18 +377,52 @@ void main() {
                 sp.throughput = dp.throughput;
                 sp.roughness = hitRoughness;
                 sp.normal = hitNormal;
-                vec4 stableView = cam.view * vec4(hitPos, 1.0);
+                // Use virtual position viewZ (consistent with MV computation below)
+                vec3 virtualPosVZ = camPos + viewDir * dp.sceneLength;
+                vec4 stableView = cam.view * vec4(virtualPosVZ, 1.0);
                 sp.viewZ = stableView.z;
                 sp.imageXform = dp.imageXform;
                 sp.valid = true;
 
-                // Motion vector using virtual world position
+                // Motion vector: virtual position for camera motion + object motion
+                // Virtual pos = camera origin along original view dir at total path length
                 vec3 virtualPos = camPos + viewDir * dp.sceneLength;
                 vec4 currClip = cam.proj * cam.view * vec4(virtualPos, 1.0);
                 vec2 currUV = vec2(currClip.x/currClip.w * 0.5 + 0.5,
                                     0.5 - currClip.y/currClip.w * 0.5);
-                // Previous frame: assume same virtual position (camera motion only)
-                vec4 prevClip = cam.projPrev * cam.viewPrev * vec4(virtualPos, 1.0);
+
+                // Object motion: compute previous-frame world position from instance transforms
+                uint hitInstId = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+                vec3 prevVirtualPos = virtualPos;  // fallback: camera motion only
+                if (hitInstId < 65535u) {
+                    // Approximate local-space position via inverse OTW
+                    // (exact would need objectToWorld inverse, but transpose of rotation part works for rigid)
+                    mat3 otwRot = mat3(otw);
+                    vec3 otwTranslation = vec3(otw[0][0], otw[0][1], otw[0][2]);
+                    // Read prevTransforms for this instance
+                    uint tBase = hitInstId * 3u;
+                    vec4 prevRow0 = prevTransforms.data[tBase + 0u];
+                    vec4 prevRow1 = prevTransforms.data[tBase + 1u];
+                    vec4 prevRow2 = prevTransforms.data[tBase + 2u];
+                    // Compute approximate local pos using barycentrics + vertex positions
+                    if (geo.vertexBufferAddress != 0u) {
+                        Indices vidx = Indices(geo.indexBufferAddress);
+                        uint vi0 = vidx.i[primId*3+0];
+                        Vertices vBuf = Vertices(geo.vertexBufferAddress);
+                        vec3 v0 = vec3(vBuf.v[vi0*3+0], vBuf.v[vi0*3+1], vBuf.v[vi0*3+2]);
+                        uint vi1 = vidx.i[primId*3+1];
+                        uint vi2 = vidx.i[primId*3+2];
+                        vec3 v1 = vec3(vBuf.v[vi1*3+0], vBuf.v[vi1*3+1], vBuf.v[vi1*3+2]);
+                        vec3 v2 = vec3(vBuf.v[vi2*3+0], vBuf.v[vi2*3+1], vBuf.v[vi2*3+2]);
+                        vec3 localPos = v0 * (1.0 - bary.x - bary.y) + v1 * bary.x + v2 * bary.y;
+                        vec4 lp = vec4(localPos, 1.0);
+                        vec3 prevWorldPos = vec3(dot(prevRow0, lp), dot(prevRow1, lp), dot(prevRow2, lp));
+                        // Virtual previous pos: same view dir, but with object's world-space displacement
+                        vec3 objectMotion = prevWorldPos - hitPos;
+                        prevVirtualPos = virtualPos + objectMotion;
+                    }
+                }
+                vec4 prevClip = cam.projPrev * cam.viewPrev * vec4(prevVirtualPos, 1.0);
                 vec2 prevUV = vec2(prevClip.x/prevClip.w * 0.5 + 0.5,
                                     0.5 - prevClip.y/prevClip.w * 0.5);
                 sp.motionVector = prevUV - currUV;
@@ -313,19 +432,47 @@ void main() {
                 break;
             }
 
-            // Still delta — continue tracing
-            // Reflect for this iteration (simplified: always reflect for delta chain)
-            vec3 nextDir = reflect(dp.dir, hitNormal);
-            dp.imageXform = dp.imageXform * spMirrorMatrix(hitNormal);
-            dp.branchID = spAdvanceBranchID(dp.branchID, 1u);
-            dp.origin = hitPos;
-            dp.dir = nextDir;
-            dp.normal = hitNormal;
+            // Still delta — continue tracing.
+            // For glass: ALWAYS refract through (never reflect in the BUILD pass).
+            // This prevents infinite mirror cavities between close glass surfaces.
+            // The BUILD pass only needs to find the first non-delta surface for
+            // guide buffers — it doesn't need to simulate multi-bounce reflections.
+            bool isGlassDelta = (hitTransmission > 0.5 && hitRoughness < 0.05);
+            if (isGlassDelta) {
+                float hitIOR = max(uintBitsToFloat(materialBuffer.matData[matBase + MAT_OFFSET_IOR]), 1.01);
+                bool entering = hitFrontFace;
+                float etaChain = entering ? (1.0 / hitIOR) : hitIOR;
+                vec3 refNormal = entering ? hitNormal : -hitNormal;
+                vec3 nextDir = refract(dp.dir, refNormal, etaChain);
+
+                if (dot(nextDir, nextDir) < 0.0001) {
+                    // Total internal reflection — just pass through (keep direction)
+                    // to avoid getting stuck in cavities
+                    nextDir = dp.dir;
+                }
+                dp.imageXform = dp.imageXform * spRotateFromTo(nextDir, dp.dir);
+                dp.branchID = spAdvanceBranchID(dp.branchID, 0u);
+                dp.dir = nextDir;
+                dp.origin = hitPos;
+                dp.normal = entering ? -hitNormal : hitNormal;
+            } else {
+                // Mirror surface: reflect
+                vec3 nextDir = reflect(dp.dir, hitNormal);
+                dp.imageXform = dp.imageXform * spMirrorMatrix(hitNormal);
+                dp.branchID = spAdvanceBranchID(dp.branchID, 1u);
+                dp.origin = hitPos;
+                dp.dir = nextDir;
+                dp.normal = hitNormal;
+            }
         }
     }
 
     // Write header: branchIDs for each plane
-    uint dominantPlane = 0u;  // plane 0 is dominant by default
+    // Dominant plane selection by Fresnel: at normal incidence, ~96% is transmission
+    // (plane 1), so transmission dominates for most viewing angles. Reflection (plane 0)
+    // only dominates at extreme grazing angles (F > 0.5 ≈ 85° for IOR=1.5).
+    // If refraction is impossible (TIR), reflection is the only valid plane.
+    uint dominantPlane = (!canRefract || F > 0.5) ? 0u : 1u;
     float firstHitLength = primaryHitT;
     uint headerW = (floatBitsToUint(firstHitLength) & 0xFFFFFFFCu) | (dominantPlane & 3u);
 

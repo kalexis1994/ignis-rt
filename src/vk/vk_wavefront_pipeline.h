@@ -61,8 +61,10 @@ private:
     VkDeviceMemory hitResultMemory_ = VK_NULL_HANDLE;
     VkBuffer shadowRayBuffer_ = VK_NULL_HANDLE;        // ShadowRay[]
     VkDeviceMemory shadowRayMemory_ = VK_NULL_HANDLE;
-    VkBuffer pixelRadianceBuffer_ = VK_NULL_HANDLE;    // PixelRadiance[]
+    VkBuffer pixelRadianceBuffer_ = VK_NULL_HANDLE;    // PixelRadiance[] (dominant plane)
     VkDeviceMemory pixelRadianceMemory_ = VK_NULL_HANDLE;
+    VkBuffer pixelRadianceAuxBuffer_ = VK_NULL_HANDLE;  // PixelRadianceAux[] (secondary plane for glass)
+    VkDeviceMemory pixelRadianceAuxMemory_ = VK_NULL_HANDLE;
     VkBuffer primaryGBufBuffer_ = VK_NULL_HANDLE;      // PrimaryGBuffer[]
     VkDeviceMemory primaryGBufMemory_ = VK_NULL_HANDLE;
     VkBuffer countersBuffer_ = VK_NULL_HANDLE;          // WavefrontCounters
@@ -88,7 +90,7 @@ private:
     // Descriptor sets for ping-pong (2 sets, no host updates during recording)
     // SoA bindings: 0=originDir(R), 7=originDir(W), 9=pixelRng(R), 10=pixelRng(W),
     //               11=throughput(R), 12=throughput(W), 13=flags(R), 14=flags(W)
-    // Plus: 1=hitResult, 2=shadowRay, 3=pixelRadiance, 4=primaryGBuf, 5=counters, 6=indirect, 8=sharc
+    // Plus: 1=hitResult, 2=shadowRay, 3=pixelRadiance, 4=primaryGBuf, 5=counters, 6=indirect, 8=sharc, 20=pixelRadianceAux
     VkDescriptorSetLayout wfDescSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool wfDescPool_ = VK_NULL_HANDLE;
     VkDescriptorSet wfDescSet_[2] = {};  // [0] = A, [1] = B
