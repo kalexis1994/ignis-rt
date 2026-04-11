@@ -1,0 +1,184 @@
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 2, set = 0) uniform CameraProperties {
+    mat4 viewInverse;
+    mat4 projInverse;
+    mat4 view;
+    mat4 proj;
+    mat4 viewPrev;
+    mat4 projPrev;
+    uvec4 parameters;
+    vec4 jitterData;
+    vec4 sunLight;
+    vec4 ambientLight;
+    vec4 skyLight;
+    vec4 ptParams0;
+    vec4 ptParams1;
+    vec4 windParams;
+    vec4 rainParams;
+    vec4 dofParams;
+    vec4 dofParams2;
+    ivec4 jitterPattern[8];
+    uint lightCount;
+    uint lightPad0, lightPad1, lightPad2;
+    vec4 lights[128];
+    uint64_t sharcHashEntriesAddr;
+    uint64_t sharcAccumulationAddr;
+    uint64_t sharcResolvedAddr;
+    uint sharcCapacity;
+    float sharcSceneScale;
+    float sharcRadianceScale;
+    float sharcWarmupFactor;
+} cam;
+
+// ReSTIR PT: read from current (after temporal), write back to current
+layout(binding = 15, set = 1, std430) buffer PTResCurrBuf { vec4 data[]; } ptResCurr;
+
+// Primary G-buffer (for surface data at neighbor pixels)
+layout(binding = 4, set = 1, scalar) buffer PrimaryGBufBuffer { float gbufData[]; } primaryGBuf;
+
+layout(push_constant) uniform PushConst {
+    uint width;
+    uint height;
+    uint frameIndex;
+    uint pad0;
+} pc;
+
+#include "../include/common.glsl"
+#include "../include/pt_reservoir.glsl"
+
+// Blue noise–inspired neighbor offsets (fixed pattern, 8 candidates)
+const ivec2 NEIGHBOR_OFFSETS[8] = ivec2[8](
+    ivec2(-12, -3), ivec2( 7, -15), ivec2( 18,  5), ivec2(-5,  20),
+    ivec2( 14, 11), ivec2(-19,  8), ivec2( 3, -22), ivec2(-10, 17)
+);
+
+PTReservoir readReservoirAt(int idx) {
+    PTReservoir r;
+    int rb = idx * 8;
+    r.rcVertexPos = ptResCurr.data[rb+0].xyz; r.weightSum = ptResCurr.data[rb+0].w;
+    r.rcRadiance = ptResCurr.data[rb+1].xyz; r.M = ptResCurr.data[rb+1].w;
+    r.rcVertexNormal = ptOctDecode(ptResCurr.data[rb+2].xy);
+    r.targetFunction = ptResCurr.data[rb+2].z;
+    r.rcBounceDepth = floatBitsToUint(ptResCurr.data[rb+2].w);
+    r.rngSeed = floatBitsToUint(ptResCurr.data[rb+3].x);
+    r.lightType = floatBitsToUint(ptResCurr.data[rb+3].y);
+    r.lightIndex = floatBitsToUint(ptResCurr.data[rb+3].z);
+    r.age = ptResCurr.data[rb+3].w;
+    r.primaryPos = ptResCurr.data[rb+4].xyz;
+    r.primaryRoughness = ptResCurr.data[rb+4].w;
+    r.primaryNormal = ptOctDecode(ptResCurr.data[rb+5].xy);
+    return r;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(pc.width) || pixel.y >= int(pc.height)) return;
+
+    int pixelIdx = pixel.y * int(pc.width) + pixel.x;
+
+    // Read current pixel's reservoir (after temporal pass)
+    PTReservoir curr = readReservoirAt(pixelIdx);
+
+    // Skip if current pixel has no valid sample
+    if (curr.M < 0.5) return;
+
+    // Current surface data for similarity checks
+    uint gBase = uint(pixelIdx) * 24u;
+    vec3 myNormal = vec3(primaryGBuf.gbufData[gBase+0],
+                          primaryGBuf.gbufData[gBase+1],
+                          primaryGBuf.gbufData[gBase+2]);
+    float myRough = primaryGBuf.gbufData[gBase+3];
+    vec3 myPos = vec3(primaryGBuf.gbufData[gBase+4],
+                       primaryGBuf.gbufData[gBase+5],
+                       primaryGBuf.gbufData[gBase+6]);
+    float myViewZ = primaryGBuf.gbufData[gBase+7];
+
+    // Skip sky pixels
+    if (myViewZ > -0.001) return;
+
+    // RNG for spatial sampling
+    rngState = uint(pixelIdx) * 1973u + pc.frameIndex * 6133u;
+    rngState = pcg(rngState);
+
+    // ── Sample spatial neighbors ──
+    const int NUM_SPATIAL = 4;
+    int startIdx = int(pcg(rngState) % 8u);  // randomize which neighbors we pick
+
+    for (int s = 0; s < NUM_SPATIAL; s++) {
+        ivec2 offset = NEIGHBOR_OFFSETS[(startIdx + s) % 8];
+        // Rotate offsets by frame for temporal variation
+        if ((pc.frameIndex & 1u) != 0u) offset = ivec2(-offset.y, offset.x);
+
+        ivec2 neighbor = pixel + offset;
+        if (neighbor.x < 0 || neighbor.x >= int(pc.width) ||
+            neighbor.y < 0 || neighbor.y >= int(pc.height)) continue;
+
+        int nIdx = neighbor.y * int(pc.width) + neighbor.x;
+
+        // Read neighbor's surface data
+        uint nGBase = uint(nIdx) * 24u;
+        vec3 nNormal = vec3(primaryGBuf.gbufData[nGBase+0],
+                             primaryGBuf.gbufData[nGBase+1],
+                             primaryGBuf.gbufData[nGBase+2]);
+        float nRough = primaryGBuf.gbufData[nGBase+3];
+        vec3 nPos = vec3(primaryGBuf.gbufData[nGBase+4],
+                          primaryGBuf.gbufData[nGBase+5],
+                          primaryGBuf.gbufData[nGBase+6]);
+
+        // Surface similarity check (strict for spatial)
+        if (!ptSurfaceSimilar(myNormal, nNormal, myRough, nRough, myPos, nPos))
+            continue;
+
+        // Read neighbor's reservoir
+        PTReservoir nRes = readReservoirAt(nIdx);
+        if (nRes.M < 0.5 || any(isnan(nRes.rcRadiance)) || any(isinf(nRes.rcRadiance)))
+            continue;
+
+        nRes.rcRadiance = min(nRes.rcRadiance, vec3(20.0));
+        nRes.M = min(nRes.M, 500.0);  // spatial M-cap (per paper)
+
+        // Compute target PDF of neighbor's sample at my surface
+        float pHat = ptTargetPDF(nRes);
+        if (pHat < 0.001) continue;
+
+        // Jacobian correction for domain shift
+        float J = ptJacobian(nRes.rcVertexPos, nRes.rcVertexNormal, myPos, nRes.primaryPos);
+        if (J < 0.001) continue;
+
+        // Merge with Jacobian-weighted importance
+        float rng = rand01();
+        float mergeWeight = pHat * J;
+        nRes.targetFunction = pHat;
+
+        // RIS combine
+        float w = mergeWeight * nRes.weightSum * nRes.M;
+        if (w <= 0.0 || isnan(w) || isinf(w)) continue;
+        float oldM = curr.M;
+        ptReservoirUpdate(curr, nRes, w, rng);
+        curr.M = oldM + nRes.M;
+    }
+
+    // Re-finalize after spatial combinations
+    ptFinalizeReservoir(curr);
+
+    // Write back
+    {
+        int rb = pixelIdx * 8;
+        vec2 rcN = ptOctEncode(curr.rcVertexNormal);
+        vec2 pN  = ptOctEncode(curr.primaryNormal);
+        ptResCurr.data[rb+0] = vec4(curr.rcVertexPos, curr.weightSum);
+        ptResCurr.data[rb+1] = vec4(curr.rcRadiance, curr.M);
+        ptResCurr.data[rb+2] = vec4(rcN, curr.targetFunction, uintBitsToFloat(curr.rcBounceDepth));
+        ptResCurr.data[rb+3] = vec4(uintBitsToFloat(curr.rngSeed), uintBitsToFloat(curr.lightType),
+                                     uintBitsToFloat(curr.lightIndex), curr.age);
+        ptResCurr.data[rb+4] = vec4(curr.primaryPos, curr.primaryRoughness);
+        ptResCurr.data[rb+5] = vec4(pN, 0.0, 0.0);
+        ptResCurr.data[rb+6] = vec4(0); ptResCurr.data[rb+7] = vec4(0);
+    }
+}

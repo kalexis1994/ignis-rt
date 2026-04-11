@@ -1,0 +1,139 @@
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 2, set = 0) uniform CameraProperties {
+    mat4 viewInverse;
+    mat4 projInverse;
+    mat4 view;
+    mat4 proj;
+    mat4 viewPrev;
+    mat4 projPrev;
+    uvec4 parameters;
+    vec4 jitterData;
+    vec4 sunLight;
+    vec4 ambientLight;
+    vec4 skyLight;
+    vec4 ptParams0;
+    vec4 ptParams1;
+    vec4 windParams;
+    vec4 rainParams;
+    vec4 dofParams;
+    vec4 dofParams2;
+    ivec4 jitterPattern[8];
+    uint lightCount;
+    uint lightPad0, lightPad1, lightPad2;
+    vec4 lights[128];
+    uint64_t sharcHashEntriesAddr;
+    uint64_t sharcAccumulationAddr;
+    uint64_t sharcResolvedAddr;
+    uint sharcCapacity;
+    float sharcSceneScale;
+    float sharcRadianceScale;
+    float sharcWarmupFactor;
+} cam;
+
+// Finalized PT reservoir (after temporal + spatial)
+layout(binding = 15, set = 1, std430) buffer PTResCurrBuf { vec4 data[]; } ptResCurr;
+
+// Pixel radiance (accumulated by K2/K3, we modulate the indirect component)
+layout(binding = 3, set = 1, scalar) buffer PixelRadianceBuffer { uint radDataU[]; } pixelRadiance;
+
+// Primary G-buffer
+layout(binding = 4, set = 1, scalar) buffer PrimaryGBufBuffer { float gbufData[]; } primaryGBuf;
+
+layout(push_constant) uniform PushConst {
+    uint width;
+    uint height;
+    uint frameIndex;
+    uint spp;
+} pc;
+
+#include "../include/common.glsl"
+#include "../include/pt_reservoir.glsl"
+
+// Atomic float add (same as wf_shade)
+void atomicAddFloat(uint index, float value) {
+    uint expected = pixelRadiance.radDataU[index];
+    uint desired;
+    do {
+        desired = floatBitsToUint(uintBitsToFloat(expected) + value);
+    } while ((expected = atomicCompSwap(pixelRadiance.radDataU[index], expected, desired)) != desired);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(pc.width) || pixel.y >= int(pc.height)) return;
+
+    int pixelIdx = pixel.y * int(pc.width) + pixel.x;
+
+    // Read finalized reservoir
+    int rb = pixelIdx * 8;
+    vec3  rcPos     = ptResCurr.data[rb+0].xyz;
+    float W         = ptResCurr.data[rb+0].w;    // contribution weight (finalized)
+    vec3  rcRad     = ptResCurr.data[rb+1].xyz;
+    float M         = ptResCurr.data[rb+1].w;
+    float tgtFunc   = ptResCurr.data[rb+2].z;
+
+    // Skip empty/invalid reservoirs
+    if (M < 0.5 || W <= 0.0 || tgtFunc <= 0.0) return;
+
+    // Read primary surface data
+    uint gBase = uint(pixelIdx) * 24u;
+    vec3 primaryNormal = vec3(primaryGBuf.gbufData[gBase+0],
+                               primaryGBuf.gbufData[gBase+1],
+                               primaryGBuf.gbufData[gBase+2]);
+    vec3 primaryPos = vec3(primaryGBuf.gbufData[gBase+4],
+                            primaryGBuf.gbufData[gBase+5],
+                            primaryGBuf.gbufData[gBase+6]);
+    float primaryViewZ = primaryGBuf.gbufData[gBase+7];
+    vec3 primaryAlbedo = vec3(primaryGBuf.gbufData[gBase+8],
+                               primaryGBuf.gbufData[gBase+9],
+                               primaryGBuf.gbufData[gBase+10]);
+
+    // Skip sky pixels
+    if (primaryViewZ > -0.001) return;
+
+    // ── Final shading: L_indirect = BRDF * Lo(rcVertex) * W ──
+    // Per RTXDI: the product targetFunction * W gives the final radiance.
+    // We evaluate the BRDF at the primary surface toward the rcVertex.
+    vec3 toRC = rcPos - primaryPos;
+    float dist = length(toRC);
+    if (dist < 0.01) return;
+    vec3 rcDir = toRC / dist;
+
+    float cosTheta = max(dot(primaryNormal, rcDir), 0.0);
+    if (cosTheta < 0.001) return;
+
+    // Lambertian BRDF evaluation: f * cos = albedo * cosTheta / PI
+    vec3 giContrib = rcRad * primaryAlbedo * (cosTheta / PI) * W;
+
+    // NaN/Inf guard
+    if (any(isnan(giContrib)) || any(isinf(giContrib))) return;
+
+    // Energy conservation: contribution cannot exceed source
+    float giLum = dot(giContrib, vec3(0.2126, 0.7152, 0.0722));
+    float srcLum = dot(rcRad, vec3(0.2126, 0.7152, 0.0722));
+    if (giLum > srcLum * 2.0 && srcLum > 0.001) {
+        giContrib *= (srcLum * 2.0) / giLum;
+    }
+
+    // ── Modulate: blend reservoir contribution with traced path ──
+    // Confidence-based: at high M, reservoir dominates.
+    // The traced path's contribution was already reduced by throughput
+    // modulation in wf_shade (1-confidence factor).
+    float confidence = clamp(M / 20.0, 0.0, 0.8);
+    giContrib *= confidence;
+
+    float giIntensity = cam.ptParams0.y;
+    giContrib *= giIntensity;
+
+    // Add to diffuse radiance channel
+    uint rBase = uint(pixelIdx) * 8u;
+    atomicAddFloat(rBase + 0u, giContrib.r);
+    atomicAddFloat(rBase + 1u, giContrib.g);
+    atomicAddFloat(rBase + 2u, giContrib.b);
+}

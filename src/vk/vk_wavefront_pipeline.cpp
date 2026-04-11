@@ -124,6 +124,9 @@ void WavefrontPipeline::Shutdown() {
     destroyPipeline(pipelineSortCount_);
     destroyPipeline(pipelineSortPrefix_);
     destroyPipeline(pipelineSortScatter_);
+    destroyPipeline(pipelinePTTemporal_);
+    destroyPipeline(pipelinePTSpatial_);
+    destroyPipeline(pipelinePTFinal_);
 
     destroyPipeline(pipelineK2RT_);
     if (pipelineLayoutRT_) { vkDestroyPipelineLayout(device, pipelineLayoutRT_, nullptr); pipelineLayoutRT_ = VK_NULL_HANDLE; }
@@ -147,6 +150,9 @@ void WavefrontPipeline::Shutdown() {
     DestroySSBO(device, countersBuffer_, countersMemory_);
     DestroySSBO(device, indirectDispatchBuffer_, indirectDispatchMemory_);
     DestroySSBO(device, sharcStateBuffer_, sharcStateMemory_);
+    for (int i = 0; i < 2; i++)
+        DestroySSBO(device, ptReservoirBuffer_[i], ptReservoirMemory_[i]);
+    DestroySSBO(device, ptPathRecordBuffer_, ptPathRecordMemory_);
 
     ready_ = false;
 }
@@ -300,6 +306,12 @@ bool WavefrontPipeline::CreateBuffers(uint32_t pixelCount) {
     // PrimaryGBuffer: 96 bytes per pixel (16 base floats + 8 PSR floats = 24 floats)
     if (!CreateSSBO(device, physDevice, pixelCount * 96, &primaryGBufBuffer_, &primaryGBufMemory_)) return false;
 
+    // ReSTIR PT: reservoirs (128 bytes/pixel, 2x ping-pong) + path records (96 bytes/pixel)
+    for (int i = 0; i < 2; i++) {
+        if (!CreateSSBO(device, physDevice, pixelCount * 128, &ptReservoirBuffer_[i], &ptReservoirMemory_[i])) return false;
+    }
+    if (!CreateSSBO(device, physDevice, pixelCount * 96, &ptPathRecordBuffer_, &ptPathRecordMemory_)) return false;
+
     // Counters: 64 bytes (16 base + 20 sort bin counts + 20 sort bin offsets + 8 pad)
     if (!CreateSSBO(device, physDevice, 64, &countersBuffer_, &countersMemory_)) return false;
 
@@ -344,7 +356,8 @@ bool WavefrontPipeline::CreateDescriptorSet() {
     // binding 5:  Counters             binding 12: throughput WRITE
     // binding 6:  IndirectDispatch     binding 13: flags READ
     //                                  binding 14: flags WRITE
-    constexpr int NUM_BINDINGS = 15;
+    // 15 original + 3 ReSTIR PT (15=ptResCurr, 16=ptResPrev, 17=ptPathRecord)
+    constexpr int NUM_BINDINGS = 18;
     VkDescriptorSetLayoutBinding bindings[NUM_BINDINGS] = {};
     for (int i = 0; i < NUM_BINDINGS; i++) {
         bindings[i].binding = i;
@@ -401,6 +414,9 @@ bool WavefrontPipeline::CreateDescriptorSet() {
             throughputBuffer_[w],          // 12: throughput WRITE
             flagsBuffer_[r],              // 13: flags READ
             flagsBuffer_[w],              // 14: flags WRITE
+            ptReservoirBuffer_[0],        // 15: PT reservoir current write
+            ptReservoirBuffer_[1],        // 16: PT reservoir previous read
+            ptPathRecordBuffer_,           // 17: PT path record
         };
 
         VkDescriptorBufferInfo bufInfos[NUM_BINDINGS] = {};
@@ -504,7 +520,18 @@ bool WavefrontPipeline::CreatePipelines() {
         Log(L"[Wavefront] WARNING: SortScatter shader not found\n");
     }
 
-    Log(L"[Wavefront] All compute pipelines created (K0-K5 + compact + sort)\n");
+    // ReSTIR PT kernels (optional — skip if shaders not found)
+    if (!createCompute("shaders/wavefront/wf_pt_temporal.comp.spv", &pipelinePTTemporal_)) {
+        Log(L"[Wavefront] WARNING: PT temporal shader not found (ReSTIR PT disabled)\n");
+    }
+    if (!createCompute("shaders/wavefront/wf_pt_spatial.comp.spv", &pipelinePTSpatial_)) {
+        Log(L"[Wavefront] WARNING: PT spatial shader not found\n");
+    }
+    if (!createCompute("shaders/wavefront/wf_pt_final.comp.spv", &pipelinePTFinal_)) {
+        Log(L"[Wavefront] WARNING: PT final shader not found\n");
+    }
+
+    Log(L"[Wavefront] All compute pipelines created (K0-K5 + compact + sort + PT)\n");
 
     // RT pipeline layout for K2 (same descriptor sets, push constants for RAYGEN stage)
     VkPushConstantRange pushRangeRT{};
@@ -737,15 +764,71 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
 
     } // end SPP loop
 
-    // K5: Output (after all SPP samples accumulated) — uses set A (radiance + gbuf are shared)
-    VkDescriptorSet setsK5[2] = { sceneDescSet, wfDescSet_[0] };
     uint32_t groupsX = (width + 7) / 8;
     uint32_t groupsY = (height + 7) / 8;
+
+    // ── ReSTIR PT passes (after bounce loop, before output) ──
+    bool ptActive = pipelinePTTemporal_ && pipelinePTSpatial_ && pipelinePTFinal_;
+    if (ptActive) {
+        VkDescriptorSet setsPT[2] = { sceneDescSet, wfDescSet_[0] };
+
+        // Push constants for PT kernels (width, height, frameIndex, pad)
+        struct PTPush { uint32_t width, height, frameIndex, pad; };
+        PTPush ptPush = { width, height, frameIndex_, 0 };
+
+        VkMemoryBarrier ptBarrier{};
+        ptBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        ptBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        ptBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+        // PT Temporal: create initial reservoirs + merge with previous frame
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelinePTTemporal_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+            0, 2, setsPT, 0, nullptr);
+        vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ptPush), &ptPush);
+        vkCmdDispatch(cmd, groupsX, groupsY, 1);
+
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &ptBarrier, 0, nullptr, 0, nullptr);
+
+        // PT Spatial: spatial neighbor resampling
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelinePTSpatial_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+            0, 2, setsPT, 0, nullptr);
+        vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ptPush), &ptPush);
+        vkCmdDispatch(cmd, groupsX, groupsY, 1);
+
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &ptBarrier, 0, nullptr, 0, nullptr);
+
+        // PT Final: evaluate resampled path → write to pixel radiance
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelinePTFinal_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
+            0, 2, setsPT, 0, nullptr);
+        // PT Final uses spp in push constants
+        struct PTFinalPush { uint32_t width, height, frameIndex, spp; };
+        PTFinalPush ptfPush = { width, height, frameIndex_, spp };
+        vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ptfPush), &ptfPush);
+        vkCmdDispatch(cmd, groupsX, groupsY, 1);
+
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &ptBarrier, 0, nullptr, 0, nullptr);
+
+        // Ping-pong PT reservoir buffers for next frame
+        // Swap bindings 15↔16 by updating descriptors
+        // (Actually, we swap at descriptor write time — for now, swap the buffer pointers)
+        ptReservoirCurrent_ = 1 - ptReservoirCurrent_;
+    }
+
+    // K5: Output (after all SPP samples + PT accumulated)
+    VkDescriptorSet setsK5[2] = { sceneDescSet, wfDescSet_[0] };
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK5_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
         0, 2, setsK5, 0, nullptr);
     vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     vkCmdDispatch(cmd, groupsX, groupsY, 1);
+
+    frameIndex_++;
 }
 
 } // namespace vk

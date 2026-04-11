@@ -74,61 +74,8 @@ vec3 ptOctDecode(vec2 e) {
     return normalize(n);
 }
 
-// ── Pack/Unpack (operate on raw vec4[] arrays) ──
-// Reservoir: 8 vec4s = 128 bytes per pixel
-
-void ptPackReservoir(int pixelIdx, PTReservoir r, inout vec4 buf[]) {
-    int b = pixelIdx * 8;
-    vec2 rcN = ptOctEncode(r.rcVertexNormal);
-    vec2 pN  = ptOctEncode(r.primaryNormal);
-    buf[b+0] = vec4(r.rcVertexPos, r.weightSum);
-    buf[b+1] = vec4(r.rcRadiance, r.M);
-    buf[b+2] = vec4(rcN, r.targetFunction, uintBitsToFloat(r.rcBounceDepth));
-    buf[b+3] = vec4(uintBitsToFloat(r.rngSeed), uintBitsToFloat(r.lightType), uintBitsToFloat(r.lightIndex), r.age);
-    buf[b+4] = vec4(r.primaryPos, r.primaryRoughness);
-    buf[b+5] = vec4(pN, 0.0, 0.0);
-    buf[b+6] = vec4(0); buf[b+7] = vec4(0);
-}
-
-PTReservoir ptUnpackReservoir(int pixelIdx, vec4 buf[]) {
-    PTReservoir r;
-    int b = pixelIdx * 8;
-    r.rcVertexPos = buf[b+0].xyz; r.weightSum = buf[b+0].w;
-    r.rcRadiance = buf[b+1].xyz; r.M = buf[b+1].w;
-    r.rcVertexNormal = ptOctDecode(buf[b+2].xy); r.targetFunction = buf[b+2].z;
-    r.rcBounceDepth = floatBitsToUint(buf[b+2].w);
-    r.rngSeed = floatBitsToUint(buf[b+3].x); r.lightType = floatBitsToUint(buf[b+3].y);
-    r.lightIndex = floatBitsToUint(buf[b+3].z); r.age = buf[b+3].w;
-    r.primaryPos = buf[b+4].xyz; r.primaryRoughness = buf[b+4].w;
-    r.primaryNormal = ptOctDecode(buf[b+5].xy);
-    return r;
-}
-
-// Path record: 6 vec4s = 96 bytes per pixel
-
-void ptPackPathRecord(int pixelIdx, PTPathRecord pr, inout vec4 buf[]) {
-    int b = pixelIdx * 6;
-    buf[b+0] = vec4(pr.primaryPos, pr.primaryRoughness);
-    buf[b+1] = vec4(ptOctEncode(pr.primaryNormal), uintBitsToFloat(pr.primaryInstanceId), uintBitsToFloat(pr.rngSeed));
-    buf[b+2] = vec4(pr.rcPos, pr.rcDist);
-    buf[b+3] = vec4(pr.rcRadiance, pr.pathRadianceLum);
-    buf[b+4] = vec4(ptOctEncode(pr.rcNormal), uintBitsToFloat(pr.rcBounce), pr.rcValid ? 1.0 : 0.0);
-    buf[b+5] = vec4(uintBitsToFloat(pr.lightType), uintBitsToFloat(pr.lightIndex), 0.0, 0.0);
-}
-
-PTPathRecord ptUnpackPathRecord(int pixelIdx, vec4 buf[]) {
-    PTPathRecord pr;
-    int b = pixelIdx * 6;
-    pr.primaryPos = buf[b+0].xyz; pr.primaryRoughness = buf[b+0].w;
-    pr.primaryNormal = ptOctDecode(buf[b+1].xy);
-    pr.primaryInstanceId = floatBitsToUint(buf[b+1].z); pr.rngSeed = floatBitsToUint(buf[b+1].w);
-    pr.rcPos = buf[b+2].xyz; pr.rcDist = buf[b+2].w;
-    pr.rcRadiance = buf[b+3].xyz; pr.pathRadianceLum = buf[b+3].w;
-    pr.rcNormal = ptOctDecode(buf[b+4].xy);
-    pr.rcBounce = floatBitsToUint(buf[b+4].z); pr.rcValid = (buf[b+4].w > 0.5);
-    pr.lightType = floatBitsToUint(buf[b+5].x); pr.lightIndex = floatBitsToUint(buf[b+5].y);
-    return pr;
-}
+// Pack/unpack is done inline in each shader (GLSL doesn't support
+// unsized array parameters). See wf_pt_temporal.comp for reference.
 
 // ── Algorithm functions ──
 

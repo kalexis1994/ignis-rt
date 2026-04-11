@@ -72,6 +72,13 @@ private:
     VkBuffer sharcStateBuffer_ = VK_NULL_HANDLE;       // SharcState[] per-pixel (persists across bounces)
     VkDeviceMemory sharcStateMemory_ = VK_NULL_HANDLE;
 
+    // ReSTIR PT buffers
+    VkBuffer ptReservoirBuffer_[2] = {};               // ping-pong reservoirs (128 bytes/pixel)
+    VkDeviceMemory ptReservoirMemory_[2] = {};
+    VkBuffer ptPathRecordBuffer_ = VK_NULL_HANDLE;     // path records (96 bytes/pixel)
+    VkDeviceMemory ptPathRecordMemory_ = VK_NULL_HANDLE;
+    uint32_t ptReservoirCurrent_ = 0;                  // ping-pong index
+
     // Descriptor sets for ping-pong (2 sets, no host updates during recording)
     // SoA bindings: 0=originDir(R), 7=originDir(W), 9=pixelRng(R), 10=pixelRng(W),
     //               11=throughput(R), 12=throughput(W), 13=flags(R), 14=flags(W)
@@ -92,6 +99,11 @@ private:
     VkPipeline pipelineSortCount_ = VK_NULL_HANDLE;   // material sort phase 1
     VkPipeline pipelineSortPrefix_ = VK_NULL_HANDLE;  // material sort phase 2
     VkPipeline pipelineSortScatter_ = VK_NULL_HANDLE; // material sort phase 3
+
+    // ReSTIR PT compute pipelines
+    VkPipeline pipelinePTTemporal_ = VK_NULL_HANDLE;
+    VkPipeline pipelinePTSpatial_ = VK_NULL_HANDLE;
+    VkPipeline pipelinePTFinal_ = VK_NULL_HANDLE;
 
     // RT pipeline for K2 (shade) — enables hardware SER via reorderThreadNV
     VkPipeline pipelineK2RT_ = VK_NULL_HANDLE;

@@ -1,0 +1,188 @@
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Scene data (set 0)
+layout(binding = 2, set = 0) uniform CameraProperties {
+    mat4 viewInverse;
+    mat4 projInverse;
+    mat4 view;
+    mat4 proj;
+    mat4 viewPrev;
+    mat4 projPrev;
+    uvec4 parameters;
+    vec4 jitterData;
+    vec4 sunLight;
+    vec4 ambientLight;
+    vec4 skyLight;
+    vec4 ptParams0;
+    vec4 ptParams1;
+    vec4 windParams;
+    vec4 rainParams;
+    vec4 dofParams;
+    vec4 dofParams2;
+    ivec4 jitterPattern[8];
+    uint lightCount;
+    uint lightPad0, lightPad1, lightPad2;
+    vec4 lights[128];
+    uint64_t sharcHashEntriesAddr;
+    uint64_t sharcAccumulationAddr;
+    uint64_t sharcResolvedAddr;
+    uint sharcCapacity;
+    float sharcSceneScale;
+    float sharcRadianceScale;
+    float sharcWarmupFactor;
+} cam;
+
+// Previous-frame instance transforms (for motion vectors)
+layout(binding = 28, set = 0, std430) buffer PrevTransformBuf {
+    vec4 data[];
+} prevTransforms;
+
+// ReSTIR PT buffers (set 1)
+layout(binding = 15, set = 1, std430) buffer PTResCurrBuf  { vec4 data[]; } ptResCurr;
+layout(binding = 16, set = 1, std430) buffer PTResPrevBuf  { vec4 data[]; } ptResPrev;
+layout(binding = 17, set = 1, std430) buffer PTPathBuf     { vec4 data[]; } ptPathRec;
+
+// Primary G-buffer (for motion vector computation)
+layout(binding = 4, set = 1, scalar) buffer PrimaryGBufBuffer { float gbufData[]; } primaryGBuf;
+
+layout(push_constant) uniform PushConst {
+    uint width;
+    uint height;
+    uint frameIndex;
+    uint pad0;
+} pc;
+
+#include "../include/common.glsl"
+#include "../include/pt_reservoir.glsl"
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(pc.width) || pixel.y >= int(pc.height)) return;
+
+    int pixelIdx = pixel.y * int(pc.width) + pixel.x;
+    ivec2 launchSize = ivec2(pc.width, pc.height);
+
+    // ── Read path record from current frame's K2 shade ──
+    PTPathRecord pr;
+    {
+        int pb = pixelIdx * 6;
+        vec4 d0 = ptPathRec.data[pb+0];
+        vec4 d1 = ptPathRec.data[pb+1];
+        vec4 d2 = ptPathRec.data[pb+2];
+        vec4 d3 = ptPathRec.data[pb+3];
+        vec4 d4 = ptPathRec.data[pb+4];
+        vec4 d5 = ptPathRec.data[pb+5];
+        pr.primaryPos = d0.xyz; pr.primaryRoughness = d0.w;
+        pr.primaryNormal = ptOctDecode(d1.xy);
+        pr.primaryInstanceId = floatBitsToUint(d1.z); pr.rngSeed = floatBitsToUint(d1.w);
+        pr.rcPos = d2.xyz; pr.rcDist = d2.w;
+        pr.rcRadiance = d3.xyz; pr.pathRadianceLum = d3.w;
+        pr.rcNormal = ptOctDecode(d4.xy);
+        pr.rcBounce = floatBitsToUint(d4.z); pr.rcValid = (d4.w > 0.5);
+        pr.lightType = floatBitsToUint(d5.x); pr.lightIndex = floatBitsToUint(d5.y);
+    }
+
+    // Create initial reservoir from current frame's path
+    PTReservoir curr = ptCreateFromPathRecord(pr);
+
+    // ── Temporal resampling: reproject to previous frame ──
+    if (curr.M > 0.0) {
+        // Compute motion vector from primary surface
+        uint instId = pr.primaryInstanceId;
+        uint gBase = uint(pixelIdx) * 24u;
+        vec3 localPos = vec3(primaryGBuf.gbufData[gBase+12],
+                              primaryGBuf.gbufData[gBase+13],
+                              primaryGBuf.gbufData[gBase+14]);
+
+        vec4 currClip = cam.proj * cam.view * vec4(pr.primaryPos, 1.0);
+        vec2 currNDC = currClip.xy / currClip.w;
+        vec2 currUV = vec2(currNDC.x * 0.5 + 0.5, 0.5 - currNDC.y * 0.5);
+
+        uint tBase = instId * 3u;
+        vec4 pRow0 = prevTransforms.data[tBase + 0u];
+        vec4 pRow1 = prevTransforms.data[tBase + 1u];
+        vec4 pRow2 = prevTransforms.data[tBase + 2u];
+        vec3 prevWorldPos = vec3(dot(pRow0, vec4(localPos, 1.0)),
+                                  dot(pRow1, vec4(localPos, 1.0)),
+                                  dot(pRow2, vec4(localPos, 1.0)));
+        vec4 prevClip = cam.projPrev * cam.viewPrev * vec4(prevWorldPos, 1.0);
+        vec2 prevNDC = prevClip.xy / prevClip.w;
+        vec2 prevUV = vec2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
+
+        // Find previous-frame pixel
+        if (prevUV.x >= 0.0 && prevUV.x < 1.0 && prevUV.y >= 0.0 && prevUV.y < 1.0) {
+            ivec2 prevPixel = ivec2(prevUV * vec2(launchSize));
+            int prevIdx = prevPixel.y * int(pc.width) + prevPixel.x;
+
+            // Load previous reservoir
+            PTReservoir prev;
+            {
+                int rb = prevIdx * 8;
+                prev.rcVertexPos = ptResPrev.data[rb+0].xyz; prev.weightSum = ptResPrev.data[rb+0].w;
+                prev.rcRadiance = ptResPrev.data[rb+1].xyz; prev.M = ptResPrev.data[rb+1].w;
+                prev.rcVertexNormal = ptOctDecode(ptResPrev.data[rb+2].xy);
+                prev.targetFunction = ptResPrev.data[rb+2].z;
+                prev.rcBounceDepth = floatBitsToUint(ptResPrev.data[rb+2].w);
+                prev.rngSeed = floatBitsToUint(ptResPrev.data[rb+3].x);
+                prev.lightType = floatBitsToUint(ptResPrev.data[rb+3].y);
+                prev.lightIndex = floatBitsToUint(ptResPrev.data[rb+3].z);
+                prev.age = ptResPrev.data[rb+3].w;
+                prev.primaryPos = ptResPrev.data[rb+4].xyz;
+                prev.primaryRoughness = ptResPrev.data[rb+4].w;
+                prev.primaryNormal = ptOctDecode(ptResPrev.data[rb+5].xy);
+            }
+
+            // Validate: surface similarity + age + non-empty
+            if (prev.M > 0.0 && prev.age < 30.0 &&
+                !any(isnan(prev.rcRadiance)) && !any(isinf(prev.rcRadiance))) {
+
+                // Surface similarity check
+                if (ptSurfaceSimilar(pr.primaryNormal, prev.primaryNormal,
+                                      pr.primaryRoughness, prev.primaryRoughness,
+                                      pr.primaryPos, prev.primaryPos)) {
+
+                    // Clamp temporal M to prevent unbounded history
+                    prev.M = min(prev.M, 20.0);
+                    prev.age += 1.0;
+                    prev.rcRadiance = min(prev.rcRadiance, vec3(20.0));
+
+                    // Compute target PDF of previous sample at current surface
+                    float pHat = ptTargetPDF(prev);
+
+                    if (pHat > 0.001) {
+                        // RNG for reservoir update
+                        rngState = uint(pixelIdx) ^ pc.frameIndex * 747796405u;
+                        rngState = pcg(rngState);
+                        float rng = rand01();
+
+                        // Merge previous reservoir into current
+                        ptReservoirMerge(curr, prev, pHat, rng);
+                    }
+                }
+            }
+        }
+    }
+
+    // Finalize reservoir: convert weightSum to contribution weight W
+    ptFinalizeReservoir(curr);
+
+    // Write current reservoir
+    {
+        int rb = pixelIdx * 8;
+        vec2 rcN = ptOctEncode(curr.rcVertexNormal);
+        vec2 pN  = ptOctEncode(curr.primaryNormal);
+        ptResCurr.data[rb+0] = vec4(curr.rcVertexPos, curr.weightSum);
+        ptResCurr.data[rb+1] = vec4(curr.rcRadiance, curr.M);
+        ptResCurr.data[rb+2] = vec4(rcN, curr.targetFunction, uintBitsToFloat(curr.rcBounceDepth));
+        ptResCurr.data[rb+3] = vec4(uintBitsToFloat(curr.rngSeed), uintBitsToFloat(curr.lightType),
+                                     uintBitsToFloat(curr.lightIndex), curr.age);
+        ptResCurr.data[rb+4] = vec4(curr.primaryPos, curr.primaryRoughness);
+        ptResCurr.data[rb+5] = vec4(pN, 0.0, 0.0);
+        ptResCurr.data[rb+6] = vec4(0); ptResCurr.data[rb+7] = vec4(0);
+    }
+}

@@ -182,6 +182,9 @@ if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
         wavefront/wf_sort_count.comp:wavefront/wf_sort_count.comp.spv
         wavefront/wf_sort_prefix.comp:wavefront/wf_sort_prefix.comp.spv
         wavefront/wf_sort_scatter.comp:wavefront/wf_sort_scatter.comp.spv
+        wavefront/wf_pt_temporal.comp:wavefront/wf_pt_temporal.comp.spv
+        wavefront/wf_pt_spatial.comp:wavefront/wf_pt_spatial.comp.spv
+        wavefront/wf_pt_final.comp:wavefront/wf_pt_final.comp.spv
     )
 
     set(SPV_OUTPUTS "")
