@@ -3,6 +3,7 @@
 import ctypes
 import math
 import os
+import threading
 import time
 import traceback
 import zlib
@@ -509,7 +510,7 @@ LOAD_MATERIALS = 4     # upload materials + textures
 LOAD_MATIDS = 5        # assign per-primitive material IDs
 LOAD_TLAS = 6          # build acceleration structure
 LOAD_FINALIZE = 7      # final setup (sun, etc.)
-LOAD_TEX_UPLOAD = 8    # upload textures one-at-a-time to GPU (smooth spinner)
+LOAD_TEX_UPLOAD = 8    # (unused — kept for enum compatibility)
 
 FADEIN_DURATION = 0.8  # seconds to show loading screen before starting work
 
@@ -530,7 +531,12 @@ _load_obj_to_mesh_key = None
 _load_depsgraph = None
 _load_tex_idx = 0
 _load_tex_buffers = []
-MESH_BATCH_SIZE = 4    # meshes per frame during loading
+
+# ── Background worker for GPU-heavy operations ──
+# Allows the loading screen spinner to animate while the GPU works.
+# ctypes DLL calls release the GIL, so Python can draw while they run.
+_load_worker = None       # threading.Thread or None
+_load_worker_error = None  # Exception from worker, or None
 
 
 from . import loading_screen
@@ -590,6 +596,7 @@ def _ignis_shutdown():
     global _ignis_initialized, _ignis_width, _ignis_height
     global _ignis_blas_handles, _ignis_blas_cache, _ignis_float_buffer, _ignis_byte_buffer
     global _ignis_gpu_texture, _ignis_tex_manager
+    global _load_worker, _load_worker_error
     global _ignis_frame_index, _ignis_full_dirty, _ignis_materials_dirty, _ignis_tlas_dirty, _ignis_objects_dirty
     global _ignis_changed_objects, _ignis_cached_tlas, _ignis_objkey_to_tlas
     global _ignis_last_full_upload, _ignis_instance_count
@@ -597,6 +604,11 @@ def _ignis_shutdown():
     global _load_stage, _ignis_last_draw_time
     global _ignis_cm_lut_signature, _ignis_cm_lut_valid
     global _ignis_rendering
+    # Wait for background worker to finish before destroying
+    if _load_worker is not None and _load_worker.is_alive():
+        _load_worker.join(timeout=5.0)
+    _load_worker = None
+    _load_worker_error = None
     # Wait for any in-flight render to complete before destroying
     _wait_count = 0
     while _ignis_rendering and _wait_count < 100:
@@ -823,6 +835,21 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             self._load_yield = False
             return False
 
+        # Background worker: if a GPU job is running, just animate the spinner
+        global _load_worker, _load_worker_error
+        if _load_worker is not None:
+            if _load_worker.is_alive():
+                return False  # worker still running — keep drawing spinner
+            # Worker finished — join and check for errors
+            _load_worker.join()
+            _load_worker = None
+            if _load_worker_error is not None:
+                err = _load_worker_error
+                _load_worker_error = None
+                _log(f"  Worker error: {err}")
+                raise err
+            # Fall through to next stage (already set by the code that launched the worker)
+
         if _load_stage == LOAD_FADEIN:
             # ── Fade-in phase: just show loading screen, no work yet ──
             _load_status = ""
@@ -839,8 +866,6 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
         elif _load_stage == LOAD_INIT:
             # ── Stage 0: Vulkan init in background thread (spinner stays smooth) ──
-            import threading
-
             if not hasattr(self, '_init_thread'):
                 # First call: load DLL + configure on main thread, then start worker
                 _load_status = "Initializing renderer..."
@@ -945,20 +970,16 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             return False
 
         elif _load_stage == LOAD_MESHES:
-            # ── Stage 2: Upload meshes to GPU (batch mode) ──
-            # Queue all regular meshes on CPU (staging only), then flush
-            # all BLAS builds in 3-4 GPU submits instead of N*5.
-            # Hair meshes use their own compute pipeline and are handled separately.
+            # ── Stage 2: Upload meshes to GPU (batch mode, GPU work on background thread) ──
             total = len(_load_mesh_keys)
-            _load_status = f"Building BVH... 0/{total}"
+            _load_status = f"Building BVH... {total} meshes"
             _load_progress = 0.1
-            batch_t0 = time.perf_counter()
 
-            # Pass 1: Queue regular meshes, reusing cached BLAS where possible
+            # Pass 1: Queue regular meshes on main thread (CPU staging, needs numpy arrays alive)
             queued_count = 0
             cached_count = 0
             hair_keys = []
-            active_hashes = set()  # track which cache entries are still in use
+            active_hashes = set()
 
             for mesh_key in _load_mesh_keys:
                 m = _load_unique_meshes[mesh_key]
@@ -966,19 +987,13 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                     if m.get("gpu_hair"):
                         hair_keys.append(mesh_key)
                         continue
-
-                    # Content hash for cache lookup (CRC32 of positions + indices)
                     content_hash = _mesh_content_hash(m["positions"], m["indices"])
                     m["_content_hash"] = content_hash
                     active_hashes.add(content_hash)
-
                     if content_hash in _ignis_blas_cache:
-                        # Cache hit: reuse existing BLAS (skip upload entirely)
                         _ignis_blas_handles[mesh_key] = _ignis_blas_cache[content_hash]
                         cached_count += 1
                         continue
-
-                    # Cache miss: queue for batch build
                     blas = dll_wrapper.queue_mesh(
                         m["positions"], m["vertex_count"],
                         m["indices"], m["index_count"],
@@ -993,104 +1008,87 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 except Exception:
                     _log_exception(f"LOAD_MESHES queuing '{mesh_key}'")
 
-            queue_dt = time.perf_counter() - batch_t0
-            _log(f"Stage MESHES: {cached_count} cached, {queued_count} queued in {queue_dt:.2f}s")
+            _log(f"Stage MESHES: {cached_count} cached, {queued_count} queued")
 
-            # Pass 2: Flush queued BLAS builds (minimal GPU submits)
-            if queued_count > 0:
-                flush_t0 = time.perf_counter()
-                success = dll_wrapper.flush_mesh_batch()
-                flush_dt = time.perf_counter() - flush_t0
-                _log(f"Stage MESHES: flushed {success}/{queued_count} BLAS in {flush_dt:.2f}s (GPU batch)")
-
-            # Pass 2b: Free stale BLAS (no longer referenced by any mesh)
+            # Free stale BLAS
             stale_hashes = set(_ignis_blas_cache.keys()) - active_hashes
-            if stale_hashes:
-                for h in stale_hashes:
-                    dll_wrapper.free_blas(_ignis_blas_cache[h])
-                    del _ignis_blas_cache[h]
-                _log(f"Stage MESHES: freed {len(stale_hashes)} stale BLAS")
+            for h in stale_hashes:
+                dll_wrapper.free_blas(_ignis_blas_cache[h])
+                del _ignis_blas_cache[h]
 
-            _load_progress = 0.35
+            # Pass 2: GPU flush + hair on background thread (spinner keeps animating)
+            _load_status = f"Building BVH... (GPU)"
+            _load_progress = 0.2
+            _load_stage = LOAD_MATERIALS  # advance stage — worker check will hold until done
 
-            # Pass 3: GPU hair generation (uses compute shader, can't be batched with regular BLAS)
-            for mesh_key in hair_keys:
-                m = _load_unique_meshes[mesh_key]
+            # Capture references for the worker closure
+            _hair_keys = hair_keys
+            _queued = queued_count
+
+            def _mesh_gpu_worker():
+                global _load_worker_error
                 try:
-                    hair_t0 = time.perf_counter()
-                    child_nbr = max(int(m.get("child_nbr", 0)), 0)
-                    render_parents = bool(m.get("use_parent_particles", False) or child_nbr == 0)
-                    precomputed_strands = bool(m.get("precomputed_strands", False))
-                    n_p = m["n_parents"]
-                    avg_sp = float(m.get("avg_spacing", 0.01))
-                    n_ev = m.get("n_emitter_verts", 0)
-                    n_et = m.get("n_emitter_tris", 0)
-                    _log(f"  GPU hair: {n_p} strands, {m['n_keys']} keys, {child_nbr} generated children, "
-                         f"render_parents={render_parents}, emitter={n_ev}v/{n_et}t")
-                    _psys_seed = m.get("blender_seed", 0)
-                    _frand_scrambled = None
-                    if child_nbr > 0 and not precomputed_strands:
-                        _frand_scrambled = _get_hair_frand_scrambled(_psys_seed)
-                    blas = dll_wrapper.generate_hair_gpu(
-                        m["parent_keys"], n_p, m["n_keys"], child_nbr,
-                        emitter_verts=m.get("emitter_verts"),
-                        n_emitter_verts=n_ev,
-                        emitter_tris=m.get("emitter_tris"),
-                        n_emitter_tris=n_et,
-                        emitter_cdf=m.get("emitter_cdf"),
-                        root_radius=m["root_radius"],
-                        tip_factor=m["tip_factor"],
-                        clump_noise_size=m.get("clump_noise_size", 1.0),
-                        child_roundness=m.get("child_roundness", 0.0),
-                        child_length=m.get("child_length", 1.0),
-                        avg_spacing=m.get("avg_spacing", avg_sp),
-                        kink_amplitude=m.get("kink_amplitude", 0.0),
-                        kink_frequency=m.get("kink_frequency", 2.0),
-                        clump_factor=m.get("clump_factor", 0.0),
-                        clump_shape=m.get("clump_shape", 0.0),
-                        rough1=m.get("roughness_1", 0.0),
-                        rough1_size=m.get("roughness_1_size", 1.0),
-                        rough2=m.get("roughness_2", 0.0) * m.get("roughness_2_size", 1.0),
-                        rough_end=m.get("roughness_endpoint", 0.0),
-                        child_mode=m.get("child_mode", 0),
-                        kink_shape=m.get("kink_shape", 0.0),
-                        kink_flat=m.get("kink_flat", 0.0),
-                        kink_amp_random=m.get("kink_amp_random", 0.0),
-                        opaque_hair=m.get("opaque_hair", False),
-                        child_size_random=m.get("child_size_random", 0.0),
-                        use_parent_particles=render_parents,
-                        precomputed_strands=precomputed_strands,
-                        blender_seed=_psys_seed,
-                        frand_table=_frand_scrambled)
-                    if blas >= 0:
-                        _ignis_blas_handles[mesh_key] = blas
-                        total_children = n_p * child_nbr
-                        if render_parents:
-                            total_children += n_p
-                        if precomputed_strands:
-                            subdiv_points = m["n_keys"]
-                        else:
-                            subdiv_points = (m["n_keys"] - 1) * 16 + 1 + 4
-                        tris_per_child = (subdiv_points - 1) * 4
-                        m["_gpu_tri_count"] = total_children * tris_per_child
-                        _log(f"  GPU hair OK: '{mesh_key}' → BLAS {blas} ({m['_gpu_tri_count']} tris) in {time.perf_counter() - hair_t0:.2f}s")
-                    else:
-                        _log(f"  GPU hair FAILED: '{mesh_key}' returned {blas}")
-                except Exception:
-                    _log_exception(f"GPU hair '{mesh_key}'")
+                    if _queued > 0:
+                        dll_wrapper.flush_mesh_batch()
+                    # Hair generation (GPU compute, also benefits from background)
+                    for mk in _hair_keys:
+                        m = _load_unique_meshes[mk]
+                        child_nbr = max(int(m.get("child_nbr", 0)), 0)
+                        render_parents = bool(m.get("use_parent_particles", False) or child_nbr == 0)
+                        precomputed = bool(m.get("precomputed_strands", False))
+                        n_p = m["n_parents"]
+                        _psys_seed = m.get("blender_seed", 0)
+                        _frand = None
+                        if child_nbr > 0 and not precomputed:
+                            _frand = _get_hair_frand_scrambled(_psys_seed)
+                        blas = dll_wrapper.generate_hair_gpu(
+                            m["parent_keys"], n_p, m["n_keys"], child_nbr,
+                            emitter_verts=m.get("emitter_verts"),
+                            n_emitter_verts=m.get("n_emitter_verts", 0),
+                            emitter_tris=m.get("emitter_tris"),
+                            n_emitter_tris=m.get("n_emitter_tris", 0),
+                            emitter_cdf=m.get("emitter_cdf"),
+                            root_radius=m["root_radius"], tip_factor=m["tip_factor"],
+                            clump_noise_size=m.get("clump_noise_size", 1.0),
+                            child_roundness=m.get("child_roundness", 0.0),
+                            child_length=m.get("child_length", 1.0),
+                            avg_spacing=m.get("avg_spacing", 0.01),
+                            kink_amplitude=m.get("kink_amplitude", 0.0),
+                            kink_frequency=m.get("kink_frequency", 2.0),
+                            clump_factor=m.get("clump_factor", 0.0),
+                            clump_shape=m.get("clump_shape", 0.0),
+                            rough1=m.get("roughness_1", 0.0),
+                            rough1_size=m.get("roughness_1_size", 1.0),
+                            rough2=m.get("roughness_2", 0.0) * m.get("roughness_2_size", 1.0),
+                            rough_end=m.get("roughness_endpoint", 0.0),
+                            child_mode=m.get("child_mode", 0),
+                            kink_shape=m.get("kink_shape", 0.0),
+                            kink_flat=m.get("kink_flat", 0.0),
+                            kink_amp_random=m.get("kink_amp_random", 0.0),
+                            opaque_hair=m.get("opaque_hair", False),
+                            child_size_random=m.get("child_size_random", 0.0),
+                            use_parent_particles=render_parents,
+                            precomputed_strands=precomputed,
+                            blender_seed=_psys_seed, frand_table=_frand)
+                        if blas >= 0:
+                            _ignis_blas_handles[mk] = blas
+                            total_children = n_p * child_nbr
+                            if render_parents:
+                                total_children += n_p
+                            subdiv = m["n_keys"] if precomputed else (m["n_keys"] - 1) * 16 + 1 + 4
+                            m["_gpu_tri_count"] = total_children * (subdiv - 1) * 4
+                except Exception as e:
+                    _load_worker_error = e
 
-            total_dt = time.perf_counter() - batch_t0
-            _log(f"Stage MESHES: {total} total, {len(_ignis_blas_handles)} success in {total_dt:.2f}s")
-            _load_progress = 0.5
-            _load_stage = LOAD_MATERIALS
-            self._load_yield = True
-            return False
+            _load_worker = threading.Thread(target=_mesh_gpu_worker, daemon=True)
+            _load_worker.start()
+            return False  # return immediately — spinner animates while GPU works
 
         elif _load_stage == LOAD_MATERIALS:
-            # ── Stage 3: Materials + textures (all at once, no per-frame yield) ──
+            # ── Stage 3: Materials + textures ──
+            # CPU work (Blender API) on main thread, GPU upload on background thread.
             _load_status = "Exporting materials..."
             _load_progress = 0.50
-            mat_t0 = time.perf_counter()
 
             try:
                 _load_materials_data, _load_mat_name_to_index, _load_textures_list = \
@@ -1108,7 +1106,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                     _ignis_tex_manager = None
                 _ignis_tex_manager = dll_wrapper.create_texture_manager()
 
-                # Extract ALL texture bytes + add to manager (CPU-side, no GPU yet)
+                # Extract texture bytes from Blender (main thread — needs Blender API)
                 _load_status = f"Loading {total_tex} textures..."
                 _load_progress = 0.52
                 _load_tex_buffers = []
@@ -1128,22 +1126,38 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                             1, tex_dxgi,
                         )
 
-                # Upload ALL textures to GPU in batch (UploadAll batches internally)
+                # GPU upload on background thread (spinner keeps animating)
                 _load_status = f"Uploading {total_tex} textures to GPU..."
                 _load_progress = 0.60
-                dll_wrapper.texture_manager_upload_all(_ignis_tex_manager)
-                dll_wrapper.update_texture_descriptors(_ignis_tex_manager)
-                _load_tex_buffers = []
+                _load_stage = LOAD_MATIDS  # advance — worker check holds
 
-            # Upload material buffer
+                _tex_mgr = _ignis_tex_manager
+                _mat_data = _load_materials_data
+                _mat_count = max(len(_load_mat_name_to_index), 1)
+                _tex_list = _load_textures_list
+
+                def _tex_gpu_worker():
+                    global _load_worker_error, _load_tex_buffers, _ignis_last_tex_names
+                    try:
+                        dll_wrapper.texture_manager_upload_all(_tex_mgr)
+                        dll_wrapper.update_texture_descriptors(_tex_mgr)
+                        _load_tex_buffers = []
+                        dll_wrapper.upload_materials(_mat_data, _mat_count)
+                        _ignis_last_tex_names = tuple(t["name"] for t in _tex_list)
+                    except Exception as e:
+                        _load_worker_error = e
+
+                _load_worker = threading.Thread(target=_tex_gpu_worker, daemon=True)
+                _load_worker.start()
+                return False  # return immediately — spinner animates
+
+            # No textures — upload materials directly (fast, no need for background thread)
             _load_status = "Uploading materials..."
             _load_progress = 0.68
             mat_count = max(len(_load_mat_name_to_index), 1)
             dll_wrapper.upload_materials(_load_materials_data, mat_count)
             _ignis_last_tex_names = tuple(t["name"] for t in _load_textures_list)
-
-            mat_dt = time.perf_counter() - mat_t0
-            _log(f"Stage MATERIALS: {mat_count} mat, {total_tex} tex in {mat_dt:.2f}s")
+            _log(f"Stage MATERIALS: {mat_count} mat, {total_tex} tex")
             _load_stage = LOAD_MATIDS
             self._load_yield = True
             return False
