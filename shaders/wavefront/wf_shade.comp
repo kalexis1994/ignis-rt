@@ -1047,7 +1047,8 @@ void main() {
             primaryGBuf.gbufData[gBase+13] = localPos.y;
             primaryGBuf.gbufData[gBase+14] = localPos.z;
             primaryGBuf.gbufData[gBase+15] = uintBitsToFloat(uint(instanceId));
-            pixelRadiance.radDataU[rBase+7] = floatBitsToUint(0.0);
+            // volume: metallic=0, specularLevel=0 packed as two f16
+            pixelRadiance.radDataU[rBase+7] = 0u;
             pixelRadiance.radDataU[rBase+3] = floatBitsToUint(hitT);
         }
 
@@ -1129,14 +1130,12 @@ void main() {
         primaryGBuf.gbufData[gBase+14] = localPos.z;
         primaryGBuf.gbufData[gBase+15] = uintBitsToFloat(uint(instanceId));
 
-        // Extended G-buffer fields (PrimaryGBuffer struct offsets 16-19)
-        // customIndex, metallic, specularLevel, ior
-        // We need separate storage but primaryGBuf is only 16 floats.
-        // Store metallic in the hitDist field's unused w component — actually
-        // use the radiance buffer's pad slot for metallic.
-        // Alternatively, reuse the existing layout by packing.
-        // For now, store metallic alongside pixel radiance padding.
-        pixelRadiance.radDataU[rBase+7] = floatBitsToUint(metallic);
+        // Pack metallic + specularLevel as two f16 into rBase+7.
+        // Both needed by wf_output.comp to compute the correct F0 for DLSS RR
+        // specular albedo — hardcoding F0=0.04 caused silhouette ghosting in
+        // mostly-diffuse materials (woodPlanks, etc.) because RR saw an
+        // artificially strong specular signal and leaked edges into it.
+        pixelRadiance.radDataU[rBase+7] = packHalf2x16(vec2(metallic, specularLevel));
 
         // Store hitDist in pixel radiance (bounce 0 only, no contention)
         pixelRadiance.radDataU[rBase+3] = floatBitsToUint(hitT);

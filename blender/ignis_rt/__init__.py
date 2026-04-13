@@ -171,6 +171,19 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         description="Use DLSS Ray Reconstruction (replaces NRD denoiser, requires RTX GPU + driver 535+)",
         default=True,
     )
+    dlss_rr_preset: EnumProperty(
+        name="RR Model Preset",
+        description="DLSS Ray Reconstruction neural model. Auto = E for Quality+, D for Performance+. "
+                    "E is the latest transformer model (less ghosting, better detail). "
+                    "D is the older transformer (slightly faster, sharper in some cases). "
+                    "Viewport restart required to apply changes",
+        items=[
+            ('0', "Auto (E / D by quality)", "E for Quality+ modes, D for Performance+ (current default)"),
+            ('1', "Force D — Default transformer", "Older model, sharper but more ghosting in motion"),
+            ('2', "Force E — Latest transformer", "Newer model, less ghosting, better temporal stability (DoF guide support)"),
+        ],
+        default='0',
+    )
 
     # -- Performance --
     hybrid_rasterization: BoolProperty(
@@ -191,12 +204,6 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         name="ReSTIR PT",
         description="Path resampling for indirect lighting (ReSTIR PT). Reuses full paths across pixels and frames via hybrid shift mapping for dramatically less noise",
         default=True,
-        update=_tag_redraw,
-    )
-    material_sort: BoolProperty(
-        name="Material Sort",
-        description="GPU material sorting for wavefront. Improves FPS in scenes with mixed materials (glass+hair+volume). Slight overhead for uniform scenes",
-        default=False,
         update=_tag_redraw,
     )
     sharc_enabled: BoolProperty(
@@ -441,8 +448,9 @@ class IGNIS_PT_advanced(bpy.types.Panel):
         layout.prop(props, "hybrid_rasterization")
         layout.prop(props, "restir_di")
         layout.prop(props, "restir_gi")
-        layout.prop(props, "material_sort")
         layout.prop(props, "sharc_enabled")
+        layout.prop(props, "dlss_rr_enabled")
+        layout.prop(props, "dlss_rr_preset")
         # layout.prop(props, "use_wavefront")  # TODO: not ready yet
         layout.separator()
         layout.prop(props, "debug_view")

@@ -77,8 +77,15 @@ void main() {
     rngState = px * 1973u + py * 9277u + pc.frameIndex * 26699u + pc.sampleIdx * 12347u;
     pcg(rngState);
 
-    // Blue noise temporal offset
-    ivec2 bnCoord = ivec2(px & 63, py & 63);
+    // Blue noise temporal offset — rotate sample coord with frameIndex so the
+    // per-pixel bias decorrelates frame-to-frame. Without this shift, every
+    // pixel pulls the same blue-noise value every frame, which makes the
+    // resulting sampling pattern stationary in screen-space. During camera
+    // motion the pattern appears to "stick to the screen" and — correlated
+    // with view-space geometry — fakes silhouettes of the surrounding world
+    // in otherwise mostly-diffuse materials. Matches wf_shade.comp:1263.
+    ivec2 bnCoord = ivec2((px + pc.frameIndex * 7u) & 63u,
+                          (py + pc.frameIndex * 11u) & 63u);
     float blueNoise = texelFetch(blueNoiseTexture, bnCoord, 0).r;
     rngState += uint(blueNoise * 4294967295.0);
 

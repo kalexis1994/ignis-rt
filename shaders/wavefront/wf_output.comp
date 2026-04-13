@@ -104,13 +104,21 @@ void main() {
     vec3 diffuse = vec3(uintBitsToFloat(pixelRadiance.radDataU[rBase+0]),
                         uintBitsToFloat(pixelRadiance.radDataU[rBase+1]),
                         uintBitsToFloat(pixelRadiance.radDataU[rBase+2])) * sppInv;
-    // Hit distance: K2 stores primary (positive) or secondary (negative) hitT
-    // Matching monolithic: diffHitDist = secondary > 0 ? secondary : primary
+    // Hit distance: K2 writes primary (+hitT) at bounce 0 and overwrites with
+    // secondary (-hitT) at bounce 1 when geometry is hit. If bounce 1 missed
+    // sky, the slot stays positive.
+    //
+    // For DLSS RR, hitDist means "distance from shading point to next bounce
+    // in the diffuse/specular hemisphere" — NOT camera distance. Falling back
+    // to primary (camera→surface) makes RR size its spatial filter by how far
+    // the camera is from the surface, which produced silhouette leaks in
+    // mostly-diffuse materials that vanished as the camera got closer.
+    // Instead: use 0 when there is no secondary, which tells RR "no indirect
+    // bounce hit at this pixel — don't widen the filter".
     float rawHitDist = uintBitsToFloat(pixelRadiance.radDataU[rBase+3]);
-    float primaryHitDistRaw = rawHitDist > 0.0 ? rawHitDist : 0.0;
     float secondaryHitDistRaw = rawHitDist < 0.0 ? -rawHitDist : 0.0;
-    float hitDist = primaryHitDistRaw;  // for specular
-    float diffHitDist = secondaryHitDistRaw > 0.0 ? secondaryHitDistRaw : primaryHitDistRaw; // for diffuse
+    float hitDist     = secondaryHitDistRaw;  // specular
+    float diffHitDist = secondaryHitDistRaw;  // diffuse
     vec3 specular = vec3(uintBitsToFloat(pixelRadiance.radDataU[rBase+4]),
                          uintBitsToFloat(pixelRadiance.radDataU[rBase+5]),
                          uintBitsToFloat(pixelRadiance.radDataU[rBase+6])) * sppInv;
@@ -149,16 +157,33 @@ void main() {
     bool primaryHit = (primaryViewZ < -0.001);
 
     // ── Stable Planes FILL: override guide buffers for delta surfaces ──
-    // When BUILD found a non-delta surface behind glass/mirror, use its
-    // data (normal, depth, MVs) for DLSS RR instead of the glass surface.
-    // This gives the denoiser correct temporal reprojection through glass.
+    // DISABLED — introduced in 4a10faa "Stable Planes FILL integration".
+    //
+    // The feature overrides DLSS RR guide buffers (normal/roughness/viewZ/MV/
+    // worldPos) on pixels whose primary hit is a delta surface (glass/mirror),
+    // so the denoiser reprojects the surface *behind* the glass instead of the
+    // glass itself. The intent is correct, but the motion-vector calculation
+    // in wf_stable_planes.comp:300-309 uses a synthetic "virtual position"
+    //   virtualPos = camPos + viewDir * sceneLength
+    // which is not a real world point — neither the glass nor the surface
+    // behind it — so frame-to-frame the point moves inconsistently under
+    // camera motion. DLSS RR then reprojects noise from the previous frame to
+    // wrong screen positions, drawing ghosted silhouettes of the scene's
+    // geometry on diffuse materials that happen to be seen through a window
+    // or other delta surface (e.g. woodPlanks floor behind classroom glass).
+    // The ghosts fade as the camera approaches because the synthetic MV
+    // magnitude shrinks.
+    //
+    // TODO: re-enable once wf_stable_planes.comp writes motion vectors from
+    // the real stable-plane worldPos (not the virtualPos). See NRD-Sample /
+    // RTXPT for the reference implementation.
     vec3 denoiserNormal = primaryNormal;
     float denoiserRoughness = primaryRoughness;
     float denoiserViewZ = primaryViewZ;
     vec2 denoiserMV = vec2(0);
     bool hasStablePlane = false;
 
-    if (primaryHit) {
+    if (false) {  // HOTFIX: Stable Planes FILL disabled, see comment above
         // Read dominant stable plane
         uvec4 header = spHeader.data[pixelIndex];
         uint dominantIdx = header.w & 3u;
@@ -279,12 +304,18 @@ void main() {
             imageStore(specularMVImg, pixel, vec4(motionVector, 0, 0));
         }
 
-        // Specular albedo (EnvBRDFApprox) for DLSS Ray Reconstruction
-        float primaryMetallic = uintBitsToFloat(pixelRadiance.radDataU[rBase+7]);
+        // Specular albedo (EnvBRDFApprox) for DLSS Ray Reconstruction.
+        // Decode metallic + specularLevel packed as two f16 by wf_shade.
+        // Must match wf_shade's F0 formula (0.04 * specLevel * 2.0 for dielectrics)
+        // otherwise RR sees an inflated specular albedo and leaks silhouette
+        // edges into mostly-diffuse materials (e.g. specularLevel=0.075).
+        vec2 matPacked = unpackHalf2x16(pixelRadiance.radDataU[rBase+7]);
+        float primaryMetallic      = matPacked.x;
+        float primarySpecularLevel = matPacked.y;
         vec3 camPos = (cam.viewInverse * vec4(0, 0, 0, 1)).xyz;
         vec3 viewDir = normalize(camPos - primaryWorldPos);
         float NdotV = max(dot(primaryNormal, viewDir), 0.001);
-        float f0_d = 0.04;  // default dielectric F0
+        float f0_d = 0.04 * primarySpecularLevel * 2.0;  // matches wf_shade
         vec3 F0 = mix(vec3(f0_d), primaryAlbedo, primaryMetallic);
         vec3 specAlbedo = EnvBRDFApprox(F0, primaryRoughness, NdotV);
         imageStore(specularAlbedoImg, pixel, vec4(specAlbedo, 0.0));

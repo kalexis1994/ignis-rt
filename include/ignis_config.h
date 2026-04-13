@@ -138,7 +138,10 @@ struct PathTracerConfig {
     // ReSTIR DI (reservoir-based light sampling)
     bool  restirDI           = false;
     bool  restirGI           = false;   // ReSTIR GI: temporal reuse of indirect lighting
-    bool  materialSort       = false;  // GPU material sorting for wavefront (helps mixed-material scenes)
+    // DLSS Ray Reconstruction preset: 0=Auto (E for Quality+, D for Performance+),
+    // 1=Force D (default transformer), 2=Force E (latest transformer, needed for DoF guide).
+    // Applied when the RR feature is created (viewport restart required to change).
+    int   dlssRRPreset       = 0;
     bool  sharcEnabled       = false;  // SHARC radiance cache (GI caching, can cause slowdown on large scenes)
 
     // HDRI environment map
@@ -155,5 +158,7 @@ struct PathTracerConfig {
     float sceneAABBMin[3]    = {0, 0, 0};
     float sceneAABBMax[3]    = {0, 0, 0};  // min == max means invalid (not set)
 };
+
+extern PathTracerConfig g_config;
 
 } // namespace acpt

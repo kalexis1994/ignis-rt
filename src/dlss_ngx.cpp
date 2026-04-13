@@ -1,5 +1,6 @@
 #include "dlss_ngx.h"
 #include "ignis_log.h"
+#include "ignis_config.h"
 #include <string>
 
 #ifdef ACPT_HAVE_NGX
@@ -565,13 +566,34 @@ bool DLSS_NGX::InitializeRR() {
     // Roughness is packed in normalRoughness.a
     rrParams->Set(NVSDK_NGX_Parameter_DLSS_Roughness_Mode, (unsigned int)NVSDK_NGX_DLSS_Roughness_Mode_Packed);
     rrParams->Set(NVSDK_NGX_Parameter_Use_HW_Depth, (unsigned int)0);  // linear view-space depth (better temporal reprojection)
-    // RR model preset: E = latest transformer model (D and E are the only valid RR presets)
-    rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA, (unsigned int)NVSDK_NGX_RayReconstruction_Hint_Render_Preset_E);
-    rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality, (unsigned int)NVSDK_NGX_RayReconstruction_Hint_Render_Preset_E);
-    rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced, (unsigned int)NVSDK_NGX_RayReconstruction_Hint_Render_Preset_E);
-    rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance, (unsigned int)NVSDK_NGX_RayReconstruction_Hint_Render_Preset_D);
-    rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance, (unsigned int)NVSDK_NGX_RayReconstruction_Hint_Render_Preset_D);
-    rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality, (unsigned int)NVSDK_NGX_RayReconstruction_Hint_Render_Preset_E);
+    // RR model preset: D = default transformer, E = latest transformer (DoF guide).
+    // Only D and E are valid RR presets in this SDK (F-O revert to default).
+    // Config cfg->dlssRRPreset: 0=Auto, 1=Force D, 2=Force E.
+    // Auto mirrors the historic behavior: E for Quality+ / D for Performance+.
+    unsigned int presetDLAA, presetQuality, presetBalanced, presetPerf, presetUltraPerf, presetUltraQ;
+    const int pref = acpt::g_config.dlssRRPreset;
+    if (pref == 1) {
+        presetDLAA = presetQuality = presetBalanced = presetPerf = presetUltraPerf = presetUltraQ =
+            NVSDK_NGX_RayReconstruction_Hint_Render_Preset_D;
+    } else if (pref == 2) {
+        presetDLAA = presetQuality = presetBalanced = presetPerf = presetUltraPerf = presetUltraQ =
+            NVSDK_NGX_RayReconstruction_Hint_Render_Preset_E;
+    } else {
+        presetDLAA       = NVSDK_NGX_RayReconstruction_Hint_Render_Preset_E;
+        presetQuality    = NVSDK_NGX_RayReconstruction_Hint_Render_Preset_E;
+        presetBalanced   = NVSDK_NGX_RayReconstruction_Hint_Render_Preset_E;
+        presetPerf       = NVSDK_NGX_RayReconstruction_Hint_Render_Preset_D;
+        presetUltraPerf  = NVSDK_NGX_RayReconstruction_Hint_Render_Preset_D;
+        presetUltraQ     = NVSDK_NGX_RayReconstruction_Hint_Render_Preset_E;
+    }
+    Log(L"[DLSS-RR] preset config=%d -> DLAA=%u Q=%u B=%u P=%u UP=%u UQ=%u (D=4 E=5)\n",
+        pref, presetDLAA, presetQuality, presetBalanced, presetPerf, presetUltraPerf, presetUltraQ);
+    rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA, presetDLAA);
+    rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality, presetQuality);
+    rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced, presetBalanced);
+    rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance, presetPerf);
+    rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance, presetUltraPerf);
+    rrParams->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality, presetUltraQ);
     // Output subrects (required by DLSSD)
     rrParams->Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
     // CreationNodeMask / VisibilityNodeMask

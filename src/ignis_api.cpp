@@ -811,7 +811,8 @@ IGNIS_API void ignis_set_int(const char* key, int value) {
     else if (strcmp(key, "backface_culling") == 0) cfg->backfaceCulling = (value != 0);
     else if (strcmp(key, "restir_di") == 0)      cfg->restirDI = (value != 0);
     else if (strcmp(key, "restir_gi") == 0)      cfg->restirGI = (value != 0);
-    else if (strcmp(key, "material_sort") == 0) cfg->materialSort = (value != 0);
+    else if (strcmp(key, "material_sort") == 0) { /* removed: see commit history */ }
+    else if (strcmp(key, "dlss_rr_preset") == 0) cfg->dlssRRPreset = value;
     else if (strcmp(key, "sharc_enabled") == 0) cfg->sharcEnabled = (value != 0);
     else if (strcmp(key, "hdri_tex_index") == 0)  cfg->hdriTexIndex = value;
     else if (strcmp(key, "reset_history") == 0 && value != 0) {

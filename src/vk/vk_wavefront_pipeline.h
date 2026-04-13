@@ -28,7 +28,6 @@ public:
                         uint32_t spp = 1);
 
     bool IsReady() const { return ready_; }
-    void SetMaterialSort(bool enabled) { materialSort_ = enabled; }
 
 private:
     bool CreateBuffers(uint32_t pixelCount);
@@ -39,7 +38,6 @@ private:
     Context* context_ = nullptr;
     RTPipeline* rtPipeline_ = nullptr;
     bool ready_ = false;
-    bool materialSort_ = false;
     uint32_t maxPixels_ = 0;
     uint32_t frameIndex_ = 0;
 
@@ -102,9 +100,6 @@ private:
     VkPipeline pipelineK4_ = VK_NULL_HANDLE;  // accumulate
     VkPipeline pipelineK5_ = VK_NULL_HANDLE;  // output
     VkPipeline pipelineCompact_ = VK_NULL_HANDLE;  // prepare indirect + compact
-    VkPipeline pipelineSortCount_ = VK_NULL_HANDLE;   // material sort phase 1
-    VkPipeline pipelineSortPrefix_ = VK_NULL_HANDLE;  // material sort phase 2
-    VkPipeline pipelineSortScatter_ = VK_NULL_HANDLE; // material sort phase 3
 
     // ReSTIR PT compute pipelines
     VkPipeline pipelinePTTemporal_ = VK_NULL_HANDLE;

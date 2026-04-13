@@ -712,14 +712,18 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
 
         dll_wrapper.set_int("shader_mode", 1)
 
-        # DLSS + Ray Reconstruction always enabled (core engine requirement)
+        # DLSS always on; Ray Reconstruction respects the user toggle so it
+        # can be disabled for A/B debugging (see scene prop dlss_rr_enabled).
         dll_wrapper.set_int("dlss_enabled", 1)
-        dll_wrapper.set_int("dlss_rr_enabled", 1)
         try:
             props = bpy.context.scene.ignis_rt
             quality = int(props.dlss_quality)
             dll_wrapper.set_int("dlss_quality", quality)
-            _log(f" DLSS {quality} + Ray Reconstruction")
+            rr = 1 if getattr(props, "dlss_rr_enabled", True) else 0
+            dll_wrapper.set_int("dlss_rr_enabled", rr)
+            # Seed preset before feature creation (viewport restart applies it)
+            dll_wrapper.set_int("dlss_rr_preset", int(getattr(props, "dlss_rr_preset", '0')))
+            _log(f" DLSS {quality}" + (" + Ray Reconstruction" if rr else " (RR disabled)"))
             if hasattr(props, 'samples_per_pixel') and props.samples_per_pixel > 1:
                 dll_wrapper.set_int("spp", props.samples_per_pixel)
                 _log(f" SPP: {props.samples_per_pixel}")
@@ -876,7 +880,11 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 dll_wrapper.set_base_path(get_base_path())
                 dll_wrapper.set_int("shader_mode", 1)
                 dll_wrapper.set_int("dlss_enabled", 1)
-                dll_wrapper.set_int("dlss_rr_enabled", 1)
+                try:
+                    _rr_init = 1 if getattr(bpy.context.scene.ignis_rt, "dlss_rr_enabled", True) else 0
+                except Exception:
+                    _rr_init = 1
+                dll_wrapper.set_int("dlss_rr_enabled", _rr_init)
                 # Bake active view transform LUT using OCIO (supports ALL transforms + displays)
                 try:
                     _bake_view_transform_lut(bpy.context.scene)
@@ -2279,8 +2287,12 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         dll_wrapper.set_int("backface_culling", 1 if props.backface_culling else 0)
         dll_wrapper.set_int("restir_di", 1 if props.restir_di else 0)
         dll_wrapper.set_int("restir_gi", 1 if props.restir_gi else 0)
-        dll_wrapper.set_int("material_sort", 1 if props.material_sort else 0)
         dll_wrapper.set_int("sharc_enabled", 1 if props.sharc_enabled else 0)
+        dll_wrapper.set_int("dlss_rr_enabled", 1 if getattr(props, "dlss_rr_enabled", True) else 0)
+        try:
+            dll_wrapper.set_int("dlss_rr_preset", int(getattr(props, "dlss_rr_preset", '0')))
+        except Exception:
+            pass
         dll_wrapper.set_int("debug_view", int(props.debug_view))
         # Auto sky colors always on — sun/ambient come from World settings
         dll_wrapper.set_int("auto_sky_colors", 1)
