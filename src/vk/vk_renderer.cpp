@@ -506,6 +506,19 @@ bool Renderer::InitRT() {
     // Create render-resolution G-buffers (normals, depth, MVs, albedo, ...)
     // consumed by DLSS Ray Reconstruction and the wavefront kernels.
     rtResources_->CreateGBuffers(renderWidth_, renderHeight_);
+
+    // Post-PT compute pipelines. Each is independent — failures are non-fatal.
+    if (dlssActive_ && dlssHdrOutput_ && !CreateTonemapPipeline())
+        Log(L"[VK Renderer] WARNING: Tonemap pipeline creation failed\n");
+    if (!CreateExposureResolvePipeline())
+        Log(L"[VK Renderer] WARNING: Auto-exposure resolve pipeline creation failed\n");
+    if (!CreateSHARCResolvePipeline())
+        Log(L"[VK Renderer] WARNING: SHARC resolve pipeline creation failed\n");
+    if (!CreateSurfelResolvePipeline())
+        Log(L"[VK Renderer] WARNING: Surfel resolve pipeline creation failed\n");
+    if (!CreateHairContourPipeline())
+        Log(L"[VK Renderer] WARNING: Hair contour pipeline creation failed\n");
+
     Log(L"[VK Renderer] RT modules initialized\n");
 
     // Initialize NRC (Neural Radiance Cache)
@@ -636,6 +649,18 @@ void Renderer::InitRT_Remaining() {
 
     // G-buffers for DLSS RR / wavefront
     rtResources_->CreateGBuffers(renderWidth_, renderHeight_);
+
+    // Post-PT compute pipelines. Each is independent — failures are non-fatal.
+    if (dlssActive_ && dlssHdrOutput_ && !CreateTonemapPipeline())
+        Log(L"[VK Renderer] WARNING: Tonemap pipeline creation failed\n");
+    if (!CreateExposureResolvePipeline())
+        Log(L"[VK Renderer] WARNING: Auto-exposure resolve pipeline creation failed\n");
+    if (!CreateSHARCResolvePipeline())
+        Log(L"[VK Renderer] WARNING: SHARC resolve pipeline creation failed\n");
+    if (!CreateSurfelResolvePipeline())
+        Log(L"[VK Renderer] WARNING: Surfel resolve pipeline creation failed\n");
+    if (!CreateHairContourPipeline())
+        Log(L"[VK Renderer] WARNING: Hair contour pipeline creation failed\n");
 
     // NRC (Neural Radiance Cache)
 
