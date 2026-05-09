@@ -57,6 +57,7 @@ set(IGNIS_CORE_SOURCES
     src/vk/vk_renderer_tonemap.cpp
     src/vk/vk_renderer_hybrid.cpp
     src/vk/vk_renderer_hair.cpp
+    src/vk/vk_renderer_nrd.cpp
     src/vk/vk_context.cpp
     src/vk/vk_pipeline.cpp
     src/vk/vk_geometry.cpp
