@@ -59,6 +59,8 @@ set(IGNIS_CORE_SOURCES
     src/vk/vk_renderer_sharc.cpp
     src/vk/vk_renderer_surfel.cpp
     src/vk/vk_renderer_imgui.cpp
+    src/vk/vk_renderer_timestamps.cpp
+    src/vk/vk_renderer_dlss.cpp
     src/vk/vk_context.cpp
     src/vk/vk_pipeline.cpp
     src/vk/vk_geometry.cpp

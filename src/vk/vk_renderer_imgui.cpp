@@ -183,34 +183,6 @@ void Renderer::RenderImGuiOverlay(VkCommandBuffer cmd) {
 
 
 
-void Renderer::ShutdownDLSS() {
-    VkDevice device = context_ ? context_->GetDevice() : VK_NULL_HANDLE;
-
-    // Shutdown tonemap pipeline (depends on DLSS HDR output)
-    ShutdownTonemap();
-
-    if (dlss_) {
-        dlss_->Shutdown();
-        delete dlss_;
-        dlss_ = nullptr;
-    }
-
-    if (device != VK_NULL_HANDLE) {
-        if (dlssColorInputView_) { vkDestroyImageView(device, dlssColorInputView_, nullptr); dlssColorInputView_ = VK_NULL_HANDLE; }
-        if (dlssColorInput_) { vkDestroyImage(device, dlssColorInput_, nullptr); dlssColorInput_ = VK_NULL_HANDLE; }
-        if (dlssColorInputMemory_) { vkFreeMemory(device, dlssColorInputMemory_, nullptr); dlssColorInputMemory_ = VK_NULL_HANDLE; }
-
-        if (dlssHdrOutputView_) { vkDestroyImageView(device, dlssHdrOutputView_, nullptr); dlssHdrOutputView_ = VK_NULL_HANDLE; }
-        if (dlssHdrOutput_) { vkDestroyImage(device, dlssHdrOutput_, nullptr); dlssHdrOutput_ = VK_NULL_HANDLE; }
-        if (dlssHdrOutputMemory_) { vkFreeMemory(device, dlssHdrOutputMemory_, nullptr); dlssHdrOutputMemory_ = VK_NULL_HANDLE; }
-    }
-
-    dlssActive_ = false;
-    dlssRRActive_ = false;
-    Log(L"[VK Renderer] DLSS shutdown\n");
-}
-
-
 void Renderer::ShutdownImGui() {
     if (!imguiReady_) return;
     VkDevice device = context_->GetDevice();
