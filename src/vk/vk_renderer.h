@@ -15,7 +15,7 @@ class Context;
 class Pipeline;
 class Geometry;
 class Rasterizer;
-class RTPipeline;
+class RTResources;
 class WavefrontPipeline;
 class Interop;
 struct Mesh;
@@ -115,7 +115,7 @@ public:
     int GetActualDLSSQuality() const;
 
     Context* GetContext() const { return context_; }
-    RTPipeline* GetRTPipeline() const { return rtPipeline_; }
+    RTResources* GetRTResources() const { return rtResources_; }
     AccelStructureBuilder* GetAccelBuilder() const { return accelBuilder_; }
     Geometry* GetGeometry() const { return geometry_; }
     Rasterizer* GetRasterizer() const { return rasterizer_; }
@@ -146,7 +146,7 @@ private:
 
     // RT modules
     AccelStructureBuilder* accelBuilder_ = nullptr;
-    RTPipeline* rtPipeline_ = nullptr;
+    RTResources* rtResources_ = nullptr;
     WavefrontPipeline* wavefrontPipeline_ = nullptr;
     Interop* interop_ = nullptr;
     class NircIntegration* nirc_ = nullptr;

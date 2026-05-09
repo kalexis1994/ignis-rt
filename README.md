@@ -85,8 +85,7 @@ ignis-rt/
   src/vk/            # Vulkan core (context, renderer, RT pipeline, interop)
   shaders/
     include/          # Shared GLSL (BRDF, sampling, sky, tonemapping)
-    raygen_blender.rgen  # Main path tracer
-    wavefront/        # Compute-based wavefront kernels
+    wavefront/        # Compute-based wavefront kernels (the path tracer)
   blender/ignis_rt/   # Blender addon (Python)
 ```
 

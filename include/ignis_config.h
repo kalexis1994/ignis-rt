@@ -116,11 +116,8 @@ struct PathTracerConfig {
     int   weatherType        = 0;
     bool  autoWeather        = false;
 
-    // Shader mode: 0=AC (raygen.rgen), 1=Blender GI (raygen_blender.rgen)
+    // Shader mode: 0=AC, 1=Blender GI (legacy flag, no longer branches in code)
     int   shaderMode         = 0;
-
-    // Wavefront path tracing (experimental — compute-based multi-kernel pipeline)
-    bool  useWavefront       = true;
 
     // Hybrid rasterization: rasterize primary visibility, path trace secondary bounces
     bool  hybridRasterization = true;

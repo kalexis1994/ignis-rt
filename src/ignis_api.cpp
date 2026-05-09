@@ -3,7 +3,7 @@
 #include "ignis_log.h"
 #include "ignis_texture.h"
 #include "vk/vk_renderer.h"
-#include "vk/vk_rt_pipeline.h"
+#include "vk/vk_rt_resources.h"
 #include "vk/vk_accel_structure.h"
 #include "vk/vk_texture_manager.h"
 #include "vk/vk_context.h"
@@ -410,10 +410,18 @@ IGNIS_API bool ignis_upload_lut(const float* rgbData, uint32_t lutSize) {
 }
 
 IGNIS_API bool ignis_reload_shaders() {
+    // Recompile shader sources from disk via compile_shaders.bat. The wavefront
+    // compute pipelines are not recreated here, so changes only take effect on
+    // the next renderer restart (close/reopen the Blender viewport).
     if (!g_renderer) return false;
-    auto* pipeline = g_renderer->GetRTPipeline();
-    if (!pipeline) return false;
-    return pipeline->ReloadShaders();
+    std::string cmd = "cd /d \"" + IgnisResolvePath("") + "\" && compile_shaders.bat >nul 2>&1";
+    int ret = std::system(cmd.c_str());
+    if (ret != 0) {
+        Log(L"[ignis_api] compile_shaders.bat returned %d\n", ret);
+        return false;
+    }
+    Log(L"[ignis_api] Shaders recompiled — restart the viewport to apply changes\n");
+    return true;
 }
 
 // Previous frame camera matrices for motion vectors
@@ -576,8 +584,8 @@ IGNIS_API void ignis_set_camera(const float* viewInverse, const float* projInver
     }
 
     // SHARC radiance cache: pass buffer device addresses + grid parameters
-    if (g_renderer && g_renderer->GetRTPipeline() && g_renderer->GetRTPipeline()->HasSHARCBuffers()) {
-        auto* rtp = g_renderer->GetRTPipeline();
+    if (g_renderer && g_renderer->GetRTResources() && g_renderer->GetRTResources()->HasSHARCBuffers()) {
+        auto* rtp = g_renderer->GetRTResources();
         cam.sharcHashEntriesAddr = rtp->GetSHARCHashEntriesAddr();
         cam.sharcAccumulationAddr = rtp->GetSHARCAccumulationAddr();
         cam.sharcResolvedAddr = rtp->GetSHARCResolvedAddr();
@@ -805,7 +813,6 @@ IGNIS_API void ignis_set_int(const char* key, int value) {
     else if (strcmp(key, "max_bounces") == 0)       cfg->maxBounces = (value < 1 ? 1 : (value > 8 ? 8 : value));
     else if (strcmp(key, "spp") == 0)              cfg->samplesPerPixel = (value < 1 ? 1 : (value > 128 ? 128 : value));
     else if (strcmp(key, "shader_mode") == 0)       cfg->shaderMode = value;
-    else if (strcmp(key, "use_wavefront") == 0)    cfg->useWavefront = (value != 0);
     else if (strcmp(key, "hybrid_rasterization") == 0) cfg->hybridRasterization = (value != 0);
     else if (strcmp(key, "dof_blades") == 0)        cfg->dofBlades = value;
     else if (strcmp(key, "backface_culling") == 0) cfg->backfaceCulling = (value != 0);
@@ -838,7 +845,6 @@ IGNIS_API int ignis_get_int(const char* key) {
     if (strcmp(key, "max_bounces") == 0)       return cfg->maxBounces;
     if (strcmp(key, "debug_view") == 0)        return cfg->debugView;
     if (strcmp(key, "shader_mode") == 0)       return cfg->shaderMode;
-    if (strcmp(key, "use_wavefront") == 0)    return cfg->useWavefront ? 1 : 0;
     if (strcmp(key, "hybrid_rasterization") == 0) return cfg->hybridRasterization ? 1 : 0;
 
     // Render size queries (actual Vulkan image size, may differ from viewport)

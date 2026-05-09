@@ -422,7 +422,6 @@ def _capture_restart_config(scene):
         props = scene.ignis_rt
         return {
             "dlss_quality": int(props.dlss_quality),
-            "use_wavefront": bool(props.use_wavefront),
         }
     except Exception:
         return {}
@@ -727,9 +726,6 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
             if hasattr(props, 'samples_per_pixel') and props.samples_per_pixel > 1:
                 dll_wrapper.set_int("spp", props.samples_per_pixel)
                 _log(f" SPP: {props.samples_per_pixel}")
-            if props.use_wavefront:
-                dll_wrapper.set_int("use_wavefront", 1)
-                _log(f" Wavefront path tracing enabled")
         except Exception:
             pass
 
@@ -895,8 +891,6 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                     dll_wrapper.set_int("dlss_quality", int(props.dlss_quality))
                     if hasattr(props, 'samples_per_pixel') and props.samples_per_pixel > 1:
                         dll_wrapper.set_int("spp", props.samples_per_pixel)
-                    if props.use_wavefront:
-                        dll_wrapper.set_int("use_wavefront", 1)
                 except Exception:
                     pass
 

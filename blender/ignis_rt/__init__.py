@@ -141,6 +141,7 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
             ('5', "UV", "UV coordinates as RG color"),
             ('7', "UV Checker", "Checkerboard pattern on UV coordinates"),
             ('6', "Complexity", "Shader cost heatmap (green=cheap, red=expensive)"),
+            ('8', "Motion Vectors", "MV visualization (R=X, G=Y, 0.5=no motion, scaled x50)"),
         ],
         default='0',
         description="Viewport visualization mode",
@@ -212,12 +213,6 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         default=False,
         update=_tag_redraw,
     )
-    use_wavefront: BoolProperty(
-        name="Wavefront Path Tracing",
-        description="Experimental: compute-based multi-kernel path tracing for better GPU occupancy",
-        default=False,
-    )
-
     # -- Performance --
     vsync: BoolProperty(
         name="V-Sync",
@@ -451,7 +446,6 @@ class IGNIS_PT_advanced(bpy.types.Panel):
         layout.prop(props, "sharc_enabled")
         layout.prop(props, "dlss_rr_enabled")
         layout.prop(props, "dlss_rr_preset")
-        # layout.prop(props, "use_wavefront")  # TODO: not ready yet
         layout.separator()
         layout.prop(props, "debug_view")
         layout.separator()

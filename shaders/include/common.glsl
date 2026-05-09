@@ -1,6 +1,6 @@
 // ============================================================
 // common.glsl — Constants, RNG, TBN computation
-// Shared between raygen_blender.rgen, raygen.rgen, hybrid.rgen
+// Shared by all wavefront compute kernels
 // ============================================================
 
 #ifndef COMMON_GLSL

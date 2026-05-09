@@ -82,7 +82,7 @@ layout(binding = 4, set = 0, scalar) buffer MaterialBuffer {
 } materialBuffer;
 
 // Material field offsets (in uint32 units within the GPUMaterial struct)
-// GPUMaterial = 2204 bytes = 551 uints (scalar layout, see vk_rt_pipeline.h)
+// GPUMaterial = 2204 bytes = 551 uints (scalar layout, see vk_rt_resources.h)
 const uint MAT_OFFSET_FLAGS = 16u;    // uint flags
 const uint MAT_OFFSET_MULTB = 28u;    // float multB (transparent_prob / stochastic passthrough)
 const uint MAT_OFFSET_MULTA = 29u;    // float multA (transmission)

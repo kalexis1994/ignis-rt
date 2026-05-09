@@ -7,7 +7,7 @@ namespace acpt {
 namespace vk {
 
 class Context;
-class RTPipeline;
+class RTResources;
 
 /// Wavefront path tracing pipeline — replaces monolithic raygen with
 /// multiple compute kernels for better GPU occupancy.
@@ -17,12 +17,12 @@ class RTPipeline;
 /// Bounced K1-K4 loop with path compaction between iterations.
 class WavefrontPipeline {
 public:
-    bool Initialize(Context* context, RTPipeline* rtPipeline,
+    bool Initialize(Context* context, RTResources* rtPipeline,
                     uint32_t width, uint32_t height, uint32_t maxBounces);
     void Shutdown();
 
     /// Record all wavefront dispatches into the command buffer.
-    /// Uses the same descriptor set 0 as RTPipeline for scene data.
+    /// Uses the same descriptor set 0 as RTResources for scene data.
     void RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                         VkDescriptorSet sceneDescSet, uint32_t maxBounces,
                         uint32_t spp = 1);
@@ -36,7 +36,7 @@ private:
     bool LoadComputeShader(const char* path, VkShaderModule* outModule);
 
     Context* context_ = nullptr;
-    RTPipeline* rtPipeline_ = nullptr;
+    RTResources* rtResources_ = nullptr;
     bool ready_ = false;
     uint32_t maxPixels_ = 0;
     uint32_t frameIndex_ = 0;
@@ -123,7 +123,7 @@ private:
     PFN_vkCmdTraceRaysKHR vkCmdTraceRaysKHR_ = nullptr;
     PFN_vkGetBufferDeviceAddressKHR vkGetBufferDeviceAddressKHR_ = nullptr;
     bool serAvailable_ = false;
-    bool CreateK2RTPipeline();
+    bool CreateK2RTResources();
 
     static constexpr uint32_t WORKGROUP_SIZE = 256;
     static constexpr uint32_t MAX_SHADOW_RAYS_PER_PATH = 10; // sun + 8 lights + emissive

@@ -541,12 +541,12 @@ bool Context::CheckRTExtensionSupport(VkPhysicalDevice device) const {
     std::vector<VkExtensionProperties> extensions(extensionCount);
     vkEnumerateDeviceExtensionProperties(device, nullptr, &extensionCount, extensions.data());
 
-    bool hasAccelStruct = false, hasRayQuery = false, hasBDA = false, hasDeferredOps = false, hasRTPipeline = false;
+    bool hasAccelStruct = false, hasRayQuery = false, hasBDA = false, hasDeferredOps = false, hasRTResources = false;
     bool hasInvocationReorder = false;
     for (const auto& ext : extensions) {
         if (strcmp(ext.extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) == 0) hasAccelStruct = true;
         if (strcmp(ext.extensionName, VK_KHR_RAY_QUERY_EXTENSION_NAME) == 0) hasRayQuery = true;
-        if (strcmp(ext.extensionName, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) == 0) hasRTPipeline = true;
+        if (strcmp(ext.extensionName, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) == 0) hasRTResources = true;
         if (strcmp(ext.extensionName, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) == 0) hasBDA = true;
         if (strcmp(ext.extensionName, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) == 0) hasDeferredOps = true;
         if (strcmp(ext.extensionName, "VK_NV_ray_tracing_invocation_reorder") == 0) hasInvocationReorder = true;
@@ -555,9 +555,9 @@ bool Context::CheckRTExtensionSupport(VkPhysicalDevice device) const {
         Log(L"[VK Context] VK_NV_ray_tracing_invocation_reorder available (SER)\n");
     }
 
-    bool supported = hasAccelStruct && hasRayQuery && hasRTPipeline && hasBDA && hasDeferredOps;
+    bool supported = hasAccelStruct && hasRayQuery && hasRTResources && hasBDA && hasDeferredOps;
     Log(L"[VK Context] RT extension check: AS=%d RQ=%d RTP=%d BDA=%d DHO=%d => %s\n",
-        hasAccelStruct, hasRayQuery, hasRTPipeline, hasBDA, hasDeferredOps,
+        hasAccelStruct, hasRayQuery, hasRTResources, hasBDA, hasDeferredOps,
         supported ? L"SUPPORTED" : L"NOT SUPPORTED");
     return supported;
 }

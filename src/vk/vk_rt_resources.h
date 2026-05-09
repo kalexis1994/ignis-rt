@@ -134,17 +134,16 @@ struct PickResult {
     uint32_t valid;  // 1 if pick hit something
 };
 
-// RT pipeline using ray tracing pipeline with raygen.rgen
-class RTPipeline {
+// Shared RT resources (descriptors, G-buffers, SSBOs) used by the wavefront pipeline.
+// Despite the name, this class no longer owns a ray tracing pipeline — the monolithic
+// raygen path was removed in favor of compute-based wavefront kernels.
+class RTResources {
 public:
     bool Initialize(Context* context, AccelStructureBuilder* accelBuilder, Interop* interop);
     void Shutdown();
 
     // Update camera UBO
     void UpdateCamera(const CameraUBO& camera);
-
-    // Record dispatch commands into command buffer
-    void RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint32_t height);
 
     // Update TLAS descriptor after rebuild
     void UpdateTLASDescriptor();
@@ -243,39 +242,23 @@ public:
     static constexpr uint32_t SURFEL_CAPACITY = 1u << 20;  // 1M entries
     bool CreateSurfelBuffers();
 
-    // Hot-reload shaders from disk (recompile + recreate pipeline)
-    bool ReloadShaders();
-
 private:
     bool CreateDescriptorSetLayout();
-    bool CreatePipeline();
     bool CreateDescriptorPool();
     bool CreateDescriptorSet();
-    bool CreateSBT();
     bool CreateDummyResources();
-    bool LoadShaderModule(const char* path, VkShaderModule* outModule);
 
     Context* context_ = nullptr;
     AccelStructureBuilder* accelBuilder_ = nullptr;
     Interop* interop_ = nullptr;
 
     VkDescriptorSetLayout descriptorSetLayout_ = VK_NULL_HANDLE;
-    VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
-    VkPipeline pipeline_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
 
     // Camera UBO
     VkBuffer cameraBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory cameraMemory_ = VK_NULL_HANDLE;
-
-    // SBT
-    VkBuffer sbtBuffer_ = VK_NULL_HANDLE;
-    VkDeviceMemory sbtMemory_ = VK_NULL_HANDLE;
-    VkStridedDeviceAddressRegionKHR raygenRegion_{};
-    VkStridedDeviceAddressRegionKHR missRegion_{};
-    VkStridedDeviceAddressRegionKHR hitRegion_{};
-    VkStridedDeviceAddressRegionKHR callableRegion_{};
 
     // NRC constants UBO (binding 43)
 #ifdef IGNIS_HAVE_NRC
@@ -403,11 +386,6 @@ private:
     void* currTransformsMapped_ = nullptr;
     uint32_t currTransformsCapacity_ = 0;
 
-    // Function pointers
-    PFN_vkCreateRayTracingPipelinesKHR vkCreateRayTracingPipelinesKHR_ = nullptr;
-    PFN_vkGetRayTracingShaderGroupHandlesKHR vkGetRayTracingShaderGroupHandlesKHR_ = nullptr;
-    PFN_vkCmdTraceRaysKHR vkCmdTraceRaysKHR_ = nullptr;
-    PFN_vkGetBufferDeviceAddressKHR vkGetBufferDeviceAddressKHR_ = nullptr;
 };
 
 } // namespace vk

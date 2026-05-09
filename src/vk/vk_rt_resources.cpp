@@ -1,4 +1,4 @@
-#include "vk_rt_pipeline.h"
+#include "vk_rt_resources.h"
 #include "vk_context.h"
 #include <algorithm>
 #include "vk_accel_structure.h"
@@ -6,36 +6,19 @@
 #include "vk_texture_manager.h"
 #include "../../include/ignis_log.h"
 #include "../../include/ignis_config.h"
-#include <fstream>
 #include <vector>
 #include <cstring>
-#include <algorithm>
 
 namespace acpt {
     extern PathTracerConfig g_config;
 namespace vk {
 
-bool RTPipeline::Initialize(Context* context, AccelStructureBuilder* accelBuilder, Interop* interop) {
+bool RTResources::Initialize(Context* context, AccelStructureBuilder* accelBuilder, Interop* interop) {
     context_ = context;
     accelBuilder_ = accelBuilder;
     interop_ = interop;
 
     VkDevice device = context_->GetDevice();
-
-    // Load function pointers
-    vkCreateRayTracingPipelinesKHR_ = (PFN_vkCreateRayTracingPipelinesKHR)
-        vkGetDeviceProcAddr(device, "vkCreateRayTracingPipelinesKHR");
-    vkGetRayTracingShaderGroupHandlesKHR_ = (PFN_vkGetRayTracingShaderGroupHandlesKHR)
-        vkGetDeviceProcAddr(device, "vkGetRayTracingShaderGroupHandlesKHR");
-    vkCmdTraceRaysKHR_ = (PFN_vkCmdTraceRaysKHR)
-        vkGetDeviceProcAddr(device, "vkCmdTraceRaysKHR");
-    vkGetBufferDeviceAddressKHR_ = (PFN_vkGetBufferDeviceAddressKHR)
-        vkGetDeviceProcAddr(device, "vkGetBufferDeviceAddressKHR");
-
-    if (!vkCreateRayTracingPipelinesKHR_ || !vkGetRayTracingShaderGroupHandlesKHR_ || !vkCmdTraceRaysKHR_) {
-        Log(L"[VK RTPipeline] ERROR: Failed to load RT pipeline function pointers\n");
-        return false;
-    }
 
     if (!CreateDummyResources()) return false;
 
@@ -104,20 +87,18 @@ bool RTPipeline::Initialize(Context* context, AccelStructureBuilder* accelBuilde
         vkMapMemory(device, pickMemory_, 0, sizeof(PickResult), 0, &mapped);
         pickMappedPtr_ = static_cast<PickResult*>(mapped);
         memset(pickMappedPtr_, 0, sizeof(PickResult));
-        Log(L"[VK RTPipeline] Pick buffer created (16 bytes, persistently mapped)\n");
+        Log(L"[VK RTResources] Pick buffer created (16 bytes, persistently mapped)\n");
     }
 
     if (!CreateDescriptorSetLayout()) return false;
-    if (!CreatePipeline()) return false;
     if (!CreateDescriptorPool()) return false;
     if (!CreateDescriptorSet()) return false;
-    if (!CreateSBT()) return false;
 
-    Log(L"[VK RTPipeline] Initialized successfully\n");
+    Log(L"[VK RTResources] Initialized successfully\n");
     return true;
 }
 
-bool RTPipeline::CreateSHARCBuffers() {
+bool RTResources::CreateSHARCBuffers() {
     if (sharcCreated_) return true;
 
     VkDevice device = context_->GetDevice();
@@ -147,7 +128,7 @@ bool RTPipeline::CreateSHARCBuffers() {
         bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
         if (vkCreateBuffer(device, &bufInfo, nullptr, &sharcBuffer_[i]) != VK_SUCCESS) {
-            Log(L"[VK RTPipeline] ERROR: Failed to create SHARC %S buffer\n", names[i]);
+            Log(L"[VK RTResources] ERROR: Failed to create SHARC %S buffer\n", names[i]);
             return false;
         }
 
@@ -166,7 +147,7 @@ bool RTPipeline::CreateSHARCBuffers() {
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
         if (vkAllocateMemory(device, &allocInfo, nullptr, &sharcMemory_[i]) != VK_SUCCESS) {
-            Log(L"[VK RTPipeline] ERROR: Failed to allocate SHARC %S memory\n", names[i]);
+            Log(L"[VK RTResources] ERROR: Failed to allocate SHARC %S memory\n", names[i]);
             return false;
         }
         vkBindBufferMemory(device, sharcBuffer_[i], sharcMemory_[i], 0);
@@ -203,7 +184,7 @@ bool RTPipeline::CreateSHARCBuffers() {
     vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
 
     VkDeviceSize totalMB = (sizes[0] + sizes[1] + sizes[2]) / (1024 * 1024);
-    Log(L"[VK RTPipeline] SHARC buffers created: %u MiB (%u entries), addrs=[%llx, %llx, %llx]\n",
+    Log(L"[VK RTResources] SHARC buffers created: %u MiB (%u entries), addrs=[%llx, %llx, %llx]\n",
         (uint32_t)totalMB, SHARC_CAPACITY,
         (unsigned long long)sharcDeviceAddr_[0],
         (unsigned long long)sharcDeviceAddr_[1],
@@ -211,7 +192,7 @@ bool RTPipeline::CreateSHARCBuffers() {
     return true;
 }
 
-void RTPipeline::DestroySHARCBuffers() {
+void RTResources::DestroySHARCBuffers() {
     if (!sharcCreated_) return;
     VkDevice device = context_->GetDevice();
     for (int i = 0; i < 2; i++) {
@@ -222,7 +203,7 @@ void RTPipeline::DestroySHARCBuffers() {
     sharcCreated_ = false;
 }
 
-bool RTPipeline::CreateSurfelBuffers() {
+bool RTResources::CreateSurfelBuffers() {
     if (surfelCreated_) return true;
 
     VkDevice device = context_->GetDevice();
@@ -248,7 +229,7 @@ bool RTPipeline::CreateSurfelBuffers() {
         bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
         if (vkCreateBuffer(device, &bufInfo, nullptr, &surfelBuffer_[i]) != VK_SUCCESS) {
-            Log(L"[VK RTPipeline] ERROR: Failed to create surfel buffer %d\n", i);
+            Log(L"[VK RTResources] ERROR: Failed to create surfel buffer %d\n", i);
             return false;
         }
 
@@ -267,7 +248,7 @@ bool RTPipeline::CreateSurfelBuffers() {
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
         if (vkAllocateMemory(device, &allocInfo, nullptr, &surfelMemory_[i]) != VK_SUCCESS) {
-            Log(L"[VK RTPipeline] ERROR: Failed to allocate surfel memory %d\n", i);
+            Log(L"[VK RTResources] ERROR: Failed to allocate surfel memory %d\n", i);
             return false;
         }
         vkBindBufferMemory(device, surfelBuffer_[i], surfelMemory_[i], 0);
@@ -297,12 +278,12 @@ bool RTPipeline::CreateSurfelBuffers() {
     vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
 
     VkDeviceSize totalMB = (sizes[0] + sizes[1]) / (1024 * 1024);
-    Log(L"[VK RTPipeline] Surfel GI buffers created: %u MiB (%u entries)\n",
+    Log(L"[VK RTResources] Surfel GI buffers created: %u MiB (%u entries)\n",
         (uint32_t)totalMB, SURFEL_CAPACITY);
     return true;
 }
 
-bool RTPipeline::CreateGIReservoirBuffers(uint32_t width, uint32_t height) {
+bool RTResources::CreateGIReservoirBuffers(uint32_t width, uint32_t height) {
     if (giReservoirCreated_) return true;
 
     VkDevice device = context_->GetDevice();
@@ -317,7 +298,7 @@ bool RTPipeline::CreateGIReservoirBuffers(uint32_t width, uint32_t height) {
         bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
         if (vkCreateBuffer(device, &bufInfo, nullptr, &giReservoirBuffer_[i]) != VK_SUCCESS) {
-            Log(L"[VK RTPipeline] ERROR: Failed to create GI reservoir buffer[%d]\n", i);
+            Log(L"[VK RTResources] ERROR: Failed to create GI reservoir buffer[%d]\n", i);
             return false;
         }
 
@@ -331,7 +312,7 @@ bool RTPipeline::CreateGIReservoirBuffers(uint32_t width, uint32_t height) {
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
         if (vkAllocateMemory(device, &allocInfo, nullptr, &giReservoirMemory_[i]) != VK_SUCCESS) {
-            Log(L"[VK RTPipeline] ERROR: Failed to allocate GI reservoir memory[%d]\n", i);
+            Log(L"[VK RTResources] ERROR: Failed to allocate GI reservoir memory[%d]\n", i);
             return false;
         }
         vkBindBufferMemory(device, giReservoirBuffer_[i], giReservoirMemory_[i], 0);
@@ -372,12 +353,12 @@ bool RTPipeline::CreateGIReservoirBuffers(uint32_t width, uint32_t height) {
 
     vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
 
-    Log(L"[VK RTPipeline] GI reservoir buffers created (2x %.1f MiB, %u pixels)\n",
+    Log(L"[VK RTResources] GI reservoir buffers created (2x %.1f MiB, %u pixels)\n",
         (float)bufSize / (1024.0f * 1024.0f), giReservoirPixelCount_);
     return true;
 }
 
-void RTPipeline::DestroyGIReservoirBuffers() {
+void RTResources::DestroyGIReservoirBuffers() {
     if (!giReservoirCreated_) return;
     VkDevice device = context_->GetDevice();
     for (int i = 0; i < 2; i++) {
@@ -387,7 +368,7 @@ void RTPipeline::DestroyGIReservoirBuffers() {
     giReservoirCreated_ = false;
 }
 
-bool RTPipeline::CreateGIWfReservoirBuffers(uint32_t width, uint32_t height) {
+bool RTResources::CreateGIWfReservoirBuffers(uint32_t width, uint32_t height) {
     if (giWfReservoirCreated_) return true;
     VkDevice device = context_->GetDevice();
     uint32_t pixelCount = width * height;
@@ -441,12 +422,12 @@ bool RTPipeline::CreateGIWfReservoirBuffers(uint32_t width, uint32_t height) {
     writes[1].pBufferInfo = &prevInfo;
 
     vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
-    Log(L"[VK RTPipeline] GI wavefront reservoir buffers created (2x %.1f MiB)\n",
+    Log(L"[VK RTResources] GI wavefront reservoir buffers created (2x %.1f MiB)\n",
         (float)bufSize / (1024.0f * 1024.0f));
     return true;
 }
 
-void RTPipeline::DestroyGIWfReservoirBuffers() {
+void RTResources::DestroyGIWfReservoirBuffers() {
     if (!giWfReservoirCreated_) return;
     VkDevice device = context_->GetDevice();
     for (int i = 0; i < 2; i++) {
@@ -456,7 +437,7 @@ void RTPipeline::DestroyGIWfReservoirBuffers() {
     giWfReservoirCreated_ = false;
 }
 
-void RTPipeline::SwapGIWfReservoirBuffers() {
+void RTResources::SwapGIWfReservoirBuffers() {
     if (!giWfReservoirCreated_) return;
     std::swap(giWfReservoirBuffer_[0], giWfReservoirBuffer_[1]);
     std::swap(giWfReservoirMemory_[0], giWfReservoirMemory_[1]);
@@ -483,7 +464,7 @@ void RTPipeline::SwapGIWfReservoirBuffers() {
     vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
 }
 
-void RTPipeline::SwapGIReservoirBuffers() {
+void RTResources::SwapGIReservoirBuffers() {
     if (!giReservoirCreated_) return;
     std::swap(giReservoirBuffer_[0], giReservoirBuffer_[1]);
     std::swap(giReservoirMemory_[0], giReservoirMemory_[1]);
@@ -513,7 +494,7 @@ void RTPipeline::SwapGIReservoirBuffers() {
     vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
 }
 
-bool RTPipeline::CreateShadowAccumBuffers(uint32_t width, uint32_t height) {
+bool RTResources::CreateShadowAccumBuffers(uint32_t width, uint32_t height) {
     if (shadowAccumCreated_) return true;
 
     for (int i = 0; i < 2; i++) {
@@ -527,18 +508,18 @@ bool RTPipeline::CreateShadowAccumBuffers(uint32_t width, uint32_t height) {
     shadowAccumCurrent_ = 0;
     shadowAccumCreated_ = true;
     UpdateShadowAccumDescriptors();
-    Log(L"[VK RTPipeline] Shadow accumulation buffers created (%ux%u)\n", width, height);
+    Log(L"[VK RTResources] Shadow accumulation buffers created (%ux%u)\n", width, height);
     return true;
 }
 
-void RTPipeline::DestroyShadowAccumBuffers() {
+void RTResources::DestroyShadowAccumBuffers() {
     if (!shadowAccumCreated_) return;
     DestroyGBufferImage(shadowAccumImage_[0]);
     DestroyGBufferImage(shadowAccumImage_[1]);
     shadowAccumCreated_ = false;
 }
 
-void RTPipeline::UpdateShadowAccumDescriptors() {
+void RTResources::UpdateShadowAccumDescriptors() {
     if (!shadowAccumCreated_ || descriptorSet_ == VK_NULL_HANDLE) return;
 
     VkDevice device = context_->GetDevice();
@@ -576,20 +557,18 @@ void RTPipeline::UpdateShadowAccumDescriptors() {
     vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
 }
 
-void RTPipeline::SwapShadowAccumBuffers() {
+void RTResources::SwapShadowAccumBuffers() {
     if (!shadowAccumCreated_) return;
     shadowAccumCurrent_ = 1 - shadowAccumCurrent_;
     UpdateShadowAccumDescriptors();
 }
 
-void RTPipeline::Shutdown() {
+void RTResources::Shutdown() {
     VkDevice device = context_ ? context_->GetDevice() : VK_NULL_HANDLE;
     if (device == VK_NULL_HANDLE) return;
 
     vkDeviceWaitIdle(device);
 
-    if (sbtBuffer_) { vkDestroyBuffer(device, sbtBuffer_, nullptr); sbtBuffer_ = VK_NULL_HANDLE; }
-    if (sbtMemory_) { vkFreeMemory(device, sbtMemory_, nullptr); sbtMemory_ = VK_NULL_HANDLE; }
     if (cameraBuffer_) { vkDestroyBuffer(device, cameraBuffer_, nullptr); cameraBuffer_ = VK_NULL_HANDLE; }
     if (cameraMemory_) { vkFreeMemory(device, cameraMemory_, nullptr); cameraMemory_ = VK_NULL_HANDLE; }
     if (geometryMetadataBuffer_) { vkDestroyBuffer(device, geometryMetadataBuffer_, nullptr); geometryMetadataBuffer_ = VK_NULL_HANDLE; }
@@ -610,8 +589,6 @@ void RTPipeline::Shutdown() {
     if (emissiveTriBuffer_) { vkDestroyBuffer(device, emissiveTriBuffer_, nullptr); emissiveTriBuffer_ = VK_NULL_HANDLE; }
     if (emissiveTriMemory_) { vkFreeMemory(device, emissiveTriMemory_, nullptr); emissiveTriMemory_ = VK_NULL_HANDLE; }
     emissiveTriCount_ = 0;
-    if (pipeline_) { vkDestroyPipeline(device, pipeline_, nullptr); pipeline_ = VK_NULL_HANDLE; }
-    if (pipelineLayout_) { vkDestroyPipelineLayout(device, pipelineLayout_, nullptr); pipelineLayout_ = VK_NULL_HANDLE; }
     if (descriptorPool_) { vkDestroyDescriptorPool(device, descriptorPool_, nullptr); descriptorPool_ = VK_NULL_HANDLE; }
     if (descriptorSetLayout_) { vkDestroyDescriptorSetLayout(device, descriptorSetLayout_, nullptr); descriptorSetLayout_ = VK_NULL_HANDLE; }
 
@@ -661,10 +638,10 @@ void RTPipeline::Shutdown() {
     if (dummyBuffer_) { vkDestroyBuffer(device, dummyBuffer_, nullptr); dummyBuffer_ = VK_NULL_HANDLE; }
     if (dummyBufferMemory_) { vkFreeMemory(device, dummyBufferMemory_, nullptr); dummyBufferMemory_ = VK_NULL_HANDLE; }
 
-    Log(L"[VK RTPipeline] Shutdown\n");
+    Log(L"[VK RTResources] Shutdown\n");
 }
 
-bool RTPipeline::CreateGBufferImage(GBufferImage& gb, VkFormat format, uint32_t width, uint32_t height, const char* name) {
+bool RTResources::CreateGBufferImage(GBufferImage& gb, VkFormat format, uint32_t width, uint32_t height, const char* name) {
     VkDevice device = context_->GetDevice();
 
     VkImageCreateInfo imgInfo{};
@@ -681,7 +658,7 @@ bool RTPipeline::CreateGBufferImage(GBufferImage& gb, VkFormat format, uint32_t 
     imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     if (vkCreateImage(device, &imgInfo, nullptr, &gb.image) != VK_SUCCESS) {
-        Log(L"[VK RTPipeline] ERROR: Failed to create G-buffer image: %S\n", name);
+        Log(L"[VK RTResources] ERROR: Failed to create G-buffer image: %S\n", name);
         return false;
     }
 
@@ -693,7 +670,7 @@ bool RTPipeline::CreateGBufferImage(GBufferImage& gb, VkFormat format, uint32_t 
     allocInfo.allocationSize = memReqs.size;
     allocInfo.memoryTypeIndex = context_->FindMemoryType(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (vkAllocateMemory(device, &allocInfo, nullptr, &gb.memory) != VK_SUCCESS) {
-        Log(L"[VK RTPipeline] ERROR: Failed to allocate G-buffer memory: %S\n", name);
+        Log(L"[VK RTResources] ERROR: Failed to allocate G-buffer memory: %S\n", name);
         return false;
     }
     vkBindImageMemory(device, gb.image, gb.memory, 0);
@@ -723,22 +700,22 @@ bool RTPipeline::CreateGBufferImage(GBufferImage& gb, VkFormat format, uint32_t 
     viewInfo.subresourceRange.levelCount = 1;
     viewInfo.subresourceRange.layerCount = 1;
     if (vkCreateImageView(device, &viewInfo, nullptr, &gb.view) != VK_SUCCESS) {
-        Log(L"[VK RTPipeline] ERROR: Failed to create G-buffer image view: %S\n", name);
+        Log(L"[VK RTResources] ERROR: Failed to create G-buffer image view: %S\n", name);
         return false;
     }
 
-    Log(L"[VK RTPipeline] Created G-buffer: %S (%ux%u)\n", name, width, height);
+    Log(L"[VK RTResources] Created G-buffer: %S (%ux%u)\n", name, width, height);
     return true;
 }
 
-void RTPipeline::DestroyGBufferImage(GBufferImage& gb) {
+void RTResources::DestroyGBufferImage(GBufferImage& gb) {
     VkDevice device = context_->GetDevice();
     if (gb.view) { vkDestroyImageView(device, gb.view, nullptr); gb.view = VK_NULL_HANDLE; }
     if (gb.image) { vkDestroyImage(device, gb.image, nullptr); gb.image = VK_NULL_HANDLE; }
     if (gb.memory) { vkFreeMemory(device, gb.memory, nullptr); gb.memory = VK_NULL_HANDLE; }
 }
 
-bool RTPipeline::CreateGBuffers(uint32_t width, uint32_t height) {
+bool RTResources::CreateGBuffers(uint32_t width, uint32_t height) {
     if (gbuffersCreated_ && gbufferWidth_ == width && gbufferHeight_ == height) {
         return true;  // Already created at this size
     }
@@ -825,11 +802,11 @@ bool RTPipeline::CreateGBuffers(uint32_t width, uint32_t height) {
     }
 
     vkUpdateDescriptorSets(device, (uint32_t)writes.size(), writes.data(), 0, nullptr);
-    Log(L"[VK RTPipeline] G-buffer descriptors updated (%ux%u, incl. confidence/reactive masks)\n", width, height);
+    Log(L"[VK RTResources] G-buffer descriptors updated (%ux%u, incl. confidence/reactive masks)\n", width, height);
     return true;
 }
 
-bool RTPipeline::CreateDummyResources() {
+bool RTResources::CreateDummyResources() {
     VkDevice device = context_->GetDevice();
 
     // Dummy 1x1 image for unused image bindings
@@ -998,7 +975,7 @@ bool RTPipeline::CreateDummyResources() {
     return true;
 }
 
-bool RTPipeline::CreateDescriptorSetLayout() {
+bool RTResources::CreateDescriptorSetLayout() {
     // Bindings matching raygen.rgen (0-31)
     std::vector<VkDescriptorSetLayoutBinding> bindings(32);
 
@@ -1300,217 +1277,15 @@ bool RTPipeline::CreateDescriptorSetLayout() {
     layoutInfo.pBindings = bindings.data();
 
     if (vkCreateDescriptorSetLayout(context_->GetDevice(), &layoutInfo, nullptr, &descriptorSetLayout_) != VK_SUCCESS) {
-        Log(L"[VK RTPipeline] ERROR: Failed to create descriptor set layout\n");
+        Log(L"[VK RTResources] ERROR: Failed to create descriptor set layout\n");
         return false;
     }
 
-    VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
-    pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pipelineLayoutInfo.setLayoutCount = 1;
-    pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout_;
-
-    if (vkCreatePipelineLayout(context_->GetDevice(), &pipelineLayoutInfo, nullptr, &pipelineLayout_) != VK_SUCCESS) {
-        Log(L"[VK RTPipeline] ERROR: Failed to create pipeline layout\n");
-        return false;
-    }
-
-    Log(L"[VK RTPipeline] Descriptor set layout created (24 bindings)\n");
+    Log(L"[VK RTResources] Descriptor set layout created (24 bindings)\n");
     return true;
 }
 
-bool RTPipeline::LoadShaderModule(const char* path, VkShaderModule* outModule) {
-    std::string resolved = IgnisResolvePath(path);
-    std::ifstream file(resolved, std::ios::ate | std::ios::binary);
-    if (!file.is_open()) {
-        Log(L"[VK RTPipeline] ERROR: Failed to open shader: %S\n", resolved.c_str());
-        return false;
-    }
-
-    size_t fileSize = (size_t)file.tellg();
-    std::vector<char> code(fileSize);
-    file.seekg(0);
-    file.read(code.data(), fileSize);
-    file.close();
-
-    VkShaderModuleCreateInfo createInfo{};
-    createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    createInfo.codeSize = code.size();
-    createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-
-    if (vkCreateShaderModule(context_->GetDevice(), &createInfo, nullptr, outModule) != VK_SUCCESS) {
-        Log(L"[VK RTPipeline] ERROR: Failed to create shader module: %S\n", path);
-        return false;
-    }
-
-    Log(L"[VK RTPipeline] Loaded shader: %S (%zu bytes)\n", resolved.c_str(), fileSize);
-    return true;
-}
-
-bool RTPipeline::CreatePipeline() {
-    VkShaderModule raygenModule = VK_NULL_HANDLE;
-    const char* shaderPath = "shaders/raygen_blender.rgen.spv";
-    if (!LoadShaderModule(shaderPath, &raygenModule)) {
-        return false;
-    }
-
-    // Single shader stage: raygen
-    VkPipelineShaderStageCreateInfo stageInfo{};
-    stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stageInfo.stage = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
-    stageInfo.module = raygenModule;
-    stageInfo.pName = "main";
-
-    // Single shader group: raygen
-    VkRayTracingShaderGroupCreateInfoKHR groupInfo{};
-    groupInfo.sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
-    groupInfo.type = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-    groupInfo.generalShader = 0;
-    groupInfo.closestHitShader = VK_SHADER_UNUSED_KHR;
-    groupInfo.anyHitShader = VK_SHADER_UNUSED_KHR;
-    groupInfo.intersectionShader = VK_SHADER_UNUSED_KHR;
-
-    VkRayTracingPipelineCreateInfoKHR pipelineInfo{};
-    pipelineInfo.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
-    pipelineInfo.stageCount = 1;
-    pipelineInfo.pStages = &stageInfo;
-    pipelineInfo.groupCount = 1;
-    pipelineInfo.pGroups = &groupInfo;
-    pipelineInfo.maxPipelineRayRecursionDepth = 1;
-    pipelineInfo.layout = pipelineLayout_;
-
-    VkResult result = vkCreateRayTracingPipelinesKHR_(context_->GetDevice(),
-        VK_NULL_HANDLE, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline_);
-
-    vkDestroyShaderModule(context_->GetDevice(), raygenModule, nullptr);
-
-    if (result != VK_SUCCESS) {
-        Log(L"[VK RTPipeline] ERROR: Failed to create RT pipeline (result=%d)\n", result);
-        return false;
-    }
-
-    Log(L"[VK RTPipeline] RT pipeline created\n");
-    return true;
-}
-
-bool RTPipeline::ReloadShaders() {
-    VkDevice device = context_->GetDevice();
-    vkDeviceWaitIdle(device);
-
-    // Destroy old pipeline (keep layout, descriptor sets, SBT buffer — only pipeline changes)
-    if (pipeline_ != VK_NULL_HANDLE) {
-        vkDestroyPipeline(device, pipeline_, nullptr);
-        pipeline_ = VK_NULL_HANDLE;
-    }
-
-    // Recompile shaders from disk
-    std::string compileCmd = "cd /d \"" + IgnisResolvePath("") + "\" && compile_shaders.bat >nul 2>&1";
-    int ret = system(compileCmd.c_str());
-    if (ret != 0) {
-        Log(L"[VK RTPipeline] WARNING: compile_shaders.bat returned %d\n", ret);
-    }
-
-    // Recreate pipeline from new .spv
-    if (!CreatePipeline()) {
-        Log(L"[VK RTPipeline] ERROR: Failed to reload shaders\n");
-        return false;
-    }
-
-    // Recreate SBT for the new pipeline
-    if (!CreateSBT()) {
-        Log(L"[VK RTPipeline] ERROR: Failed to recreate SBT after shader reload\n");
-        return false;
-    }
-
-    Log(L"[VK RTPipeline] Shaders reloaded successfully\n");
-    return true;
-}
-
-bool RTPipeline::CreateSBT() {
-    VkDevice device = context_->GetDevice();
-
-    // Query RT pipeline properties for handle size/alignment
-    VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtProps{};
-    rtProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
-    VkPhysicalDeviceProperties2 props2{};
-    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-    props2.pNext = &rtProps;
-    vkGetPhysicalDeviceProperties2(context_->GetPhysicalDevice(), &props2);
-
-    uint32_t handleSize = rtProps.shaderGroupHandleSize;
-    uint32_t handleAlignment = rtProps.shaderGroupHandleAlignment;
-    uint32_t baseAlignment = rtProps.shaderGroupBaseAlignment;
-
-    // Align handle size to alignment
-    uint32_t handleSizeAligned = (handleSize + handleAlignment - 1) & ~(handleAlignment - 1);
-
-    // We have 1 group (raygen only)
-    uint32_t sbtSize = baseAlignment; // One group aligned to base alignment
-
-    // Get shader group handle
-    std::vector<uint8_t> handleData(handleSize);
-    vkGetRayTracingShaderGroupHandlesKHR_(device, pipeline_, 0, 1, handleSize, handleData.data());
-
-    // Create SBT buffer
-    VkBufferCreateInfo bufInfo{};
-    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufInfo.size = sbtSize;
-    bufInfo.usage = VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR |
-                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-    if (vkCreateBuffer(device, &bufInfo, nullptr, &sbtBuffer_) != VK_SUCCESS) {
-        Log(L"[VK RTPipeline] ERROR: Failed to create SBT buffer\n");
-        return false;
-    }
-
-    VkMemoryRequirements memReqs;
-    vkGetBufferMemoryRequirements(device, sbtBuffer_, &memReqs);
-
-    VkMemoryAllocateFlagsInfo allocFlags{};
-    allocFlags.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
-    allocFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.pNext = &allocFlags;
-    allocInfo.allocationSize = memReqs.size;
-    allocInfo.memoryTypeIndex = context_->FindMemoryType(memReqs.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-    if (vkAllocateMemory(device, &allocInfo, nullptr, &sbtMemory_) != VK_SUCCESS) {
-        Log(L"[VK RTPipeline] ERROR: Failed to allocate SBT memory\n");
-        return false;
-    }
-    vkBindBufferMemory(device, sbtBuffer_, sbtMemory_, 0);
-
-    // Write handle to SBT
-    void* mapped;
-    vkMapMemory(device, sbtMemory_, 0, sbtSize, 0, &mapped);
-    memset(mapped, 0, sbtSize);
-    memcpy(mapped, handleData.data(), handleSize);
-    vkUnmapMemory(device, sbtMemory_);
-
-    // Get SBT device address
-    VkBufferDeviceAddressInfo addrInfo{};
-    addrInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
-    addrInfo.buffer = sbtBuffer_;
-    VkDeviceAddress sbtAddress = vkGetBufferDeviceAddressKHR_(device, &addrInfo);
-
-    // Set up regions
-    raygenRegion_.deviceAddress = sbtAddress;
-    raygenRegion_.stride = handleSizeAligned;
-    raygenRegion_.size = handleSizeAligned;
-
-    // Empty miss/hit/callable regions
-    missRegion_ = {};
-    hitRegion_ = {};
-    callableRegion_ = {};
-
-    Log(L"[VK RTPipeline] SBT created (handleSize=%u, aligned=%u)\n", handleSize, handleSizeAligned);
-    return true;
-}
-
-bool RTPipeline::CreateDescriptorPool() {
+bool RTResources::CreateDescriptorPool() {
     VkDescriptorPoolSize poolSizes[] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 25},   // 13 base + 3 masks(29-31) + 1 hairV(34) + 3 hybrid(35-37) + padding
@@ -1527,13 +1302,13 @@ bool RTPipeline::CreateDescriptorPool() {
     poolInfo.pPoolSizes = poolSizes;
 
     if (vkCreateDescriptorPool(context_->GetDevice(), &poolInfo, nullptr, &descriptorPool_) != VK_SUCCESS) {
-        Log(L"[VK RTPipeline] ERROR: Failed to create descriptor pool\n");
+        Log(L"[VK RTResources] ERROR: Failed to create descriptor pool\n");
         return false;
     }
     return true;
 }
 
-bool RTPipeline::CreateDescriptorSet() {
+bool RTResources::CreateDescriptorSet() {
     // Allocate descriptor set with fixed 1024 texture slots (PARTIALLY_BOUND allows unwritten slots)
     VkDescriptorSetAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -1542,7 +1317,7 @@ bool RTPipeline::CreateDescriptorSet() {
     allocInfo.pSetLayouts = &descriptorSetLayout_;
 
     if (vkAllocateDescriptorSets(context_->GetDevice(), &allocInfo, &descriptorSet_) != VK_SUCCESS) {
-        Log(L"[VK RTPipeline] ERROR: Failed to allocate descriptor set\n");
+        Log(L"[VK RTResources] ERROR: Failed to allocate descriptor set\n");
         return false;
     }
 
@@ -1878,11 +1653,11 @@ bool RTPipeline::CreateDescriptorSet() {
 
     vkUpdateDescriptorSets(context_->GetDevice(), (uint32_t)writes.size(), writes.data(), 0, nullptr);
 
-    Log(L"[VK RTPipeline] Descriptor set created with dummy resources\n");
+    Log(L"[VK RTResources] Descriptor set created with dummy resources\n");
     return true;
 }
 
-void RTPipeline::UpdateTLASDescriptor() {
+void RTResources::UpdateTLASDescriptor() {
     if (!accelBuilder_->HasTLAS()) return;
 
     VkDevice device = context_->GetDevice();
@@ -1949,7 +1724,7 @@ void RTPipeline::UpdateTLASDescriptor() {
 
         static uint32_t s_metaLogCount = 0;
         if (s_metaLogCount++ < 3)
-            Log(L"[VK RTPipeline] Geometry metadata buffer created (%zu entries, vtx=0x%llX, idx=0x%llX)\n",
+            Log(L"[VK RTResources] Geometry metadata buffer created (%zu entries, vtx=0x%llX, idx=0x%llX)\n",
                 blasList.size(), metaData[0].vertexBufferAddress, metaData[0].indexBufferAddress);
     }
 
@@ -1991,10 +1766,10 @@ void RTPipeline::UpdateTLASDescriptor() {
     vkUpdateDescriptorSets(device, (uint32_t)writes.size(), writes.data(), 0, nullptr);
     static uint32_t s_tlasLogCount = 0;
     if (s_tlasLogCount++ < 3)
-        Log(L"[VK RTPipeline] TLAS descriptor updated\n");
+        Log(L"[VK RTResources] TLAS descriptor updated\n");
 }
 
-void RTPipeline::UpdateStorageImage(VkImageView imageView) {
+void RTResources::UpdateStorageImage(VkImageView imageView) {
     if (!imageView || descriptorSet_ == VK_NULL_HANDLE) return;
 
     VkDescriptorImageInfo imageInfo{};
@@ -2010,10 +1785,10 @@ void RTPipeline::UpdateStorageImage(VkImageView imageView) {
     write.pImageInfo = &imageInfo;
 
     vkUpdateDescriptorSets(context_->GetDevice(), 1, &write, 0, nullptr);
-    Log(L"[VK RTPipeline] Storage image descriptor updated (D3D11 interop)\n");
+    Log(L"[VK RTResources] Storage image descriptor updated (D3D11 interop)\n");
 }
 
-void RTPipeline::UpdateHybridGBufferDescriptors(VkImageView primIdView, VkImageView instanceInfoView,
+void RTResources::UpdateHybridGBufferDescriptors(VkImageView primIdView, VkImageView instanceInfoView,
                                                  VkImageView depthView) {
     if (descriptorSet_ == VK_NULL_HANDLE) return;
     VkDevice device = context_->GetDevice();
@@ -2040,7 +1815,7 @@ void RTPipeline::UpdateHybridGBufferDescriptors(VkImageView primIdView, VkImageV
     vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
 }
 
-void RTPipeline::UpdateNrcBufferDescriptors(VkBuffer counter, VkDeviceSize counterSize,
+void RTResources::UpdateNrcBufferDescriptors(VkBuffer counter, VkDeviceSize counterSize,
                                              VkBuffer queryPathInfo, VkDeviceSize queryPathInfoSize,
                                              VkBuffer trainingPathInfo, VkDeviceSize trainingPathInfoSize,
                                              VkBuffer trainingPathVertices, VkDeviceSize trainingPathVerticesSize,
@@ -2069,7 +1844,7 @@ void RTPipeline::UpdateNrcBufferDescriptors(VkBuffer counter, VkDeviceSize count
 #endif
 }
 
-void RTPipeline::UpdateCloudShadowDescriptor(VkImageView view, VkSampler sampler) {
+void RTResources::UpdateCloudShadowDescriptor(VkImageView view, VkSampler sampler) {
     if (!view || !sampler || descriptorSet_ == VK_NULL_HANDLE) return;
 
     VkDescriptorImageInfo imageInfo{};
@@ -2086,13 +1861,13 @@ void RTPipeline::UpdateCloudShadowDescriptor(VkImageView view, VkSampler sampler
     write.pImageInfo = &imageInfo;
 
     vkUpdateDescriptorSets(context_->GetDevice(), 1, &write, 0, nullptr);
-    Log(L"[VK RTPipeline] Cloud shadow map descriptor updated (binding 23)\n");
+    Log(L"[VK RTResources] Cloud shadow map descriptor updated (binding 23)\n");
 }
 
-void RTPipeline::UpdateCamera(const CameraUBO& camera) {
+void RTResources::UpdateCamera(const CameraUBO& camera) {
     static int logCount = 0;
     if (logCount < 3) {
-        Log(L"[VK RTPipeline] UpdateCamera: viewInv col3=(%.2f, %.2f, %.2f), projInv[0]=(%.4f), size=%zu\n",
+        Log(L"[VK RTResources] UpdateCamera: viewInv col3=(%.2f, %.2f, %.2f), projInv[0]=(%.4f), size=%zu\n",
             camera.viewInverse[12], camera.viewInverse[13], camera.viewInverse[14],
             camera.projInverse[0], sizeof(CameraUBO));
         logCount++;
@@ -2100,7 +1875,7 @@ void RTPipeline::UpdateCamera(const CameraUBO& camera) {
     void* mapped;
     VkResult r = vkMapMemory(context_->GetDevice(), cameraMemory_, 0, sizeof(CameraUBO), 0, &mapped);
     if (r != VK_SUCCESS) {
-        Log(L"[VK RTPipeline] UpdateCamera: vkMapMemory FAILED %d\n", r);
+        Log(L"[VK RTResources] UpdateCamera: vkMapMemory FAILED %d\n", r);
         return;
     }
     memcpy(mapped, &camera, sizeof(CameraUBO));
@@ -2108,7 +1883,7 @@ void RTPipeline::UpdateCamera(const CameraUBO& camera) {
 }
 
 #ifdef IGNIS_HAVE_NRC
-void RTPipeline::UpdateNrcConstants(const void* constants, size_t size) {
+void RTResources::UpdateNrcConstants(const void* constants, size_t size) {
     if (!nrcConstantsMapped_ || !constants) return;
     memcpy(nrcConstantsMapped_, constants, std::min(size, (size_t)128));
 
@@ -2129,14 +1904,14 @@ void RTPipeline::UpdateNrcConstants(const void* constants, size_t size) {
 }
 #endif
 
-void RTPipeline::UpdateMaterialBuffer(const GPUMaterial* materials, uint32_t count) {
+void RTResources::UpdateMaterialBuffer(const GPUMaterial* materials, uint32_t count) {
     if (!materials || count == 0) return;
 
     VkDevice device = context_->GetDevice();
     VkDeviceSize bufSize = count * sizeof(GPUMaterial);
     static bool loggedOnce = false;
     if (!loggedOnce) {
-        Log(L"[VK RTPipeline] sizeof(GPUMaterial) = %zu, count=%u, bufSize=%llu\n",
+        Log(L"[VK RTResources] sizeof(GPUMaterial) = %zu, count=%u, bufSize=%llu\n",
             sizeof(GPUMaterial), count, (unsigned long long)bufSize);
         loggedOnce = true;
     }
@@ -2182,10 +1957,10 @@ void RTPipeline::UpdateMaterialBuffer(const GPUMaterial* materials, uint32_t cou
     write.pBufferInfo = &matInfo;
 
     vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
-    Log(L"[VK RTPipeline] Material buffer updated: %u materials\n", count);
+    Log(L"[VK RTResources] Material buffer updated: %u materials\n", count);
 }
 
-void RTPipeline::UpdateEmissiveTriangleBuffer(const float* data, uint32_t triangleCount) {
+void RTResources::UpdateEmissiveTriangleBuffer(const float* data, uint32_t triangleCount) {
     if (!data || triangleCount == 0) {
         emissiveTriCount_ = 0;
         return;
@@ -2237,10 +2012,10 @@ void RTPipeline::UpdateEmissiveTriangleBuffer(const float* data, uint32_t triang
     write.pBufferInfo = &emissiveInfo;
 
     vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
-    Log(L"[VK RTPipeline] Emissive triangle buffer updated: %u triangles\n", triangleCount);
+    Log(L"[VK RTResources] Emissive triangle buffer updated: %u triangles\n", triangleCount);
 }
 
-void RTPipeline::UpdateLightTreeBuffer(const void* nodes, uint32_t nodeCount) {
+void RTResources::UpdateLightTreeBuffer(const void* nodes, uint32_t nodeCount) {
     if (!nodes || nodeCount == 0) {
         lightTreeNodeCount_ = 0;
         return;
@@ -2298,7 +2073,7 @@ void RTPipeline::UpdateLightTreeBuffer(const void* nodes, uint32_t nodeCount) {
     vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
 }
 
-void RTPipeline::UpdatePrevTransforms(const float* transforms, uint32_t instanceCount) {
+void RTResources::UpdatePrevTransforms(const float* transforms, uint32_t instanceCount) {
     if (!transforms || instanceCount == 0) return;
 
     VkDevice device = context_->GetDevice();
@@ -2355,7 +2130,7 @@ void RTPipeline::UpdatePrevTransforms(const float* transforms, uint32_t instance
     vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
 }
 
-void RTPipeline::UpdateCurrTransforms(const float* transforms, uint32_t instanceCount) {
+void RTResources::UpdateCurrTransforms(const float* transforms, uint32_t instanceCount) {
     if (!transforms || instanceCount == 0) return;
 
     VkDevice device = context_->GetDevice();
@@ -2407,7 +2182,7 @@ void RTPipeline::UpdateCurrTransforms(const float* transforms, uint32_t instance
     vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
 }
 
-void RTPipeline::UpdateTextureDescriptors(TextureManager* texMgr) {
+void RTResources::UpdateTextureDescriptors(TextureManager* texMgr) {
     if (!texMgr || texMgr->GetTextureCount() == 0) return;
 
     VkDevice device = context_->GetDevice();
@@ -2415,7 +2190,7 @@ void RTPipeline::UpdateTextureDescriptors(TextureManager* texMgr) {
 
     // Clamp to descriptor array limit to prevent descriptor overflow
     if (texCount > 1024) {
-        Log(L"[VK RTPipeline] WARNING: %u textures exceeds 1024 limit, clamping\n", texCount);
+        Log(L"[VK RTResources] WARNING: %u textures exceeds 1024 limit, clamping\n", texCount);
         texCount = 1024;
     }
 
@@ -2437,28 +2212,15 @@ void RTPipeline::UpdateTextureDescriptors(TextureManager* texMgr) {
     write.pImageInfo = imageInfos.data();
 
     vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
-    Log(L"[VK RTPipeline] Texture descriptors updated: %u textures\n", texCount);
+    Log(L"[VK RTResources] Texture descriptors updated: %u textures\n", texCount);
 }
 
-void RTPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline_);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
-        pipelineLayout_, 0, 1, &descriptorSet_, 0, nullptr);
-
-    vkCmdTraceRaysKHR_(cmd,
-        &raygenRegion_,
-        &missRegion_,
-        &hitRegion_,
-        &callableRegion_,
-        width, height, 1);
-}
-
-PickResult RTPipeline::ReadPickResult() {
+PickResult RTResources::ReadPickResult() {
     if (!pickMappedPtr_) return {0, 0, 0, 0};
     return *pickMappedPtr_;
 }
 
-void RTPipeline::ResetPickBuffer() {
+void RTResources::ResetPickBuffer() {
     if (pickMappedPtr_) pickMappedPtr_->valid = 0;
 }
 

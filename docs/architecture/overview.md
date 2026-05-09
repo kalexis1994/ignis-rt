@@ -20,7 +20,7 @@ flowchart TB
     end
 
     subgraph GPU["GPU Shaders (GLSL)"]
-        RT[raygen_blender.rgen] --> VM[Node VM]
+        RT[wavefront/wf_*.comp] --> VM[Node VM]
         RT --> BRDF[PBR BRDF]
         RT --> VOL[Volume March]
         RT --> SKY[Sky Model]

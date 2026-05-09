@@ -1,6 +1,6 @@
 #include "vk_wavefront_pipeline.h"
 #include "vk_context.h"
-#include "vk_rt_pipeline.h"
+#include "vk_rt_resources.h"
 #include "ignis_log.h"
 
 #include <fstream>
@@ -75,10 +75,10 @@ bool WavefrontPipeline::LoadComputeShader(const char* path, VkShaderModule* outM
     return vkCreateShaderModule(context_->GetDevice(), &createInfo, nullptr, outModule) == VK_SUCCESS;
 }
 
-bool WavefrontPipeline::Initialize(Context* context, RTPipeline* rtPipeline,
+bool WavefrontPipeline::Initialize(Context* context, RTResources* rtPipeline,
                                      uint32_t width, uint32_t height, uint32_t maxBounces) {
     context_ = context;
-    rtPipeline_ = rtPipeline;
+    rtResources_ = rtPipeline;
     maxPixels_ = width * height;
 
     Log(L"[Wavefront] Initializing wavefront pipeline (%ux%u = %u pixels)...\n",
@@ -157,7 +157,7 @@ void WavefrontPipeline::Shutdown() {
     ready_ = false;
 }
 
-bool WavefrontPipeline::CreateK2RTPipeline() {
+bool WavefrontPipeline::CreateK2RTResources() {
     VkDevice device = context_->GetDevice();
 
     // Load RT function pointers
@@ -448,10 +448,10 @@ bool WavefrontPipeline::CreateDescriptorSet() {
 bool WavefrontPipeline::CreatePipelines() {
     VkDevice device = context_->GetDevice();
 
-    // Pipeline layout: set 0 (scene data from RTPipeline) + set 1 (wavefront buffers)
+    // Pipeline layout: set 0 (scene data from RTResources) + set 1 (wavefront buffers)
     // + push constants (width, height, frameIndex, maxBounces, currentBounce)
     VkDescriptorSetLayout setLayouts[2] = {
-        rtPipeline_->GetDescriptorSetLayout(),
+        rtResources_->GetDescriptorSetLayout(),
         wfDescSetLayout_
     };
 
@@ -553,7 +553,7 @@ bool WavefrontPipeline::CreatePipelines() {
     // Attempt to create RT K2 pipeline for hardware SER
     // Only enable on RTX 40+ (Ada) — RTX 30 has software SER which is slower than material sort
     serAvailable_ = false;
-    if (pipelineLayoutRT_ && context_->IsHardwareSERCapable() && CreateK2RTPipeline()) {
+    if (pipelineLayoutRT_ && context_->IsHardwareSERCapable() && CreateK2RTResources()) {
         serAvailable_ = true;
         Log(L"[Wavefront] K2 RT pipeline created (hardware SER on RTX %u)\n", context_->GetRTXSeries());
     } else {

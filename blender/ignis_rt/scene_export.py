@@ -3871,7 +3871,7 @@ _NodeVmCompiler._compile_node = _patched_compile_node
 
 
 # ---- GPUMaterial struct layout (1180 bytes, scalar) ----
-# Must match GPUMaterial in vk_rt_pipeline.h exactly.
+# Must match GPUMaterial in vk_rt_resources.h exactly.
 # 35 base fields (140 bytes) + nodeVmHeader(4) + pad(12) + nodeVmCode(1024) = 1180
 _GPU_MATERIAL_BASE = struct.Struct('<' + 'I' * 5 + 'f' * 3  # tex indices (4) + normalDetail + ks (3)
                                    + 'f' * 4                  # ksSpecularEXP + emissive RGB

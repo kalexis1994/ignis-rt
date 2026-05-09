@@ -54,13 +54,15 @@ set(IGNIS_CORE_SOURCES
     src/imgui_stub.cpp
     src/sky_nishita.cpp
     src/vk/vk_renderer.cpp
+    src/vk/vk_renderer_tonemap.cpp
+    src/vk/vk_renderer_hybrid.cpp
     src/vk/vk_context.cpp
     src/vk/vk_pipeline.cpp
     src/vk/vk_geometry.cpp
     src/vk/vk_rasterizer.cpp
     src/vk/vk_wavefront_pipeline.cpp
     src/vk/vk_accel_structure.cpp
-    src/vk/vk_rt_pipeline.cpp
+    src/vk/vk_rt_resources.cpp
     src/vk/vk_interop.cpp
     src/vk/vk_texture_manager.cpp
 )
@@ -159,8 +161,6 @@ if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     set(IGNIS_SHADER_SOURCES
         basic.vert:basic.vert.spv
         basic.frag:basic.frag.spv
-        closesthit.rchit:closesthit.rchit.spv
-        miss.rmiss:miss.rmiss.spv
         nrd_composite.comp:nrd_composite.spv
         exposure_resolve.comp:exposure_resolve.comp.spv
         tonemap.comp:tonemap.comp.spv
@@ -170,8 +170,6 @@ if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
         hair_generate.comp:hair_generate.comp.spv
         gbuffer_hybrid.vert:gbuffer_hybrid.vert.spv
         gbuffer_hybrid.frag:gbuffer_hybrid.frag.spv
-        hybrid.rgen:hybrid.rgen.spv
-        # raygen_blender.rgen:raygen_blender.rgen.spv  # legacy monolithic — replaced by wavefront
         wavefront/wf_camera_rays.comp:wavefront/wf_camera_rays.comp.spv
         wavefront/wf_intersect.comp:wavefront/wf_intersect.comp.spv
         wavefront/wf_shade.comp:wavefront/wf_shade.comp.spv
