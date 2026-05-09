@@ -64,23 +64,6 @@ struct PathTracerConfig {
     // Debug
     int   debugView          = 0;       // 0 = off, >0 = debug view mode
 
-    // NRD
-    bool  nrdEnabled         = true;
-    float nrdMaxAccumFrames  = 32.0f;    // higher = smoother when static (was 24)
-    float nrdFastAccumFrames = 6.0f;    // fast history for disoccluded regions (was 4)
-    float nrdLobeAngleFraction  = 0.85f;  // [0..1] higher = more permissive lobe matching (smoother reflections)
-    float nrdRoughnessFraction  = 0.5f;   // [0..1] higher = more permissive roughness matching
-    float nrdMinHitDistanceWeight = 0.05f;
-    float nrdDisocclusionThreshold = 0.01f;
-    float nrdDiffusePrepassBlur  = 0.0f;   // [0..75] pre-pass blur radius for diffuse (0=disabled, recommended)
-    float nrdSpecularPrepassBlur = 8.0f;   // [0..75] pre-pass blur radius for specular
-    int   nrdAtrousIterations    = 5;      // [2..8] A-trous wavelet iterations (2^(N-1) pixel radius)
-    bool  nrdAntiFirefly         = true;   // clamp outlier firefly pixels
-    int   nrdHistoryFixFrameNum  = 1;      // [0..6] spatial reconstruction frames for disoccluded pixels (lower=faster recovery)
-    float nrdDepthThreshold      = 0.004f; // [0.001..0.1] depth-based edge stopping
-    float nrdDiffusePhiLuminance = 2.0f;   // [0.5..8.0] luminance edge stopping for diffuse A-trous
-    float nrdSpecularPhiLuminance= 1.0f;   // [0.5..8.0] luminance edge stopping for specular A-trous (lower = sharper reflections)
-
     // Camera jitter
     float cameraJitterScale  = 0.75f;  // [0..1] scale for Halton sub-pixel jitter
 

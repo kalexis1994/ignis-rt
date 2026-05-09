@@ -7,11 +7,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ============================================================================
 # Options
 # ============================================================================
-option(IGNIS_USE_NRD   "Enable NRD denoiser"       OFF)
 option(IGNIS_USE_DLSS  "Enable NVIDIA DLSS"         OFF)
 option(IGNIS_ENABLE_VALIDATION "Enable Vulkan validation layers in debug builds" OFF)
 
-set(IGNIS_NRD_ROOT "" CACHE PATH "Path to NVIDIA NRD root directory")
 set(IGNIS_NGX_ROOT "" CACHE PATH "Path to NVIDIA NGX SDK (headers + lib)")
 
 # ============================================================================
@@ -57,7 +55,6 @@ set(IGNIS_CORE_SOURCES
     src/vk/vk_renderer_tonemap.cpp
     src/vk/vk_renderer_hybrid.cpp
     src/vk/vk_renderer_hair.cpp
-    src/vk/vk_renderer_nrd.cpp
     src/vk/vk_context.cpp
     src/vk/vk_pipeline.cpp
     src/vk/vk_geometry.cpp
@@ -68,11 +65,6 @@ set(IGNIS_CORE_SOURCES
     src/vk/vk_interop.cpp
     src/vk/vk_texture_manager.cpp
 )
-
-# ============================================================================
-# NRD integration (always compiled — has built-in stubs when ACPT_HAVE_NRD is not defined)
-# ============================================================================
-list(APPEND IGNIS_CORE_SOURCES src/nrd_vulkan_integration.cpp)
 
 # ============================================================================
 # NIRC (always compiled — custom implementation, no external dependency)
@@ -119,20 +111,6 @@ target_compile_definitions(ignis_rt
 )
 
 # Conditional compile definitions
-if(IGNIS_USE_NRD)
-    target_compile_definitions(ignis_rt PRIVATE ACPT_HAVE_NRD)
-    if(EXISTS "${IGNIS_NRD_ROOT}/Include/NRD.h")
-        message(STATUS "Using NRD at ${IGNIS_NRD_ROOT}")
-        target_include_directories(ignis_rt PRIVATE "${IGNIS_NRD_ROOT}/Include")
-        target_link_libraries(ignis_rt PRIVATE "${IGNIS_NRD_ROOT}/_Bin/Release/NRD.lib")
-    elseif(EXISTS "${IGNIS_NRD_ROOT}/NRD/Include/NRD.h")
-        message(STATUS "Using NRD at ${IGNIS_NRD_ROOT}/NRD")
-        target_include_directories(ignis_rt PRIVATE "${IGNIS_NRD_ROOT}/NRD/Include")
-        target_link_libraries(ignis_rt PRIVATE "${IGNIS_NRD_ROOT}/NRD/_Bin/Release/NRD.lib")
-    else()
-        message(WARNING "NRD not found at IGNIS_NRD_ROOT='${IGNIS_NRD_ROOT}' — set IGNIS_NRD_ROOT")
-    endif()
-endif()
 if(IGNIS_USE_DLSS)
     target_compile_definitions(ignis_rt PRIVATE ACPT_HAVE_NGX)
     # Try NGX_ROOT
@@ -163,7 +141,6 @@ if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     set(IGNIS_SHADER_SOURCES
         basic.vert:basic.vert.spv
         basic.frag:basic.frag.spv
-        nrd_composite.comp:nrd_composite.spv
         exposure_resolve.comp:exposure_resolve.comp.spv
         tonemap.comp:tonemap.comp.spv
         sharc_resolve.comp:sharc_resolve.comp.spv

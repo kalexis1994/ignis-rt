@@ -11,7 +11,6 @@
 #include "ignis_log.h"
 #include "ignis_config.h"
 #include "vk_check.h"
-#include "nrd_vulkan_integration.h"
 #include "nirc_integration.h"
 #include <vector>
 #include <fstream>
@@ -160,9 +159,8 @@ const char* Renderer::InitializeStep(HWND hwnd, uint32_t width, uint32_t height)
     }
 
     if (initStep_ == 4) {
-        // Step 4: NRD + G-buffers + RT pipeline + compose
-        // Call the full InitRT which handles the remaining setup
-        // (interop + DLSS already done, InitRT will skip those)
+        // Step 4: G-buffers + RT resources + wavefront pipeline
+        // (interop + DLSS already done above)
         InitRT_Remaining();
         Log(L"[VK Renderer] ========== INITIALIZATION COMPLETE ==========\n");
         initStep_ = 5;
@@ -257,7 +255,7 @@ bool Renderer::InitRT() {
         return false;
     }
 
-    // Initialize DLSS (before NRD so we know render resolution)
+    // Initialize DLSS so we know render resolution before allocating G-buffers
     renderWidth_ = width_;
     renderHeight_ = height_;
 
@@ -476,9 +474,9 @@ bool Renderer::InitRT() {
     if (cfg && cfg->dlssRREnabled && dlssActive_ && dlss_) {
         if (dlss_->InitializeRR()) {
             dlssRRActive_ = true;
-            Log(L"[VK Renderer] DLSS Ray Reconstruction active — will skip NRD\n");
+            Log(L"[VK Renderer] DLSS Ray Reconstruction active\n");
         } else {
-            Log(L"[VK Renderer] RR unavailable, falling back to NRD + SR\n");
+            Log(L"[VK Renderer] RR unavailable, using DLSS SR only\n");
         }
     }
 
@@ -505,14 +503,10 @@ bool Renderer::InitRT() {
         rtResources_->UpdateStorageImage(dlssColorInputView_);
     }
 
-    // Create G-buffers and initialize NRD denoiser (at render resolution)
-    if (!InitNRD()) {
-        // NRD failed — create G-buffers anyway so shader bindings are valid
-        rtResources_->CreateGBuffers(renderWidth_, renderHeight_);
-        Log(L"[VK Renderer] RT modules initialized (no denoiser)\n");
-    } else {
-        Log(L"[VK Renderer] RT modules initialized with NRD denoiser\n");
-    }
+    // Create render-resolution G-buffers (normals, depth, MVs, albedo, ...)
+    // consumed by DLSS Ray Reconstruction and the wavefront kernels.
+    rtResources_->CreateGBuffers(renderWidth_, renderHeight_);
+    Log(L"[VK Renderer] RT modules initialized\n");
 
     // Initialize NRC (Neural Radiance Cache)
 
@@ -530,7 +524,7 @@ bool Renderer::InitRT() {
 
 void Renderer::InitRT_Remaining() {
     // Called from phased init step 4 — interop + DLSS already initialized.
-    // Handles: DLSS images, RR, AccelStruct, RT Pipeline, NRD, Wavefront.
+    // Handles: DLSS images, RR, AccelStruct, RT resources, G-buffers, Wavefront.
     PathTracerConfig* cfg = VK_GetConfig();
     VkDevice device = context_->GetDevice();
 
@@ -640,10 +634,8 @@ void Renderer::InitRT_Remaining() {
         rtResources_->UpdateStorageImage(dlssColorInputView_);
     }
 
-    // NRD denoiser
-    if (!InitNRD()) {
-        rtResources_->CreateGBuffers(renderWidth_, renderHeight_);
-    }
+    // G-buffers for DLSS RR / wavefront
+    rtResources_->CreateGBuffers(renderWidth_, renderHeight_);
 
     // NRC (Neural Radiance Cache)
 
@@ -845,20 +837,16 @@ void Renderer::UpdateCamera(const CameraUBO& camera) {
         rtResources_->UpdateCamera(camera);
     }
     // Track the Python-side frame index for shader use.
-    // Do NOT reset renderer frameIndex_ here — NRD's anti-lag handles
-    // shadow changes naturally without destructive CLEAR_AND_RESTART.
 
-    // Store matrices for NRD
+    // Cache view/proj for downstream passes (DLSS RR jitter, hybrid raster MVPs)
     memcpy(lastView_, camera.view, 64);
     memcpy(lastProj_, camera.proj, 64);
-    memcpy(lastViewPrev_, camera.viewPrev, 64);
-    memcpy(lastProjPrev_, camera.projPrev, 64);
     // Extract camera world position from viewInverse column 3 (column-major)
     camWorldPos_[0] = camera.viewInverse[12];
     camWorldPos_[1] = camera.viewInverse[13];
     camWorldPos_[2] = camera.viewInverse[14];
 
-    // Store jitter for NRD and DLSS
+    // Store jitter for DLSS
     prevJitterX_ = jitterX_;
     prevJitterY_ = jitterY_;
     jitterX_ = camera.jitterData[0];
@@ -911,7 +899,7 @@ void Renderer::RenderFrameRT() {
         ReloadAgXLutIfChanged();  // filesystem stat every ~10s, not every 2s
     }
 
-    // Single command buffer: RT → NRD → Composite → ImGui → Readback
+    // Single command buffer: RT → DLSS (RR or SR+tonemap) → ImGui → Readback
     vkResetCommandBuffer(cmd, 0);
 
     VkCommandBufferBeginInfo beginInfo{};
@@ -1109,8 +1097,8 @@ void Renderer::RenderFrameRT() {
 
     WriteTimestamp(cmd, TS_HAIR);
 
-    // Wavefront path: skip NRD denoise + composite — K5 wrote G-buffers + output
-    // But DLSS SR + tonemap still need to run if DLSS is active
+    // K5 (wf_output) wrote G-buffers + the final HDR image into dlssColorInput.
+    // From here we either feed DLSS SR + tonemap, or DLSS Ray Reconstruction.
     bool wavefrontActive = wavefrontPipeline_ && wavefrontPipeline_->IsReady();
 
     if (wavefrontActive && dlssActive_ && dlss_ && dlss_->IsInitialized() && dlss_->IsSupported() && !dlssRRActive_ && !debugViewActive) {
@@ -1169,8 +1157,7 @@ void Renderer::RenderFrameRT() {
         }
     }
 
-    // 2. Ray Reconstruction path (replaces NRD + composite + DLSS SR)
-    // RR still runs with wavefront — it denoises + upscales K5's noisy output
+    // 2. Ray Reconstruction path (denoises + upscales K5's noisy output in one pass)
     // Skip when debug view active — raygen wrote final LDR directly to interop
     if (dlssRRActive_ && dlss_ && dlss_->IsRRActive() && !debugViewActive) {
         // Barrier: RT/compute writes → RR reads (G-buffers and noisy color)
@@ -1222,7 +1209,7 @@ void Renderer::RenderFrameRT() {
             rtResources_->GetReactiveMaskView());
 
         WriteTimestamp(cmd, TS_DENOISE);
-        WriteTimestamp(cmd, TS_COMPOSITE);  // RR path has no separate composite
+        WriteTimestamp(cmd, TS_COMPOSITE);  // no separate composite, marker only
 
         // Barrier: RR writes → tonemap reads
         VkMemoryBarrier rrBarrier{};
@@ -1261,242 +1248,6 @@ void Renderer::RenderFrameRT() {
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                 0, 1, &tonemapBarrier, 0, nullptr, 0, nullptr);
-        }
-    }
-    // 2b. NRD denoise path (traditional pipeline)
-    // Skip when debug view active — raygen wrote final LDR directly to interop
-    else if (!wavefrontActive && nrdInitialized_ && !debugViewActive) {
-        // Barrier: RT writes → NRD reads (G-buffers and output image)
-        VkMemoryBarrier rtToNrd{};
-        rtToNrd.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        rtToNrd.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        rtToNrd.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 1, &rtToNrd, 0, nullptr, 0, nullptr);
-
-        // Measure real frame delta for NRD temporal accumulation
-        static auto s_lastFrameTime = std::chrono::high_resolution_clock::now();
-        auto now = std::chrono::high_resolution_clock::now();
-        float frameDeltaMs = std::chrono::duration<float, std::milli>(now - s_lastFrameTime).count();
-        s_lastFrameTime = now;
-        // Clamp to reasonable range (1ms = 1000fps, 100ms = 10fps)
-        if (frameDeltaMs < 1.0f) frameDeltaMs = 1.0f;
-        if (frameDeltaMs > 100.0f) frameDeltaMs = 100.0f;
-
-        // Set sun direction for SIGMA shadow denoiser
-        {
-            PathTracerConfig* nrdCfg = VK_GetConfig();
-            float nrdSunDir[3] = {0.4f, 0.85f, 0.35f};
-            if (nrdCfg) {
-                float az = nrdCfg->sunAzimuth * 3.14159265f / 180.0f;
-                float el = nrdCfg->sunElevation * 3.14159265f / 180.0f;
-                nrdSunDir[0] = sinf(az) * cosf(el);
-                nrdSunDir[1] = sinf(el);
-                nrdSunDir[2] = cosf(az) * cosf(el);
-            }
-            acpt::NRD_Vulkan_SetSunDirection(nrdSunDir[0], nrdSunDir[1], nrdSunDir[2]);
-        }
-
-        // Pass actual sub-pixel jitter to NRD for correct temporal reprojection.
-        // NRD expects pixel-space jitter matching what was applied in the shader.
-        acpt::NRD_Vulkan_Denoise(cmd, frameIndex_,
-            lastView_, lastProj_, lastViewPrev_, lastProjPrev_,
-            jitterX_, jitterY_, prevJitterX_, prevJitterY_, frameDeltaMs,
-            dlssActive_);
-
-        if (diagFlush) {
-            if (!VK_CHECK(vkEndCommandBuffer(cmd))) return;
-            VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-            Log(L"[DIAG] frame %u: submitting NRD denoise...\n", frameIndex_);
-            VkResult r = vkQueueSubmit(context_->GetGraphicsQueue(), 1, &si, VK_NULL_HANDLE);
-            if (r != VK_SUCCESS) { Log(L"[DIAG] NRD submit FAILED: %d\n", r); return; }
-            vkQueueWaitIdle(context_->GetGraphicsQueue());
-            Log(L"[DIAG] frame %u: NRD denoise OK\n", frameIndex_);
-            vkResetCommandBuffer(cmd, 0);
-            VkCommandBufferBeginInfo bi2{}; bi2.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            vkBeginCommandBuffer(cmd, &bi2);
-        }
-
-        WriteTimestamp(cmd, TS_DENOISE);
-
-        // 3. Composite dispatch (reads NRD outputs, writes to interop image)
-        // Skip when debug view is active — raygen already wrote final output directly
-        if (compositeReady_ && !debugViewActive) {
-            // Barrier: NRD writes → Composite reads
-            VkMemoryBarrier nrdToComposite{};
-            nrdToComposite.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-            nrdToComposite.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            nrdToComposite.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            vkCmdPipelineBarrier(cmd,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0, 1, &nrdToComposite, 0, nullptr, 0, nullptr);
-
-            // Update composite descriptors (binds NRD outputs + interop image)
-            UpdateCompositeDescriptors();
-
-            // Bind composite pipeline and dispatch
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, compositePipeline_);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                compositePipelineLayout_, 0, 1, &compositeDescriptorSet_, 0, nullptr);
-
-            PathTracerConfig* cfg = VK_GetConfig();
-
-            // CPU readback of auto-exposure from previous frame (1-frame delay, standard practice)
-            if (cfg->ptAutoExposure && exposureResolveReady_ && exposureStagingSSBO_.memory != VK_NULL_HANDLE) {
-                void* mapped;
-                if (vkMapMemory(device, exposureStagingSSBO_.memory, 0, 12, 0, &mapped) == VK_SUCCESS) {
-                    float* data = reinterpret_cast<float*>(static_cast<uint8_t*>(mapped) + 8);  // offset to currentExposure
-                    computedExposure_ = *data;
-                    vkUnmapMemory(device, exposureStagingSSBO_.memory);
-                }
-            }
-
-            struct { uint32_t mode; uint32_t tonemapMode; float exposure; float saturation; float contrast; uint32_t hdrOutput; } compositeParams;
-            compositeParams.mode = 1;  // Normal NRD composite
-            compositeParams.tonemapMode = static_cast<uint32_t>(cfg->ptTonemapMode);
-            compositeParams.exposure = cfg->ptAutoExposure ? computedExposure_ : cfg->ptExposure;
-            compositeParams.saturation = cfg->ptSaturation;
-            compositeParams.contrast = cfg->ptContrast;
-            compositeParams.hdrOutput = dlssActive_ ? 1 : 0;
-            vkCmdPushConstants(cmd, compositePipelineLayout_,
-                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(compositeParams), &compositeParams);
-
-            vkCmdDispatch(cmd, (renderWidth_ + 7) / 8, (renderHeight_ + 7) / 8, 1);
-
-            // Auto-exposure resolve: read accumulated luminance, compute EMA exposure, reset accumulators
-            if (exposureResolveReady_ && cfg->ptAutoExposure) {
-                // Barrier: composite SSBO writes → resolve reads/writes
-                VkMemoryBarrier exposureBarrier{};
-                exposureBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-                exposureBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                exposureBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &exposureBarrier, 0, nullptr, 0, nullptr);
-
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, exposureResolvePipeline_);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                    exposureResolvePipelineLayout_, 0, 1, &exposureResolveDescSet_, 0, nullptr);
-
-                float dt = 1.0f / 60.0f;  // approximate; good enough for EMA
-                struct { float key, speed, minE, maxE; } resolvePush;
-                resolvePush.key = cfg->ptAutoExposureKey;
-                resolvePush.speed = 1.0f - expf(-cfg->ptAutoExposureSpeed * dt);  // frame-rate independent EMA
-                resolvePush.minE = cfg->ptAutoExposureMin;
-                resolvePush.maxE = cfg->ptAutoExposureMax;
-                vkCmdPushConstants(cmd, exposureResolvePipelineLayout_,
-                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(resolvePush), &resolvePush);
-
-                vkCmdDispatch(cmd, 1, 1, 1);
-
-                // Barrier: resolve writes → staging copy
-                VkMemoryBarrier resolveCopyBarrier{};
-                resolveCopyBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-                resolveCopyBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                resolveCopyBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &resolveCopyBarrier, 0, nullptr, 0, nullptr);
-
-                // Copy SSBO to staging for CPU readback next frame
-                VkBufferCopy copyRegion{};
-                copyRegion.size = 12;
-                vkCmdCopyBuffer(cmd, exposureSSBO_.buffer, exposureStagingSSBO_.buffer, 1, &copyRegion);
-            }
-
-            // Barrier: Composite writes → Rain/DLSS/ImGui/readback reads
-            VkMemoryBarrier compositeBarrier{};
-            compositeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-            compositeBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            compositeBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
-            vkCmdPipelineBarrier(cmd,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                0, 1, &compositeBarrier, 0, nullptr, 0, nullptr);
-
-            if (diagFlush) {
-                if (!VK_CHECK(vkEndCommandBuffer(cmd))) return;
-                VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-                si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-                Log(L"[DIAG] frame %u: submitting composite...\n", frameIndex_);
-                VkResult r = vkQueueSubmit(context_->GetGraphicsQueue(), 1, &si, VK_NULL_HANDLE);
-                if (r != VK_SUCCESS) { Log(L"[DIAG] composite submit FAILED: %d\n", r); return; }
-                vkQueueWaitIdle(context_->GetGraphicsQueue());
-                Log(L"[DIAG] frame %u: composite OK\n", frameIndex_);
-                vkResetCommandBuffer(cmd, 0);
-                VkCommandBufferBeginInfo bi2{}; bi2.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-                vkBeginCommandBuffer(cmd, &bi2);
-            }
-
-            WriteTimestamp(cmd, TS_COMPOSITE);
-
-            // 3b. DLSS upscaling (render res → display res)
-            if (dlssActive_ && dlss_ && dlss_->IsInitialized() && dlss_->IsSupported()) {
-                // Measure real frame delta for DLSS
-                static auto s_lastDlssTime = std::chrono::high_resolution_clock::now();
-                auto dlssNow = std::chrono::high_resolution_clock::now();
-                float dlssDeltaMs = std::chrono::duration<float, std::milli>(dlssNow - s_lastDlssTime).count();
-                s_lastDlssTime = dlssNow;
-                if (dlssDeltaMs < 1.0f) dlssDeltaMs = 1.0f;
-                if (dlssDeltaMs > 100.0f) dlssDeltaMs = 100.0f;
-
-                dlss_->Evaluate(cmd,
-                    dlssColorInput_, dlssColorInputView_,          // HDR color (RGBA16F, render res)
-                    rtResources_->GetDlssDepthImage(),              // NDC depth [0,1] (binding 22)
-                    rtResources_->GetDlssDepthView(),
-                    rtResources_->GetMotionVectorsImage(),          // MV
-                    rtResources_->GetMotionVectorsView(),
-                    dlssHdrOutput_, dlssHdrOutputView_,            // HDR output (RGBA16F, display res)
-                    VK_FORMAT_R16G16B16A16_SFLOAT,                 // color format (HDR)
-                    VK_FORMAT_R32_SFLOAT,                          // depth format
-                    VK_FORMAT_R16G16B16A16_SFLOAT,                 // MV format
-                    jitterX_, jitterY_,                            // pixel-space jitter
-                    dlssDeltaMs / 1000.0f,                         // deltaTime (seconds)
-                    0.0f,                                          // sharpness
-                    false,                                         // reset
-                    rtResources_->GetReactiveMaskImage(),            // reactive mask
-                    rtResources_->GetReactiveMaskView());            // reactive mask view
-
-                // Barrier: DLSS writes → tonemap reads
-                VkMemoryBarrier dlssBarrier{};
-                dlssBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-                dlssBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                dlssBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                vkCmdPipelineBarrier(cmd,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    0, 1, &dlssBarrier, 0, nullptr, 0, nullptr);
-
-                // Tonemap: DLSS HDR output → LDR interop
-                if (tonemapReady_) {
-                    UpdateTonemapDescriptors();
-                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, tonemapPipeline_);
-                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                        tonemapPipelineLayout_, 0, 1, &tonemapDescSet_, 0, nullptr);
-
-                    struct { uint32_t mode; float exposure, saturation, contrast; } tonemapPush;
-                    tonemapPush.mode = static_cast<uint32_t>(cfg->ptTonemapMode);
-                    tonemapPush.exposure = cfg->ptAutoExposure ? computedExposure_ : cfg->ptExposure;
-                    tonemapPush.saturation = cfg->ptSaturation;
-                    tonemapPush.contrast = cfg->ptContrast;
-                    vkCmdPushConstants(cmd, tonemapPipelineLayout_,
-                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tonemapPush), &tonemapPush);
-
-                    vkCmdDispatch(cmd, (width_ + 7) / 8, (height_ + 7) / 8, 1);
-
-                    // Barrier: tonemap writes → ImGui/readback reads
-                    VkMemoryBarrier tonemapBarrier{};
-                    tonemapBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-                    tonemapBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                    tonemapBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
-                    vkCmdPipelineBarrier(cmd,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                        0, 1, &tonemapBarrier, 0, nullptr, 0, nullptr);
-                }
-            }
         }
     }
 
@@ -1555,10 +1306,7 @@ void Renderer::RenderFrameRT() {
 
     VkResult submitResult = vkQueueSubmit(context_->GetGraphicsQueue(), 1, &submitInfo, inFlightFences_[currentFrame_]);
     if (submitResult != VK_SUCCESS) {
-        if (nrdInitialized_) {
-            Log(L"[VK Renderer] Submit failed (%d) — disabling NRD\n", (int)submitResult);
-            nrdInitialized_ = false;
-        }
+        Log(L"[VK Renderer] vkQueueSubmit failed: %d\n", (int)submitResult);
         return;
     }
 
@@ -1591,9 +1339,6 @@ void Renderer::RenderFrameRT() {
         }
         if (tonemapReady_) {
             UpdateTonemapDescriptors();
-        }
-        if (compositeReady_ && !dlssActive_) {
-            UpdateCompositeDescriptors();
         }
     }
 
@@ -2506,8 +2251,8 @@ void Renderer::ReadbackTimestamps() {
     gpuStageMs_[0] = delta(TS_START, TS_HYBRID);     // Hybrid Raster
     gpuStageMs_[1] = delta(TS_HYBRID, TS_RT);         // RT Trace
     gpuStageMs_[2] = delta(TS_RT, TS_HAIR);           // Hair Contour
-    gpuStageMs_[3] = delta(TS_HAIR, TS_DENOISE);      // Denoise (NRD/DLSS RR)
-    gpuStageMs_[4] = delta(TS_DENOISE, TS_COMPOSITE); // Composite
+    gpuStageMs_[3] = delta(TS_HAIR, TS_DENOISE);      // DLSS RR
+    gpuStageMs_[4] = delta(TS_DENOISE, TS_COMPOSITE); // (unused — composite removed)
     gpuStageMs_[5] = delta(TS_COMPOSITE, TS_TONEMAP);  // Tonemap/DLSS SR
     gpuStageMs_[6] = delta(TS_START, TS_TONEMAP);      // Total
 }
@@ -2531,12 +2276,11 @@ void Renderer::Shutdown() {
         }
     }
 
-    // Shutdown hair contour + SHARC resolve + auto-exposure + NRD + composite + DLSS
+    // Shutdown sub-systems (hair contour, SHARC resolve, auto-exposure, hybrid, DLSS)
     ShutdownHairContour();
     ShutdownSHARCResolve();
     ShutdownExposureResolve();
     ShutdownHybridGBuffer();
-    ShutdownNRD();
     ShutdownDLSS();
     if (nirc_) { nirc_->Shutdown(); delete nirc_; nirc_ = nullptr; }
 

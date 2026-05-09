@@ -20,7 +20,6 @@ echo Compiling hybrid G-buffer shaders...
 %GLSLC% %ARGS% "%SHADER_DIR%\gbuffer_hybrid.frag"   -o "%SHADER_DIR%\gbuffer_hybrid.frag.spv"
 
 echo Compiling compute shaders...
-%GLSLC% %ARGS% "%SHADER_DIR%\nrd_composite.comp"    -o "%SHADER_DIR%\nrd_composite.spv"
 %GLSLC% %ARGS% "%SHADER_DIR%\tonemap.comp"          -o "%SHADER_DIR%\tonemap.comp.spv"
 %GLSLC% %ARGS% "%SHADER_DIR%\exposure_resolve.comp" -o "%SHADER_DIR%\exposure_resolve.comp.spv"
 %GLSLC% %ARGS% "%SHADER_DIR%\sharc_resolve.comp"    -o "%SHADER_DIR%\sharc_resolve.comp.spv"

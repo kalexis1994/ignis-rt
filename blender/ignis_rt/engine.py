@@ -739,11 +739,8 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         # Report denoiser status
         dlss_on = dll_wrapper.get_int("dlss_active")
         rr_on = dll_wrapper.get_int("dlss_rr_active")
-        nrd_on = dll_wrapper.get_int("nrd_active")
         if rr_on:
             _log(" Denoiser: DLSS Ray Reconstruction")
-        elif nrd_on:
-            _log(" Denoiser: NRD (RELAX + SIGMA)")
         elif dlss_on:
             _log(" Denoiser: DLSS SR only (no denoiser)")
         else:
@@ -2520,7 +2517,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         _total_ms = _perf_timings.get("total", 0.0) * 1000
         _perf_flush(_ignis_frame_index, _total_ms, force=(_ignis_frame_index < 20))
 
-        # Always request next frame — NRD needs continuous accumulation to converge
+        # Always request next frame — DLSS RR needs continuous history to converge
         self.tag_redraw()
 
     # Final render (F12)

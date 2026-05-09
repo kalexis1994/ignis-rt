@@ -65,7 +65,7 @@ static void DestroyHiddenWindow() {
     }
 }
 
-// Expose config for NRD integration (extern in nrd_vulkan_integration.cpp)
+// Expose config to other translation units (e.g. vk_renderer)
 namespace acpt {
     PathTracerConfig* VK_GetConfig() { return &g_config; }
 }
@@ -205,11 +205,7 @@ IGNIS_API bool ignis_create(uint32_t width, uint32_t height) {
         return false;
     }
 
-    // Log NRD config at creation time
-    acpt::PathTracerConfig* cfg = &acpt::g_config;
-    Log(L"[Ignis] Created OK. NRD config: maxAccum=%.1f fastAccum=%.1f disocclusion=%.4f\n",
-        cfg->nrdMaxAccumFrames, cfg->nrdFastAccumFrames, cfg->nrdDisocclusionThreshold);
-
+    Log(L"[Ignis] Created OK\n");
     return true;
 }
 
@@ -776,17 +772,6 @@ IGNIS_API void ignis_set_float(const char* key, float value) {
     else if (strcmp(key, "auto_exposure_speed") == 0) cfg->ptAutoExposureSpeed = value;
     else if (strcmp(key, "auto_exposure_min") == 0)  cfg->ptAutoExposureMin = value;
     else if (strcmp(key, "auto_exposure_max") == 0)  cfg->ptAutoExposureMax = value;
-    else if (strcmp(key, "nrd_max_accum") == 0)      cfg->nrdMaxAccumFrames = value;
-    else if (strcmp(key, "nrd_fast_accum") == 0)      cfg->nrdFastAccumFrames = value;
-    else if (strcmp(key, "nrd_disocclusion") == 0)   cfg->nrdDisocclusionThreshold = value;
-    else if (strcmp(key, "nrd_diffuse_prepass_blur") == 0)  cfg->nrdDiffusePrepassBlur = value;
-    else if (strcmp(key, "nrd_specular_prepass_blur") == 0) cfg->nrdSpecularPrepassBlur = value;
-    else if (strcmp(key, "nrd_depth_threshold") == 0)       cfg->nrdDepthThreshold = value;
-    else if (strcmp(key, "nrd_diffuse_phi_luminance") == 0) cfg->nrdDiffusePhiLuminance = value;
-    else if (strcmp(key, "nrd_specular_phi_luminance") == 0) cfg->nrdSpecularPhiLuminance = value;
-    else if (strcmp(key, "nrd_lobe_angle_fraction") == 0)   cfg->nrdLobeAngleFraction = value;
-    else if (strcmp(key, "nrd_roughness_fraction") == 0)    cfg->nrdRoughnessFraction = value;
-    else if (strcmp(key, "nrd_min_hit_dist_weight") == 0)   cfg->nrdMinHitDistanceWeight = value;
     else if (strcmp(key, "hdri_strength") == 0)             cfg->hdriStrength = value;
     else if (strcmp(key, "dof_aperture") == 0)              cfg->dofAperture = value;
     else if (strcmp(key, "dof_focus_dist") == 0)            cfg->dofFocusDist = value;
@@ -806,10 +791,6 @@ IGNIS_API void ignis_set_int(const char* key, int value) {
     else if (strcmp(key, "dlss_enabled") == 0)      cfg->dlssEnabled = (value != 0);
     else if (strcmp(key, "dlss_quality") == 0)      cfg->dlssQualityMode = value;
     else if (strcmp(key, "dlss_rr_enabled") == 0)   cfg->dlssRREnabled = (value != 0);
-    else if (strcmp(key, "nrd_enabled") == 0)       cfg->nrdEnabled = (value != 0);
-    else if (strcmp(key, "nrd_atrous_iterations") == 0) cfg->nrdAtrousIterations = (value < 2 ? 2 : (value > 8 ? 8 : value));
-    else if (strcmp(key, "nrd_anti_firefly") == 0)  cfg->nrdAntiFirefly = (value != 0);
-    else if (strcmp(key, "nrd_history_fix_frames") == 0) cfg->nrdHistoryFixFrameNum = (value < 0 ? 0 : (value > 6 ? 6 : value));
     else if (strcmp(key, "max_bounces") == 0)       cfg->maxBounces = (value < 1 ? 1 : (value > 8 ? 8 : value));
     else if (strcmp(key, "spp") == 0)              cfg->samplesPerPixel = (value < 1 ? 1 : (value > 128 ? 128 : value));
     else if (strcmp(key, "shader_mode") == 0)       cfg->shaderMode = value;
@@ -833,7 +814,6 @@ IGNIS_API int ignis_get_int(const char* key) {
     // Renderer state queries
     if (strcmp(key, "dlss_active") == 0)      return g_renderer && g_renderer->IsDLSSActive() ? 1 : 0;
     if (strcmp(key, "dlss_rr_active") == 0)    return g_renderer && g_renderer->IsDLSSRRActive() ? 1 : 0;
-    if (strcmp(key, "nrd_active") == 0)        return g_renderer && g_renderer->IsDLSSActive() && !g_renderer->IsDLSSRRActive() ? 1 : 0;
     if (strcmp(key, "display_width") == 0)     return g_renderer ? (int)g_renderer->GetRenderWidth() : 0;
     if (strcmp(key, "display_height") == 0)    return g_renderer ? (int)g_renderer->GetRenderHeight() : 0;
 
@@ -841,7 +821,6 @@ IGNIS_API int ignis_get_int(const char* key) {
     acpt::PathTracerConfig* cfg = &acpt::g_config;
     if (strcmp(key, "dlss_enabled") == 0)      return cfg->dlssEnabled ? 1 : 0;
     if (strcmp(key, "dlss_rr_enabled") == 0)   return cfg->dlssRREnabled ? 1 : 0;
-    if (strcmp(key, "nrd_enabled") == 0)       return cfg->nrdEnabled ? 1 : 0;
     if (strcmp(key, "max_bounces") == 0)       return cfg->maxBounces;
     if (strcmp(key, "debug_view") == 0)        return cfg->debugView;
     if (strcmp(key, "shader_mode") == 0)       return cfg->shaderMode;
@@ -981,23 +960,6 @@ IGNIS_API bool ignis_save_config(const char* path) {
     fprintf(f, "color_b=%.4f\n", cfg->ambientColorB);
     fprintf(f, "intensity=%.4f\n", cfg->ambientIntensity);
     fprintf(f, "visibility_km=%.4f\n", cfg->cloudVisibility);
-
-    fprintf(f, "\n[nrd]\n");
-    fprintf(f, "enabled=%d\n", cfg->nrdEnabled ? 1 : 0);
-    fprintf(f, "max_accum_frames=%.1f\n", cfg->nrdMaxAccumFrames);
-    fprintf(f, "fast_accum_frames=%.1f\n", cfg->nrdFastAccumFrames);
-    fprintf(f, "lobe_angle_fraction=%.4f\n", cfg->nrdLobeAngleFraction);
-    fprintf(f, "roughness_fraction=%.4f\n", cfg->nrdRoughnessFraction);
-    fprintf(f, "min_hit_dist_weight=%.4f\n", cfg->nrdMinHitDistanceWeight);
-    fprintf(f, "disocclusion_threshold=%.4f\n", cfg->nrdDisocclusionThreshold);
-    fprintf(f, "diffuse_prepass_blur=%.1f\n", cfg->nrdDiffusePrepassBlur);
-    fprintf(f, "specular_prepass_blur=%.1f\n", cfg->nrdSpecularPrepassBlur);
-    fprintf(f, "atrous_iterations=%d\n", cfg->nrdAtrousIterations);
-    fprintf(f, "anti_firefly=%d\n", cfg->nrdAntiFirefly ? 1 : 0);
-    fprintf(f, "history_fix_frames=%d\n", cfg->nrdHistoryFixFrameNum);
-    fprintf(f, "depth_threshold=%.4f\n", cfg->nrdDepthThreshold);
-    fprintf(f, "diffuse_phi_luminance=%.4f\n", cfg->nrdDiffusePhiLuminance);
-    fprintf(f, "specular_phi_luminance=%.4f\n", cfg->nrdSpecularPhiLuminance);
 
     fprintf(f, "\n[dlss]\n");
     fprintf(f, "enabled=%d\n", cfg->dlssEnabled ? 1 : 0);

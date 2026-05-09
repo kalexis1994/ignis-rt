@@ -30,7 +30,7 @@ public:
     // Step 1: Basic pipelines + geometry
     // Step 2: RT pipeline + interop
     // Step 3: DLSS initialization
-    // Step 4: NRD + G-buffers + compose pipelines
+    // Step 4: G-buffers + RT resources + wavefront pipeline
     // Returns step name string, or nullptr when all steps complete.
     const char* InitializeStep(HWND hwnd, uint32_t width, uint32_t height);
     int GetInitStep() const { return initStep_; }
@@ -137,7 +137,7 @@ public:
 private:
     bool CreateCommandBuffers();
     bool CreateSyncObjects();
-    void InitRT_Remaining();  // RT pipeline + NRD (called after DLSS init in phased mode)
+    void InitRT_Remaining();  // RT resources + G-buffers + wavefront (called after DLSS init in phased mode)
 
     Context* context_ = nullptr;
     Pipeline* pipeline_ = nullptr;
@@ -239,28 +239,11 @@ private:
     bool CreateTonemapPipeline();
     void ShutdownTonemap();
 
-    // NRD denoiser
-    bool nrdInitialized_ = false;
+    // Camera state cached for downstream passes (DLSS RR jitter, hybrid raster MVPs).
     uint32_t frameIndex_ = 0;
     float lastView_[16] = {0};
     float lastProj_[16] = {0};
-    float lastViewPrev_[16] = {0};
-    float lastProjPrev_[16] = {0};
     float camWorldPos_[3] = {0};
-
-    // Composite compute pipeline
-    VkPipeline compositePipeline_ = VK_NULL_HANDLE;
-    VkPipelineLayout compositePipelineLayout_ = VK_NULL_HANDLE;
-    VkDescriptorSetLayout compositeDescriptorSetLayout_ = VK_NULL_HANDLE;
-    VkDescriptorPool compositeDescriptorPool_ = VK_NULL_HANDLE;
-    VkDescriptorSet compositeDescriptorSet_ = VK_NULL_HANDLE;
-    VkSampler compositeSampler_ = VK_NULL_HANDLE;
-    bool compositeReady_ = false;
-
-    bool InitNRD();
-    bool CreateCompositePipeline();
-    void UpdateCompositeDescriptors();
-    void ShutdownNRD();
 
     // Hybrid G-buffer rasterization pipeline
     VkRenderPass hybridRenderPass_ = VK_NULL_HANDLE;

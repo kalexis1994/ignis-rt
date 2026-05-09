@@ -24,7 +24,6 @@ Real-time Vulkan path tracing renderer for Blender. Hardware-accelerated ray tra
 
 ### Denoising & Upscaling
 - **DLSS Ray Reconstruction** — neural denoiser that replaces traditional denoising + upscaling in one pass (all RTX GPUs)
-- **NRD ReLAX + SIGMA** fallback — temporal denoiser for diffuse/specular + shadow denoiser
 - **DLSS Super Resolution** — temporal upscaling (Ultra Performance to DLAA)
 - **Auto-exposure** with GPU histogram and EMA smoothing
 

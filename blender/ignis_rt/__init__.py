@@ -169,7 +169,7 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
     )
     dlss_rr_enabled: BoolProperty(
         name="Ray Reconstruction",
-        description="Use DLSS Ray Reconstruction (replaces NRD denoiser, requires RTX GPU + driver 535+)",
+        description="Use DLSS Ray Reconstruction as the path tracing denoiser (requires RTX GPU + driver 535+)",
         default=True,
     )
     dlss_rr_preset: EnumProperty(
