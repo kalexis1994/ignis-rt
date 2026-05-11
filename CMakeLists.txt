@@ -157,6 +157,9 @@ if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
         gbuffer_hybrid.frag:gbuffer_hybrid.frag.spv
         wavefront/wf_prepare_lights.comp:wavefront/wf_prepare_lights.comp.spv
         wavefront/wf_di_initial_samples.comp:wavefront/wf_di_initial_samples.comp.spv
+        wavefront/wf_di_temporal.comp:wavefront/wf_di_temporal.comp.spv
+        wavefront/wf_di_spatial.comp:wavefront/wf_di_spatial.comp.spv
+        wavefront/wf_di_shade.comp:wavefront/wf_di_shade.comp.spv
         wavefront/wf_camera_rays.comp:wavefront/wf_camera_rays.comp.spv
         wavefront/wf_intersect.comp:wavefront/wf_intersect.comp.spv
         wavefront/wf_shade.comp:wavefront/wf_shade.comp.spv

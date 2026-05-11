@@ -1,0 +1,415 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+
+// ============================================================
+// wf_di_spatial.comp — RTXDI DI spatial reuse (Phase 4e).
+//
+// Reads each pixel's post-temporal reservoir from diPolyScratch
+// (set 2 b=2), loops K random neighbours in a disk, validates
+// each one (surface gates + albedo + chromaticity), re-evaluates
+// target pdfs at the current surface, and merges with defensive-1/k
+// pairwise MIS (Bitterli 2020 + ignis-web 8edf296). Writes the
+// post-spatial final reservoir into diPolyFinalCurr (set 2 b=3).
+// That buffer becomes diPolyFinalPrev next frame via the
+// ping-pong, closing the temporal loop.
+//
+// Fast-path: pixels whose own.M has converged to ≥ 0.75 × clamp
+// skip the neighbour loop entirely. In steady state this fires
+// for nearly all pixels; camera motion / disocclusion temporal
+// gates reset M where spatial is useful.
+//
+// Disocclusion boost: past the fast-path check, own.M ≤ 15 by
+// construction (freshly disoccluded). Bump K to 8 (RTXPT's
+// numDisocclusionBoostSamples default) so the disocclusion band
+// shrinks within 1-2 frames instead of ~5.
+//
+// Port differences from ignis-ac (mirror wf_di_temporal):
+//   - set 3 → set 2, bindings shifted (scratch b=2, finalCurr b=3).
+//   - primaryGBuf stride 26, primitiveId in place of materialId,
+//     hardcoded dielectric metallic / specularLevel.
+// ============================================================
+
+#include "../include/common.glsl"
+#include "../include/pbr_brdf.glsl"
+#include "../include/wf_lights.glsl"
+#include "../include/wf_di_reservoir.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// ── set 0: scene ──
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+
+layout(binding = 2, set = 0) uniform CameraProperties {
+    mat4 viewInverse;
+    mat4 projInverse;
+    mat4 view;
+    mat4 proj;
+    mat4 viewPrev;
+    mat4 projPrev;
+    uvec4 parameters;
+    vec4 jitterData;
+    vec4 sunLight;
+    vec4 ambientLight;
+    vec4 skyLight;
+    vec4 ptParams0;
+    vec4 ptParams1;
+    vec4 windParams;
+    vec4 rainParams;
+    vec4 dofParams;
+    vec4 dofParams2;
+    ivec4 jitterPattern[8];
+    uint lightCount;
+    uint lightPad0, lightPad1, lightPad2;
+    vec4 lights[128];
+    uint64_t sharcHashEntriesAddr;
+    uint64_t sharcAccumulationAddr;
+    uint64_t sharcResolvedAddr;
+    uint sharcCapacity;
+    float sharcSceneScale;
+    float sharcRadianceScale;
+    float sharcWarmupFactor;
+} cam;
+
+// ── set 1: primary gbuf ──
+layout(binding = 4, set = 1, scalar) buffer PrimaryGBufBuffer {
+    float gbufData[];
+} primaryGBuf;
+
+// ── set 2: DI port ──
+layout(binding = 0, set = 2, scalar) readonly  buffer PolyLightsBuf    { WFLightInfo data[]; } polyLights;
+layout(binding = 2, set = 2, std430) readonly  buffer DIPolyScratchBuf { vec4 data[]; }       diPolyScratch;
+layout(binding = 3, set = 2, std430) writeonly buffer DIPolyFinalCurr  { vec4 data[]; }       diPolyFinalCurr;
+
+layout(push_constant) uniform PC {
+    uint width;
+    uint height;
+    uint frameIndex;
+    uint lightCount;
+} pc;
+
+const uint WF_PRIMARY_GBUF_STRIDE = 26u;
+
+WFDIReservoir loadScratch(uint idx) {
+    uint b = idx * 2u;
+    return wf_di_reservoir_unpack(diPolyScratch.data[b + 0u], diPolyScratch.data[b + 1u]);
+}
+void storeFinalCurr(uint idx, WFDIReservoir r) {
+    uint b = idx * 2u;
+    vec4 v0, v1;
+    wf_di_reservoir_pack(r, v0, v1);
+    diPolyFinalCurr.data[b + 0u] = v0;
+    diPolyFinalCurr.data[b + 1u] = v1;
+}
+bool reservoirLightMatches(WFDIReservoir r) {
+    return r.lightIdx < pc.lightCount &&
+           r.stableId != 0u &&
+           polyLights.data[r.lightIdx].stableId == r.stableId;
+}
+
+struct SurfaceData {
+    vec3  x_v, n_v;
+    float roughness;
+    vec3  baseColor;
+    float metallic;
+    float specularLevel;
+    float depth_view;
+    uint  instanceId;
+    uint  primitiveId;
+    uint  customIndex;
+    bool  valid;
+};
+SurfaceData loadSurface(uint pixelIdx) {
+    uint gBase = pixelIdx * WF_PRIMARY_GBUF_STRIDE;
+    SurfaceData s;
+    s.n_v           = vec3(primaryGBuf.gbufData[gBase + 0u],
+                             primaryGBuf.gbufData[gBase + 1u],
+                             primaryGBuf.gbufData[gBase + 2u]);
+    s.roughness     = primaryGBuf.gbufData[gBase + 3u];
+    s.x_v           = vec3(primaryGBuf.gbufData[gBase + 4u],
+                             primaryGBuf.gbufData[gBase + 5u],
+                             primaryGBuf.gbufData[gBase + 6u]);
+    float viewZ     = primaryGBuf.gbufData[gBase + 7u];
+    s.baseColor     = vec3(primaryGBuf.gbufData[gBase + 8u],
+                             primaryGBuf.gbufData[gBase + 9u],
+                             primaryGBuf.gbufData[gBase + 10u]);
+    s.metallic      = 0.0;
+    s.specularLevel = 0.5;
+    s.instanceId    = floatBitsToUint(primaryGBuf.gbufData[gBase + 15u]);
+    s.primitiveId   = floatBitsToUint(primaryGBuf.gbufData[gBase + 24u]);
+    s.customIndex   = floatBitsToUint(primaryGBuf.gbufData[gBase + 25u]);
+    s.depth_view    = -viewZ;
+    s.valid         = (viewZ < -0.001) && dot(s.n_v, s.n_v) > 1e-6;
+    return s;
+}
+
+bool spatialMaterialsCompatible(SurfaceData a, SurfaceData b) {
+    // primitiveId stands in for materialId here (see header note).
+    if (a.primitiveId != b.primitiveId) return false;
+    if (abs(a.roughness     - b.roughness)     > WF_DI_ROUGHNESS_MAX_DIFF) return false;
+    if (abs(a.metallic      - b.metallic)      > WF_DI_METALLIC_MAX_DIFF)  return false;
+    if (abs(a.specularLevel - b.specularLevel) > WF_DI_SPECULAR_MAX_DIFF)  return false;
+    return true;
+}
+
+void reconstructSample(in WFLightInfo li, vec2 uv,
+                         out vec3 samplePos, out vec3 sampleNormal) {
+    if (li.type == WF_LIGHT_TYPE_TRIANGLE) {
+        samplePos = li.base + li.edges0 * uv.x + li.edges1 * uv.y;
+        vec3 c = cross(li.edges0, li.edges1);
+        float len = length(c);
+        sampleNormal = (len > 1e-8) ? (c / len) : vec3(0.0, 1.0, 0.0);
+    } else if (li.type == WF_LIGHT_TYPE_DIRECTIONAL) {
+        samplePos    = normalize(li.base) * 1e6;
+        sampleNormal = -normalize(li.base);
+    } else {
+        samplePos    = li.base;
+        sampleNormal = (li.type == WF_LIGHT_TYPE_SPOT) ? normalize(li.edges0)
+                                                       : vec3(0.0, 1.0, 0.0);
+    }
+}
+
+void evalBRDF(vec3 N, vec3 V, vec3 L,
+              vec3 baseColor, float roughness, float metallic, float specularLevel,
+              out vec3 diff, out vec3 spec) {
+    evaluateCookTorrance(N, V, L, baseColor, roughness, metallic, specularLevel,
+                          1.5, 0.0, diff, spec,
+                          0.0, 0.0, 1.5,
+                          0.0, vec3(0.0), 0.0,
+                          0.0, vec3(0.0), vec3(0.0),
+                          vec3(1.0), 0.0);
+}
+
+float evalTargetPdfAt(in WFLightInfo li, vec2 lightUV,
+                       vec3 x_v, vec3 n_v, vec3 V,
+                       vec3 baseColor, float roughness,
+                       float metallic, float specularLevel) {
+    vec3 contrib = vec3(0.0);
+
+    if (li.type == WF_LIGHT_TYPE_DIRECTIONAL) {
+        vec3 L = normalize(li.base);
+        float ndl = dot(n_v, L);
+        if (ndl <= 0.0) return 0.0;
+        vec3 dC, sC;
+        evalBRDF(n_v, V, L, baseColor, roughness, metallic, specularLevel, dC, sC);
+        contrib = (dC + sC) * li.emission;
+    }
+    else if (li.type == WF_LIGHT_TYPE_POINT || li.type == WF_LIGHT_TYPE_SPOT) {
+        vec3 toL = li.base - x_v;
+        float dist = length(toL);
+        if (dist < 1e-4) return 0.0;
+        float range = (li.type == WF_LIGHT_TYPE_POINT) ? li.scalars.x : li.scalars.z;
+        if (range > 0.0 && dist > range) return 0.0;
+        vec3 L = toL / dist;
+        float ndl = dot(n_v, L);
+        if (ndl <= 0.0) return 0.0;
+
+        float atten = 1.0;
+        if (li.type == WF_LIGHT_TYPE_SPOT) {
+            vec3 axis = normalize(li.edges0);
+            float cosInner = li.scalars.x;
+            float cosOuter = li.scalars.y;
+            atten = smoothstep(cosOuter, cosInner, dot(-L, axis));
+            if (atten <= 0.0) return 0.0;
+        }
+        float falloff = 1.0 / (dist * dist + 0.01);
+        float window = 1.0;
+        if (range > 0.0) {
+            window = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0);
+            window = window * window;
+        }
+        vec3 dC, sC;
+        evalBRDF(n_v, V, L, baseColor, roughness, metallic, specularLevel, dC, sC);
+        contrib = (dC + sC) * li.emission * falloff * window * atten;
+    }
+    else if (li.type == WF_LIGHT_TYPE_TRIANGLE) {
+        vec3 samplePos, sampleNormal;
+        reconstructSample(li, lightUV, samplePos, sampleNormal);
+        vec3 toL = samplePos - x_v;
+        float dist = length(toL);
+        if (dist < 1e-4) return 0.0;
+        vec3 L = toL / dist;
+        float ndl = dot(n_v, L);
+        if (ndl <= 0.0) return 0.0;
+        float cosLight = dot(-L, sampleNormal);
+        if (cosLight <= 0.0) return 0.0;
+        vec3 dC, sC;
+        evalBRDF(n_v, V, L, baseColor, roughness, metallic, specularLevel, dC, sC);
+        float G = cosLight / (dist * dist);
+        contrib = (dC + sC) * li.emission * G;
+    }
+
+    return max(contrib.r, max(contrib.g, contrib.b));
+}
+
+bool traceOccluded(vec3 origin, vec3 dir, float tmax) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, topLevelAS,
+                           gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                           0xFFu, origin, 1e-4, dir, tmax);
+    rayQueryProceedEXT(rq);
+    return rayQueryGetIntersectionTypeEXT(rq, true)
+            != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(pc.width) || pixel.y >= int(pc.height)) return;
+    uint pixelIdx = uint(pixel.y) * pc.width + uint(pixel.x);
+
+    SurfaceData s_r = loadSurface(pixelIdx);
+    if (!s_r.valid) {
+        storeFinalCurr(pixelIdx, wf_di_reservoir_empty());
+        return;
+    }
+
+    WFDIReservoir own = loadScratch(pixelIdx);
+
+    // Fast-path: skip spatial once history saturates.
+    if (own.M > WF_DI_M_CLAMP * 0.75) {
+        storeFinalCurr(pixelIdx, own);
+        return;
+    }
+
+    if (own.M <= 0.0 ||
+        own.lightIdx == WF_DI_INVALID_LIGHT ||
+        !reservoirLightMatches(own)) {
+        storeFinalCurr(pixelIdx, wf_di_reservoir_empty());
+        return;
+    }
+
+    vec3 cameraPos = cam.viewInverse[3].xyz;
+    vec3 V         = normalize(cameraPos - s_r.x_v);
+
+    rngState = (pixelIdx * 2654435761u) ^ (pc.frameIndex * 0x6AF9D5C1u);
+    rngState = pcg(rngState);
+
+    const uint  K     = WF_DI_SPATIAL_K_BOOST;
+    const float INV_K = 1.0 / float(K);
+
+    const float M_r = own.M;
+    float p_hat_r_Xr = evalTargetPdfAt(polyLights.data[own.lightIdx], own.lightUV,
+                                        s_r.x_v, s_r.n_v, V,
+                                        s_r.baseColor, s_r.roughness,
+                                        s_r.metallic, s_r.specularLevel);
+
+    WFDIReservoir r = wf_di_reservoir_empty();
+    float canonical_mis_minus = 0.0;
+
+    for (uint k = 0u; k < K; k++) {
+        vec2  u     = rand2();
+        float theta = u.x * 6.28318530718;
+        float radius = sqrt(u.y) * WF_DI_SPATIAL_RADIUS;
+        ivec2 off = ivec2(int(round(radius * cos(theta))),
+                            int(round(radius * sin(theta))));
+        ivec2 px_q = pixel + off;
+        if (px_q.x < 0 || px_q.y < 0 ||
+            px_q.x >= int(pc.width) || px_q.y >= int(pc.height)) continue;
+        uint idx_q = uint(px_q.y) * pc.width + uint(px_q.x);
+        if (idx_q == pixelIdx) continue;
+
+        SurfaceData s_q = loadSurface(idx_q);
+        if (!s_q.valid) continue;
+
+        float depth_rel_err = abs(s_r.depth_view - s_q.depth_view) /
+                               max(s_r.depth_view, 0.1);
+        if (depth_rel_err > WF_DI_DEPTH_VALID_RELERR) continue;
+        if (dot(s_r.n_v, s_q.n_v) < WF_DI_NORMAL_VALID_COS) continue;
+
+        if (!spatialMaterialsCompatible(s_r, s_q)) continue;
+
+        // Albedo + chromaticity gate.
+        float lum_r = dot(s_r.baseColor, vec3(0.2126, 0.7152, 0.0722));
+        float lum_q = dot(s_q.baseColor, vec3(0.2126, 0.7152, 0.0722));
+        float lum_min = min(lum_r, lum_q);
+        float lum_max = max(lum_r, lum_q);
+        if (lum_min < 1e-3 && lum_max > 1e-3) continue;
+        if (lum_max / max(lum_min, 1e-3) > 4.0) continue;
+        float len_r = length(s_r.baseColor);
+        float len_q = length(s_q.baseColor);
+        if (len_r > 1e-4 && len_q > 1e-4) {
+            float chromaDot = dot(s_r.baseColor, s_q.baseColor) / (len_r * len_q);
+            if (chromaDot < 0.92) continue;
+        }
+
+        WFDIReservoir prev_q = loadScratch(idx_q);
+        if (prev_q.M <= 0.0 || !reservoirLightMatches(prev_q)) continue;
+        if ((prev_q.flags & WF_DI_FLAG_OCCLUDED) != 0u) continue;
+
+        WFLightInfo li_q = polyLights.data[prev_q.lightIdx];
+
+        float p_hat_r_Xq = evalTargetPdfAt(li_q, prev_q.lightUV,
+                                             s_r.x_v, s_r.n_v, V,
+                                             s_r.baseColor, s_r.roughness,
+                                             s_r.metallic, s_r.specularLevel);
+        if (p_hat_r_Xq <= 0.0) continue;
+
+        vec3 samplePos, sampleN;
+        reconstructSample(li_q, prev_q.lightUV, samplePos, sampleN);
+        vec3  seg     = samplePos - s_r.x_v;
+        float seg_len = length(seg);
+        if (seg_len < 1e-4) continue;
+        vec3 seg_dir  = seg / seg_len;
+        float tmax    = (li_q.type == WF_LIGHT_TYPE_DIRECTIONAL)
+                          ? seg_len
+                          : max(seg_len - 0.15, seg_len * 0.5);
+        vec3 origin   = s_r.x_v + s_r.n_v * 0.001;
+        if (traceOccluded(origin, seg_dir, tmax)) continue;
+
+        vec3 V_q = normalize(cameraPos - s_q.x_v);
+        float p_hat_q_Xq = evalTargetPdfAt(li_q, prev_q.lightUV,
+                                             s_q.x_v, s_q.n_v, V_q,
+                                             s_q.baseColor, s_q.roughness,
+                                             s_q.metallic, s_q.specularLevel);
+        float p_hat_q_Xr = evalTargetPdfAt(polyLights.data[own.lightIdx], own.lightUV,
+                                             s_q.x_v, s_q.n_v, V_q,
+                                             s_q.baseColor, s_q.roughness,
+                                             s_q.metallic, s_q.specularLevel);
+
+        float M_q = min(prev_q.M, WF_DI_M_CLAMP);
+
+        float denom_q = M_r * p_hat_r_Xq + M_q * p_hat_q_Xq;
+        float m_q = (denom_q > 1e-10)
+                     ? INV_K * (M_q * p_hat_q_Xq) / denom_q
+                     : 0.0;
+
+        float denom_r = M_r * p_hat_r_Xr + M_q * p_hat_q_Xr;
+        if (denom_r > 1e-10) {
+            canonical_mis_minus += INV_K * (M_q * p_hat_q_Xr) / denom_r;
+        }
+
+        float w_q = m_q * p_hat_r_Xq * prev_q.W;
+        r.wSum += w_q;
+        r.M    += M_q;
+        if (w_q > 0.0 && rand01() * r.wSum < w_q) {
+            r.lightIdx  = prev_q.lightIdx;
+            r.stableId  = prev_q.stableId;
+            r.lightUV   = prev_q.lightUV;
+            r.targetPdf = p_hat_r_Xq;
+            r.flags     = prev_q.flags;
+        }
+    }
+
+    if (p_hat_r_Xr > 0.0 && own.W > 0.0 && reservoirLightMatches(own)) {
+        float m_r = max(1.0 - canonical_mis_minus, 0.0);
+        float w_r = m_r * p_hat_r_Xr * own.W;
+        r.wSum += w_r;
+        r.M    += M_r;
+        if (w_r > 0.0 && rand01() * r.wSum < w_r) {
+            r.lightIdx  = own.lightIdx;
+            r.stableId  = own.stableId;
+            r.lightUV   = own.lightUV;
+            r.targetPdf = p_hat_r_Xr;
+            r.flags     = own.flags;
+        }
+    } else {
+        r.M += M_r;
+    }
+
+    wf_di_reservoir_finalize(r);
+
+    storeFinalCurr(pixelIdx, r);
+}

@@ -200,7 +200,8 @@ public:
     // 4b-derived light tiles, etc.) will add more bindings here without
     // touching set 1.
     VkDescriptorSetLayout GetDIDescriptorSetLayout() const { return diDescriptorSetLayout_; }
-    VkDescriptorSet       GetDIDescriptorSet() const       { return diDescriptorSet_; }
+    VkDescriptorSet       GetDIDescriptorSet() const       { return diDescriptorSet_[diSetIndex_]; }
+    void                  FlipDIDescriptorSet()            { diSetIndex_ ^= 1u; }
 
     // Create full-resolution G-buffer images and update descriptors
     bool CreateGBuffers(uint32_t width, uint32_t height);
@@ -261,10 +262,10 @@ private:
     bool CreateDescriptorSetLayout();
     bool CreateDescriptorPool();
     bool CreateDescriptorSet();
-    bool CreateDIDescriptorSet();   // Phase 4b: descriptor set 2 (DI port).
-    bool CreateDIPolyBuffers(uint32_t width, uint32_t height); // Phase 4c
-    void DestroyDIPolyBuffers();
-    void UpdateDIInitialDescriptor();                          // rewrites set 2 b=1
+    bool CreateDIDescriptorSet();   // Phase 4b/4d: descriptor set 2 (DI port).
+    bool CreateDIBuffers(uint32_t width, uint32_t height);     // Phase 4c/4d
+    void DestroyDIBuffers();
+    void WriteDIDescriptors();                                 // rewrites all DI b=1..6
     bool CreateDummyResources();
 
     Context* context_ = nullptr;
@@ -275,17 +276,29 @@ private:
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
 
-    // Descriptor set 2 — RTXDI DI port resources.
-    // Binding 0: polyLightsBuffer_   (Phase 4b — storage buffer, scalar)
-    // Binding 1: diPolyInitialBuffer_ (Phase 4c — 32 B / pixel reservoir; sized
-    //            by CreateDIPolyBuffers, rewritten on resize)
+    // Descriptor set 2 — RTXDI DI port resources. 7 bindings; the per-
+    // pixel buffers (final[2], gbuf[2]) ping-pong between the two sets.
+    //   b=0 polyLights        (4b — no pp)
+    //   b=1 diPolyInitial     (4c — no pp)
+    //   b=2 diPolyScratch     (4d — no pp)
+    //   b=3 diPolyFinalCurr   (4d — pp write — to be consumed by 4e spatial)
+    //   b=4 diPolyFinalPrev   (4d — pp read)
+    //   b=5 diGBufPrev        (4d — pp read)
+    //   b=6 diGBufCurr        (4d — pp write)
     VkDescriptorSetLayout diDescriptorSetLayout_ = VK_NULL_HANDLE;
-    VkDescriptorPool diDescriptorPool_ = VK_NULL_HANDLE;
-    VkDescriptorSet diDescriptorSet_ = VK_NULL_HANDLE;
+    VkDescriptorPool      diDescriptorPool_      = VK_NULL_HANDLE;
+    VkDescriptorSet       diDescriptorSet_[2]    = {};
+    uint32_t              diSetIndex_            = 0;
 
-    VkBuffer       diPolyInitialBuffer_ = VK_NULL_HANDLE;
-    VkDeviceMemory diPolyInitialMemory_ = VK_NULL_HANDLE;
-    uint32_t       diPolyPixelCount_ = 0;
+    VkBuffer       diPolyInitialBuffer_  = VK_NULL_HANDLE;
+    VkDeviceMemory diPolyInitialMemory_  = VK_NULL_HANDLE;
+    VkBuffer       diPolyScratchBuffer_  = VK_NULL_HANDLE;
+    VkDeviceMemory diPolyScratchMemory_  = VK_NULL_HANDLE;
+    VkBuffer       diPolyFinalBuffer_[2] = {};
+    VkDeviceMemory diPolyFinalMemory_[2] = {};
+    VkBuffer       diGBufBuffer_[2]      = {};
+    VkDeviceMemory diGBufMemory_[2]      = {};
+    uint32_t       diPolyPixelCount_     = 0;
 
     // Camera UBO
     VkBuffer cameraBuffer_ = VK_NULL_HANDLE;

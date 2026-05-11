@@ -45,6 +45,45 @@ public:
                                  uint32_t frameIndex,
                                  uint32_t lightCount);
 
+    /// Phase 4d: dispatch wf_di_temporal over primary pixels.
+    /// Reads diPolyInitial + diPolyFinalPrev + diGBufPrev (via set 2),
+    /// writes diPolyScratch + diGBufCurr. Must be called AFTER
+    /// RecordDIInitialSamples (depends on initial reservoir).
+    /// No-op when lightCount == 0.
+    void RecordDITemporal(VkCommandBuffer cmd,
+                           VkDescriptorSet sceneDescSet,
+                           VkDescriptorSet diDescSet,
+                           uint32_t width, uint32_t height,
+                           uint32_t frameIndex,
+                           uint32_t lightCount);
+
+    /// Phase 4e: dispatch wf_di_spatial over primary pixels.
+    /// Reads diPolyScratch (the temporal output) and writes
+    /// diPolyFinalCurr (the closes-the-loop final reservoir for
+    /// next-frame temporal reuse). Must be called AFTER
+    /// RecordDITemporal. No-op when lightCount == 0.
+    void RecordDISpatial(VkCommandBuffer cmd,
+                          VkDescriptorSet sceneDescSet,
+                          VkDescriptorSet diDescSet,
+                          uint32_t width, uint32_t height,
+                          uint32_t frameIndex,
+                          uint32_t lightCount);
+
+    /// Phase 4f: dispatch wf_di_shade over primary pixels.
+    /// Reads diPolyFinalCurr, atomic-adds BSDF × Li × geometry × W
+    /// into pixelRadiance's diffuse slots. Currently runs additively
+    /// on top of the inline NEE in wf_shade — directly-lit primary
+    /// surfaces will look ~2× as bright until the inline path is
+    /// gated off at bounce 0 in a follow-up.
+    /// Must be called AFTER RecordDISpatial. No-op when
+    /// lightCount == 0.
+    void RecordDIShade(VkCommandBuffer cmd,
+                        VkDescriptorSet sceneDescSet,
+                        VkDescriptorSet diDescSet,
+                        uint32_t width, uint32_t height,
+                        uint32_t frameIndex,
+                        uint32_t lightCount);
+
     bool IsReady() const { return ready_; }
 
 private:
@@ -145,11 +184,14 @@ private:
     VkPipelineLayout pipelineLayoutDIPrepare_ = VK_NULL_HANDLE;
     VkPipeline       pipelinePrepareLights_   = VK_NULL_HANDLE;
 
-    // Phase 4c — DI initial-sample reservoir generator. Same descriptor
-    // sets as the main wavefront (scene + wavefront + DI port). Push:
-    // width, height, frameIndex, lightCount.
+    // Phase 4c/4d — DI port compute pipelines. All share the same
+    // 3-set + 4×u32-push layout. Initial / temporal differ only in
+    // which set 2 bindings they touch.
     VkPipelineLayout pipelineLayoutDI_     = VK_NULL_HANDLE;
     VkPipeline       pipelineDIInitial_    = VK_NULL_HANDLE;
+    VkPipeline       pipelineDITemporal_   = VK_NULL_HANDLE;
+    VkPipeline       pipelineDISpatial_    = VK_NULL_HANDLE;
+    VkPipeline       pipelineDIShade_      = VK_NULL_HANDLE;
 
     // RT pipeline for K2 (shade) — enables hardware SER via reorderThreadNV
     VkPipeline pipelineK2RT_ = VK_NULL_HANDLE;

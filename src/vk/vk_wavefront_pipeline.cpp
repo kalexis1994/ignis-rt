@@ -130,8 +130,11 @@ void WavefrontPipeline::Shutdown() {
     destroyPipeline(pipelinePrepareLights_);
     if (pipelineLayoutDIPrepare_) { vkDestroyPipelineLayout(device, pipelineLayoutDIPrepare_, nullptr); pipelineLayoutDIPrepare_ = VK_NULL_HANDLE; }
 
-    // Phase 4c — wf_di_initial_samples.
+    // Phase 4c/4d/4e/4f — DI port pipelines.
     destroyPipeline(pipelineDIInitial_);
+    destroyPipeline(pipelineDITemporal_);
+    destroyPipeline(pipelineDISpatial_);
+    destroyPipeline(pipelineDIShade_);
     if (pipelineLayoutDI_) { vkDestroyPipelineLayout(device, pipelineLayoutDI_, nullptr); pipelineLayoutDI_ = VK_NULL_HANDLE; }
 
     destroyPipeline(pipelineK2RT_);
@@ -203,41 +206,37 @@ void WavefrontPipeline::RecordPrepareLights(VkCommandBuffer cmd,
 }
 
 // ------------------------------------------------------------
-// Phase 4c: wf_di_initial_samples dispatch.
-//   8×8 workgroups over the render resolution. Uses set 1 [0]
-//   for primaryGBuf (read-only here — choice of ping-pong is
-//   irrelevant since both sets bind the same primaryGBuf at b=4).
-//   Inserts a memory barrier so 4d (temporal) can read the freshly
-//   written reservoir.
+// Phase 4c/4d: DI port dispatch helper. 8×8 workgroups over the
+// render resolution; same push-constant shape and set bindings for
+// every DI compute pipeline. After each dispatch we issue a
+// SHADER_WRITE → SHADER_READ barrier so downstream DI kernels see
+// the freshly written reservoir / gbuf snapshot.
 // ------------------------------------------------------------
-void WavefrontPipeline::RecordDIInitialSamples(VkCommandBuffer cmd,
-                                                VkDescriptorSet sceneDescSet,
-                                                VkDescriptorSet diDescSet,
-                                                uint32_t width, uint32_t height,
-                                                uint32_t frameIndex,
-                                                uint32_t lightCount) {
-    if (!ready_ || pipelineDIInitial_ == VK_NULL_HANDLE) return;
-    if (lightCount == 0) return;
-    if (width == 0 || height == 0) return;
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineDIInitial_);
-    VkDescriptorSet sets[3] = { sceneDescSet, wfDescSet_[0], diDescSet };
+static void recordDIDispatch(VkCommandBuffer cmd,
+                              VkPipelineLayout layout,
+                              VkPipeline pipeline,
+                              VkDescriptorSet sceneDescSet,
+                              VkDescriptorSet wfDescSet,
+                              VkDescriptorSet diDescSet,
+                              uint32_t width, uint32_t height,
+                              uint32_t frameIndex, uint32_t lightCount) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    VkDescriptorSet sets[3] = { sceneDescSet, wfDescSet, diDescSet };
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipelineLayoutDI_, 0, 3, sets, 0, nullptr);
+                            layout, 0, 3, sets, 0, nullptr);
 
     struct { uint32_t width, height, frameIndex, lightCount; } pc;
     pc.width      = width;
     pc.height     = height;
     pc.frameIndex = frameIndex;
     pc.lightCount = lightCount;
-    vkCmdPushConstants(cmd, pipelineLayoutDI_,
-                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(pc), &pc);
 
     uint32_t gx = (width  + 7) / 8;
     uint32_t gy = (height + 7) / 8;
     vkCmdDispatch(cmd, gx, gy, 1);
 
-    // diPolyInitial → consumed by future DI temporal/spatial passes.
     VkMemoryBarrier b{};
     b.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -245,6 +244,58 @@ void WavefrontPipeline::RecordDIInitialSamples(VkCommandBuffer cmd,
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 1, &b, 0, nullptr, 0, nullptr);
+}
+
+void WavefrontPipeline::RecordDIInitialSamples(VkCommandBuffer cmd,
+                                                VkDescriptorSet sceneDescSet,
+                                                VkDescriptorSet diDescSet,
+                                                uint32_t width, uint32_t height,
+                                                uint32_t frameIndex,
+                                                uint32_t lightCount) {
+    if (!ready_ || pipelineDIInitial_ == VK_NULL_HANDLE) return;
+    if (lightCount == 0 || width == 0 || height == 0) return;
+    recordDIDispatch(cmd, pipelineLayoutDI_, pipelineDIInitial_,
+                     sceneDescSet, wfDescSet_[0], diDescSet,
+                     width, height, frameIndex, lightCount);
+}
+
+void WavefrontPipeline::RecordDITemporal(VkCommandBuffer cmd,
+                                          VkDescriptorSet sceneDescSet,
+                                          VkDescriptorSet diDescSet,
+                                          uint32_t width, uint32_t height,
+                                          uint32_t frameIndex,
+                                          uint32_t lightCount) {
+    if (!ready_ || pipelineDITemporal_ == VK_NULL_HANDLE) return;
+    if (lightCount == 0 || width == 0 || height == 0) return;
+    recordDIDispatch(cmd, pipelineLayoutDI_, pipelineDITemporal_,
+                     sceneDescSet, wfDescSet_[0], diDescSet,
+                     width, height, frameIndex, lightCount);
+}
+
+void WavefrontPipeline::RecordDISpatial(VkCommandBuffer cmd,
+                                         VkDescriptorSet sceneDescSet,
+                                         VkDescriptorSet diDescSet,
+                                         uint32_t width, uint32_t height,
+                                         uint32_t frameIndex,
+                                         uint32_t lightCount) {
+    if (!ready_ || pipelineDISpatial_ == VK_NULL_HANDLE) return;
+    if (lightCount == 0 || width == 0 || height == 0) return;
+    recordDIDispatch(cmd, pipelineLayoutDI_, pipelineDISpatial_,
+                     sceneDescSet, wfDescSet_[0], diDescSet,
+                     width, height, frameIndex, lightCount);
+}
+
+void WavefrontPipeline::RecordDIShade(VkCommandBuffer cmd,
+                                       VkDescriptorSet sceneDescSet,
+                                       VkDescriptorSet diDescSet,
+                                       uint32_t width, uint32_t height,
+                                       uint32_t frameIndex,
+                                       uint32_t lightCount) {
+    if (!ready_ || pipelineDIShade_ == VK_NULL_HANDLE) return;
+    if (lightCount == 0 || width == 0 || height == 0) return;
+    recordDIDispatch(cmd, pipelineLayoutDI_, pipelineDIShade_,
+                     sceneDescSet, wfDescSet_[0], diDescSet,
+                     width, height, frameIndex, lightCount);
 }
 
 bool WavefrontPipeline::CreateK2RTResources() {
@@ -728,25 +779,45 @@ bool WavefrontPipeline::CreatePipelines() {
             return false;
         }
 
-        VkShaderModule diMod;
-        if (!LoadComputeShader("shaders/wavefront/wf_di_initial_samples.comp.spv", &diMod)) {
-            Log(L"[Wavefront] ERROR: wf_di_initial_samples shader not found\n");
+        auto buildDIPipeline = [&](const char* path, VkPipeline* outPipe, const wchar_t* tag) -> bool {
+            VkShaderModule mod;
+            if (!LoadComputeShader(path, &mod)) {
+                Log(L"[Wavefront] ERROR: %s shader not found\n", tag);
+                return false;
+            }
+            VkComputePipelineCreateInfo pi{};
+            pi.sType        = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+            pi.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            pi.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+            pi.stage.module = mod;
+            pi.stage.pName  = "main";
+            pi.layout       = pipelineLayoutDI_;
+            VkResult r = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pi, nullptr, outPipe);
+            vkDestroyShaderModule(device, mod, nullptr);
+            if (r != VK_SUCCESS) {
+                Log(L"[Wavefront] ERROR: Failed to create %s pipeline\n", tag);
+                return false;
+            }
+            Log(L"[Wavefront] %s pipeline created (sets 0+1+2)\n", tag);
+            return true;
+        };
+
+        if (!buildDIPipeline("shaders/wavefront/wf_di_initial_samples.comp.spv",
+                              &pipelineDIInitial_, L"wf_di_initial_samples")) {
             return false;
         }
-        VkComputePipelineCreateInfo diPi{};
-        diPi.sType        = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        diPi.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        diPi.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-        diPi.stage.module = diMod;
-        diPi.stage.pName  = "main";
-        diPi.layout       = pipelineLayoutDI_;
-        VkResult diR = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &diPi, nullptr, &pipelineDIInitial_);
-        vkDestroyShaderModule(device, diMod, nullptr);
-        if (diR != VK_SUCCESS) {
-            Log(L"[Wavefront] ERROR: Failed to create wf_di_initial_samples pipeline\n");
+        if (!buildDIPipeline("shaders/wavefront/wf_di_temporal.comp.spv",
+                              &pipelineDITemporal_, L"wf_di_temporal")) {
             return false;
         }
-        Log(L"[Wavefront] wf_di_initial_samples pipeline created (sets 0+1+2)\n");
+        if (!buildDIPipeline("shaders/wavefront/wf_di_spatial.comp.spv",
+                              &pipelineDISpatial_, L"wf_di_spatial")) {
+            return false;
+        }
+        if (!buildDIPipeline("shaders/wavefront/wf_di_shade.comp.spv",
+                              &pipelineDIShade_, L"wf_di_shade")) {
+            return false;
+        }
     }
 
     // RT pipeline layout for K2 (same descriptor sets, push constants for RAYGEN stage)

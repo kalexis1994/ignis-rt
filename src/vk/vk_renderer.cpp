@@ -1022,6 +1022,36 @@ void Renderer::RenderFrameRT() {
             rtResources_->GetDIDescriptorSet(),
             dispW, dispH, frameIndex_,
             rtResources_->GetPolyLightsCount());
+
+        // Phase 4d: DI temporal reuse. Reads initial + finalPrev + gbufPrev
+        // via set 2, writes scratch + gbufCurr.
+        wavefrontPipeline_->RecordDITemporal(cmd,
+            rtResources_->GetDescriptorSet(),
+            rtResources_->GetDIDescriptorSet(),
+            dispW, dispH, frameIndex_,
+            rtResources_->GetPolyLightsCount());
+
+        // Phase 4e: DI spatial reuse. Reads scratch, writes finalCurr —
+        // closes the temporal loop.
+        wavefrontPipeline_->RecordDISpatial(cmd,
+            rtResources_->GetDescriptorSet(),
+            rtResources_->GetDIDescriptorSet(),
+            dispW, dispH, frameIndex_,
+            rtResources_->GetPolyLightsCount());
+
+        // Phase 4f: DI shade. Reads finalCurr, atomic-adds BSDF × Li × W
+        // into pixelRadiance diffuse. Currently runs additively on top of
+        // wf_shade.comp's inline NEE — directly-lit surfaces will look
+        // brighter; the inline path is gated off in a follow-up.
+        wavefrontPipeline_->RecordDIShade(cmd,
+            rtResources_->GetDescriptorSet(),
+            rtResources_->GetDIDescriptorSet(),
+            dispW, dispH, frameIndex_,
+            rtResources_->GetPolyLightsCount());
+
+        // Flip the DI ping-pong so next frame's finalPrev / gbufPrev
+        // point at this frame's finalCurr / gbufCurr.
+        rtResources_->FlipDIDescriptorSet();
     }
 
     if (diagFlush) {

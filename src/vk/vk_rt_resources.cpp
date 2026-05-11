@@ -164,30 +164,37 @@ bool RTResources::Initialize(Context* context, AccelStructureBuilder* accelBuild
 }
 
 // ---------------------------------------------------------------
-// Descriptor set 2 (DI port). Bindings:
-//   0: polyLights         — scene-level, valid at init time.
-//   1: diPolyInitial      — per-pixel reservoir (32 B/px). Bound to
-//      the dummy buffer here; CreateDIPolyBuffers() rewrites the
-//      slot once the resolution is known.
-// Kept separate from set 1 so the existing 24-binding wavefront
-// layout stays untouched.
+// Descriptor set 2 (DI port). 7 bindings, 2 ping-pong'd sets so
+// the per-pixel state ping-pongs frame-to-frame without descriptor
+// updates on the hot path. polyLights / initial / scratch bind to
+// the same buffer on both sets; final[] and gbuf[] swap.
+//
+//   b=0 polyLights         (set [0,1] → same buffer)
+//   b=1 diPolyInitial      (set [0,1] → same buffer)
+//   b=2 diPolyScratch      (set [0,1] → same buffer)
+//   b=3 diPolyFinalCurr    (set s → final[s])
+//   b=4 diPolyFinalPrev    (set s → final[1-s])
+//   b=5 diGBufPrev         (set s → gbuf[1-s])
+//   b=6 diGBufCurr         (set s → gbuf[s])
+//
+// Per-pixel buffers are created later by CreateDIBuffers; at init
+// time bindings 1..6 are bound to dummyBuffer_ so the set is valid.
 // ---------------------------------------------------------------
 bool RTResources::CreateDIDescriptorSet() {
     VkDevice device = context_->GetDevice();
 
-    VkDescriptorSetLayoutBinding bindings[2] = {};
-    bindings[0].binding         = 0;
-    bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    bindings[0].descriptorCount = 1;
-    bindings[0].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-    bindings[1].binding         = 1;
-    bindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    bindings[1].descriptorCount = 1;
-    bindings[1].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    constexpr uint32_t kNumBindings = 7;
+    VkDescriptorSetLayoutBinding bindings[kNumBindings] = {};
+    for (uint32_t i = 0; i < kNumBindings; i++) {
+        bindings[i].binding         = i;
+        bindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 2;
+    layoutInfo.bindingCount = kNumBindings;
     layoutInfo.pBindings    = bindings;
 
     if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &diDescriptorSetLayout_) != VK_SUCCESS) {
@@ -197,11 +204,11 @@ bool RTResources::CreateDIDescriptorSet() {
 
     VkDescriptorPoolSize poolSize{};
     poolSize.type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = 2;
+    poolSize.descriptorCount = kNumBindings * 2;
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.maxSets       = 1;
+    poolInfo.maxSets       = 2;
     poolInfo.poolSizeCount = 1;
     poolInfo.pPoolSizes    = &poolSize;
 
@@ -210,119 +217,168 @@ bool RTResources::CreateDIDescriptorSet() {
         return false;
     }
 
+    VkDescriptorSetLayout layouts[2] = { diDescriptorSetLayout_, diDescriptorSetLayout_ };
     VkDescriptorSetAllocateInfo ai{};
     ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     ai.descriptorPool     = diDescriptorPool_;
-    ai.descriptorSetCount = 1;
-    ai.pSetLayouts        = &diDescriptorSetLayout_;
+    ai.descriptorSetCount = 2;
+    ai.pSetLayouts        = layouts;
 
-    if (vkAllocateDescriptorSets(device, &ai, &diDescriptorSet_) != VK_SUCCESS) {
-        Log(L"[VK RTResources] ERROR: Failed to allocate DI descriptor set\n");
+    if (vkAllocateDescriptorSets(device, &ai, diDescriptorSet_) != VK_SUCCESS) {
+        Log(L"[VK RTResources] ERROR: Failed to allocate DI descriptor sets\n");
         return false;
     }
+    diSetIndex_ = 0;
 
-    VkDescriptorBufferInfo bi0{};
-    bi0.buffer = polyLightsBuffer_;
-    bi0.offset = 0;
-    bi0.range  = VK_WHOLE_SIZE;
+    // Initial bind: polyLights at b=0, dummies at b=1..6. The first
+    // CreateDIBuffers() rewrites bindings 1..6 with real per-pixel
+    // buffers. We bind something to every slot up-front so the set is
+    // valid even if a kernel accidentally dispatches before resize.
+    WriteDIDescriptors();
 
-    // b=1 gets a dummy until CreateDIPolyBuffers rewrites it.
-    VkDescriptorBufferInfo bi1{};
-    bi1.buffer = dummyBuffer_;
-    bi1.offset = 0;
-    bi1.range  = VK_WHOLE_SIZE;
-
-    VkWriteDescriptorSet writes[2] = {};
-    for (int i = 0; i < 2; i++) {
-        writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet          = diDescriptorSet_;
-        writes[i].dstBinding      = (uint32_t)i;
-        writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].descriptorCount = 1;
-    }
-    writes[0].pBufferInfo = &bi0;
-    writes[1].pBufferInfo = &bi1;
-    vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
-
-    Log(L"[VK RTResources] DI descriptor set 2 created (2 bindings: polyLights + diPolyInitial[dummy])\n");
+    Log(L"[VK RTResources] DI descriptor set 2 created (7 bindings × 2 ping-pong sets)\n");
     return true;
 }
 
 // ---------------------------------------------------------------
-// Phase 4c — per-pixel DI reservoir buffer. 32 B / pixel. Called
-// from CreateGBuffers when resolution is known; reuses the device-
-// local memory pattern. On resize the buffer is rebuilt and the
-// descriptor set 2 binding 1 is rewritten.
+// Phase 4c/4d — per-pixel DI buffers. Layout per pixel:
+//   initial   : 32 B (single)
+//   scratch   : 32 B (single)
+//   final[2]  : 32 B (ping-pong)
+//   gbuf[2]   : 64 B (ping-pong; compact x_v + n_v + albedo +
+//                roughness + ids snapshot)
+// Total per pixel ≈ 256 B. At 1080p ≈ 530 MiB → too much. At 1080p
+// the actual cost is: 4 × 32 + 2 × 64 = 256 B/px × 2.07M = 530 MiB.
+// Wait — recompute: 4 × 32 (initial+scratch+final×2) = 128 B per
+// pixel for reservoirs + 2 × 64 (gbuf×2) = 128 B for snapshots =
+// 256 B/px total. That's heavy but matches ignis-ac. At DLSS-Q
+// 1280×720 base ≈ 235 MiB. Fine on an RTX 3080.
 // ---------------------------------------------------------------
-bool RTResources::CreateDIPolyBuffers(uint32_t width, uint32_t height) {
+bool RTResources::CreateDIBuffers(uint32_t width, uint32_t height) {
     VkDevice device = context_->GetDevice();
     uint32_t pixelCount = width * height;
     if (pixelCount == 0) return false;
     if (diPolyPixelCount_ == pixelCount && diPolyInitialBuffer_ != VK_NULL_HANDLE) {
         return true;
     }
-    DestroyDIPolyBuffers();
+    DestroyDIBuffers();
 
     constexpr VkDeviceSize kReservoirBytes = 32; // 2 × vec4
-    VkDeviceSize sizeBytes = (VkDeviceSize)pixelCount * kReservoirBytes;
+    constexpr VkDeviceSize kGBufBytes      = 64; // 4 × vec4
+    VkDeviceSize reservoirSize = (VkDeviceSize)pixelCount * kReservoirBytes;
+    VkDeviceSize gbufSize      = (VkDeviceSize)pixelCount * kGBufBytes;
 
-    VkBufferCreateInfo bi{};
-    bi.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bi.size        = sizeBytes;
-    bi.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkCreateBuffer(device, &bi, nullptr, &diPolyInitialBuffer_) != VK_SUCCESS) {
-        Log(L"[VK RTResources] ERROR: Failed to create diPolyInitial buffer\n");
-        return false;
+    auto createDeviceLocal = [&](VkDeviceSize size, VkBuffer& buf, VkDeviceMemory& mem,
+                                  const wchar_t* tag) -> bool {
+        VkBufferCreateInfo bi{};
+        bi.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bi.size        = size;
+        bi.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vkCreateBuffer(device, &bi, nullptr, &buf) != VK_SUCCESS) {
+            Log(L"[VK RTResources] ERROR: Failed to create %s buffer\n", tag);
+            return false;
+        }
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(device, buf, &req);
+        VkMemoryAllocateInfo ai{};
+        ai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        ai.allocationSize  = req.size;
+        ai.memoryTypeIndex = context_->FindMemoryType(req.memoryTypeBits,
+                                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (vkAllocateMemory(device, &ai, nullptr, &mem) != VK_SUCCESS) {
+            Log(L"[VK RTResources] ERROR: Failed to alloc %s memory (%llu B)\n",
+                tag, (unsigned long long)req.size);
+            return false;
+        }
+        vkBindBufferMemory(device, buf, mem, 0);
+        return true;
+    };
+
+    if (!createDeviceLocal(reservoirSize, diPolyInitialBuffer_, diPolyInitialMemory_, L"diPolyInitial")) { DestroyDIBuffers(); return false; }
+    if (!createDeviceLocal(reservoirSize, diPolyScratchBuffer_, diPolyScratchMemory_, L"diPolyScratch")) { DestroyDIBuffers(); return false; }
+    for (int s = 0; s < 2; s++) {
+        if (!createDeviceLocal(reservoirSize, diPolyFinalBuffer_[s], diPolyFinalMemory_[s], L"diPolyFinal")) { DestroyDIBuffers(); return false; }
+        if (!createDeviceLocal(gbufSize,      diGBufBuffer_[s],      diGBufMemory_[s],      L"diGBuf"))      { DestroyDIBuffers(); return false; }
     }
-
-    VkMemoryRequirements req;
-    vkGetBufferMemoryRequirements(device, diPolyInitialBuffer_, &req);
-
-    VkMemoryAllocateInfo ai{};
-    ai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    ai.allocationSize  = req.size;
-    ai.memoryTypeIndex = context_->FindMemoryType(req.memoryTypeBits,
-                                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (vkAllocateMemory(device, &ai, nullptr, &diPolyInitialMemory_) != VK_SUCCESS) {
-        Log(L"[VK RTResources] ERROR: Failed to allocate diPolyInitial memory (%llu bytes)\n",
-            (unsigned long long)req.size);
-        DestroyDIPolyBuffers();
-        return false;
-    }
-    vkBindBufferMemory(device, diPolyInitialBuffer_, diPolyInitialMemory_, 0);
     diPolyPixelCount_ = pixelCount;
 
-    UpdateDIInitialDescriptor();
+    // Zero-fill so the temporal pass's M/valid gates see a clean
+    // empty state on the first frame instead of driver garbage.
+    {
+        VkCommandBuffer cmd = context_->BeginSingleTimeCommands();
+        vkCmdFillBuffer(cmd, diPolyInitialBuffer_, 0, reservoirSize, 0);
+        vkCmdFillBuffer(cmd, diPolyScratchBuffer_, 0, reservoirSize, 0);
+        for (int s = 0; s < 2; s++) {
+            vkCmdFillBuffer(cmd, diPolyFinalBuffer_[s], 0, reservoirSize, 0);
+            vkCmdFillBuffer(cmd, diGBufBuffer_[s],      0, gbufSize,      0);
+        }
+        context_->EndSingleTimeCommands(cmd);
+    }
 
-    Log(L"[VK RTResources] diPolyInitial buffer (%u px × 32 B = %llu KiB)\n",
-        pixelCount, (unsigned long long)(sizeBytes / 1024));
+    WriteDIDescriptors();
+
+    VkDeviceSize total = reservoirSize * 4 + gbufSize * 2;
+    Log(L"[VK RTResources] DI per-pixel buffers (%u px → %llu KiB total)\n",
+        pixelCount, (unsigned long long)(total / 1024));
     return true;
 }
 
-void RTResources::DestroyDIPolyBuffers() {
+void RTResources::DestroyDIBuffers() {
     VkDevice device = context_ ? context_->GetDevice() : VK_NULL_HANDLE;
     if (device == VK_NULL_HANDLE) return;
-    if (diPolyInitialBuffer_) { vkDestroyBuffer(device, diPolyInitialBuffer_, nullptr); diPolyInitialBuffer_ = VK_NULL_HANDLE; }
-    if (diPolyInitialMemory_) { vkFreeMemory(device, diPolyInitialMemory_, nullptr); diPolyInitialMemory_ = VK_NULL_HANDLE; }
+    auto kill = [&](VkBuffer& b, VkDeviceMemory& m) {
+        if (b) { vkDestroyBuffer(device, b, nullptr); b = VK_NULL_HANDLE; }
+        if (m) { vkFreeMemory(device, m, nullptr);    m = VK_NULL_HANDLE; }
+    };
+    kill(diPolyInitialBuffer_, diPolyInitialMemory_);
+    kill(diPolyScratchBuffer_, diPolyScratchMemory_);
+    for (int s = 0; s < 2; s++) {
+        kill(diPolyFinalBuffer_[s], diPolyFinalMemory_[s]);
+        kill(diGBufBuffer_[s],      diGBufMemory_[s]);
+    }
     diPolyPixelCount_ = 0;
 }
 
-void RTResources::UpdateDIInitialDescriptor() {
-    if (diDescriptorSet_ == VK_NULL_HANDLE || diPolyInitialBuffer_ == VK_NULL_HANDLE) return;
-    VkDescriptorBufferInfo bi{};
-    bi.buffer = diPolyInitialBuffer_;
-    bi.offset = 0;
-    bi.range  = VK_WHOLE_SIZE;
+// Rewrite every binding on both ping-pong sets. Called at init
+// (when only polyLights is real, the rest fall back to dummy) and
+// after CreateDIBuffers (when all per-pixel buffers exist).
+void RTResources::WriteDIDescriptors() {
+    if (diDescriptorSet_[0] == VK_NULL_HANDLE) return;
+    VkDevice device = context_->GetDevice();
 
-    VkWriteDescriptorSet write{};
-    write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet          = diDescriptorSet_;
-    write.dstBinding      = 1;
-    write.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    write.descriptorCount = 1;
-    write.pBufferInfo     = &bi;
-    vkUpdateDescriptorSets(context_->GetDevice(), 1, &write, 0, nullptr);
+    // Pick real buffer or dummy depending on what's been allocated.
+    auto pick = [&](VkBuffer real) -> VkBuffer {
+        return real != VK_NULL_HANDLE ? real : dummyBuffer_;
+    };
+
+    constexpr uint32_t kNumBindings = 7;
+    for (int s = 0; s < 2; s++) {
+        VkBuffer slot[kNumBindings] = {
+            polyLightsBuffer_,                        // 0
+            pick(diPolyInitialBuffer_),               // 1
+            pick(diPolyScratchBuffer_),               // 2
+            pick(diPolyFinalBuffer_[s]),              // 3 finalCurr
+            pick(diPolyFinalBuffer_[1 - s]),          // 4 finalPrev
+            pick(diGBufBuffer_[1 - s]),               // 5 gbufPrev
+            pick(diGBufBuffer_[s]),                   // 6 gbufCurr
+        };
+
+        VkDescriptorBufferInfo bi[kNumBindings] = {};
+        VkWriteDescriptorSet   wr[kNumBindings] = {};
+        for (uint32_t i = 0; i < kNumBindings; i++) {
+            bi[i].buffer = slot[i];
+            bi[i].offset = 0;
+            bi[i].range  = VK_WHOLE_SIZE;
+            wr[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            wr[i].dstSet          = diDescriptorSet_[s];
+            wr[i].dstBinding      = i;
+            wr[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            wr[i].descriptorCount = 1;
+            wr[i].pBufferInfo     = &bi[i];
+        }
+        vkUpdateDescriptorSets(device, kNumBindings, wr, 0, nullptr);
+    }
 }
 
 bool RTResources::CreateSHARCBuffers() {
@@ -830,11 +886,13 @@ void RTResources::Shutdown() {
     if (descriptorPool_) { vkDestroyDescriptorPool(device, descriptorPool_, nullptr); descriptorPool_ = VK_NULL_HANDLE; }
     if (descriptorSetLayout_) { vkDestroyDescriptorSetLayout(device, descriptorSetLayout_, nullptr); descriptorSetLayout_ = VK_NULL_HANDLE; }
 
-    // Descriptor set 2 — DI port resources (Phase 4b/4c).
-    DestroyDIPolyBuffers();
+    // Descriptor set 2 — DI port resources (Phase 4b/4c/4d).
+    DestroyDIBuffers();
     if (diDescriptorPool_) { vkDestroyDescriptorPool(device, diDescriptorPool_, nullptr); diDescriptorPool_ = VK_NULL_HANDLE; }
     if (diDescriptorSetLayout_) { vkDestroyDescriptorSetLayout(device, diDescriptorSetLayout_, nullptr); diDescriptorSetLayout_ = VK_NULL_HANDLE; }
-    diDescriptorSet_ = VK_NULL_HANDLE;
+    diDescriptorSet_[0] = VK_NULL_HANDLE;
+    diDescriptorSet_[1] = VK_NULL_HANDLE;
+    diSetIndex_ = 0;
 
     // SHARC radiance cache buffers
     DestroySHARCBuffers();
@@ -1014,8 +1072,8 @@ bool RTResources::CreateGBuffers(uint32_t width, uint32_t height) {
     CreateGIReservoirBuffers(width, height);   // DI on 24-25
     CreateGIWfReservoirBuffers(width, height); // GI on 49-50
 
-    // Phase 4c: DI port polymorphic reservoir buffer (set 2, b=1).
-    CreateDIPolyBuffers(width, height);
+    // Phase 4c/4d: DI port per-pixel buffers (set 2, b=1..6).
+    CreateDIBuffers(width, height);
 
     // Update descriptor set with real G-buffer images
     VkDevice device = context_->GetDevice();
