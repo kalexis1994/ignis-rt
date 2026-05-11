@@ -122,7 +122,7 @@ void main() {
     if (pixel.x >= int(pc.width) || pixel.y >= int(pc.height)) return;
 
     int pixelIdx = pixel.y * int(pc.width) + pixel.x;
-    uint gBase = uint(pixelIdx) * 24u;
+    uint gBase = uint(pixelIdx) * 26u;
 
     // Initialize header: all planes invalid
     spHeader.data[pixelIdx] = uvec4(0u);

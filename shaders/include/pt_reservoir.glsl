@@ -33,6 +33,20 @@ struct PTReservoir {
     float partialJacobian;  // cached 1/(cos/dist^2) for Jacobian
     float rcWiPdf;          // BRDF PDF at rcVertex
     uint  pathLength;       // total path bounces
+
+    // ── Source vertex attributes (RTXPT-style deep prefix replay) ──
+    // Surface state at the LAST shading vertex of the camera prefix (the one
+    // immediately before rcVertex). Used by pt_replay to validate that a
+    // shifted prefix lands on the same source surface; if material / position
+    // / normal don't match after re-tracing, the reuse is rejected. Eliminates
+    // radiance leaks across walls that the approximate replay used to allow.
+    vec3  sourcePos;
+    vec3  sourceNormal;
+    float sourceRoughness;
+    float sourceAlbedoLuma;     // luminance, not RGB — compact + sufficient
+    float sourceMetallic;
+    float sourceSpecularLevel;
+    vec3  prefixThroughput;     // accumulated throughput primary → source
 };
 
 struct PTPathRecord {
@@ -50,6 +64,14 @@ struct PTPathRecord {
     uint  lightType;
     uint  lightIndex;
     float pathRadianceLum;
+    // Source vertex (last camera-prefix shading point before rcVertex).
+    vec3  sourcePos;
+    vec3  sourceNormal;
+    float sourceRoughness;
+    float sourceAlbedoLuma;
+    float sourceMetallic;
+    float sourceSpecularLevel;
+    vec3  prefixThroughput;
 };
 
 // ── Helpers ──
@@ -61,6 +83,10 @@ PTReservoir ptEmptyReservoir() {
     r.rcBounceDepth = 0u; r.rngSeed = 0u; r.lightType = 0u; r.lightIndex = 0u;
     r.primaryPos = vec3(0); r.primaryNormal = vec3(0,1,0); r.primaryRoughness = 1.0;
     r.age = 0.0; r.partialJacobian = 0.0; r.rcWiPdf = 0.0; r.pathLength = 0u;
+    r.sourcePos = vec3(0); r.sourceNormal = vec3(0,1,0);
+    r.sourceRoughness = 1.0; r.sourceAlbedoLuma = 0.5;
+    r.sourceMetallic = 0.0; r.sourceSpecularLevel = 0.5;
+    r.prefixThroughput = vec3(1.0);
     return r;
 }
 
@@ -97,6 +123,15 @@ PTReservoir ptCreateFromPathRecord(PTPathRecord pr, float cachedPartialJ, float 
     r.primaryRoughness = pr.primaryRoughness; r.age = 0.0;
     r.partialJacobian = cachedPartialJ; r.rcWiPdf = rcPdf;
     r.pathLength = pr.rcBounce + 1u;
+    // Source vertex copied from path record (set by wf_shade when forming
+    // the initial reservoir at the camera prefix's last shading vertex).
+    r.sourcePos = pr.sourcePos;
+    r.sourceNormal = pr.sourceNormal;
+    r.sourceRoughness = pr.sourceRoughness;
+    r.sourceAlbedoLuma = pr.sourceAlbedoLuma;
+    r.sourceMetallic = pr.sourceMetallic;
+    r.sourceSpecularLevel = pr.sourceSpecularLevel;
+    r.prefixThroughput = pr.prefixThroughput;
     float pHat = ptTargetPDF(r);
     if (pHat > 0.001) { r.weightSum = 1.0; r.M = 1.0; r.targetFunction = pHat; }
     return r;
@@ -114,6 +149,15 @@ bool ptReservoirUpdate(inout PTReservoir r, PTReservoir cand, float weight, inou
         r.primaryRoughness = cand.primaryRoughness; r.targetFunction = cand.targetFunction;
         r.age = cand.age; r.partialJacobian = cand.partialJacobian;
         r.rcWiPdf = cand.rcWiPdf; r.pathLength = cand.pathLength;
+        // Source vertex follows the selected sample so subsequent shifts can
+        // validate against the right surface, not the merger's seed value.
+        r.sourcePos = cand.sourcePos;
+        r.sourceNormal = cand.sourceNormal;
+        r.sourceRoughness = cand.sourceRoughness;
+        r.sourceAlbedoLuma = cand.sourceAlbedoLuma;
+        r.sourceMetallic = cand.sourceMetallic;
+        r.sourceSpecularLevel = cand.sourceSpecularLevel;
+        r.prefixThroughput = cand.prefixThroughput;
     }
     rng = fract(rng * 747.6513 + 0.3713);
     return sel;
@@ -139,6 +183,27 @@ bool ptSurfaceSimilar(vec3 n1, vec3 n2, float r1, float r2, vec3 p1, vec3 p2) {
     float d = length(p1 - p2);
     if (d / max(length(p1), 0.1) > 0.15) return false;
     if (abs(r1 - r2) > 0.3) return false;
+    return true;
+}
+
+// Used by pt_replay to reject shifts whose replayed source vertex landed on a
+// surface with materially different reflectance — even if normal/position
+// match. Mirrors RTXPT's RAB_AreMaterialsSimilar via the compact AC scalars.
+const float WF_PT_DIFFUSE_LUMA_MAX_DIFF = 0.25;
+const float WF_PT_REFLECTIVITY_MAX_DIFF = 0.25;
+
+float ptLuminance(vec3 v) {
+    return dot(v, vec3(0.2126, 0.7152, 0.0722));
+}
+
+bool ptMaterialSimilarLuma(float albedoLumaA, float metallicA, float specularA,
+                           float albedoLumaB, float metallicB, float specularB) {
+    float diffuseA = albedoLumaA * (1.0 - clamp(metallicA, 0.0, 1.0));
+    float diffuseB = albedoLumaB * (1.0 - clamp(metallicB, 0.0, 1.0));
+    float specA = mix(0.04 * clamp(specularA, 0.0, 1.0), albedoLumaA, clamp(metallicA, 0.0, 1.0));
+    float specB = mix(0.04 * clamp(specularB, 0.0, 1.0), albedoLumaB, clamp(metallicB, 0.0, 1.0));
+    if (abs(diffuseA - diffuseB) > WF_PT_DIFFUSE_LUMA_MAX_DIFF) return false;
+    if (abs(specA - specB) > WF_PT_REFLECTIVITY_MAX_DIFF) return false;
     return true;
 }
 

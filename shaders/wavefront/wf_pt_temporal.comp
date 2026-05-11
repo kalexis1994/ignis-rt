@@ -3,7 +3,13 @@
 #extension GL_EXT_ray_query : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
 #extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
+// RTXDI boiling filter — subgroup reductions over the 8x8 tile.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -53,6 +59,13 @@ layout(binding = 17, set = 1, std430) buffer PTPathBuf     { vec4 data[]; } ptPa
 // Primary G-buffer (for motion vector computation)
 layout(binding = 4, set = 1, scalar) buffer PrimaryGBufBuffer { float gbufData[]; } primaryGBuf;
 
+// Surface history (previous frame) — written by K5 (wf_output) of frame N-1.
+// 5 uints/pixel: validFlags, instanceId, materialId, primitiveId, customIndex.
+const uint WF_SURFACE_HISTORY_STRIDE = 5u;
+layout(binding = 20, set = 1, std430) readonly buffer SurfaceHistoryPrevBuf {
+    uint data[];
+} surfaceHistoryPrev;
+
 layout(push_constant) uniform PushConst {
     uint width;
     uint height;
@@ -62,14 +75,25 @@ layout(push_constant) uniform PushConst {
 
 #include "../include/common.glsl"
 #include "../include/pt_reservoir.glsl"
+#include "../include/pt_replay.glsl"
+#include "../include/wf_boiling_filter.glsl"
+
+// Boiling-filter aggressiveness for PT reservoirs. RTXPT uses 0.2 for DI; PT
+// inherits the same default — multiplier ≈41× the tile non-zero mean weight.
+const float WF_PT_BOILING_STRENGTH = 0.2;
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-    if (pixel.x >= int(pc.width) || pixel.y >= int(pc.height)) return;
+    // No early-return: the boiling filter uses workgroup barriers and subgroup
+    // reductions, so every lane in the 8×8 tile must reach the filter call.
+    bool inBounds = (pixel.x < int(pc.width) && pixel.y < int(pc.height));
 
-    int pixelIdx = pixel.y * int(pc.width) + pixel.x;
+    int pixelIdx = inBounds ? (pixel.y * int(pc.width) + pixel.x) : 0;
     ivec2 launchSize = ivec2(pc.width, pc.height);
 
+    PTReservoir curr = ptEmptyReservoir();
+
+    if (inBounds) {
     // ── Read path record from current frame's K2 shade ──
     PTPathRecord pr;
     {
@@ -93,13 +117,34 @@ void main() {
     float rcPdf = ptPathRec.data[pixelIdx * 6 + 5].w;
 
     // Create initial reservoir from current frame's path
-    PTReservoir curr = ptCreateFromPathRecord(pr, cachedPJ, rcPdf);
+    curr = ptCreateFromPathRecord(pr, cachedPJ, rcPdf);
+
+    // Populate source-vertex attrs from this pixel's primary G-buffer.
+    // For rcBounceDepth=1 the source IS the primary surface — exact.
+    // For deeper paths it's an approximation that matches what wf_shade
+    // recorded (the path tracer doesn't yet persist per-bounce surface
+    // state), but pt_replay's sameSource check stays self-consistent.
+    {
+        uint gB = uint(pixelIdx) * 26u;
+        curr.sourcePos = pr.primaryPos;
+        curr.sourceNormal = pr.primaryNormal;
+        curr.sourceRoughness = pr.primaryRoughness;
+        vec3 primAlbedo = vec3(primaryGBuf.gbufData[gB+8],
+                                primaryGBuf.gbufData[gB+9],
+                                primaryGBuf.gbufData[gB+10]);
+        curr.sourceAlbedoLuma = ptLuminance(primAlbedo);
+        // metallic/specularLevel aren't in the gbuf at this resolution;
+        // use neutral defaults — matches the placeholder wf_shade pattern.
+        curr.sourceMetallic = 0.0;
+        curr.sourceSpecularLevel = 0.5;
+        curr.prefixThroughput = primAlbedo;
+    }
 
     // ── Temporal resampling: reproject to previous frame ──
     if (curr.M > 0.0) {
         // Compute motion vector from primary surface
         uint instId = pr.primaryInstanceId;
-        uint gBase = uint(pixelIdx) * 24u;
+        uint gBase = uint(pixelIdx) * 26u;
         vec3 localPos = vec3(primaryGBuf.gbufData[gBase+12],
                               primaryGBuf.gbufData[gBase+13],
                               primaryGBuf.gbufData[gBase+14]);
@@ -124,10 +169,26 @@ void main() {
             ivec2 prevPixel = ivec2(prevUV * vec2(launchSize));
             int prevIdx = prevPixel.y * int(pc.width) + prevPixel.x;
 
-            // Load previous reservoir
+            // ── Surface history veto (RTXPT-style) ──
+            // If the pixel that prevUV reprojects to belonged to a different
+            // instance/primitive last frame, skip the temporal merge — the
+            // surface revealed by camera motion has no shared radiance with
+            // whatever object covered the same pixel a frame ago.
+            uint myPrimId    = floatBitsToUint(primaryGBuf.gbufData[gBase+24]);
+            uint myCustomIdx = floatBitsToUint(primaryGBuf.gbufData[gBase+25]);
+            uint shBase = uint(prevIdx) * WF_SURFACE_HISTORY_STRIDE;
+            bool prevValid = (surfaceHistoryPrev.data[shBase + 0u] & 1u) != 0u;
+            bool surfaceMatch = prevValid &&
+                surfaceHistoryPrev.data[shBase + 1u] == instId &&
+                surfaceHistoryPrev.data[shBase + 3u] == myPrimId &&
+                surfaceHistoryPrev.data[shBase + 4u] == myCustomIdx;
+            if (surfaceMatch) {
+
+            // Load previous reservoir (10 vec4 stride — slots 7-9 hold the
+            // source-vertex attrs used by pt_replay's sameSource check)
             PTReservoir prev;
             {
-                int rb = prevIdx * 8;
+                int rb = prevIdx * 10;
                 prev.rcVertexPos = ptResPrev.data[rb+0].xyz; prev.weightSum = ptResPrev.data[rb+0].w;
                 prev.rcRadiance = ptResPrev.data[rb+1].xyz; prev.M = ptResPrev.data[rb+1].w;
                 prev.rcVertexNormal = ptOctDecode(ptResPrev.data[rb+2].xy);
@@ -140,13 +201,20 @@ void main() {
                 prev.primaryPos = ptResPrev.data[rb+4].xyz;
                 prev.primaryRoughness = ptResPrev.data[rb+4].w;
                 prev.primaryNormal = ptOctDecode(ptResPrev.data[rb+5].xy);
-                // New fields from slots 6-7
                 prev.partialJacobian = ptResPrev.data[rb+6].x;
                 prev.rcWiPdf = ptResPrev.data[rb+6].y;
                 prev.pathLength = floatBitsToUint(ptResPrev.data[rb+6].z);
+                // Source-vertex attrs (slots 7-9, new for pt_replay).
+                prev.sourcePos = ptResPrev.data[rb+7].xyz;
+                prev.sourceRoughness = ptResPrev.data[rb+7].w;
+                prev.sourceNormal = ptOctDecode(ptResPrev.data[rb+8].xy);
+                prev.sourceAlbedoLuma = ptResPrev.data[rb+8].z;
+                prev.sourceMetallic = ptResPrev.data[rb+8].w;
+                prev.sourceSpecularLevel = ptResPrev.data[rb+9].x;
+                prev.prefixThroughput = ptResPrev.data[rb+9].yzw;
             }
 
-            // Validate: surface similarity + age + non-empty + no NaN
+            // Validate: surface similarity + age + non-empty + no NaN.
             if (prev.M > 0.0 && prev.age < 30.0 &&
                 !any(isnan(prev.rcRadiance)) && !any(isinf(prev.rcRadiance)) &&
                 ptSurfaceSimilar(pr.primaryNormal, prev.primaryNormal,
@@ -157,79 +225,27 @@ void main() {
                 prev.age += 1.0;
                 prev.rcRadiance = min(prev.rcRadiance, vec3(20.0));
 
-                // ── Random Replay: re-trace prefix when RcVertexLength > 2 ──
-                // For RcVertexLength == 2: connect directly from primary surface.
-                // For RcVertexLength > 2: trace intermediate bounces using the
-                // stored RNG seed to regenerate the same BRDF sampling decisions,
-                // starting from the CURRENT pixel's primary surface.
-                vec3 shiftedReceiverPos = pr.primaryPos;
-                vec3 shiftedReceiverNormal = pr.primaryNormal;
-                float shiftedReceiverRoughness = pr.primaryRoughness;
-                bool replayValid = true;
-
-                if (prev.rcBounceDepth > 2u) {
-                    // Re-trace prefix: from primary surface, trace (rcBounceDepth-2)
-                    // bounces using the neighbor's RNG seed for BRDF sampling.
-                    uint replayRng = prev.rngSeed;
-                    vec3 replayOrigin = pr.primaryPos;
-                    vec3 replayDir;
-
-                    // Generate first bounce direction using replayed RNG
-                    // (cosine hemisphere from primary normal — matching wf_shade's diffuse sampling)
-                    replayRng = replayRng * 747796405u + 2891336453u;
-                    float u1 = float(replayRng) / 4294967295.0;
-                    replayRng = replayRng * 747796405u + 2891336453u;
-                    float u2 = float(replayRng) / 4294967295.0;
-                    // Cosine hemisphere sample
-                    float r_s = sqrt(u1);
-                    float phi = 6.28318 * u2;
-                    vec3 localDir = vec3(r_s * cos(phi), r_s * sin(phi), sqrt(max(1.0 - u1, 0.0)));
-                    // Build TBN from normal
-                    vec3 up = abs(pr.primaryNormal.y) < 0.999 ? vec3(0,1,0) : vec3(1,0,0);
-                    vec3 T = normalize(cross(up, pr.primaryNormal));
-                    vec3 B = cross(pr.primaryNormal, T);
-                    replayDir = T * localDir.x + B * localDir.y + pr.primaryNormal * localDir.z;
-
-                    // Trace intermediate bounces
-                    for (uint ri = 0u; ri < prev.rcBounceDepth - 2u; ri++) {
-                        rayQueryEXT rpRQ;
-                        rayQueryInitializeEXT(rpRQ, topLevelAS, gl_RayFlagsOpaqueEXT,
-                            0xFF, replayOrigin + shiftedReceiverNormal * 0.002,
-                            0.001, replayDir, 10000.0);
-                        while (rayQueryProceedEXT(rpRQ)) {}
-
-                        if (rayQueryGetIntersectionTypeEXT(rpRQ, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
-                            replayValid = false;
-                            break;
-                        }
-
-                        float rpHitT = rayQueryGetIntersectionTEXT(rpRQ, true);
-                        shiftedReceiverPos = replayOrigin + replayDir * rpHitT;
-                        // Approximate normal from geometric face normal
-                        mat4x3 rpOTW = rayQueryGetIntersectionObjectToWorldEXT(rpRQ, true);
-                        shiftedReceiverNormal = normalize(cross(
-                            rpOTW[1] - rpOTW[0], rpOTW[2] - rpOTW[0]));
-                        if (dot(shiftedReceiverNormal, -replayDir) < 0.0)
-                            shiftedReceiverNormal = -shiftedReceiverNormal;
-                        shiftedReceiverRoughness = 0.5; // approximate
-
-                        // Generate next direction for subsequent bounces
-                        replayRng = replayRng * 747796405u + 2891336453u;
-                        u1 = float(replayRng) / 4294967295.0;
-                        replayRng = replayRng * 747796405u + 2891336453u;
-                        u2 = float(replayRng) / 4294967295.0;
-                        r_s = sqrt(u1); phi = 6.28318 * u2;
-                        localDir = vec3(r_s * cos(phi), r_s * sin(phi), sqrt(max(1.0 - u1, 0.0)));
-                        up = abs(shiftedReceiverNormal.y) < 0.999 ? vec3(0,1,0) : vec3(1,0,0);
-                        T = normalize(cross(up, shiftedReceiverNormal));
-                        B = cross(shiftedReceiverNormal, T);
-                        replayDir = T * localDir.x + B * localDir.y + shiftedReceiverNormal * localDir.z;
-                        replayOrigin = shiftedReceiverPos;
-                    }
-                }
+                // ── Deep prefix replay (RTXPT-style) ──
+                // Re-traces the prefix from this pixel's primary using prev's
+                // RNG seed, reconstructs the surface at every bounce from
+                // geometry+material buffers, and rejects the reuse if the
+                // shifted source vertex doesn't materially match prev.source*.
+                // This is what eliminates light leak across walls that the
+                // previous approximate replay used to allow.
+                vec3 shiftedReceiverPos, shiftedReceiverNormal;
+                vec3 shiftedReceiverAlbedo, shiftedPrefixThroughput;
+                float shiftedReceiverRoughness, shiftedReceiverMetallic, shiftedReceiverSpecular;
+                bool replayValid = ptReplayDeepPrefix(prev,
+                    pr.primaryPos, pr.primaryNormal,
+                    curr.prefixThroughput,                  // primary albedo (we stored it here)
+                    pr.primaryRoughness, curr.sourceMetallic, curr.sourceSpecularLevel,
+                    shiftedReceiverPos, shiftedReceiverNormal,
+                    shiftedReceiverAlbedo,
+                    shiftedReceiverRoughness, shiftedReceiverMetallic, shiftedReceiverSpecular,
+                    shiftedPrefixThroughput);
 
                 // ── Jacobian: geometry term ratio at shifted receiver ──
-                float J = 1.0;
+                float J = 0.0;
                 if (replayValid) {
                     if (prev.partialJacobian > 0.0) {
                         J = ptJacobianCached(shiftedReceiverPos, prev);
@@ -238,8 +254,6 @@ void main() {
                                         shiftedReceiverPos, prev.primaryPos);
                     }
                     if (J < 0.001) J = 0.0;
-                } else {
-                    J = 0.0;
                 }
 
                 // ── Invertibility at shifted receiver ──
@@ -278,17 +292,36 @@ void main() {
                     ptReservoirMerge(curr, prev, pHat, rng);
                 }
             }
+            } // end if (surfaceMatch) — surface history veto
         }
     }
 
     // Finalize reservoir: convert weightSum to contribution weight W
     ptFinalizeReservoir(curr);
+    } // end if (inBounds)
 
-    // Write current reservoir
+    // ── RTXDI boiling filter ──
+    // Reservoir-agnostic proxy: targetFunction · weightSum. Out-of-bounds /
+    // empty / NaN lanes contribute 0 but must still execute the subgroup
+    // reductions, so this block is OUTSIDE the inBounds gate.
     {
-        int rb = pixelIdx * 8;
+        float bfWeight = (!inBounds || curr.M <= 0.0)
+            ? 0.0
+            : (curr.targetFunction * curr.weightSum);
+        bool isBoiling = wf_boiling_filter(gl_LocalInvocationID.xy,
+                                            WF_PT_BOILING_STRENGTH,
+                                            bfWeight);
+        if (inBounds && isBoiling) {
+            curr = ptEmptyReservoir();
+        }
+    }
+
+    // Write current reservoir (10 vec4 stride — slots 7-9 are the source vertex)
+    if (inBounds) {
+        int rb = pixelIdx * 10;
         vec2 rcN = ptOctEncode(curr.rcVertexNormal);
         vec2 pN  = ptOctEncode(curr.primaryNormal);
+        vec2 sN  = ptOctEncode(curr.sourceNormal);
         ptResCurr.data[rb+0] = vec4(curr.rcVertexPos, curr.weightSum);
         ptResCurr.data[rb+1] = vec4(curr.rcRadiance, curr.M);
         ptResCurr.data[rb+2] = vec4(rcN, curr.targetFunction, uintBitsToFloat(curr.rcBounceDepth));
@@ -298,6 +331,8 @@ void main() {
         ptResCurr.data[rb+5] = vec4(pN, 0.0, 0.0);
         ptResCurr.data[rb+6] = vec4(curr.partialJacobian, curr.rcWiPdf,
                                      uintBitsToFloat(curr.pathLength), 0.0);
-        ptResCurr.data[rb+7] = vec4(0);
+        ptResCurr.data[rb+7] = vec4(curr.sourcePos, curr.sourceRoughness);
+        ptResCurr.data[rb+8] = vec4(sN, curr.sourceAlbedoLuma, curr.sourceMetallic);
+        ptResCurr.data[rb+9] = vec4(curr.sourceSpecularLevel, curr.prefixThroughput);
     }
 }

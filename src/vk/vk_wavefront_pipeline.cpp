@@ -153,6 +153,10 @@ void WavefrontPipeline::Shutdown() {
     DestroySSBO(device, ptPathRecordBuffer_, ptPathRecordMemory_);
     DestroySSBO(device, spHeaderBuffer_, spHeaderMemory_);
     DestroySSBO(device, spDataBuffer_, spDataMemory_);
+    for (int i = 0; i < 2; i++)
+        DestroySSBO(device, surfaceHistoryBuffer_[i], surfaceHistoryMemory_[i]);
+    for (int i = 0; i < 2; i++)
+        DestroySSBO(device, fireflyKBuffer_[i], fireflyKMemory_[i]);
 
     ready_ = false;
 }
@@ -285,12 +289,13 @@ bool WavefrontPipeline::CreateBuffers(uint32_t pixelCount) {
     VkDevice device = context_->GetDevice();
     VkPhysicalDevice physDevice = context_->GetPhysicalDevice();
 
-    // PathState SoA — 4 field buffers, each double-buffered (48 bytes/path total)
+    // PathState SoA — 5 field buffers, each double-buffered (52 bytes/path total)
     for (int i = 0; i < 2; i++) {
         if (!CreateSSBO(device, physDevice, pixelCount * 24, &originDirBuffer_[i], &originDirMemory_[i])) return false;     // 6 floats
         if (!CreateSSBO(device, physDevice, pixelCount * 8,  &pixelRngBuffer_[i], &pixelRngMemory_[i])) return false;       // 2 uints
         if (!CreateSSBO(device, physDevice, pixelCount * 12, &throughputBuffer_[i], &throughputMemory_[i])) return false;    // 3 floats
         if (!CreateSSBO(device, physDevice, pixelCount * 4,  &flagsBuffer_[i], &flagsMemory_[i])) return false;             // 1 uint
+        if (!CreateSSBO(device, physDevice, pixelCount * 4,  &fireflyKBuffer_[i], &fireflyKMemory_[i])) return false;       // 1 float (firefly_k)
     }
 
     // HitResult: 80 bytes per pixel (20 floats: 8 base + 12 objToWorld)
@@ -303,18 +308,40 @@ bool WavefrontPipeline::CreateBuffers(uint32_t pixelCount) {
     // PixelRadiance: 32 bytes per pixel
     if (!CreateSSBO(device, physDevice, pixelCount * 32, &pixelRadianceBuffer_, &pixelRadianceMemory_)) return false;
 
-    // PrimaryGBuffer: 96 bytes per pixel (16 base floats + 8 PSR floats = 24 floats)
-    if (!CreateSSBO(device, physDevice, pixelCount * 96, &primaryGBufBuffer_, &primaryGBufMemory_)) return false;
+    // PrimaryGBuffer: 104 bytes per pixel (16 base + 8 PSR + 2 surface IDs = 26 floats).
+    // Slot 23 = primitiveId (uintBits), slot 24 = customIndex (uintBits) — used by
+    // wf_output to populate the SurfaceHistory ring; slot 25 reserved.
+    if (!CreateSSBO(device, physDevice, pixelCount * 104, &primaryGBufBuffer_, &primaryGBufMemory_)) return false;
 
-    // ReSTIR PT: reservoirs (128 bytes/pixel, 2x ping-pong) + path records (96 bytes/pixel)
+    // ReSTIR PT: reservoirs (10 vec4 = 160 bytes/pixel, 2× ping-pong)
+    //   + path records (96 bytes/pixel = 6 vec4, unchanged for now — wf_shade
+    //   passes source attrs separately into the reservoir at create time).
+    // Reservoir layout (slots 7-9 added for pt_replay deep-prefix shift):
+    //   rb+0..6  unchanged (rcVertex, primary, jacobian, etc.)
+    //   rb+7     sourcePos.xyz, sourceRoughness
+    //   rb+8     sourceNormal.xy (oct), sourceAlbedoLuma, sourceMetallic
+    //   rb+9     sourceSpecularLevel, prefixThroughput.xyz
     for (int i = 0; i < 2; i++) {
-        if (!CreateSSBO(device, physDevice, pixelCount * 128, &ptReservoirBuffer_[i], &ptReservoirMemory_[i])) return false;
+        if (!CreateSSBO(device, physDevice, pixelCount * 160, &ptReservoirBuffer_[i], &ptReservoirMemory_[i])) return false;
     }
     if (!CreateSSBO(device, physDevice, pixelCount * 96, &ptPathRecordBuffer_, &ptPathRecordMemory_)) return false;
 
     // Stable Planes: header (16 bytes/pixel) + data (24 vec4s = 384 bytes/pixel)
     if (!CreateSSBO(device, physDevice, pixelCount * 16, &spHeaderBuffer_, &spHeaderMemory_)) return false;
     if (!CreateSSBO(device, physDevice, pixelCount * 384, &spDataBuffer_, &spDataMemory_)) return false;
+
+    // Surface History: 5 uints/pixel × 2 buffers (ping-pong). Zero-fill on
+    // creation so the first frame's "prev" reads bit0=0 (invalid) everywhere
+    // — without this, the temporal veto could pass on random GPU memory.
+    for (int i = 0; i < 2; i++) {
+        if (!CreateSSBO(device, physDevice, pixelCount * 20, &surfaceHistoryBuffer_[i], &surfaceHistoryMemory_[i])) return false;
+    }
+    {
+        VkCommandBuffer cmd = context_->BeginSingleTimeCommands();
+        for (int i = 0; i < 2; i++)
+            vkCmdFillBuffer(cmd, surfaceHistoryBuffer_[i], 0, pixelCount * 20, 0);
+        context_->EndSingleTimeCommands(cmd);
+    }
 
     // Counters: 64 bytes (16 base + 20 sort bin counts + 20 sort bin offsets + 8 pad)
     if (!CreateSSBO(device, physDevice, 64, &countersBuffer_, &countersMemory_)) return false;
@@ -360,8 +387,8 @@ bool WavefrontPipeline::CreateDescriptorSet() {
     // binding 5:  Counters             binding 12: throughput WRITE
     // binding 6:  IndirectDispatch     binding 13: flags READ
     //                                  binding 14: flags WRITE
-    // 15 original + 3 ReSTIR PT + 2 Stable Planes
-    constexpr int NUM_BINDINGS = 20;
+    // 15 original + 3 ReSTIR PT + 2 Stable Planes + 2 Surface History + 2 firefly_k
+    constexpr int NUM_BINDINGS = 24;
     VkDescriptorSetLayoutBinding bindings[NUM_BINDINGS] = {};
     for (int i = 0; i < NUM_BINDINGS; i++) {
         bindings[i].binding = i;
@@ -423,6 +450,10 @@ bool WavefrontPipeline::CreateDescriptorSet() {
             ptPathRecordBuffer_,           // 17: PT path record
             spHeaderBuffer_,               // 18: Stable Planes header
             spDataBuffer_,                 // 19: Stable Planes data
+            surfaceHistoryBuffer_[setIdx],     // 20: Surface History PREV (read)
+            surfaceHistoryBuffer_[1 - setIdx], // 21: Surface History CURR (write)
+            fireflyKBuffer_[r],                // 22: firefly_k READ
+            fireflyKBuffer_[w],                // 23: firefly_k WRITE
         };
 
         VkDescriptorBufferInfo bufInfos[NUM_BINDINGS] = {};
@@ -590,9 +621,12 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
     // Set 1 (B): read=buffer[1], write=buffer[0]
     pathStateCurrent_ = 0;
 
-    // Clear pixel radiance, primary G-buffer, and SharcState (once per frame, before all SPP samples)
+    // Clear pixel radiance, primary G-buffer, and SharcState (once per frame, before all SPP samples).
+    // primaryGBuf stride = 26 floats × 4 = 104 bytes/pixel — must clear all of it,
+    // otherwise slots that K2 doesn't write on sky pixels (PSR/IDs) hold stale data
+    // that wf_output then persists into SurfaceHistory.
     vkCmdFillBuffer(cmd, pixelRadianceBuffer_, 0, totalPixels * 32, 0);
-    vkCmdFillBuffer(cmd, primaryGBufBuffer_, 0, totalPixels * 64, 0);
+    vkCmdFillBuffer(cmd, primaryGBufBuffer_, 0, totalPixels * 104, 0);
     vkCmdFillBuffer(cmd, sharcStateBuffer_, 0, totalPixels * 80, 0);  // pathLength=0 = initialized
 
     VkMemoryBarrier clearBarrier{};
@@ -741,9 +775,12 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
     }
 
     // ── ReSTIR PT passes (after stable planes, before output) ──
+    // Pick the descriptor set whose binding 20 = surfaceHistory PREV. K5
+    // below writes the CURR side via binding 21 in the same set.
+    const uint32_t shSetIdx = surfaceHistoryCurrent_;
     bool ptActive = pipelinePTTemporal_ && pipelinePTSpatial_ && pipelinePTFinal_;
     if (ptActive) {
-        VkDescriptorSet setsPT[2] = { sceneDescSet, wfDescSet_[0] };
+        VkDescriptorSet setsPT[2] = { sceneDescSet, wfDescSet_[shSetIdx] };
 
         // Push constants for PT kernels (width, height, frameIndex, pad)
         struct PTPush { uint32_t width, height, frameIndex, pad; };
@@ -793,14 +830,18 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
         ptReservoirCurrent_ = 1 - ptReservoirCurrent_;
     }
 
-    // K5: Output (after all SPP samples + PT accumulated)
-    VkDescriptorSet setsK5[2] = { sceneDescSet, wfDescSet_[0] };
+    // K5: Output (after all SPP samples + PT accumulated). Uses the same
+    // descriptor set as PT so binding 20=surfaceHistory PREV (read for
+    // motion-vector / surface-match logic) and binding 21=CURR (write).
+    VkDescriptorSet setsK5[2] = { sceneDescSet, wfDescSet_[shSetIdx] };
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK5_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
         0, 2, setsK5, 0, nullptr);
     vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     vkCmdDispatch(cmd, groupsX, groupsY, 1);
 
+    // Surface history ping-pong: this frame's CURR becomes next frame's PREV.
+    surfaceHistoryCurrent_ = 1 - surfaceHistoryCurrent_;
     frameIndex_++;
 }
 

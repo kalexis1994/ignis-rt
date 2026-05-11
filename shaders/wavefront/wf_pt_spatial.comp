@@ -3,7 +3,9 @@
 #extension GL_EXT_ray_query : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
 #extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : require
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -55,6 +57,7 @@ layout(push_constant) uniform PushConst {
 
 #include "../include/common.glsl"
 #include "../include/pt_reservoir.glsl"
+#include "../include/pt_replay.glsl"
 
 // Blue noise–inspired neighbor offsets (fixed pattern, 8 candidates)
 const ivec2 NEIGHBOR_OFFSETS[8] = ivec2[8](
@@ -64,7 +67,7 @@ const ivec2 NEIGHBOR_OFFSETS[8] = ivec2[8](
 
 PTReservoir readReservoirAt(int idx) {
     PTReservoir r;
-    int rb = idx * 8;
+    int rb = idx * 10;
     r.rcVertexPos = ptResCurr.data[rb+0].xyz; r.weightSum = ptResCurr.data[rb+0].w;
     r.rcRadiance = ptResCurr.data[rb+1].xyz; r.M = ptResCurr.data[rb+1].w;
     r.rcVertexNormal = ptOctDecode(ptResCurr.data[rb+2].xy);
@@ -80,6 +83,14 @@ PTReservoir readReservoirAt(int idx) {
     r.partialJacobian = ptResCurr.data[rb+6].x;
     r.rcWiPdf = ptResCurr.data[rb+6].y;
     r.pathLength = floatBitsToUint(ptResCurr.data[rb+6].z);
+    // Source vertex (slots 7-9, new for pt_replay sameSource check)
+    r.sourcePos = ptResCurr.data[rb+7].xyz;
+    r.sourceRoughness = ptResCurr.data[rb+7].w;
+    r.sourceNormal = ptOctDecode(ptResCurr.data[rb+8].xy);
+    r.sourceAlbedoLuma = ptResCurr.data[rb+8].z;
+    r.sourceMetallic = ptResCurr.data[rb+8].w;
+    r.sourceSpecularLevel = ptResCurr.data[rb+9].x;
+    r.prefixThroughput = ptResCurr.data[rb+9].yzw;
     return r;
 }
 
@@ -96,7 +107,7 @@ void main() {
     if (curr.M < 0.5) return;
 
     // Current surface data for similarity checks
-    uint gBase = uint(pixelIdx) * 24u;
+    uint gBase = uint(pixelIdx) * 26u;
     vec3 myNormal = vec3(primaryGBuf.gbufData[gBase+0],
                           primaryGBuf.gbufData[gBase+1],
                           primaryGBuf.gbufData[gBase+2]);
@@ -105,6 +116,9 @@ void main() {
                        primaryGBuf.gbufData[gBase+5],
                        primaryGBuf.gbufData[gBase+6]);
     float myViewZ = primaryGBuf.gbufData[gBase+7];
+    vec3 myAlbedo = vec3(primaryGBuf.gbufData[gBase+8],
+                          primaryGBuf.gbufData[gBase+9],
+                          primaryGBuf.gbufData[gBase+10]);
 
     // Skip sky pixels
     if (myViewZ > -0.001) return;
@@ -129,7 +143,7 @@ void main() {
         int nIdx = neighbor.y * int(pc.width) + neighbor.x;
 
         // Read neighbor's surface data
-        uint nGBase = uint(nIdx) * 24u;
+        uint nGBase = uint(nIdx) * 26u;
         vec3 nNormal = vec3(primaryGBuf.gbufData[nGBase+0],
                              primaryGBuf.gbufData[nGBase+1],
                              primaryGBuf.gbufData[nGBase+2]);
@@ -153,17 +167,30 @@ void main() {
         float pHat = ptTargetPDF(nRes);
         if (pHat < 0.001) continue;
 
-        // Jacobian: cached partial if available, otherwise compute fresh
+        // ── Deep prefix replay ──
+        // Shift the neighbor's path to start at MY primary; reject if the
+        // replayed source vertex doesn't materially match the neighbor's.
+        vec3 shiftedPos, shiftedNormal, shiftedAlbedo, shiftedThroughput;
+        float shiftedRough, shiftedMetallic, shiftedSpecular;
+        bool replayValid = ptReplayDeepPrefix(nRes,
+            myPos, myNormal, myAlbedo,
+            myRough, 0.0, 0.5,
+            shiftedPos, shiftedNormal, shiftedAlbedo,
+            shiftedRough, shiftedMetallic, shiftedSpecular,
+            shiftedThroughput);
+        if (!replayValid) continue;
+
+        // Jacobian at the shifted receiver (= myPos for rcBounceDepth=1)
         float J = (nRes.partialJacobian > 0.0)
-            ? ptJacobianCached(myPos, nRes)
-            : ptJacobian(nRes.rcVertexPos, nRes.rcVertexNormal, myPos, nRes.primaryPos);
+            ? ptJacobianCached(shiftedPos, nRes)
+            : ptJacobian(nRes.rcVertexPos, nRes.rcVertexNormal, shiftedPos, nRes.primaryPos);
         if (J < 0.001) continue;
 
-        // Invertibility validation
-        if (!ptValidateInvertibility(myPos, myNormal, myRough, nRes)) continue;
+        // Invertibility validation against the shifted surface
+        if (!ptValidateInvertibility(shiftedPos, shiftedNormal, shiftedRough, nRes)) continue;
 
-        // Visibility: trace shadow ray from current surface to reconnection vertex
-        vec3 toRC = nRes.rcVertexPos - myPos;
+        // Visibility: trace shadow ray from shifted receiver to reconnection vertex
+        vec3 toRC = nRes.rcVertexPos - shiftedPos;
         float rcDist = length(toRC);
         bool visible = true;
         if (rcDist > 0.01) {
@@ -171,7 +198,7 @@ void main() {
             rayQueryEXT visRQ;
             rayQueryInitializeEXT(visRQ, topLevelAS,
                 gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
-                0xFF, myPos + myNormal * 0.002,
+                0xFF, shiftedPos + shiftedNormal * 0.002,
                 0.001, rcDir, rcDist - 0.01);
             while (rayQueryProceedEXT(visRQ)) {}
             visible = (rayQueryGetIntersectionTypeEXT(visRQ, true) ==
@@ -188,11 +215,12 @@ void main() {
     // Re-finalize after spatial combinations
     ptFinalizeReservoir(curr);
 
-    // Write back
+    // Write back (10 vec4 stride — slots 7-9 are the source vertex)
     {
-        int rb = pixelIdx * 8;
+        int rb = pixelIdx * 10;
         vec2 rcN = ptOctEncode(curr.rcVertexNormal);
         vec2 pN  = ptOctEncode(curr.primaryNormal);
+        vec2 sN  = ptOctEncode(curr.sourceNormal);
         ptResCurr.data[rb+0] = vec4(curr.rcVertexPos, curr.weightSum);
         ptResCurr.data[rb+1] = vec4(curr.rcRadiance, curr.M);
         ptResCurr.data[rb+2] = vec4(rcN, curr.targetFunction, uintBitsToFloat(curr.rcBounceDepth));
@@ -202,6 +230,8 @@ void main() {
         ptResCurr.data[rb+5] = vec4(pN, 0.0, 0.0);
         ptResCurr.data[rb+6] = vec4(curr.partialJacobian, curr.rcWiPdf,
                                      uintBitsToFloat(curr.pathLength), 0.0);
-        ptResCurr.data[rb+7] = vec4(0);
+        ptResCurr.data[rb+7] = vec4(curr.sourcePos, curr.sourceRoughness);
+        ptResCurr.data[rb+8] = vec4(sN, curr.sourceAlbedoLuma, curr.sourceMetallic);
+        ptResCurr.data[rb+9] = vec4(curr.sourceSpecularLevel, curr.prefixThroughput);
     }
 }

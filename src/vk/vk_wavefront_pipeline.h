@@ -53,7 +53,11 @@ private:
     VkBuffer throughputBuffer_[2] = {};
     VkDeviceMemory throughputMemory_[2] = {};
     VkBuffer flagsBuffer_[2] = {};
+
     VkDeviceMemory flagsMemory_[2] = {};
+    // Per-path firefly_k tracker (RTXPT). 1 float/path, ping-pong R/W bindings 22/23.
+    VkBuffer fireflyKBuffer_[2] = {};
+    VkDeviceMemory fireflyKMemory_[2] = {};
     uint32_t pathStateCurrent_ = 0;                    // index of current read buffer
     VkBuffer hitResultBuffer_ = VK_NULL_HANDLE;        // HitResult[]
     VkDeviceMemory hitResultMemory_ = VK_NULL_HANDLE;
@@ -82,6 +86,15 @@ private:
     VkDeviceMemory spHeaderMemory_ = VK_NULL_HANDLE;
     VkBuffer spDataBuffer_ = VK_NULL_HANDLE;           // 24 vec4s per pixel (3 planes × 8 vec4s)
     VkDeviceMemory spDataMemory_ = VK_NULL_HANDLE;
+
+    // Surface History (ping-pong, RTXPT-style temporal-reuse veto).
+    // 5 uints/pixel: validFlags, instanceId, materialId, primitiveId, customIndex.
+    // Written by wf_output (curr), read by wf_pt_temporal/spatial (prev) to
+    // veto reservoir reuse when the reprojected surface is no longer the same
+    // instance/primitive — kills the wake/smear of objects across reveal edges.
+    VkBuffer surfaceHistoryBuffer_[2] = {};
+    VkDeviceMemory surfaceHistoryMemory_[2] = {};
+    uint32_t surfaceHistoryCurrent_ = 0;               // ping-pong index for "curr"
 
     // Descriptor sets for ping-pong (2 sets, no host updates during recording)
     // SoA bindings: 0=originDir(R), 7=originDir(W), 9=pixelRng(R), 10=pixelRng(W),

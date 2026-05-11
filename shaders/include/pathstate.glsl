@@ -23,6 +23,7 @@ layout(binding = 0,  set = 1, scalar) buffer OriginDirBuf   { float data[]; } ps
 layout(binding = 9,  set = 1, scalar) buffer PixelRngBuf    { uint  data[]; } psPixelRng;
 layout(binding = 11, set = 1, scalar) buffer ThroughputBuf  { float data[]; } psThroughput;
 layout(binding = 13, set = 1, scalar) buffer FlagsBuf       { uint  data[]; } psFlags;
+layout(binding = 22, set = 1, scalar) buffer FireflyKBuf    { float data[]; } psFireflyK;
 
 void psInitOrigin(uint idx, vec3 v)      { uint b = idx*6u; psOriginDir.data[b]=v.x; psOriginDir.data[b+1]=v.y; psOriginDir.data[b+2]=v.z; }
 void psInitDirection(uint idx, vec3 v)   { uint b = idx*6u; psOriginDir.data[b+3]=v.x; psOriginDir.data[b+4]=v.y; psOriginDir.data[b+5]=v.z; }
@@ -30,6 +31,7 @@ void psInitPixelIndex(uint idx, uint v)  { psPixelRng.data[idx*2u] = v; }
 void psInitRngState(uint idx, uint v)    { psPixelRng.data[idx*2u+1u] = v; }
 void psInitThroughput(uint idx, vec3 v)  { uint b = idx*3u; psThroughput.data[b]=v.x; psThroughput.data[b+1]=v.y; psThroughput.data[b+2]=v.z; }
 void psInitFlags(uint idx, uint v)       { psFlags.data[idx] = v; }
+void psInitFireflyK(uint idx, float v)   { psFireflyK.data[idx] = v; }
 
 void psInitAll(uint idx, vec3 origin, uint pixelIndex, vec3 dir, uint rng, vec3 throughput, uint flags) {
     psInitOrigin(idx, origin);
@@ -38,6 +40,7 @@ void psInitAll(uint idx, vec3 origin, uint pixelIndex, vec3 dir, uint rng, vec3 
     psInitRngState(idx, rng);
     psInitThroughput(idx, throughput);
     psInitFlags(idx, flags);
+    psInitFireflyK(idx, 1.0);
 }
 
 #else
@@ -51,6 +54,8 @@ layout(binding = 11, set = 1, scalar) buffer ThroughputRead   { float data[]; } 
 layout(binding = 12, set = 1, scalar) buffer ThroughputWrite  { float data[]; } psThroughputW;
 layout(binding = 13, set = 1, scalar) buffer FlagsRead        { uint  data[]; } psFlagsR;
 layout(binding = 14, set = 1, scalar) buffer FlagsWrite       { uint  data[]; } psFlagsW;
+layout(binding = 22, set = 1, scalar) buffer FireflyKRead     { float data[]; } psFireflyKR;
+layout(binding = 23, set = 1, scalar) buffer FireflyKWrite    { float data[]; } psFireflyKW;
 
 // ---- Read helpers (from READ buffers) ----
 vec3  psReadOrigin(uint idx)      { uint b = idx*6u; return vec3(psOriginDirR.data[b], psOriginDirR.data[b+1], psOriginDirR.data[b+2]); }
@@ -59,6 +64,7 @@ uint  psReadPixelIndex(uint idx)  { return psPixelRngR.data[idx*2u]; }
 uint  psReadRngState(uint idx)    { return psPixelRngR.data[idx*2u+1u]; }
 vec3  psReadThroughput(uint idx)  { uint b = idx*3u; return vec3(psThroughputR.data[b], psThroughputR.data[b+1], psThroughputR.data[b+2]); }
 uint  psReadFlags(uint idx)       { return psFlagsR.data[idx]; }
+float psReadFireflyK(uint idx)    { return psFireflyKR.data[idx]; }
 
 // ---- Write helpers (to WRITE buffers) ----
 void psWriteOrigin(uint idx, vec3 v)      { uint b = idx*6u; psOriginDirW.data[b]=v.x; psOriginDirW.data[b+1]=v.y; psOriginDirW.data[b+2]=v.z; }
@@ -67,6 +73,7 @@ void psWritePixelIndex(uint idx, uint v)  { psPixelRngW.data[idx*2u] = v; }
 void psWriteRngState(uint idx, uint v)    { psPixelRngW.data[idx*2u+1u] = v; }
 void psWriteThroughput(uint idx, vec3 v)  { uint b = idx*3u; psThroughputW.data[b]=v.x; psThroughputW.data[b+1]=v.y; psThroughputW.data[b+2]=v.z; }
 void psWriteFlags(uint idx, uint v)       { psFlagsW.data[idx] = v; }
+void psWriteFireflyK(uint idx, float v)   { psFireflyKW.data[idx] = v; }
 
 void psWriteAll(uint idx, vec3 origin, uint pixelIndex, vec3 dir, uint rng, vec3 throughput, uint flags) {
     psWriteOrigin(idx, origin);
@@ -101,6 +108,8 @@ void psCopyWriteToRead(uint srcIdx, uint dstIdx) {
         psThroughputR.data[d3 + i] = psThroughputW.data[s3 + i];
     // flags (1 uint)
     psFlagsR.data[dstIdx] = psFlagsW.data[srcIdx];
+    // firefly_k (1 float)
+    psFireflyKR.data[dstIdx] = psFireflyKW.data[srcIdx];
 }
 
 #endif // PATHSTATE_WRITE_TO_READ

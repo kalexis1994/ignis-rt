@@ -70,8 +70,8 @@ void main() {
 
     int pixelIdx = pixel.y * int(pc.width) + pixel.x;
 
-    // Read finalized reservoir
-    int rb = pixelIdx * 8;
+    // Read finalized reservoir (10 vec4 stride)
+    int rb = pixelIdx * 10;
     vec3  rcPos     = ptResCurr.data[rb+0].xyz;
     float W         = ptResCurr.data[rb+0].w;    // contribution weight (finalized)
     vec3  rcRad     = ptResCurr.data[rb+1].xyz;
@@ -82,7 +82,7 @@ void main() {
     if (M < 0.5 || W <= 0.0 || tgtFunc <= 0.0) return;
 
     // Read primary surface data
-    uint gBase = uint(pixelIdx) * 24u;
+    uint gBase = uint(pixelIdx) * 26u;
     vec3 primaryNormal = vec3(primaryGBuf.gbufData[gBase+0],
                                primaryGBuf.gbufData[gBase+1],
                                primaryGBuf.gbufData[gBase+2]);

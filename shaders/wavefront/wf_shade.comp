@@ -153,6 +153,7 @@ layout(buffer_reference, scalar) buffer Bitangents { float b[]; };
 
 // Wavefront buffers (set 1)
 #include "../include/pathstate.glsl"
+#include "../include/rtxpt_firefly.glsl"
 layout(binding = 1, set = 1, scalar) buffer HitResultBuffer { float hitData[]; } hitResults;
 layout(binding = 2, set = 1, scalar) buffer ShadowRayBuffer { float shadowData[]; } shadowRays;
 layout(binding = 3, set = 1, scalar) buffer PixelRadianceBuffer { uint radDataU[]; } pixelRadiance;
@@ -275,6 +276,10 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= counters.activeRayCount) return;
 
+    // RTXPT per-path firefly tracker (phase 2 infrastructure: read + forward
+    // unchanged; clamping + scatter-based update will land in a later pass).
+    float pathFireflyK = psReadFireflyK(idx);
+
     // Read PathState
     vec3 rayOrigin = psReadOrigin(idx);
     uint pixelIndex = psReadPixelIndex(idx);
@@ -294,7 +299,7 @@ void main() {
     bool ptEnabled = (cam.lightPad2 & 8u) != 0u;  // same bit as ReSTIR GI toggle
     if (ptEnabled && bounce == 0u && pc.sampleIdx == 0u) {
         // Store RNG seed in G-buffer slot 23 (persists across dispatches)
-        uint gBaseRng = pixelIndex * 24u;
+        uint gBaseRng = pixelIndex * 26u;
         primaryGBuf.gbufData[gBaseRng + 23] = uintBitsToFloat(rngState);
     }
 
@@ -587,7 +592,7 @@ void main() {
         // surface position so output kernel can compute specular motion vectors
         // from the object being reflected, not the mirror surface.
         if ((flags & 0x40u) != 0u) {
-            uint gBase = pixelIndex * 24u;
+            uint gBase = pixelIndex * 26u;
             primaryGBuf.gbufData[gBase+16] = worldPos.x;
             primaryGBuf.gbufData[gBase+17] = worldPos.y;
             primaryGBuf.gbufData[gBase+18] = worldPos.z;
@@ -802,6 +807,8 @@ void main() {
             uint nBase = nextIdx * 12u;
             vec3 newOrigin = skipOrigin; // already past all transparent layers
             psWriteAll(nextIdx, newOrigin, pixelIndex, rayDir, rngState, throughput, flags | matCatBits);
+            pathFireflyK = rtxpt_update_firefly_k(pathFireflyK, isDiffusePath ? 1.0 : 50.0, 1.0);
+            psWriteFireflyK(nextIdx, pathFireflyK);
             break;
         }
         psTerminate(idx, flags);
@@ -872,6 +879,8 @@ void main() {
             uint nBase = nextIdx * 12u;
             vec3 skipOrigin = worldPos + rayDir * 0.002;
             psWriteAll(nextIdx, skipOrigin, pixelIndex, rayDir, rngState, throughput, flags);
+            pathFireflyK = rtxpt_update_firefly_k(pathFireflyK, isDiffusePath ? 1.0 : 50.0, 1.0);
+            psWriteFireflyK(nextIdx, pathFireflyK);
             psTerminate(idx, flags);
             return;
         }
@@ -1029,7 +1038,7 @@ void main() {
 
         // Write G-buffer for volume surface (bounce 0)
         if (bounce == 0u && pc.sampleIdx == 0u) {
-            uint gBase = pixelIndex * 24u;
+            uint gBase = pixelIndex * 26u;
             primaryGBuf.gbufData[gBase+0] = N.x;
             primaryGBuf.gbufData[gBase+1] = N.y;
             primaryGBuf.gbufData[gBase+2] = N.z;
@@ -1047,6 +1056,11 @@ void main() {
             primaryGBuf.gbufData[gBase+13] = localPos.y;
             primaryGBuf.gbufData[gBase+14] = localPos.z;
             primaryGBuf.gbufData[gBase+15] = uintBitsToFloat(uint(instanceId));
+            // Surface IDs for SurfaceHistory veto in PT temporal/spatial.
+            // Slot 23 is reserved for PSR roughness / pt rng seed proxy, so we
+            // place the IDs at 24/25 inside the 26-float gbuffer stride.
+            primaryGBuf.gbufData[gBase+24] = uintBitsToFloat(uint(primitiveId));
+            primaryGBuf.gbufData[gBase+25] = uintBitsToFloat(customIndex);
             // volume: metallic=0, specularLevel=0 packed as two f16
             pixelRadiance.radDataU[rBase+7] = 0u;
             pixelRadiance.radDataU[rBase+3] = floatBitsToUint(hitT);
@@ -1065,6 +1079,8 @@ void main() {
         }
         uint volFlags = bounce | (isDiffusePath ? 0x10u : 0u) | (flags & 0xFF00u) | matCatBits;
         psWriteAll(nextIdx, volExit, pixelIndex, rayDir, rngState, throughput, volFlags);
+        pathFireflyK = rtxpt_update_firefly_k(pathFireflyK, isDiffusePath ? 1.0 : 50.0, 1.0);
+        psWriteFireflyK(nextIdx, pathFireflyK);
         psTerminate(idx, flags);
         return;
     }
@@ -1110,7 +1126,7 @@ void main() {
     // Early glass returns before here, so this only fires for non-glass or
     // the resolved surface behind glass (last surface at bounce 0 wins).
     if (bounce == 0u && pc.sampleIdx == 0u) {
-        uint gBase = pixelIndex * 24u;
+        uint gBase = pixelIndex * 26u;
         primaryGBuf.gbufData[gBase+0] = N.x;
         primaryGBuf.gbufData[gBase+1] = N.y;
         primaryGBuf.gbufData[gBase+2] = N.z;
@@ -1129,6 +1145,10 @@ void main() {
         primaryGBuf.gbufData[gBase+13] = localPos.y;
         primaryGBuf.gbufData[gBase+14] = localPos.z;
         primaryGBuf.gbufData[gBase+15] = uintBitsToFloat(uint(instanceId));
+        // Surface IDs for SurfaceHistory veto in PT temporal/spatial.
+        // Slot 23 reserved (PSR roughness / pt rng proxy); IDs at 24/25.
+        primaryGBuf.gbufData[gBase+24] = uintBitsToFloat(uint(primitiveId));
+        primaryGBuf.gbufData[gBase+25] = uintBitsToFloat(customIndex);
 
         // Pack metallic + specularLevel as two f16 into rBase+7.
         // Both needed by wf_output.comp to compute the correct F0 for DLSS RR
@@ -1235,6 +1255,8 @@ void main() {
         uint nBase = nextIdx * 12u;
         uint glassFlags = bounce | ((glassBounces & 0xFu) << 8u) | matCatBits;
         psWriteAll(nextIdx, newOrigin, pixelIndex, newDir, rngState, throughput, glassFlags);
+        pathFireflyK = rtxpt_update_firefly_k(pathFireflyK, isDiffusePath ? 1.0 : 50.0, 1.0);
+        psWriteFireflyK(nextIdx, pathFireflyK);
         psTerminate(idx, flags);
         return;
     }
@@ -2070,6 +2092,8 @@ void main() {
             uint nBase = nextIdx * 12u;
             uint thinFlags = bounce | (flags & 0xFF00u) | matCatBits;
             psWriteAll(nextIdx, thinOrigin, pixelIndex, rayDir, rngState, throughput, thinFlags);
+            pathFireflyK = rtxpt_update_firefly_k(pathFireflyK, isDiffusePath ? 1.0 : 50.0, 1.0);
+            psWriteFireflyK(nextIdx, pathFireflyK);
             psTerminate(idx, flags);
             return;
         } else if (thinReflectProb > 0.001 && thinRnd < thinTotalProb) {
@@ -2089,6 +2113,8 @@ void main() {
             vec3 reflOrigin = worldPos + N * 0.001;
             uint reflFlags = bounce | (flags & 0xFF00u) | matCatBits;
             psWriteAll(nextIdx, reflOrigin, pixelIndex, newDir, rngState, throughput, reflFlags);
+            pathFireflyK = rtxpt_update_firefly_k(pathFireflyK, isDiffusePath ? 1.0 : 50.0, 1.0);
+            psWriteFireflyK(nextIdx, pathFireflyK);
             psTerminate(idx, flags);
             return;
         }
@@ -2114,6 +2140,8 @@ void main() {
         // Preserve bounce + glass counter, clear isDiffuse
         uint tpFlags = bounce | (flags & 0xFF00u) | matCatBits;
         psWriteAll(nextIdx, skipOrigin, pixelIndex, rayDir, rngState, throughput, tpFlags);
+        pathFireflyK = rtxpt_update_firefly_k(pathFireflyK, isDiffusePath ? 1.0 : 50.0, 1.0);
+        psWriteFireflyK(nextIdx, pathFireflyK);
         psTerminate(idx, flags);
         return;
     }
@@ -2125,6 +2153,8 @@ void main() {
         vec3 skipOrigin = worldPos + rayDir * 0.002;
         uint lpFlags = bounce | (flags & 0xFF00u) | matCatBits;
         psWriteAll(nextIdx, skipOrigin, pixelIndex, rayDir, rngState, throughput, lpFlags);
+        pathFireflyK = rtxpt_update_firefly_k(pathFireflyK, isDiffusePath ? 1.0 : 50.0, 1.0);
+        psWriteFireflyK(nextIdx, pathFireflyK);
         psTerminate(idx, flags);
         return;
     }
@@ -2201,6 +2231,8 @@ void main() {
         // Same bounce, not diffuse, updated glass counter
         uint glassFlags = bounce | ((glassBounces & 0xFu) << 8u) | matCatBits;
         psWriteAll(nextIdx, rayOrigin, pixelIndex, rayDir, rngState, throughput, glassFlags);
+        pathFireflyK = rtxpt_update_firefly_k(pathFireflyK, isDiffusePath ? 1.0 : 50.0, 1.0);
+        psWriteFireflyK(nextIdx, pathFireflyK);
         psTerminate(idx, flags);
         return;
 
@@ -2302,6 +2334,8 @@ void main() {
                     uint nBase = nextIdx * 12u;
                     uint newFlags = nextBounce | matCatBits;
                     psWriteAll(nextIdx, rayOrigin, pixelIndex, rayDir, rngState, throughput, newFlags);
+                    pathFireflyK = rtxpt_update_firefly_k(pathFireflyK, isDiffusePath ? 1.0 : 50.0, 1.0);
+                    psWriteFireflyK(nextIdx, pathFireflyK);
                 }
                 psTerminate(idx, flags);
                 return;
@@ -2394,7 +2428,7 @@ void main() {
         // This means reconnection always measures against the primary, which is
         // correct for RcVertexLength = 2 (the common case) and conservative for
         // deeper bounces (requires both rough + far from primary).
-        uint gBase = pixelIndex * 24u;
+        uint gBase = pixelIndex * 26u;
         vec3 prevPos = vec3(primaryGBuf.gbufData[gBase+4],
                              primaryGBuf.gbufData[gBase+5],
                              primaryGBuf.gbufData[gBase+6]);
@@ -2449,6 +2483,8 @@ void main() {
         uint nBase = nextIdx * 12u;
         uint newFlags = nextBounce | (isDiffusePath ? 0x10u : 0u) | matCatBits;
         psWriteAll(nextIdx, rayOrigin, pixelIndex, rayDir, rngState, throughput, newFlags);
+        pathFireflyK = rtxpt_update_firefly_k(pathFireflyK, isDiffusePath ? 1.0 : 50.0, 1.0);
+        psWriteFireflyK(nextIdx, pathFireflyK);
     }
 
     // Mark current path as processed (not terminated — it continues via nextActiveRayCount)

@@ -62,10 +62,28 @@ layout(binding = 28, set = 0, std430) buffer PrevTransformBuf {
 // Wavefront buffers (set 1)
 layout(binding = 3, set = 1, scalar) buffer PixelRadianceBuffer { uint radDataU[]; } pixelRadiance;
 layout(binding = 4, set = 1, scalar) buffer PrimaryGBufBuffer { float gbufData[]; } primaryGBuf;
+// Per-path firefly_k written by the last wf_shade dispatch — adapts the
+// output clamp threshold so paths that scattered through many wide-lobe
+// (diffuse) bounces get clamped harder than narrow specular chains.
+layout(binding = 22, set = 1, scalar) readonly buffer PathFireflyKBuf { float data[]; } pathFireflyK;
 
 // Stable Planes (set 1)
 layout(binding = 18, set = 1, std430) buffer SPHeaderBuf { uvec4 data[]; } spHeader;
 layout(binding = 19, set = 1, std430) buffer SPDataBuf   { vec4  data[]; } spData;
+
+// Surface History (RTXPT-style temporal-reuse veto). 5 uints per pixel:
+//   [0] validFlags (bit0=valid, bit1=alphaUnstable [reserved])
+//   [1] instanceId
+//   [2] materialId (currently 0 — placeholder for future per-prim mat veto)
+//   [3] primitiveId
+//   [4] customIndex (raw geometry index in TLAS)
+const uint WF_SURFACE_HISTORY_STRIDE = 5u;
+layout(binding = 20, set = 1, std430) readonly buffer SurfaceHistoryPrevBuf {
+    uint data[];
+} surfaceHistoryPrev;
+layout(binding = 21, set = 1, std430) buffer SurfaceHistoryCurrBuf {
+    uint data[];
+} surfaceHistoryCurr;
 
 layout(push_constant) uniform PushConst {
     uint width;
@@ -123,19 +141,26 @@ void main() {
                          uintBitsToFloat(pixelRadiance.radDataU[rBase+5]),
                          uintBitsToFloat(pixelRadiance.radDataU[rBase+6])) * sppInv;
 
-    // Firefly suppression — clamp outlier radiance before DLSS RR.
-    // Uses a soft clamp: values above threshold are compressed, not hard-cut.
+    // Firefly suppression — RTXPT-style adaptive clamp.
+    // Threshold = FIREFLY_THRESHOLD * firefly_k. firefly_k starts at 1.0 and
+    // shrinks after every BSDF scatter (diffuse bounces collapse it, specular
+    // preserves it), so paths with multiple wide-lobe rebounds get clamped
+    // tighter and one anomalously bright sample can't poison the pixel.
     const float FIREFLY_THRESHOLD = 50.0;
+    // Floor k at 0.5 so the worst case (many diffuse bounces) only halves
+    // the threshold instead of crushing legitimate daylight indirect.
+    float k = clamp(pathFireflyK.data[pixelIndex], 0.5, 1.0);
+    float adaptThreshold = FIREFLY_THRESHOLD * k;
     float diffLum = dot(diffuse, vec3(0.2126, 0.7152, 0.0722));
-    if (diffLum > FIREFLY_THRESHOLD) diffuse *= FIREFLY_THRESHOLD / diffLum;
+    if (diffLum > adaptThreshold) diffuse *= adaptThreshold / diffLum;
     float specLum = dot(specular, vec3(0.2126, 0.7152, 0.0722));
-    if (specLum > FIREFLY_THRESHOLD) specular *= FIREFLY_THRESHOLD / specLum;
+    if (specLum > adaptThreshold) specular *= adaptThreshold / specLum;
     // NaN guard
     if (any(isnan(diffuse)))  diffuse  = vec3(0.0);
     if (any(isnan(specular))) specular = vec3(0.0);
 
     // Read primary G-buffer (24 floats per pixel, written by K2)
-    uint gBase = pixelIndex * 24u;
+    uint gBase = pixelIndex * 26u;
     vec3 primaryNormal = vec3(primaryGBuf.gbufData[gBase+0],
                                primaryGBuf.gbufData[gBase+1],
                                primaryGBuf.gbufData[gBase+2]);
@@ -152,9 +177,21 @@ void main() {
                                  primaryGBuf.gbufData[gBase+13],
                                  primaryGBuf.gbufData[gBase+14]);
     uint primaryInstanceId = floatBitsToUint(primaryGBuf.gbufData[gBase+15]);
+    uint primaryPrimitiveId = floatBitsToUint(primaryGBuf.gbufData[gBase+24]);
+    uint primaryCustomIndex = floatBitsToUint(primaryGBuf.gbufData[gBase+25]);
 
     // viewZ < 0 for visible geometry (RH convention), 0 for sky (buffer cleared to 0)
     bool primaryHit = (primaryViewZ < -0.001);
+
+    // ── Persist this pixel's visible-surface IDs for next frame's veto ──
+    {
+        uint base = pixelIndex * WF_SURFACE_HISTORY_STRIDE;
+        surfaceHistoryCurr.data[base + 0u] = primaryHit ? 1u : 0u;
+        surfaceHistoryCurr.data[base + 1u] = primaryInstanceId;
+        surfaceHistoryCurr.data[base + 2u] = 0u; // materialId reserved
+        surfaceHistoryCurr.data[base + 3u] = primaryPrimitiveId;
+        surfaceHistoryCurr.data[base + 4u] = primaryCustomIndex;
+    }
 
     // ── Stable Planes FILL: override guide buffers for delta surfaces ──
     // DISABLED — introduced in 4a10faa "Stable Planes FILL integration".
@@ -182,6 +219,8 @@ void main() {
     float denoiserViewZ = primaryViewZ;
     vec2 denoiserMV = vec2(0);
     bool hasStablePlane = false;
+    // Lifted out of the primaryHit block so debug view 8 can read it later.
+    vec2 debugMotionVector = vec2(0.0);
 
     if (false) {  // HOTFIX: Stable Planes FILL disabled, see comment above
         // Read dominant stable plane
@@ -253,6 +292,7 @@ void main() {
             mvZ = (cam.viewPrev * vec4(prevWorldPos, 1.0)).z - primaryViewZ;
         }
         imageStore(motionVectorsImg, pixel, vec4(motionVector, mvZ, 0));
+        debugMotionVector = motionVector;
 
         // Demodulate diffuse by albedo for NRD
         vec3 albedo = max(primaryAlbedo, vec3(0.01));
@@ -266,19 +306,28 @@ void main() {
         float ndcZ = clamp(clipPos.z / clipPos.w, 0.0, 1.0);
         imageStore(dlssDepthImg, pixel, vec4(ndcZ, 0, 0, 0));
 
-        // Specular MV — use PSR (Primary Surface Replacement) when available.
-        // For specular surfaces (roughness < 0.4), wf_shade stores the reflected
-        // surface's worldPos/localPos/instanceId at gbuf offsets 16-22.
-        // Motion vectors computed from the reflected object track the actual
-        // visual content in reflections, eliminating ghosting during camera motion.
+        // Specular MV — Primary Surface Replacement (port of ignis-ac).
+        // wf_shade stores the reflected surface's worldPos/localPos/instanceId
+        // at gbuf offsets 16-22 (only for low-roughness primaries). DLSS RR
+        // wants reflections to reproject by the reflected CONTENT, not by the
+        // mirror surface, otherwise reflections ghost.
+        //
+        // ignis-ac replaces the binary roughness<0.4 gate with a continuous
+        // psrGuideWeight from smoothstep on the specular confidence; we
+        // reuse that idea using roughness alone (no stable-planes signal yet).
+        // Soft transition avoids popping when a material crosses the
+        // 0.4-roughness threshold mid-frame (e.g. wet asphalt drying).
         vec3 psrWorldPos = vec3(primaryGBuf.gbufData[gBase+16],
                                  primaryGBuf.gbufData[gBase+17],
                                  primaryGBuf.gbufData[gBase+18]);
         uint psrInstanceId = floatBitsToUint(primaryGBuf.gbufData[gBase+22]);
-        bool hasPSR = (psrInstanceId != 0xFFFFFFFFu) && (primaryRoughness < 0.4);
+        bool psrInstanceValid = (psrInstanceId != 0xFFFFFFFFu);
+        float psrGuideWeight = psrInstanceValid
+            ? (1.0 - smoothstep(0.05, 0.40, primaryRoughness))
+            : 0.0;
 
-        if (hasPSR) {
-            // Compute specular MV from reflected surface
+        vec2 specularMotionVector = motionVector;  // default: reuse primary MV
+        if (psrGuideWeight > 0.001) {
             vec3 psrLocalPos = vec3(primaryGBuf.gbufData[gBase+19],
                                      primaryGBuf.gbufData[gBase+20],
                                      primaryGBuf.gbufData[gBase+21]);
@@ -297,12 +346,19 @@ void main() {
             vec4 psrPrevClip = cam.projPrev * cam.viewPrev * vec4(psrPrevWorldPos, 1.0);
             vec2 psrPrevNDC = psrPrevClip.xy / psrPrevClip.w;
             vec2 psrPrevUV = vec2(psrPrevNDC.x * 0.5 + 0.5, 0.5 - psrPrevNDC.y * 0.5);
-            vec2 specMV = psrPrevUV - psrCurrUV;
-            imageStore(specularMVImg, pixel, vec4(specMV, 0, 0));
-        } else {
-            // Non-specular or no PSR data: use regular geometric MV
-            imageStore(specularMVImg, pixel, vec4(motionVector, 0, 0));
+
+            vec2 psrMotionVector = psrPrevUV - psrCurrUV;
+            // Reject pathological reprojections: behind-camera (w<=0), NaN/Inf,
+            // or huge MVs that suggest a degenerate reflection.
+            bool psrMvFinite = psrCurrClip.w > 1e-5 && psrPrevClip.w > 1e-5 &&
+                               !any(isnan(psrMotionVector)) &&
+                               !any(isinf(psrMotionVector)) &&
+                               all(lessThan(abs(psrMotionVector), vec2(2.0)));
+            if (psrMvFinite) {
+                specularMotionVector = mix(motionVector, psrMotionVector, psrGuideWeight);
+            }
         }
+        imageStore(specularMVImg, pixel, vec4(specularMotionVector, 0, 0));
 
         // Specular albedo (EnvBRDFApprox) for DLSS Ray Reconstruction.
         // Decode metallic + specularLevel packed as two f16 by wf_shade.
@@ -375,6 +431,27 @@ void main() {
 
     // Combined radiance for direct output
     vec3 color = diffuse + specular;
+
+    // Debug view 8: Motion Vector visualization — unsigned magnitude.
+    //   R = |MV.x| * 100 (horizontal motion magnitude)
+    //   G = |MV.y| * 100 (vertical motion magnitude)
+    //   B = length(MV) * 500 (total magnitude at sub-pixel sensitivity)
+    // MV is in UV [0,1] space. Saturation points:
+    //   R/G saturated at |MV| = 0.01 UV ≈ 12.8 pixels @ 1280 width
+    //   B saturated at  |MV| = 0.002 UV ≈ 2.5 pixels @ 1280 width
+    // Static camera expected: near-black everywhere (any glow = MV offset bug).
+    // Slow pan: dim red/green gradient, static pixels still near-black.
+    // Per-object colour inconsistency under motion = MV miscomputed for that
+    // instance (likely stale prevTransforms or wrong localPos).
+    if (cam.parameters.y == 8u) {
+        float magX = abs(debugMotionVector.x) * 100.0;
+        float magY = abs(debugMotionVector.y) * 100.0;
+        float magTot = length(debugMotionVector) * 500.0;
+        color = vec3(magX, magY, magTot);
+        color = clamp(color, 0.0, 1.0);
+        imageStore(outputImage, pixel, vec4(color, 1.0));
+        return;
+    }
 
     // HDR output flag
     bool hdrOutput = (cam.parameters.w != 0u);
