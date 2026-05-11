@@ -189,11 +189,18 @@ public:
 
     // Polymorphic light buffer (Phase 4a). `data` is an array of
     // ignis::LightInfo (96 bytes each). Device-local; this copies via staging.
-    // Coexists with the legacy lightTree + emissive buffers — neither path
-    // reads it yet, so this is purely a CPU/GPU plumbing test until 4b.
+    // Coexists with the legacy lightTree + emissive buffers; the DI passes
+    // (4b onwards) read from this one via descriptor set 2 below.
     void UpdatePolyLightsBuffer(const void* data, uint32_t lightCount);
     VkBuffer GetPolyLightsBuffer() const { return polyLightsBuffer_; }
     uint32_t GetPolyLightsCount() const { return polyLightsCount_; }
+
+    // Descriptor set 2 — RTXDI DI port resources. Currently exposes the
+    // polymorphic light buffer at binding 0. Future DI passes (4c reservoirs,
+    // 4b-derived light tiles, etc.) will add more bindings here without
+    // touching set 1.
+    VkDescriptorSetLayout GetDIDescriptorSetLayout() const { return diDescriptorSetLayout_; }
+    VkDescriptorSet       GetDIDescriptorSet() const       { return diDescriptorSet_; }
 
     // Create full-resolution G-buffer images and update descriptors
     bool CreateGBuffers(uint32_t width, uint32_t height);
@@ -254,6 +261,10 @@ private:
     bool CreateDescriptorSetLayout();
     bool CreateDescriptorPool();
     bool CreateDescriptorSet();
+    bool CreateDIDescriptorSet();   // Phase 4b: descriptor set 2 (DI port).
+    bool CreateDIPolyBuffers(uint32_t width, uint32_t height); // Phase 4c
+    void DestroyDIPolyBuffers();
+    void UpdateDIInitialDescriptor();                          // rewrites set 2 b=1
     bool CreateDummyResources();
 
     Context* context_ = nullptr;
@@ -263,6 +274,18 @@ private:
     VkDescriptorSetLayout descriptorSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
+
+    // Descriptor set 2 — RTXDI DI port resources.
+    // Binding 0: polyLightsBuffer_   (Phase 4b — storage buffer, scalar)
+    // Binding 1: diPolyInitialBuffer_ (Phase 4c — 32 B / pixel reservoir; sized
+    //            by CreateDIPolyBuffers, rewritten on resize)
+    VkDescriptorSetLayout diDescriptorSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorPool diDescriptorPool_ = VK_NULL_HANDLE;
+    VkDescriptorSet diDescriptorSet_ = VK_NULL_HANDLE;
+
+    VkBuffer       diPolyInitialBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory diPolyInitialMemory_ = VK_NULL_HANDLE;
+    uint32_t       diPolyPixelCount_ = 0;
 
     // Camera UBO
     VkBuffer cameraBuffer_ = VK_NULL_HANDLE;

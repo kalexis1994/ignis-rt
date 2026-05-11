@@ -1,0 +1,398 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+
+// ============================================================
+// wf_di_initial_samples.comp — RTXDI DI port Phase 4c.
+//
+// Per-pixel initial candidate generation for the polymorphic DI
+// reservoir. Runs after wf_prepare_lights has refreshed the per-
+// light `power` proxy (a cheap CDF-like weight; the proper aliased
+// CDF lands in 4d). One thread per primary pixel.
+//
+// For each valid primary pixel, M_INITIAL (=8) light candidates
+// are drawn proportionally to `power`, sampled on the light
+// (uniform-area for triangles, delta for point/spot/directional),
+// evaluated for unshadowed Cook-Torrance × Li × geometry, and
+// streamed into a WRS reservoir with wi = pHat / srcPdf. After
+// streaming, a single shadow ray probes the winner; occluded
+// reservoirs keep their indices but zero W so they no longer
+// contribute. Temporal + spatial reuse consume the result in 4d/4e.
+//
+// Ignis-rt port differences from ignis-ac:
+//   - polyLights at set=2 b=0, not set=0 b=52 (no growth of the
+//     existing 24-binding wavefront set).
+//   - diPolyInitial at set=2 b=1 (DI port set, dedicated).
+//   - primaryGBuf stride is 26 floats, slots 20/21 hold PSR data
+//     instead of metallic/specularLevel. The ignis-rt gbuf does
+//     not currently carry material PBR scalars; we approximate
+//     dielectric (metallic=0, specularLevel=0.5) at the DI target-
+//     pdf evaluation. Revisit in 4f if direct-light scale on
+//     painted metal regresses vs the inline NEE path.
+// ============================================================
+
+#include "../include/common.glsl"
+#include "../include/pbr_brdf.glsl"
+#include "../include/wf_lights.glsl"
+#include "../include/wf_di_reservoir.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// ── set 0: scene data (shared with the rest of the wavefront) ──
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+
+layout(binding = 2, set = 0) uniform CameraProperties {
+    mat4 viewInverse;
+    mat4 projInverse;
+    mat4 view;
+    mat4 proj;
+    mat4 viewPrev;
+    mat4 projPrev;
+    uvec4 parameters;
+    vec4 jitterData;
+    vec4 sunLight;
+    vec4 ambientLight;
+    vec4 skyLight;
+    vec4 ptParams0;
+    vec4 ptParams1;
+    vec4 windParams;
+    vec4 rainParams;
+    vec4 dofParams;
+    vec4 dofParams2;
+    ivec4 jitterPattern[8];
+    uint lightCount;
+    uint lightPad0, lightPad1, lightPad2;
+    vec4 lights[128];
+    uint64_t sharcHashEntriesAddr;
+    uint64_t sharcAccumulationAddr;
+    uint64_t sharcResolvedAddr;
+    uint sharcCapacity;
+    float sharcSceneScale;
+    float sharcRadianceScale;
+    float sharcWarmupFactor;
+} cam;
+
+// ── set 1: wavefront resources — only primaryGBuf is consumed here ──
+layout(binding = 4, set = 1, scalar) buffer PrimaryGBufBuffer {
+    float gbufData[];
+} primaryGBuf;
+
+// ── set 2: DI port resources ──
+// b=0: polyLights (read), b=1: diPolyInitial (write — 32 B/px = 2 × vec4).
+layout(binding = 0, set = 2, scalar) readonly buffer PolyLightsBuf {
+    WFLightInfo data[];
+} polyLights;
+
+layout(binding = 1, set = 2, std430) writeonly buffer DIPolyInitialBuf {
+    vec4 data[];
+} diPolyInitial;
+
+layout(push_constant) uniform PC {
+    uint width;
+    uint height;
+    uint frameIndex;
+    uint lightCount;
+} pc;
+
+const uint WF_PRIMARY_GBUF_STRIDE = 26u;
+
+void storeReservoir(uint pixelIdx, vec4 v0, vec4 v1) {
+    uint base = pixelIdx * 2u;
+    diPolyInitial.data[base + 0u] = v0;
+    diPolyInitial.data[base + 1u] = v1;
+}
+
+// CDF-bin search over polyLights.power (cumulative). Falls back to
+// uniform sampling when the CDF is degenerate (all-zero powers, or
+// no valid lights).
+uint sampleLightFromCDF(float xi, out float lightPickPdf) {
+    if (pc.lightCount == 0u) {
+        lightPickPdf = 0.0;
+        return WF_DI_INVALID_LIGHT;
+    }
+
+    float last = polyLights.data[pc.lightCount - 1u].power;
+    if (last <= 0.0 || isnan(last) || isinf(last)) {
+        lightPickPdf = 1.0 / float(pc.lightCount);
+        uint li = uint(xi * float(pc.lightCount));
+        return min(li, pc.lightCount - 1u);
+    }
+
+    xi = clamp(xi, 0.0, 0.99999994);
+    uint lo = 0u;
+    uint hi = pc.lightCount - 1u;
+    for (uint step = 0u; step < 16u && lo < hi; ++step) {
+        uint mid = (lo + hi) >> 1u;
+        if (xi <= polyLights.data[mid].power) hi = mid;
+        else lo = mid + 1u;
+    }
+
+    uint li = lo;
+    float prev = (li == 0u) ? 0.0 : polyLights.data[li - 1u].power;
+    float curr = polyLights.data[li].power;
+    lightPickPdf = max(curr - prev, 0.0);
+    if (lightPickPdf <= 0.0) {
+        lightPickPdf = 1.0 / float(pc.lightCount);
+    }
+    return li;
+}
+
+void sampleLightPoint(in WFLightInfo li,
+                       vec3 x_v,
+                       vec2 rnd,
+                       out vec3  samplePos,
+                       out vec3  sampleNormal,
+                       out vec2  sampleUV,
+                       out float sourcePdf) {
+    if (li.type == WF_LIGHT_TYPE_DIRECTIONAL) {
+        vec3 sunDir = normalize(li.base);
+        samplePos    = x_v + sunDir * 10000.0;
+        sampleNormal = -sunDir;
+        sampleUV     = vec2(0.0);
+        sourcePdf    = 1.0;
+    }
+    else if (li.type == WF_LIGHT_TYPE_POINT || li.type == WF_LIGHT_TYPE_SPOT) {
+        samplePos    = li.base;
+        sampleNormal = (li.type == WF_LIGHT_TYPE_SPOT) ? normalize(li.edges0)
+                                                       : vec3(0.0, 1.0, 0.0);
+        sampleUV     = vec2(0.0);
+        sourcePdf    = 1.0;
+    }
+    else if (li.type == WF_LIGHT_TYPE_TRIANGLE) {
+        float sqrtU = sqrt(max(rnd.x, 0.0));
+        float u     = 1.0 - sqrtU;
+        float v     = rnd.y * sqrtU;
+        sampleUV   = vec2(u, v);
+        samplePos  = li.base + li.edges0 * u + li.edges1 * v;
+        vec3 c     = cross(li.edges0, li.edges1);
+        float area = 0.5 * length(c);
+        sampleNormal = (area > 1e-8) ? (c / (2.0 * area)) : vec3(0.0, 1.0, 0.0);
+        sourcePdf    = (area > 1e-8) ? (1.0 / area) : 0.0;
+    }
+    else {
+        samplePos    = vec3(0.0);
+        sampleNormal = vec3(0.0);
+        sampleUV     = vec2(0.0);
+        sourcePdf    = 0.0;
+    }
+}
+
+// Wraps ignis-rt's full-featured evaluateCookTorrance with zero-valued
+// coat/sheen/aniso so the call site reads cleanly. Dielectric BRDF
+// only (no transmission) — fine for DI target-pdf scoring.
+void evalBRDF(vec3 N, vec3 V, vec3 L,
+              vec3 baseColor, float roughness, float metallic, float specularLevel,
+              out vec3 diff, out vec3 spec) {
+    evaluateCookTorrance(N, V, L, baseColor, roughness, metallic, specularLevel,
+                          1.5 /*ior*/, 0.0 /*transmission*/,
+                          diff, spec,
+                          0.0, 0.0, 1.5,            // coat
+                          0.0, vec3(0.0), 0.0,      // sheen
+                          0.0, vec3(0.0), vec3(0.0),// aniso
+                          vec3(1.0), 0.0);          // specTint, diffRoughness
+}
+
+vec3 evalLightContrib(in WFLightInfo li,
+                       vec3 x_v, vec3 n_v, vec3 V,
+                       vec3 baseColor, float roughness, float metallic, float specularLevel,
+                       vec3 samplePos, vec3 sampleNormal,
+                       out vec3  outL,
+                       out float outDist) {
+    outL    = vec3(0.0, 1.0, 0.0);
+    outDist = 0.0;
+
+    if (li.type == WF_LIGHT_TYPE_DIRECTIONAL) {
+        vec3 L = normalize(li.base);
+        float NdotL = dot(n_v, L);
+        if (NdotL <= 0.0) return vec3(0.0);
+        vec3 dC, sC;
+        evalBRDF(n_v, V, L, baseColor, roughness, metallic, specularLevel, dC, sC);
+        outL    = L;
+        outDist = 20000.0;
+        return (dC + sC) * li.emission;
+    }
+
+    if (li.type == WF_LIGHT_TYPE_POINT || li.type == WF_LIGHT_TYPE_SPOT) {
+        vec3 toLight = li.base - x_v;
+        float dist   = length(toLight);
+        if (dist < 1e-4) return vec3(0.0);
+
+        float range = (li.type == WF_LIGHT_TYPE_POINT) ? li.scalars.x : li.scalars.z;
+        if (range > 0.0 && dist > range) return vec3(0.0);
+
+        vec3 L = toLight / dist;
+        float NdotL = dot(n_v, L);
+        if (NdotL <= 0.0) return vec3(0.0);
+
+        float spotAtten = 1.0;
+        if (li.type == WF_LIGHT_TYPE_SPOT) {
+            vec3 axis      = normalize(li.edges0);
+            float cosInner = li.scalars.x;
+            float cosOuter = li.scalars.y;
+            float cosAng   = dot(-L, axis);
+            spotAtten      = smoothstep(cosOuter, cosInner, cosAng);
+            if (spotAtten <= 0.0) return vec3(0.0);
+        }
+
+        float falloff = 1.0 / (dist * dist + 0.01);
+        float window  = 1.0;
+        if (range > 0.0) {
+            window = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0);
+            window = window * window;
+        }
+
+        vec3 dC, sC;
+        evalBRDF(n_v, V, L, baseColor, roughness, metallic, specularLevel, dC, sC);
+        outL    = L;
+        outDist = dist;
+        return (dC + sC) * li.emission * falloff * window * spotAtten;
+    }
+
+    if (li.type == WF_LIGHT_TYPE_TRIANGLE) {
+        vec3 toLight = samplePos - x_v;
+        float dist   = length(toLight);
+        if (dist < 1e-4) return vec3(0.0);
+        vec3 L = toLight / dist;
+        float NdotL = dot(n_v, L);
+        if (NdotL <= 0.0) return vec3(0.0);
+        float cosLight = dot(-L, sampleNormal);
+        if (cosLight <= 0.0) return vec3(0.0);
+
+        vec3 dC, sC;
+        evalBRDF(n_v, V, L, baseColor, roughness, metallic, specularLevel, dC, sC);
+        float G = cosLight / (dist * dist);
+        outL    = L;
+        outDist = dist;
+        return (dC + sC) * li.emission * G;
+    }
+
+    return vec3(0.0);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(pc.width) || pixel.y >= int(pc.height)) return;
+    uint pixelIdx = uint(pixel.y) * pc.width + uint(pixel.x);
+
+    if (pc.lightCount == 0u) {
+        vec4 ev0, ev1;
+        wf_di_reservoir_pack(wf_di_reservoir_empty(), ev0, ev1);
+        storeReservoir(pixelIdx, ev0, ev1);
+        return;
+    }
+
+    rngState = (pixelIdx * 2654435761u) ^ (pc.frameIndex * 0x9E3779B1u);
+    rngState = pcg(rngState);
+
+    uint gBase = pixelIdx * WF_PRIMARY_GBUF_STRIDE;
+    vec3  n_v       = vec3(primaryGBuf.gbufData[gBase + 0u],
+                            primaryGBuf.gbufData[gBase + 1u],
+                            primaryGBuf.gbufData[gBase + 2u]);
+    float roughness = primaryGBuf.gbufData[gBase + 3u];
+    vec3  x_v       = vec3(primaryGBuf.gbufData[gBase + 4u],
+                            primaryGBuf.gbufData[gBase + 5u],
+                            primaryGBuf.gbufData[gBase + 6u]);
+    float viewZ     = primaryGBuf.gbufData[gBase + 7u];
+    vec3  baseColor = vec3(primaryGBuf.gbufData[gBase + 8u],
+                            primaryGBuf.gbufData[gBase + 9u],
+                            primaryGBuf.gbufData[gBase + 10u]);
+    // ignis-rt's primaryGBuf does not carry metallic / specularLevel
+    // (slots 20/21 hold PSR localPos). Dielectric approximation for
+    // now; revisit when wiring 4f.
+    float metallic      = 0.0;
+    float specularLevel = 0.5;
+
+    bool primaryHit = (viewZ < -0.001);
+    if (!primaryHit || dot(n_v, n_v) < 1e-6) {
+        vec4 ev0, ev1;
+        wf_di_reservoir_pack(wf_di_reservoir_empty(), ev0, ev1);
+        storeReservoir(pixelIdx, ev0, ev1);
+        return;
+    }
+
+    vec3 cameraPos = cam.viewInverse[3].xyz;
+    vec3 V         = normalize(cameraPos - x_v);
+
+    WFDIReservoir r = wf_di_reservoir_empty();
+    for (uint k = 0u; k < WF_DI_M_INITIAL; k++) {
+        float lightPickPdf;
+        uint li = sampleLightFromCDF(rand01(), lightPickPdf);
+        if (li == WF_DI_INVALID_LIGHT || lightPickPdf <= 0.0) {
+            wf_di_reservoir_update(r, WF_DI_INVALID_LIGHT, 0u, vec2(0.0), 0.0, 0.0, rand01());
+            continue;
+        }
+        WFLightInfo info = polyLights.data[li];
+
+        vec3  samplePos, sampleNormal;
+        vec2  sampleUV;
+        float samplePdf;
+        sampleLightPoint(info, x_v, rand2(),
+                          samplePos, sampleNormal, sampleUV, samplePdf);
+
+        vec3  L;
+        float dist;
+        vec3  contrib = evalLightContrib(info,
+                                          x_v, n_v, V,
+                                          baseColor, roughness, metallic, specularLevel,
+                                          samplePos, sampleNormal,
+                                          L, dist);
+
+        float pHat = max(contrib.r, max(contrib.g, contrib.b));
+
+        float wi = 0.0;
+        float srcPdf = lightPickPdf * samplePdf;
+        if (pHat > 0.0 && srcPdf > 0.0) {
+            wi = pHat / srcPdf;
+        }
+
+        wf_di_reservoir_update(r, li, info.stableId, sampleUV, pHat, wi, rand01());
+    }
+
+    wf_di_reservoir_finalize(r);
+
+    if (wf_di_reservoir_is_valid(r) && r.W > 0.0) {
+        WFLightInfo winner = polyLights.data[r.lightIdx];
+        vec3 samplePos;
+        if (winner.type == WF_LIGHT_TYPE_TRIANGLE) {
+            samplePos = winner.base
+                      + winner.edges0 * r.lightUV.x
+                      + winner.edges1 * r.lightUV.y;
+        } else if (winner.type == WF_LIGHT_TYPE_DIRECTIONAL) {
+            samplePos = x_v + normalize(winner.base) * 20000.0;
+        } else {
+            samplePos = winner.base;
+        }
+
+        vec3  toLight = samplePos - x_v;
+        float dist    = length(toLight);
+        if (dist > 1e-4) {
+            vec3  L      = toLight / dist;
+            vec3  origin = x_v + n_v * 0.001;
+            float tmax   = (winner.type == WF_LIGHT_TYPE_DIRECTIONAL)
+                            ? dist
+                            : max(dist - 0.15, dist * 0.5);
+
+            rayQueryEXT rq;
+            rayQueryInitializeEXT(rq, topLevelAS,
+                                   gl_RayFlagsOpaqueEXT
+                                 | gl_RayFlagsTerminateOnFirstHitEXT,
+                                   0xFFu, origin, 1e-4, L, tmax);
+            rayQueryProceedEXT(rq);
+            bool occluded = (rayQueryGetIntersectionTypeEXT(rq, true)
+                              != gl_RayQueryCommittedIntersectionNoneEXT);
+
+            r.flags |= WF_DI_FLAG_VIS_TESTED;
+            if (occluded) {
+                r.flags |= WF_DI_FLAG_OCCLUDED;
+                r.W = 0.0;
+            }
+        }
+    }
+
+    vec4 v0, v1;
+    wf_di_reservoir_pack(r, v0, v1);
+    storeReservoir(pixelIdx, v0, v1);
+}

@@ -156,8 +156,173 @@ bool RTResources::Initialize(Context* context, AccelStructureBuilder* accelBuild
     if (!CreateDescriptorPool()) return false;
     if (!CreateDescriptorSet()) return false;
 
+    // Phase 4b: descriptor set 2 — DI port resources.
+    if (!CreateDIDescriptorSet()) return false;
+
     Log(L"[VK RTResources] Initialized successfully\n");
     return true;
+}
+
+// ---------------------------------------------------------------
+// Descriptor set 2 (DI port). Bindings:
+//   0: polyLights         — scene-level, valid at init time.
+//   1: diPolyInitial      — per-pixel reservoir (32 B/px). Bound to
+//      the dummy buffer here; CreateDIPolyBuffers() rewrites the
+//      slot once the resolution is known.
+// Kept separate from set 1 so the existing 24-binding wavefront
+// layout stays untouched.
+// ---------------------------------------------------------------
+bool RTResources::CreateDIDescriptorSet() {
+    VkDevice device = context_->GetDevice();
+
+    VkDescriptorSetLayoutBinding bindings[2] = {};
+    bindings[0].binding         = 0;
+    bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    bindings[1].binding         = 1;
+    bindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[1].descriptorCount = 1;
+    bindings[1].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = 2;
+    layoutInfo.pBindings    = bindings;
+
+    if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &diDescriptorSetLayout_) != VK_SUCCESS) {
+        Log(L"[VK RTResources] ERROR: Failed to create DI descriptor set layout\n");
+        return false;
+    }
+
+    VkDescriptorPoolSize poolSize{};
+    poolSize.type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    poolSize.descriptorCount = 2;
+
+    VkDescriptorPoolCreateInfo poolInfo{};
+    poolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.maxSets       = 1;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes    = &poolSize;
+
+    if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &diDescriptorPool_) != VK_SUCCESS) {
+        Log(L"[VK RTResources] ERROR: Failed to create DI descriptor pool\n");
+        return false;
+    }
+
+    VkDescriptorSetAllocateInfo ai{};
+    ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ai.descriptorPool     = diDescriptorPool_;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts        = &diDescriptorSetLayout_;
+
+    if (vkAllocateDescriptorSets(device, &ai, &diDescriptorSet_) != VK_SUCCESS) {
+        Log(L"[VK RTResources] ERROR: Failed to allocate DI descriptor set\n");
+        return false;
+    }
+
+    VkDescriptorBufferInfo bi0{};
+    bi0.buffer = polyLightsBuffer_;
+    bi0.offset = 0;
+    bi0.range  = VK_WHOLE_SIZE;
+
+    // b=1 gets a dummy until CreateDIPolyBuffers rewrites it.
+    VkDescriptorBufferInfo bi1{};
+    bi1.buffer = dummyBuffer_;
+    bi1.offset = 0;
+    bi1.range  = VK_WHOLE_SIZE;
+
+    VkWriteDescriptorSet writes[2] = {};
+    for (int i = 0; i < 2; i++) {
+        writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet          = diDescriptorSet_;
+        writes[i].dstBinding      = (uint32_t)i;
+        writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].descriptorCount = 1;
+    }
+    writes[0].pBufferInfo = &bi0;
+    writes[1].pBufferInfo = &bi1;
+    vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+
+    Log(L"[VK RTResources] DI descriptor set 2 created (2 bindings: polyLights + diPolyInitial[dummy])\n");
+    return true;
+}
+
+// ---------------------------------------------------------------
+// Phase 4c — per-pixel DI reservoir buffer. 32 B / pixel. Called
+// from CreateGBuffers when resolution is known; reuses the device-
+// local memory pattern. On resize the buffer is rebuilt and the
+// descriptor set 2 binding 1 is rewritten.
+// ---------------------------------------------------------------
+bool RTResources::CreateDIPolyBuffers(uint32_t width, uint32_t height) {
+    VkDevice device = context_->GetDevice();
+    uint32_t pixelCount = width * height;
+    if (pixelCount == 0) return false;
+    if (diPolyPixelCount_ == pixelCount && diPolyInitialBuffer_ != VK_NULL_HANDLE) {
+        return true;
+    }
+    DestroyDIPolyBuffers();
+
+    constexpr VkDeviceSize kReservoirBytes = 32; // 2 × vec4
+    VkDeviceSize sizeBytes = (VkDeviceSize)pixelCount * kReservoirBytes;
+
+    VkBufferCreateInfo bi{};
+    bi.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bi.size        = sizeBytes;
+    bi.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(device, &bi, nullptr, &diPolyInitialBuffer_) != VK_SUCCESS) {
+        Log(L"[VK RTResources] ERROR: Failed to create diPolyInitial buffer\n");
+        return false;
+    }
+
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(device, diPolyInitialBuffer_, &req);
+
+    VkMemoryAllocateInfo ai{};
+    ai.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize  = req.size;
+    ai.memoryTypeIndex = context_->FindMemoryType(req.memoryTypeBits,
+                                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (vkAllocateMemory(device, &ai, nullptr, &diPolyInitialMemory_) != VK_SUCCESS) {
+        Log(L"[VK RTResources] ERROR: Failed to allocate diPolyInitial memory (%llu bytes)\n",
+            (unsigned long long)req.size);
+        DestroyDIPolyBuffers();
+        return false;
+    }
+    vkBindBufferMemory(device, diPolyInitialBuffer_, diPolyInitialMemory_, 0);
+    diPolyPixelCount_ = pixelCount;
+
+    UpdateDIInitialDescriptor();
+
+    Log(L"[VK RTResources] diPolyInitial buffer (%u px × 32 B = %llu KiB)\n",
+        pixelCount, (unsigned long long)(sizeBytes / 1024));
+    return true;
+}
+
+void RTResources::DestroyDIPolyBuffers() {
+    VkDevice device = context_ ? context_->GetDevice() : VK_NULL_HANDLE;
+    if (device == VK_NULL_HANDLE) return;
+    if (diPolyInitialBuffer_) { vkDestroyBuffer(device, diPolyInitialBuffer_, nullptr); diPolyInitialBuffer_ = VK_NULL_HANDLE; }
+    if (diPolyInitialMemory_) { vkFreeMemory(device, diPolyInitialMemory_, nullptr); diPolyInitialMemory_ = VK_NULL_HANDLE; }
+    diPolyPixelCount_ = 0;
+}
+
+void RTResources::UpdateDIInitialDescriptor() {
+    if (diDescriptorSet_ == VK_NULL_HANDLE || diPolyInitialBuffer_ == VK_NULL_HANDLE) return;
+    VkDescriptorBufferInfo bi{};
+    bi.buffer = diPolyInitialBuffer_;
+    bi.offset = 0;
+    bi.range  = VK_WHOLE_SIZE;
+
+    VkWriteDescriptorSet write{};
+    write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet          = diDescriptorSet_;
+    write.dstBinding      = 1;
+    write.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.descriptorCount = 1;
+    write.pBufferInfo     = &bi;
+    vkUpdateDescriptorSets(context_->GetDevice(), 1, &write, 0, nullptr);
 }
 
 bool RTResources::CreateSHARCBuffers() {
@@ -665,6 +830,12 @@ void RTResources::Shutdown() {
     if (descriptorPool_) { vkDestroyDescriptorPool(device, descriptorPool_, nullptr); descriptorPool_ = VK_NULL_HANDLE; }
     if (descriptorSetLayout_) { vkDestroyDescriptorSetLayout(device, descriptorSetLayout_, nullptr); descriptorSetLayout_ = VK_NULL_HANDLE; }
 
+    // Descriptor set 2 — DI port resources (Phase 4b/4c).
+    DestroyDIPolyBuffers();
+    if (diDescriptorPool_) { vkDestroyDescriptorPool(device, diDescriptorPool_, nullptr); diDescriptorPool_ = VK_NULL_HANDLE; }
+    if (diDescriptorSetLayout_) { vkDestroyDescriptorSetLayout(device, diDescriptorSetLayout_, nullptr); diDescriptorSetLayout_ = VK_NULL_HANDLE; }
+    diDescriptorSet_ = VK_NULL_HANDLE;
+
     // SHARC radiance cache buffers
     DestroySHARCBuffers();
 
@@ -842,6 +1013,9 @@ bool RTResources::CreateGBuffers(uint32_t width, uint32_t height) {
     // Create reservoir buffers for ReSTIR (resolution-dependent)
     CreateGIReservoirBuffers(width, height);   // DI on 24-25
     CreateGIWfReservoirBuffers(width, height); // GI on 49-50
+
+    // Phase 4c: DI port polymorphic reservoir buffer (set 2, b=1).
+    CreateDIPolyBuffers(width, height);
 
     // Update descriptor set with real G-buffer images
     VkDevice device = context_->GetDevice();

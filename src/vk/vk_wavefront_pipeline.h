@@ -27,6 +27,24 @@ public:
                         VkDescriptorSet sceneDescSet, uint32_t maxBounces,
                         uint32_t spp = 1);
 
+    /// Phase 4b: dispatch wf_prepare_lights over the polymorphic light
+    /// buffer. lightCount = number of valid entries; the rest of the
+    /// capacity stays untouched. No-op when lightCount == 0.
+    void RecordPrepareLights(VkCommandBuffer cmd, VkDescriptorSet diDescSet,
+                             uint32_t lightCount);
+
+    /// Phase 4c: dispatch wf_di_initial_samples over primary pixels.
+    /// Generates the per-pixel DI reservoir at diPolyInitial (set 2 b=1).
+    /// Sky pixels and zero-light frames produce empty reservoirs.
+    /// Must be called AFTER RecordDispatch so primaryGBuf is populated.
+    /// No-op when lightCount == 0.
+    void RecordDIInitialSamples(VkCommandBuffer cmd,
+                                 VkDescriptorSet sceneDescSet,
+                                 VkDescriptorSet diDescSet,
+                                 uint32_t width, uint32_t height,
+                                 uint32_t frameIndex,
+                                 uint32_t lightCount);
+
     bool IsReady() const { return ready_; }
 
 private:
@@ -121,6 +139,17 @@ private:
 
     // Stable Planes compute pipeline
     VkPipeline pipelineStablePlanes_ = VK_NULL_HANDLE;
+
+    // Phase 4b — RTXDI DI port: wf_prepare_lights compute pass.
+    // Standalone layout (descriptor set 2 only + push_constant uint).
+    VkPipelineLayout pipelineLayoutDIPrepare_ = VK_NULL_HANDLE;
+    VkPipeline       pipelinePrepareLights_   = VK_NULL_HANDLE;
+
+    // Phase 4c — DI initial-sample reservoir generator. Same descriptor
+    // sets as the main wavefront (scene + wavefront + DI port). Push:
+    // width, height, frameIndex, lightCount.
+    VkPipelineLayout pipelineLayoutDI_     = VK_NULL_HANDLE;
+    VkPipeline       pipelineDIInitial_    = VK_NULL_HANDLE;
 
     // RT pipeline for K2 (shade) — enables hardware SER via reorderThreadNV
     VkPipeline pipelineK2RT_ = VK_NULL_HANDLE;

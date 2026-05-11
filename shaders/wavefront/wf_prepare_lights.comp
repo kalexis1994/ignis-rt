@@ -1,0 +1,101 @@
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+
+// ============================================================
+// wf_prepare_lights.comp — RTXDI DI port Phase 5a step 4/5.
+//
+// Per-frame preparation pass over the polymorphic light buffer at
+// set=0 / binding=52. One thread per light. Right now the stub just
+// normalises the `power` field so downstream resampling passes don't
+// have to worry about CPU-side scaling inconsistencies. In 5b this
+// same kernel will grow into the full aliased-CDF / ReGIR grid
+// build-up that GenerateInitialSamples queries for RIS.
+//
+// Power computation (matches what RTXDI uses for Li·A integration
+// weight):
+//   Directional → intensity  (scalar, sampling PDF ∝ intensity)
+//   Point       → intensity × luminance(emission)
+//   Spot        → intensity × luminance(emission) × (cosInner + 1) / 2
+//                 (cheap cone-area approximation)
+//   Triangle    → area × luminance(emission)
+//   Environment → constant 1 (TBD once HDRI importance-sampling lands)
+// ============================================================
+
+#include "../include/wf_lights.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Polymorphic light buffer — dedicated descriptor set 2, binding 0.
+// Set 2 is exclusively for the DI port resources so we don't have to
+// grow the existing wavefront/RT descriptor sets (1 / 0).
+layout(binding = 0, set = 2, scalar) buffer PolyLightsBuf {
+    WFLightInfo data[];
+} polyLights;
+
+// Push: the live light count. Dispatch sizes for `count` threads so
+// out-of-range lanes early-out (capacity is always ≥ count).
+layout(push_constant) uniform PC {
+    uint lightCount;
+} pc;
+
+float luminance(vec3 rgb) {
+    return 0.2126 * rgb.x + 0.7152 * rgb.y + 0.0722 * rgb.z;
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.lightCount) return;
+
+    WFLightInfo li = polyLights.data[gid];
+
+    float lum   = max(luminance(li.emission), 0.0);
+    float power = 0.0;
+
+    switch (li.type) {
+        case WF_LIGHT_TYPE_DIRECTIONAL:
+            // Directional: no area, power proxy is the raw intensity
+            // written by the CPU in .emission. Clamp to non-neg.
+            power = lum;
+            break;
+
+        case WF_LIGHT_TYPE_POINT:
+            // Range²-attenuated but sampling-wise we just use total
+            // radiant flux; RIS handles distance in the target pdf.
+            power = lum;
+            break;
+
+        case WF_LIGHT_TYPE_SPOT:
+            {
+                // Integrate over the outer cone solid angle:
+                //   Omega = 2pi * (1 - cosOuter)
+                // Use the outer (wider) angle so inside the hotspot
+                // we don't under-sample — inner vs outer falloff is
+                // the shader's job at shade time.
+                float cosOuter = li.scalars.y;
+                float coneSA    = 2.0 * 3.14159265 * max(1.0 - cosOuter, 0.0);
+                power = lum * coneSA;
+            }
+            break;
+
+        case WF_LIGHT_TYPE_TRIANGLE:
+            {
+                // area = ½ · |edge0 × edge1|. Emission radiance times
+                // area is the physical radiant exitance (W/sr) this
+                // triangle contributes.
+                vec3  c    = cross(li.edges0, li.edges1);
+                float area = 0.5 * length(c);
+                power = lum * area;
+            }
+            break;
+
+        case WF_LIGHT_TYPE_ENVIRONMENT:
+            // Placeholder — HDRI importance sampling lands separately.
+            power = 1.0;
+            break;
+    }
+
+    // Write back only the power field. Every other field is already
+    // CPU-authoritative and we don't want to race the CPU memcpy.
+    polyLights.data[gid].power = power;
+}

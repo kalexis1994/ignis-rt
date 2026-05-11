@@ -126,6 +126,14 @@ void WavefrontPipeline::Shutdown() {
     destroyPipeline(pipelinePTFinal_);
     destroyPipeline(pipelineStablePlanes_);
 
+    // Phase 4b — wf_prepare_lights.
+    destroyPipeline(pipelinePrepareLights_);
+    if (pipelineLayoutDIPrepare_) { vkDestroyPipelineLayout(device, pipelineLayoutDIPrepare_, nullptr); pipelineLayoutDIPrepare_ = VK_NULL_HANDLE; }
+
+    // Phase 4c — wf_di_initial_samples.
+    destroyPipeline(pipelineDIInitial_);
+    if (pipelineLayoutDI_) { vkDestroyPipelineLayout(device, pipelineLayoutDI_, nullptr); pipelineLayoutDI_ = VK_NULL_HANDLE; }
+
     destroyPipeline(pipelineK2RT_);
     if (pipelineLayoutRT_) { vkDestroyPipelineLayout(device, pipelineLayoutRT_, nullptr); pipelineLayoutRT_ = VK_NULL_HANDLE; }
     if (sbtK2Buffer_) { vkDestroyBuffer(device, sbtK2Buffer_, nullptr); sbtK2Buffer_ = VK_NULL_HANDLE; }
@@ -159,6 +167,84 @@ void WavefrontPipeline::Shutdown() {
         DestroySSBO(device, fireflyKBuffer_[i], fireflyKMemory_[i]);
 
     ready_ = false;
+}
+
+// ------------------------------------------------------------
+// Phase 4b: wf_prepare_lights dispatch.
+//   One thread per light; 64-wide workgroups. Issues a memory
+//   barrier so downstream DI passes see the updated power field.
+// ------------------------------------------------------------
+void WavefrontPipeline::RecordPrepareLights(VkCommandBuffer cmd,
+                                            VkDescriptorSet diDescSet,
+                                            uint32_t lightCount) {
+    if (!ready_ || pipelinePrepareLights_ == VK_NULL_HANDLE) return;
+    if (lightCount == 0) return;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelinePrepareLights_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pipelineLayoutDIPrepare_, 0, 1, &diDescSet, 0, nullptr);
+
+    uint32_t pc = lightCount;
+    vkCmdPushConstants(cmd, pipelineLayoutDIPrepare_,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &pc);
+
+    const uint32_t WG = 64;
+    uint32_t groups = (lightCount + WG - 1) / WG;
+    vkCmdDispatch(cmd, groups, 1, 1);
+
+    // The polyLights buffer is read by every downstream DI kernel.
+    VkMemoryBarrier b{};
+    b.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &b, 0, nullptr, 0, nullptr);
+}
+
+// ------------------------------------------------------------
+// Phase 4c: wf_di_initial_samples dispatch.
+//   8×8 workgroups over the render resolution. Uses set 1 [0]
+//   for primaryGBuf (read-only here — choice of ping-pong is
+//   irrelevant since both sets bind the same primaryGBuf at b=4).
+//   Inserts a memory barrier so 4d (temporal) can read the freshly
+//   written reservoir.
+// ------------------------------------------------------------
+void WavefrontPipeline::RecordDIInitialSamples(VkCommandBuffer cmd,
+                                                VkDescriptorSet sceneDescSet,
+                                                VkDescriptorSet diDescSet,
+                                                uint32_t width, uint32_t height,
+                                                uint32_t frameIndex,
+                                                uint32_t lightCount) {
+    if (!ready_ || pipelineDIInitial_ == VK_NULL_HANDLE) return;
+    if (lightCount == 0) return;
+    if (width == 0 || height == 0) return;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineDIInitial_);
+    VkDescriptorSet sets[3] = { sceneDescSet, wfDescSet_[0], diDescSet };
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pipelineLayoutDI_, 0, 3, sets, 0, nullptr);
+
+    struct { uint32_t width, height, frameIndex, lightCount; } pc;
+    pc.width      = width;
+    pc.height     = height;
+    pc.frameIndex = frameIndex;
+    pc.lightCount = lightCount;
+    vkCmdPushConstants(cmd, pipelineLayoutDI_,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+
+    uint32_t gx = (width  + 7) / 8;
+    uint32_t gy = (height + 7) / 8;
+    vkCmdDispatch(cmd, gx, gy, 1);
+
+    // diPolyInitial → consumed by future DI temporal/spatial passes.
+    VkMemoryBarrier b{};
+    b.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &b, 0, nullptr, 0, nullptr);
 }
 
 bool WavefrontPipeline::CreateK2RTResources() {
@@ -563,6 +649,105 @@ bool WavefrontPipeline::CreatePipelines() {
     }
 
     Log(L"[Wavefront] All compute pipelines created (K0-K5 + compact + sort + PT)\n");
+
+    // ------------------------------------------------------------
+    // Phase 4b: wf_prepare_lights pipeline.
+    //   Standalone layout — binds only descriptor set 2 (DI port:
+    //   polyLights at b=0). Push constant: uint lightCount.
+    // ------------------------------------------------------------
+    {
+        VkDescriptorSetLayout diSetLayouts[1] = { rtResources_->GetDIDescriptorSetLayout() };
+
+        VkPushConstantRange pcRange{};
+        pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pcRange.offset     = 0;
+        pcRange.size       = sizeof(uint32_t);
+
+        VkPipelineLayoutCreateInfo li{};
+        li.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        li.setLayoutCount         = 1;
+        li.pSetLayouts            = diSetLayouts;
+        li.pushConstantRangeCount = 1;
+        li.pPushConstantRanges    = &pcRange;
+
+        if (vkCreatePipelineLayout(device, &li, nullptr, &pipelineLayoutDIPrepare_) != VK_SUCCESS) {
+            Log(L"[Wavefront] ERROR: Failed to create wf_prepare_lights pipeline layout\n");
+            return false;
+        }
+
+        VkShaderModule mod;
+        if (!LoadComputeShader("shaders/wavefront/wf_prepare_lights.comp.spv", &mod)) {
+            Log(L"[Wavefront] ERROR: wf_prepare_lights shader not found\n");
+            return false;
+        }
+
+        VkComputePipelineCreateInfo pi{};
+        pi.sType        = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        pi.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pi.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+        pi.stage.module = mod;
+        pi.stage.pName  = "main";
+        pi.layout       = pipelineLayoutDIPrepare_;
+
+        VkResult r = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pi, nullptr, &pipelinePrepareLights_);
+        vkDestroyShaderModule(device, mod, nullptr);
+        if (r != VK_SUCCESS) {
+            Log(L"[Wavefront] ERROR: Failed to create wf_prepare_lights pipeline\n");
+            return false;
+        }
+
+        Log(L"[Wavefront] wf_prepare_lights pipeline created (set 2, push uint)\n");
+    }
+
+    // ------------------------------------------------------------
+    // Phase 4c: wf_di_initial_samples pipeline.
+    //   Layout binds set 0 (scene), set 1 (wavefront), set 2 (DI port).
+    //   Push: { width, height, frameIndex, lightCount } = 4 × u32.
+    // ------------------------------------------------------------
+    {
+        VkDescriptorSetLayout diLayouts[3] = {
+            rtResources_->GetDescriptorSetLayout(),     // set 0
+            wfDescSetLayout_,                            // set 1
+            rtResources_->GetDIDescriptorSetLayout(),    // set 2
+        };
+
+        VkPushConstantRange pcRange{};
+        pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pcRange.offset     = 0;
+        pcRange.size       = 4 * sizeof(uint32_t);
+
+        VkPipelineLayoutCreateInfo li{};
+        li.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        li.setLayoutCount         = 3;
+        li.pSetLayouts            = diLayouts;
+        li.pushConstantRangeCount = 1;
+        li.pPushConstantRanges    = &pcRange;
+
+        if (vkCreatePipelineLayout(device, &li, nullptr, &pipelineLayoutDI_) != VK_SUCCESS) {
+            Log(L"[Wavefront] ERROR: Failed to create DI pipeline layout\n");
+            return false;
+        }
+
+        VkShaderModule diMod;
+        if (!LoadComputeShader("shaders/wavefront/wf_di_initial_samples.comp.spv", &diMod)) {
+            Log(L"[Wavefront] ERROR: wf_di_initial_samples shader not found\n");
+            return false;
+        }
+        VkComputePipelineCreateInfo diPi{};
+        diPi.sType        = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        diPi.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        diPi.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+        diPi.stage.module = diMod;
+        diPi.stage.pName  = "main";
+        diPi.layout       = pipelineLayoutDI_;
+        VkResult diR = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &diPi, nullptr, &pipelineDIInitial_);
+        vkDestroyShaderModule(device, diMod, nullptr);
+        if (diR != VK_SUCCESS) {
+            Log(L"[Wavefront] ERROR: Failed to create wf_di_initial_samples pipeline\n");
+            return false;
+        }
+        Log(L"[Wavefront] wf_di_initial_samples pipeline created (sets 0+1+2)\n");
+    }
 
     // RT pipeline layout for K2 (same descriptor sets, push constants for RAYGEN stage)
     VkPushConstantRange pushRangeRT{};

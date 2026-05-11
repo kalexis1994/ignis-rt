@@ -1004,9 +1004,24 @@ void Renderer::RenderFrameRT() {
         }
         uint32_t dispW = (dlssDebugBypass_ && debugViewActive) ? width_ : renderWidth_;
         uint32_t dispH = (dlssDebugBypass_ && debugViewActive) ? height_ : renderHeight_;
+
+        // Phase 4b: refresh poly-light power proxy before the bounce loop.
+        wavefrontPipeline_->RecordPrepareLights(cmd,
+            rtResources_->GetDIDescriptorSet(),
+            rtResources_->GetPolyLightsCount());
+
         wavefrontPipeline_->RecordDispatch(cmd, dispW, dispH,
             rtResources_->GetDescriptorSet(), wfCfg ? wfCfg->maxBounces : 2,
             wfCfg ? static_cast<uint32_t>(wfCfg->samplesPerPixel) : 1);
+
+        // Phase 4c: DI reservoir initial samples. Runs after RecordDispatch
+        // so primaryGBuf is populated. Output is silent until 4d/4e/4f
+        // hook the consumer side; this only validates the plumbing.
+        wavefrontPipeline_->RecordDIInitialSamples(cmd,
+            rtResources_->GetDescriptorSet(),
+            rtResources_->GetDIDescriptorSet(),
+            dispW, dispH, frameIndex_,
+            rtResources_->GetPolyLightsCount());
     }
 
     if (diagFlush) {
