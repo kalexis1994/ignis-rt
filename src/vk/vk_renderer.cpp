@@ -793,6 +793,12 @@ void Renderer::UploadLightTree(const void* nodes, uint32_t nodeCount,
     }
 }
 
+void Renderer::UploadPolyLights(const void* data, uint32_t lightCount) {
+    if (rtResources_) {
+        rtResources_->UpdatePolyLightsBuffer(data, lightCount);
+    }
+}
+
 void Renderer::UpdateTextureDescriptors(void* texManager) {
     if (rtResources_) {
         rtResources_->UpdateTextureDescriptors(static_cast<vk::TextureManager*>(texManager));

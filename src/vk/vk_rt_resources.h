@@ -187,6 +187,14 @@ public:
     // Light tree buffer (binding 27)
     void UpdateLightTreeBuffer(const void* nodes, uint32_t nodeCount);
 
+    // Polymorphic light buffer (Phase 4a). `data` is an array of
+    // ignis::LightInfo (96 bytes each). Device-local; this copies via staging.
+    // Coexists with the legacy lightTree + emissive buffers — neither path
+    // reads it yet, so this is purely a CPU/GPU plumbing test until 4b.
+    void UpdatePolyLightsBuffer(const void* data, uint32_t lightCount);
+    VkBuffer GetPolyLightsBuffer() const { return polyLightsBuffer_; }
+    uint32_t GetPolyLightsCount() const { return polyLightsCount_; }
+
     // Create full-resolution G-buffer images and update descriptors
     bool CreateGBuffers(uint32_t width, uint32_t height);
 
@@ -374,6 +382,19 @@ private:
     VkDeviceMemory lightTreeMemory_ = VK_NULL_HANDLE;
     uint32_t lightTreeNodeCount_ = 0;
     uint32_t emissiveTriCount_ = 0;
+
+    // Polymorphic light buffer (RTXDI DI port, Phase 4a foundation).
+    // Device-local; uploads go through a host-visible staging buffer + single-
+    // time copy. NOT yet attached to descriptor set 1 — that lands in 4b when
+    // wf_prepare_lights gets its own descriptor set 2. Holds every analytic +
+    // emissive light in one tagged-union layout (ignis::LightInfo, 96 bytes).
+    static constexpr uint32_t POLY_LIGHTS_CAPACITY = 512;
+    VkBuffer polyLightsBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory polyLightsMemory_ = VK_NULL_HANDLE;
+    VkBuffer polyLightsStagingBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory polyLightsStagingMemory_ = VK_NULL_HANDLE;
+    void* polyLightsStagingMapped_ = nullptr;
+    uint32_t polyLightsCount_ = 0;
 
     // Previous-frame instance transforms SSBO (binding 28)
     VkBuffer prevTransformsBuffer_ = VK_NULL_HANDLE;

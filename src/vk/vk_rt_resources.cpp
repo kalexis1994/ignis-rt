@@ -90,6 +90,68 @@ bool RTResources::Initialize(Context* context, AccelStructureBuilder* accelBuild
         Log(L"[VK RTResources] Pick buffer created (16 bytes, persistently mapped)\n");
     }
 
+    // Polymorphic light buffer (Phase 4a). Device-local for shader reads,
+    // backed by a host-visible staging buffer for CPU uploads. NOT attached
+    // to descriptor set 1 — landing for that comes in 4b via a separate
+    // descriptor set 2 so we don't grow set 1 past its current 52 bindings.
+    {
+        constexpr VkDeviceSize PER_LIGHT = 96;
+        const VkDeviceSize polySize = POLY_LIGHTS_CAPACITY * PER_LIGHT;
+
+        // Device-local target buffer.
+        {
+            VkBufferCreateInfo bi{};
+            bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            bi.size = polySize;
+            bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            if (vkCreateBuffer(device, &bi, nullptr, &polyLightsBuffer_) != VK_SUCCESS) {
+                Log(L"[VK RTResources] ERROR: Failed to create polyLights buffer\n");
+                return false;
+            }
+            VkMemoryRequirements req;
+            vkGetBufferMemoryRequirements(device, polyLightsBuffer_, &req);
+            VkMemoryAllocateInfo ai{};
+            ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            ai.allocationSize = req.size;
+            ai.memoryTypeIndex = context_->FindMemoryType(req.memoryTypeBits,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (vkAllocateMemory(device, &ai, nullptr, &polyLightsMemory_) != VK_SUCCESS) {
+                Log(L"[VK RTResources] ERROR: Failed to allocate polyLights memory\n");
+                return false;
+            }
+            vkBindBufferMemory(device, polyLightsBuffer_, polyLightsMemory_, 0);
+        }
+        // Host-visible staging buffer (mapped once, reused across uploads).
+        {
+            VkBufferCreateInfo bi{};
+            bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            bi.size = polySize;
+            bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            if (vkCreateBuffer(device, &bi, nullptr, &polyLightsStagingBuffer_) != VK_SUCCESS) {
+                Log(L"[VK RTResources] ERROR: Failed to create polyLights staging buffer\n");
+                return false;
+            }
+            VkMemoryRequirements req;
+            vkGetBufferMemoryRequirements(device, polyLightsStagingBuffer_, &req);
+            VkMemoryAllocateInfo ai{};
+            ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            ai.allocationSize = req.size;
+            ai.memoryTypeIndex = context_->FindMemoryType(req.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            if (vkAllocateMemory(device, &ai, nullptr, &polyLightsStagingMemory_) != VK_SUCCESS) {
+                Log(L"[VK RTResources] ERROR: Failed to allocate polyLights staging memory\n");
+                return false;
+            }
+            vkBindBufferMemory(device, polyLightsStagingBuffer_, polyLightsStagingMemory_, 0);
+            vkMapMemory(device, polyLightsStagingMemory_, 0, polySize, 0, &polyLightsStagingMapped_);
+            memset(polyLightsStagingMapped_, 0, polySize);
+        }
+        Log(L"[VK RTResources] PolyLights buffer created (device-local %llu bytes + staging)\n",
+            (unsigned long long)polySize);
+    }
+
     if (!CreateDescriptorSetLayout()) return false;
     if (!CreateDescriptorPool()) return false;
     if (!CreateDescriptorSet()) return false;
@@ -589,6 +651,17 @@ void RTResources::Shutdown() {
     if (emissiveTriBuffer_) { vkDestroyBuffer(device, emissiveTriBuffer_, nullptr); emissiveTriBuffer_ = VK_NULL_HANDLE; }
     if (emissiveTriMemory_) { vkFreeMemory(device, emissiveTriMemory_, nullptr); emissiveTriMemory_ = VK_NULL_HANDLE; }
     emissiveTriCount_ = 0;
+    if (polyLightsStagingBuffer_) {
+        if (polyLightsStagingMapped_) {
+            vkUnmapMemory(device, polyLightsStagingMemory_);
+            polyLightsStagingMapped_ = nullptr;
+        }
+        vkDestroyBuffer(device, polyLightsStagingBuffer_, nullptr); polyLightsStagingBuffer_ = VK_NULL_HANDLE;
+    }
+    if (polyLightsStagingMemory_) { vkFreeMemory(device, polyLightsStagingMemory_, nullptr); polyLightsStagingMemory_ = VK_NULL_HANDLE; }
+    if (polyLightsBuffer_) { vkDestroyBuffer(device, polyLightsBuffer_, nullptr); polyLightsBuffer_ = VK_NULL_HANDLE; }
+    if (polyLightsMemory_) { vkFreeMemory(device, polyLightsMemory_, nullptr); polyLightsMemory_ = VK_NULL_HANDLE; }
+    polyLightsCount_ = 0;
     if (descriptorPool_) { vkDestroyDescriptorPool(device, descriptorPool_, nullptr); descriptorPool_ = VK_NULL_HANDLE; }
     if (descriptorSetLayout_) { vkDestroyDescriptorSetLayout(device, descriptorSetLayout_, nullptr); descriptorSetLayout_ = VK_NULL_HANDLE; }
 
@@ -2013,6 +2086,31 @@ void RTResources::UpdateEmissiveTriangleBuffer(const float* data, uint32_t trian
 
     vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
     Log(L"[VK RTResources] Emissive triangle buffer updated: %u triangles\n", triangleCount);
+}
+
+void RTResources::UpdatePolyLightsBuffer(const void* data, uint32_t lightCount) {
+    // Phase 4a foundation: stage CPU memory into the persistently-mapped
+    // staging buffer, then submit a single-time copy command to the
+    // device-local target. Both buffers exist on Initialize so callers
+    // don't need to worry about lifetime.
+    if (lightCount > POLY_LIGHTS_CAPACITY) {
+        Log(L"[VK RTResources] WARNING: polyLights count %u exceeds capacity %u, truncating\n",
+            lightCount, POLY_LIGHTS_CAPACITY);
+        lightCount = POLY_LIGHTS_CAPACITY;
+    }
+    polyLightsCount_ = lightCount;
+
+    if (!polyLightsStagingMapped_ || !data || lightCount == 0) return;
+
+    constexpr VkDeviceSize PER_LIGHT = 96;
+    const VkDeviceSize copySize = lightCount * PER_LIGHT;
+    memcpy(polyLightsStagingMapped_, data, copySize);
+
+    VkCommandBuffer cmd = context_->BeginSingleTimeCommands();
+    VkBufferCopy region{};
+    region.size = copySize;
+    vkCmdCopyBuffer(cmd, polyLightsStagingBuffer_, polyLightsBuffer_, 1, &region);
+    context_->EndSingleTimeCommands(cmd);
 }
 
 void RTResources::UpdateLightTreeBuffer(const void* nodes, uint32_t nodeCount) {

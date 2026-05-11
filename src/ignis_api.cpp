@@ -7,6 +7,7 @@
 #include "vk/vk_accel_structure.h"
 #include "vk/vk_texture_manager.h"
 #include "vk/vk_context.h"
+#include "ignis_lights.h"
 
 #include <cstring>
 #include <cstdio>
@@ -436,6 +437,96 @@ static std::vector<acpt::LightEmitter> s_lightEmitters;
 static float s_emissiveTriData[4096] = {0};  // 256 triangles × 16 floats
 static uint32_t s_emissiveTriCount = 0;
 
+// Phase 4a: rebuild the polymorphic light buffer (RTXDI DI port foundation).
+// Called whenever lights or emissive triangles change. Packs:
+//   - Sun (Directional)   if cfg->sunIntensity > 0
+//   - Point/Spot/Area     from s_lightData (s_lightCount × 16 floats)
+//   - Emissive triangles  from s_emissiveTriData (s_emissiveTriCount × 16)
+// Destination is RTResources::polyLightsBuffer_ (device-local, staging copy).
+// `power` is left at 0 here — wf_prepare_lights (4b) will compute it on-GPU.
+static void RebuildPolyLights() {
+    if (!g_renderer) return;
+    acpt::PathTracerConfig* cfg = &acpt::g_config;
+
+    std::vector<ignis::LightInfo> polyLights;
+    polyLights.reserve(1 + s_lightCount + s_emissiveTriCount);
+
+    // Sun (Directional) — only emit if intensity > 0.
+    if (cfg && cfg->sunIntensity > 0.001f) {
+        ignis::LightInfo s{};
+        s.type      = (uint32_t)ignis::LightType::Directional;
+        s.texture   = 0xFFFFFFFFu;
+        s.stableId  = 0u;
+        float az = cfg->sunAzimuth * 3.14159265f / 180.0f;
+        float el = cfg->sunElevation * 3.14159265f / 180.0f;
+        s.base[0] = sinf(az) * cosf(el);
+        s.base[1] = sinf(el);
+        s.base[2] = cosf(az) * cosf(el);
+        s.power     = 0.0f;
+        s.emission[0] = cfg->sunColorR * cfg->sunIntensity;
+        s.emission[1] = cfg->sunColorG * cfg->sunIntensity;
+        s.emission[2] = cfg->sunColorB * cfg->sunIntensity;
+        s.scalars[0] = 0.00465f;  // ~0.27° solar disc angular radius
+        polyLights.push_back(s);
+    }
+
+    // Point/Spot/Area from s_lightData. Layout:
+    //   [posX posY posZ range  colR colG colB intensity
+    //    dirX dirY dirZ sizeX  tanX tanY tanZ sizeY]
+    for (uint32_t i = 0; i < s_lightCount; i++) {
+        const float* ld = s_lightData + i * 16;
+        ignis::LightInfo li{};
+        li.texture  = 0xFFFFFFFFu;
+        li.stableId = i;
+        li.power    = 0.0f;
+        li.base[0] = ld[0]; li.base[1] = ld[1]; li.base[2] = ld[2];
+        li.emission[0] = ld[4] * ld[7];
+        li.emission[1] = ld[5] * ld[7];
+        li.emission[2] = ld[6] * ld[7];
+        float dirLen2 = ld[8]*ld[8] + ld[9]*ld[9] + ld[10]*ld[10];
+        float sizeX = ld[11], sizeY = ld[15];
+        if (sizeX > 0.001f || sizeY > 0.001f) {
+            // Area light approximated as one Triangle (v0=base, edges via
+            // tangent × sizeX and dir × sizeY). Drops the second triangle of
+            // the rectangle — good enough as a first cut.
+            li.type = (uint32_t)ignis::LightType::Triangle;
+            li.edges0[0] = ld[12] * sizeX; li.edges0[1] = ld[13] * sizeX; li.edges0[2] = ld[14] * sizeX;
+            li.edges1[0] = ld[8]  * sizeY; li.edges1[1] = ld[9]  * sizeY; li.edges1[2] = ld[10] * sizeY;
+        } else if (dirLen2 > 0.001f) {
+            // Spot: dir = axis, range = ld[3]. No cone-angle uniform exposed
+            // yet; default 45° outer / 30° inner cones.
+            li.type = (uint32_t)ignis::LightType::Spot;
+            li.edges0[0] = ld[8]; li.edges0[1] = ld[9]; li.edges0[2] = ld[10];
+            li.scalars[0] = 0.866f;
+            li.scalars[1] = 0.707f;
+            li.scalars[2] = ld[3];
+        } else {
+            // Point: range = ld[3].
+            li.type = (uint32_t)ignis::LightType::Point;
+            li.scalars[0] = ld[3];
+        }
+        polyLights.push_back(li);
+    }
+
+    // Emissive triangles. s_emissiveTriData layout per entry:
+    //   [v0.xyz area  v1.xyz cdf  v2.xyz totalPower  emR emG emB matIdx]
+    for (uint32_t i = 0; i < s_emissiveTriCount; i++) {
+        const float* et = s_emissiveTriData + i * 16;
+        ignis::LightInfo li{};
+        li.type     = (uint32_t)ignis::LightType::Triangle;
+        li.texture  = 0xFFFFFFFFu;
+        li.stableId = 0x80000000u | i;  // disjoint from analytic light ids
+        li.base[0] = et[0]; li.base[1] = et[1]; li.base[2] = et[2];
+        li.power    = 0.0f;
+        li.edges0[0] = et[4] - et[0]; li.edges0[1] = et[5] - et[1]; li.edges0[2] = et[6] - et[2];
+        li.edges1[0] = et[8] - et[0]; li.edges1[1] = et[9] - et[1]; li.edges1[2] = et[10] - et[2];
+        li.emission[0] = et[12]; li.emission[1] = et[13]; li.emission[2] = et[14];
+        polyLights.push_back(li);
+    }
+
+    g_renderer->UploadPolyLights(polyLights.data(), (uint32_t)polyLights.size());
+}
+
 void ignis_reset_prev_frame() {
     s_hasPrevFrame = false;
 }
@@ -678,6 +769,9 @@ IGNIS_API void ignis_upload_lights(const float* lightData, uint32_t lightCount) 
                                      s_lightEmitters.data(),
                                      (uint32_t)s_lightEmitters.size());
     }
+
+    // Phase 4a: also rebuild the polymorphic light buffer (RTXDI DI port).
+    RebuildPolyLights();
 }
 
 IGNIS_API void ignis_upload_emissive_triangles(const float* data, uint32_t triangleCount) {
@@ -688,6 +782,10 @@ IGNIS_API void ignis_upload_emissive_triangles(const float* data, uint32_t trian
     if (g_renderer) {
         g_renderer->UploadEmissiveTriangles(s_emissiveTriData, s_emissiveTriCount);
     }
+
+    // Phase 4a: also rebuild the polymorphic light buffer (RTXDI DI port).
+    RebuildPolyLights();
+
     Log(L"[Ignis] Uploaded %u emissive triangles\n", s_emissiveTriCount);
 }
 

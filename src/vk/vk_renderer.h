@@ -59,6 +59,7 @@ public:
     void UploadMaterialBuffer(const void* materials, uint32_t count);
     void UploadEmissiveTriangles(const float* data, uint32_t triangleCount);
     void UpdateTextureDescriptors(void* texManager);
+    void UploadPolyLights(const void* data, uint32_t lightCount);
     void UploadLightTree(const void* nodes, uint32_t nodeCount,
                          const void* emitters, uint32_t emitterCount);
     bool BuildTLASInstanced(const std::vector<vk::TLASInstance>& instances);
