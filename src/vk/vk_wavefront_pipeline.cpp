@@ -1086,15 +1086,39 @@ void WavefrontPipeline::RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint
         ptReservoirCurrent_ = 1 - ptReservoirCurrent_;
     }
 
-    // K5: Output (after all SPP samples + PT accumulated). Uses the same
-    // descriptor set as PT so binding 20=surfaceHistory PREV (read for
-    // motion-vector / surface-match logic) and binding 21=CURR (write).
-    VkDescriptorSet setsK5[2] = { sceneDescSet, wfDescSet_[shSetIdx] };
+    // Snapshot K5 state so RecordOutput can fire it AFTER any DI-port
+    // (or other) additive passes have contributed to pixelRadiance.
+    // K5 reads pixelRadiance and writes the interop image, so it must
+    // run last among pixelRadiance writers — moving it out of this
+    // function lets the renderer interleave the DI shading pass.
+    outputPush_.width         = push.width;
+    outputPush_.height        = push.height;
+    outputPush_.frameIndex    = push.frameIndex;
+    outputPush_.maxBounces    = push.maxBounces;
+    outputPush_.currentBounce = push.currentBounce;
+    outputPush_.spp           = push.spp;
+    outputPush_.sampleIdx     = push.sampleIdx;
+    outputGroupsX_  = groupsX;
+    outputGroupsY_  = groupsY;
+    outputShSetIdx_ = shSetIdx;
+    outputPending_  = true;
+}
+
+void WavefrontPipeline::RecordOutput(VkCommandBuffer cmd, VkDescriptorSet sceneDescSet) {
+    if (!ready_ || !outputPending_) return;
+    outputPending_ = false;
+
+    // K5: output (after all SPP samples + PT accumulated + DI port).
+    // Uses the same descriptor set as PT so binding 20=surfaceHistory
+    // PREV (read for motion-vector / surface-match logic) and
+    // binding 21=CURR (write).
+    VkDescriptorSet setsK5[2] = { sceneDescSet, wfDescSet_[outputShSetIdx_] };
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineK5_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_,
         0, 2, setsK5, 0, nullptr);
-    vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-    vkCmdDispatch(cmd, groupsX, groupsY, 1);
+    vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+        0, sizeof(outputPush_), &outputPush_);
+    vkCmdDispatch(cmd, outputGroupsX_, outputGroupsY_, 1);
 
     // Surface history ping-pong: this frame's CURR becomes next frame's PREV.
     surfaceHistoryCurrent_ = 1 - surfaceHistoryCurrent_;

@@ -21,11 +21,19 @@ public:
                     uint32_t width, uint32_t height, uint32_t maxBounces);
     void Shutdown();
 
-    /// Record all wavefront dispatches into the command buffer.
+    /// Record the bounce loop + ReSTIR PT, stopping BEFORE K5 (output).
+    /// Caller must follow with any extra pixelRadiance contributors
+    /// (e.g. the DI port) and then RecordOutput to consume the buffer.
     /// Uses the same descriptor set 0 as RTResources for scene data.
     void RecordDispatch(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                         VkDescriptorSet sceneDescSet, uint32_t maxBounces,
                         uint32_t spp = 1);
+
+    /// Dispatch K5 (wf_output): consume pixelRadiance + write the final
+    /// interop image. Must be called once after RecordDispatch and any
+    /// DI-port additive passes. Owns the surface-history ping-pong
+    /// flip + frameIndex_ increment at the tail.
+    void RecordOutput(VkCommandBuffer cmd, VkDescriptorSet sceneDescSet);
 
     /// Phase 4b: dispatch wf_prepare_lights over the polymorphic light
     /// buffer. lightCount = number of valid entries; the rest of the
@@ -208,6 +216,20 @@ private:
     PFN_vkGetBufferDeviceAddressKHR vkGetBufferDeviceAddressKHR_ = nullptr;
     bool serAvailable_ = false;
     bool CreateK2RTResources();
+
+    // Cached push-constant + workgroup-count snapshot from the most
+    // recent RecordDispatch — consumed by RecordOutput when K5 fires
+    // after the DI port. We snapshot rather than recompute so K5 sees
+    // the exact same frameIndex / spp / sampleIdx that the bounce loop
+    // and PT passes used in this frame.
+    struct OutputPush {
+        uint32_t width, height, frameIndex, maxBounces, currentBounce, spp, sampleIdx;
+    };
+    OutputPush outputPush_   = {};
+    uint32_t   outputGroupsX_ = 0;
+    uint32_t   outputGroupsY_ = 0;
+    uint32_t   outputShSetIdx_ = 0;
+    bool       outputPending_  = false;
 
     static constexpr uint32_t WORKGROUP_SIZE = 256;
     static constexpr uint32_t MAX_SHADOW_RAYS_PER_PATH = 10; // sun + 8 lights + emissive

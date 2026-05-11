@@ -74,7 +74,14 @@ layout(binding = 2, set = 0) uniform CameraProperties {
     float sharcWarmupFactor;
 } cam;
 
-// ── set 1: primary gbuf ──
+// ── set 1: wavefront resources ──
+// pixelRadiance slot 7 carries packed (metallic, specularLevel)
+// per primary pixel. Spatial reads it for BOTH the current pixel
+// and each neighbour candidate.
+layout(binding = 3, set = 1, scalar) readonly buffer PixelRadianceBuffer {
+    uint radDataU[];
+} pixelRadiance;
+
 layout(binding = 4, set = 1, scalar) buffer PrimaryGBufBuffer {
     float gbufData[];
 } primaryGBuf;
@@ -136,8 +143,9 @@ SurfaceData loadSurface(uint pixelIdx) {
     s.baseColor     = vec3(primaryGBuf.gbufData[gBase + 8u],
                              primaryGBuf.gbufData[gBase + 9u],
                              primaryGBuf.gbufData[gBase + 10u]);
-    s.metallic      = 0.0;
-    s.specularLevel = 0.5;
+    vec2 mat        = unpackHalf2x16(pixelRadiance.radDataU[pixelIdx * 8u + 7u]);
+    s.metallic      = mat.x;
+    s.specularLevel = mat.y;
     s.instanceId    = floatBitsToUint(primaryGBuf.gbufData[gBase + 15u]);
     s.primitiveId   = floatBitsToUint(primaryGBuf.gbufData[gBase + 24u]);
     s.customIndex   = floatBitsToUint(primaryGBuf.gbufData[gBase + 25u]);

@@ -75,7 +75,14 @@ layout(binding = 2, set = 0) uniform CameraProperties {
     float sharcWarmupFactor;
 } cam;
 
-// ── set 1: wavefront resources — only primaryGBuf is consumed here ──
+// ── set 1: wavefront resources ──
+// pixelRadiance is read-only here; wf_shade packed metallic +
+// specularLevel into slot 7 at bounce 0, so we can recover the
+// material at the primary hit instead of using a dielectric guess.
+layout(binding = 3, set = 1, scalar) readonly buffer PixelRadianceBuffer {
+    uint radDataU[];
+} pixelRadiance;
+
 layout(binding = 4, set = 1, scalar) buffer PrimaryGBufBuffer {
     float gbufData[];
 } primaryGBuf;
@@ -299,11 +306,13 @@ void main() {
     vec3  baseColor = vec3(primaryGBuf.gbufData[gBase + 8u],
                             primaryGBuf.gbufData[gBase + 9u],
                             primaryGBuf.gbufData[gBase + 10u]);
-    // ignis-rt's primaryGBuf does not carry metallic / specularLevel
-    // (slots 20/21 hold PSR localPos). Dielectric approximation for
-    // now; revisit when wiring 4f.
-    float metallic      = 0.0;
-    float specularLevel = 0.5;
+    // wf_shade packs (metallic, specularLevel) into pixelRadiance slot
+    // 7 at bounce 0. Sky pixels skip the write; pixelRadiance is zero-
+    // cleared per frame so unwritten slots decode to (0, 0) which is
+    // a safe "fully diffuse" fallback.
+    vec2 mat = unpackHalf2x16(pixelRadiance.radDataU[pixelIdx * 8u + 7u]);
+    float metallic      = mat.x;
+    float specularLevel = mat.y;
 
     bool primaryHit = (viewZ < -0.001);
     if (!primaryHit || dot(n_v, n_v) < 1e-6) {

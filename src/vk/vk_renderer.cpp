@@ -1014,43 +1014,39 @@ void Renderer::RenderFrameRT() {
             rtResources_->GetDescriptorSet(), wfCfg ? wfCfg->maxBounces : 2,
             wfCfg ? static_cast<uint32_t>(wfCfg->samplesPerPixel) : 1);
 
-        // Phase 4c: DI reservoir initial samples. Runs after RecordDispatch
-        // so primaryGBuf is populated. Output is silent until 4d/4e/4f
-        // hook the consumer side; this only validates the plumbing.
+        // Phase 4c: DI reservoir initial samples — needs primaryGBuf from K2.
         wavefrontPipeline_->RecordDIInitialSamples(cmd,
             rtResources_->GetDescriptorSet(),
             rtResources_->GetDIDescriptorSet(),
             dispW, dispH, frameIndex_,
             rtResources_->GetPolyLightsCount());
 
-        // Phase 4d: DI temporal reuse. Reads initial + finalPrev + gbufPrev
-        // via set 2, writes scratch + gbufCurr.
+        // Phase 4d: DI temporal reuse.
         wavefrontPipeline_->RecordDITemporal(cmd,
             rtResources_->GetDescriptorSet(),
             rtResources_->GetDIDescriptorSet(),
             dispW, dispH, frameIndex_,
             rtResources_->GetPolyLightsCount());
 
-        // Phase 4e: DI spatial reuse. Reads scratch, writes finalCurr —
-        // closes the temporal loop.
+        // Phase 4e: DI spatial reuse — closes the temporal loop.
         wavefrontPipeline_->RecordDISpatial(cmd,
             rtResources_->GetDescriptorSet(),
             rtResources_->GetDIDescriptorSet(),
             dispW, dispH, frameIndex_,
             rtResources_->GetPolyLightsCount());
 
-        // Phase 4f: DI shade. Reads finalCurr, atomic-adds BSDF × Li × W
-        // into pixelRadiance diffuse. Currently runs additively on top of
-        // wf_shade.comp's inline NEE — directly-lit surfaces will look
-        // brighter; the inline path is gated off in a follow-up.
+        // Phase 4f: DI shade — atomic-add into pixelRadiance diffuse.
         wavefrontPipeline_->RecordDIShade(cmd,
             rtResources_->GetDescriptorSet(),
             rtResources_->GetDIDescriptorSet(),
             dispW, dispH, frameIndex_,
             rtResources_->GetPolyLightsCount());
 
-        // Flip the DI ping-pong so next frame's finalPrev / gbufPrev
-        // point at this frame's finalCurr / gbufCurr.
+        // K5 (wf_output): consume pixelRadiance — must run AFTER DI shade.
+        wavefrontPipeline_->RecordOutput(cmd, rtResources_->GetDescriptorSet());
+
+        // Flip DI ping-pong: next frame's finalPrev / gbufPrev point at
+        // this frame's finalCurr / gbufCurr.
         rtResources_->FlipDIDescriptorSet();
     }
 

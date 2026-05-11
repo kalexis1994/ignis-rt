@@ -207,8 +207,12 @@ void main() {
     vec3  baseColor = vec3(primaryGBuf.gbufData[gBase + 8u],
                             primaryGBuf.gbufData[gBase + 9u],
                             primaryGBuf.gbufData[gBase + 10u]);
-    const float metallic      = 0.0;
-    const float specularLevel = 0.5;
+    // Recover (metallic, specularLevel) packed by wf_shade at bounce 0
+    // into pixelRadiance slot 7. Replaces the earlier dielectric guess
+    // that was leaking diffuse contribution onto reflective surfaces.
+    vec2 mat = unpackHalf2x16(pixelRadiance.radDataU[pixelIdx * 8u + 7u]);
+    float metallic      = mat.x;
+    float specularLevel = mat.y;
 
     bool primaryHit = (viewZ < -0.001) && dot(n_v, n_v) > 1e-6;
     if (!primaryHit) return;

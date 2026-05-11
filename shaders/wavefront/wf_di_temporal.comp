@@ -79,7 +79,13 @@ layout(binding = 2, set = 0) uniform CameraProperties {
     float sharcWarmupFactor;
 } cam;
 
-// ── set 1: primary gbuf ──
+// ── set 1: wavefront resources ──
+// pixelRadiance slot 7 carries (metallic, specularLevel) packed
+// as half2 — see wf_shade bounce-0 write.
+layout(binding = 3, set = 1, scalar) readonly buffer PixelRadianceBuffer {
+    uint radDataU[];
+} pixelRadiance;
+
 layout(binding = 4, set = 1, scalar) buffer PrimaryGBufBuffer {
     float gbufData[];
 } primaryGBuf;
@@ -312,9 +318,11 @@ void main() {
     vec3  baseColor = vec3(primaryGBuf.gbufData[gBase + 8u],
                             primaryGBuf.gbufData[gBase + 9u],
                             primaryGBuf.gbufData[gBase + 10u]);
-    // Dielectric approximation; see header note.
-    const float metallic      = 0.0;
-    const float specularLevel = 0.5;
+    // Recover (metallic, specularLevel) from pixelRadiance slot 7 —
+    // see wf_di_initial_samples for the encoding rationale.
+    vec2 mat = unpackHalf2x16(pixelRadiance.radDataU[pixelIdx * 8u + 7u]);
+    float metallic      = mat.x;
+    float specularLevel = mat.y;
     uint instanceId  = floatBitsToUint(primaryGBuf.gbufData[gBase + 15u]);
     uint primitiveId = floatBitsToUint(primaryGBuf.gbufData[gBase + 24u]);
     uint customIndex = floatBitsToUint(primaryGBuf.gbufData[gBase + 25u]);
