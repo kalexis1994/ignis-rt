@@ -628,9 +628,10 @@ VmResult executeNodeVm(uint mi, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 norma
 // Surface attributes at a committed triangle hit.
 void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
                 out vec3 N, out vec3 albedo, out float roughness, out float metallic, out vec3 emission,
-                out float ior, out float transmission, out bool frontFace) {
+                out float ior, out float transmission, out bool frontFace, out vec3 geomN) {
     GeomDesc gd = descs[id];
     N = -rd;
+    geomN = -rd;          // ray-facing geometric normal — used to offset secondary rays robustly
     roughness = 1.0; // no material -> fully rough (diffuse)
     metallic = 0.0;
     emission = vec3(0.0);
@@ -668,10 +669,12 @@ void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
         if (gd.nrm != 0ul) {
             Norms nb = Norms(gd.nrm);
             N = normalize(mat3(o2w) * (n3(nb,i0)*w0 + n3(nb,i1)*bc.x + n3(nb,i2)*bc.y));
-            // Shadow terminator fix (Cycles/Appleseed): if the smooth normal dips below
-            // the geometric face plane (grazing angles on smooth meshes), snap to the
-            // geometric normal — prevents black silhouette contours.
-            if (dot(N, geoN) < 0.0) N = geoN;
+            // Keep the smooth normal in the geometric upper hemisphere, but CONTINUOUSLY:
+            // project it onto the geometric horizon instead of snapping flat to geoN. The hard
+            // snap caused per-facet shading discontinuities (black edges between triangles) on
+            // smooth-shaded low-poly meshes at grazing camera angles. (Iray-style projection.)
+            float NdotNg = dot(N, geoN);
+            if (NdotNg < 0.0) N = normalize(N - NdotNg * geoN);
         } else {
             N = geoN;
         }
@@ -684,6 +687,7 @@ void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
             uvCoord = uv0_*w0 + uv1_*bc.x + uv2_*bc.y;
         }
         hasTBN = (gd.vtx != 0ul) && (gd.uv != 0ul);
+        geomN = geoN;          // ray-facing geometric normal for robust ray offsets
     }
     if (hasTBN) {
         vec2 d1 = uv1_ - uv0_, d2 = uv2_ - uv0_;
@@ -758,12 +762,23 @@ void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
             N = normalize(vm.bumpStrength * bumpN + (1.0 - vm.bumpStrength) * N);
         }
     }
+    // Camera-side terminator fix (port of wf_shade.comp:681 / raygen_blender.rgen): on smooth-shaded
+    // curved surfaces the interpolated/perturbed normal can dip toward or behind the view horizon at
+    // grazing angles, which renders as black contours. Blend it back to the geometric normal there.
+    float NdotV = dot(N, -rd);
+    if (NdotV < 0.01) {
+        float blend = clamp(-NdotV * 50.0 + 0.5, 0.0, 1.0);
+        N = normalize(mix(N, geomN, blend));
+    }
 }
 
 // Direct lighting (NEE): sun + scene lights, each shadow-tested, with full diffuse+GGX BRDF
 // so glossy/metal surfaces get specular highlights (glints) from the lights.
-vec3 directShade(vec3 hitPos, vec3 N, vec3 V, vec3 diffAlbedo, vec3 F0, float alpha, inout uint rng) {
-    vec3 o = hitPos + N * 0.002;
+vec3 directShade(vec3 hitPos, vec3 N, vec3 geoN, vec3 V, vec3 diffAlbedo, vec3 F0, float alpha, inout uint rng) {
+    // Offset along the geometric normal (not the shading normal): on smooth-shaded silhouettes
+    // the shading normal is nearly tangent, so offsetting along it leaves the shadow-ray origin
+    // on the surface -> self-occlusion -> black terminator. geoN always faces the ray.
+    vec3 o = hitPos + geoN * 0.002;
     vec3 sum = vec3(0.0);
     // Sun — cone-sampled within its angular radius (cam_pos.w) for soft shadows.
     vec3 sunDir = normalize(pc.sunDir.xyz);
@@ -860,10 +875,10 @@ void main() {
             float thit = rayQueryGetIntersectionTEXT(rq, true);
             mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
 
-            vec3 N, albedo, emission;
+            vec3 N, albedo, emission, geoN;
             float roughness, metallic, ior, transmission;
             bool frontFace;
-            getSurface(id, prim, bc, o2w, rd, N, albedo, roughness, metallic, emission, ior, transmission, frontFace);
+            getSurface(id, prim, bc, o2w, rd, N, albedo, roughness, metallic, emission, ior, transmission, frontFace, geoN);
             vec3 hitPos = ro + rd * thit;
 
             // Emitted radiance from this surface (emissive materials light the scene + glow).
@@ -876,7 +891,7 @@ void main() {
             float alpha = max(roughness * roughness, 1e-3);
 
             // Direct lighting (diffuse + specular glints from sun/lights, soft shadows).
-            L += tp * directShade(hitPos, N, V, diffAlbedo, F0, alpha, rng);
+            L += tp * directShade(hitPos, N, geoN, V, diffAlbedo, F0, alpha, rng);
 
             // BRDF bounce. A transmissive (glass) interaction is chosen with probability
             // pTrans; otherwise we pick the diffuse or the GGX specular lobe.
@@ -910,7 +925,7 @@ void main() {
                 float lumD = dot(diffAlbedo, vec3(0.299, 0.587, 0.114));
                 float lumS = dot(F0, vec3(0.299, 0.587, 0.114));
                 float pSpec = clamp(lumS / (lumS + lumD + 1e-4), 0.1, 0.9);
-                ro = hitPos + N * 0.002;
+                ro = hitPos + geoN * 0.002;   // offset along geometric normal (silhouette-safe)
                 if (rnd(rng) < pSpec) {
                     vec3 H = sampleGgxVndf(u, V, N, alpha);
                     vec3 Ldir = reflect(rd, H);
