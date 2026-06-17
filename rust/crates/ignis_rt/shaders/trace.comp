@@ -231,6 +231,108 @@ bool occluded(vec3 o, vec3 d, float tmax) {
 float srgb1(float c) { return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4); }
 vec3 srgbToLinear(vec3 c) { return vec3(srgb1(c.r), srgb1(c.g), srgb1(c.b)); }
 
+// ── Procedural noise (Cycles-exact, ported from include/noise.glsl) ──
+// Jenkins Lookup3 integer hash (Cycles util/hash.h hash_uint3).
+uint hash3(uvec3 k) {
+    uint a = 0xdeadbf0eu + k.x;
+    uint b = 0xdeadbf0eu + k.y;
+    uint c = 0xdeadbf0eu + k.z;
+    c ^= b; c -= (b << 14u) | (b >> 18u);
+    a ^= c; a -= (c << 11u) | (c >> 21u);
+    b ^= a; b -= (a << 25u) | (a >> 7u);
+    c ^= b; c -= (b << 16u) | (b >> 16u);
+    a ^= c; a -= (c << 4u)  | (c >> 28u);
+    b ^= a; b -= (a << 14u) | (a >> 18u);
+    c ^= b; c -= (b << 24u) | (b >> 8u);
+    return c;
+}
+// Perlin improved-noise gradient dot (Cycles grad3).
+float gradientDot3(uint hash, float x, float y, float z) {
+    uint h = hash & 15u;
+    float u = h < 8u ? x : y;
+    float vt = (h == 12u || h == 14u) ? x : z;
+    float v = h < 4u ? y : vt;
+    return ((h & 1u) != 0u ? -u : u) + ((h & 2u) != 0u ? -v : v);
+}
+// 3D Perlin noise, quintic fade, ~[-1,1].
+float perlinNoise3D(vec3 p) {
+    vec3 fl = floor(p);
+    ivec3 i = ivec3(fl);
+    vec3  f = p - fl;
+    vec3 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    float g000 = gradientDot3(hash3(uvec3(i)),                  f.x,       f.y,       f.z);
+    float g100 = gradientDot3(hash3(uvec3(i + ivec3(1,0,0))),   f.x - 1.0, f.y,       f.z);
+    float g010 = gradientDot3(hash3(uvec3(i + ivec3(0,1,0))),   f.x,       f.y - 1.0, f.z);
+    float g110 = gradientDot3(hash3(uvec3(i + ivec3(1,1,0))),   f.x - 1.0, f.y - 1.0, f.z);
+    float g001 = gradientDot3(hash3(uvec3(i + ivec3(0,0,1))),   f.x,       f.y,       f.z - 1.0);
+    float g101 = gradientDot3(hash3(uvec3(i + ivec3(1,0,1))),   f.x - 1.0, f.y,       f.z - 1.0);
+    float g011 = gradientDot3(hash3(uvec3(i + ivec3(0,1,1))),   f.x,       f.y - 1.0, f.z - 1.0);
+    float g111 = gradientDot3(hash3(uvec3(i + ivec3(1,1,1))),   f.x - 1.0, f.y - 1.0, f.z - 1.0);
+    float x00 = mix(g000, g100, u.x);
+    float x10 = mix(g010, g110, u.x);
+    float x01 = mix(g001, g101, u.x);
+    float x11 = mix(g011, g111, u.x);
+    return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
+}
+// Normalized fBM (Cycles fractal_noise.h noise_fbm), remapped to ~[0,1].
+float fbm3D(vec3 p, float detail, float roughness, float lacunarity) {
+    float fscale = 1.0, amp = 1.0, maxamp = 0.0, sum = 0.0;
+    int nOctaves = int(detail);
+    for (int i = 0; i <= nOctaves; i++) {
+        sum += perlinNoise3D(fscale * p) * amp;
+        maxamp += amp; amp *= roughness; fscale *= lacunarity;
+    }
+    float rmd = detail - floor(detail);
+    if (rmd != 0.0) {
+        float sum2 = sum + perlinNoise3D(fscale * p) * amp;
+        return mix(0.5 * sum / maxamp + 0.5, 0.5 * sum2 / (maxamp + amp) + 0.5, rmd);
+    }
+    return 0.5 * sum / maxamp + 0.5;
+}
+float gradientLinear(vec3 p)    { return clamp(p.x, 0.0, 1.0); }
+float gradientQuadratic(vec3 p) { float r = max(p.x, 0.0); return clamp(r * r, 0.0, 1.0); }
+float gradientSpherical(vec3 p) { return max(1.0 - length(p), 0.0); }
+float gradientRadial(vec3 p)    { return atan(p.y, p.x) / (2.0 * PI) + 0.5; }
+// Voronoi F1 — squared-then-sqrt nearest cell-point distance.
+float voronoiF1(vec3 p, float randomness) {
+    vec3 fl = floor(p);
+    vec3 f  = fract(p);
+    float minDist = 1e10;
+    for (int k = -1; k <= 1; k++)
+    for (int j = -1; j <= 1; j++)
+    for (int i = -1; i <= 1; i++) {
+        vec3 offset = vec3(float(i), float(j), float(k));
+        uvec3 cellId = uvec3(ivec3(fl) + ivec3(i, j, k));
+        uint h = hash3(cellId);
+        vec3 jitter = vec3(float(h & 0xFFFFu)/65535.0, float((h>>8u)&0xFFFFu)/65535.0, float((h>>16u)&0xFFFFu)/65535.0);
+        vec3 diff = (offset + randomness * jitter) - f;
+        minDist = min(minDist, dot(diff, diff));
+    }
+    return sqrt(minDist);
+}
+float waveTexture(vec3 p, float scale, float distortion, uint waveType) {
+    float coord = p.x * scale;
+    if (distortion != 0.0) coord += distortion * perlinNoise3D(p);
+    return (waveType == 0u) ? (0.5 + 0.5 * sin(coord)) : fract(coord);
+}
+float magicTexture(vec3 p, float distortion) {
+    float x = sin((p.x + p.y + p.z) * 5.0);
+    float y = sin((p.x - p.y + p.z) * 5.0);
+    float z = sin((p.x + p.y - p.z) * 5.0);
+    if (distortion > 0.0) { x = sin(x*distortion); y = sin(y*distortion); z = sin(z*distortion); }
+    return (x + y + z) / 3.0 * 0.5 + 0.5;
+}
+vec3 brickTexture(vec3 p, float scale, float mortarSize, vec3 color1, vec3 color2, vec3 mortarColor) {
+    vec2 uvB = p.xy * scale;
+    if (mod(floor(uvB.y), 2.0) > 0.5) uvB.x += 0.5;
+    vec2 brick = fract(uvB);
+    float isBrick = step(mortarSize, brick.x) * step(brick.x, 1.0 - mortarSize)
+                  * step(mortarSize, brick.y) * step(brick.y, 1.0 - mortarSize);
+    vec2 brickId = floor(uvB);
+    float h = fract(sin(dot(brickId, vec2(127.1, 311.7))) * 43758.5453);
+    return mix(mortarColor, mix(color1, color2, step(0.5, h)), isBrick);
+}
+
 vec4 evalColorRamp(uint mi, uint dataOff, uint stopCount, float factor) {
     uvec4 d0 = mats[mi].nodeVmCode[dataOff];
     float pos0 = uintBitsToFloat(d0.x);
@@ -428,6 +530,48 @@ VmResult executeNodeVm(uint mi, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 norma
             float f0 = pow((ior-1.0)/(ior+1.0), 2.0); R[dst].x = f0 + (1.0-f0)*pow(1.0-NdotV, 5.0);
         }
         else if (op == 0x84u) { R[dst] = R[sA]; pc += 6u; }          // RGB_CURVES: passthrough (Stage 2+)
+        else if (op == 0x58u) {                                      // TEX_CHECKER
+            float scale = uintBitsToFloat(instr.y);
+            vec2 cuv = R[sA].xy * scale;
+            float check = mod(floor(cuv.x) + floor(cuv.y), 2.0);
+            vec4 color2 = vec4(uintBitsToFloat(instr.z), uintBitsToFloat(instr.w), uintBitsToFloat(instr.w), 1.0);
+            R[dst] = (check < 0.5) ? R[sB] : color2;
+        }
+        else if (op == 0x80u) {                                      // TEX_NOISE (fBM)
+            float scale = uintBitsToFloat(instr.y);
+            float n = fbm3D(R[sA].xyz * scale, uintBitsToFloat(instr.z), uintBitsToFloat(instr.w), 2.0);
+            R[dst] = vec4(n, n, n, 1.0);
+        }
+        else if (op == 0x81u) {                                      // TEX_GRADIENT
+            vec3 p = R[sA].xyz; float f;
+            if (instr.y == 1u) f = gradientQuadratic(p);
+            else if (instr.y == 2u) f = gradientRadial(p);
+            else if (instr.y == 3u) f = gradientSpherical(p);
+            else f = gradientLinear(p);
+            R[dst] = vec4(f, f, f, 1.0);
+        }
+        else if (op == 0x82u) {                                      // TEX_VORONOI (F1)
+            float d = voronoiF1(R[sA].xyz * uintBitsToFloat(instr.y), 1.0);
+            R[dst] = vec4(d, d, d, 1.0);
+        }
+        else if (op == 0x83u) {                                      // TEX_WAVE
+            float w = waveTexture(R[sA].xyz, uintBitsToFloat(instr.y), uintBitsToFloat(instr.z), instr.w);
+            R[dst] = vec4(w, w, w, 1.0);
+        }
+        else if (op == 0x88u) {                                      // TEX_WHITE_NOISE
+            uvec3 ph = uvec3(floatBitsToUint(R[sA].x), floatBitsToUint(R[sA].y), floatBitsToUint(R[sA].z));
+            uint h = hash3(ph);
+            R[dst] = vec4(float(h)/4294967295.0, float(h*2654435761u)/4294967295.0, float(h*340573321u)/4294967295.0, 1.0);
+        }
+        else if (op == 0x91u) {                                      // TEX_MAGIC
+            float m = magicTexture(R[sA].xyz * uintBitsToFloat(instr.z), uintBitsToFloat(instr.y));
+            R[dst] = vec4(m, m, m, 1.0);
+        }
+        else if (op == 0x92u) {                                      // TEX_BRICK
+            vec3 b = brickTexture(R[sA].xyz, uintBitsToFloat(instr.y), uintBitsToFloat(instr.z),
+                                  vec3(0.8), vec3(0.4, 0.2, 0.1), vec3(0.1));
+            R[dst] = vec4(b, 1.0);
+        }
         else if (op >= 0xE0u) {                                      // outputs
             if (op == 0xF0u) { res.baseColor = R[sA].rgb; res.hasBaseColor = true; }
             else if (op == 0xF1u) { res.roughness = R[sA].x; res.hasRoughness = true; }
@@ -439,7 +583,7 @@ VmResult executeNodeVm(uint mi, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 norma
             else if (op == 0xF7u) { res.transmission = R[sA].x; res.hasTransmission = true; }
             else if (op == 0xEFu) { res.transformedUV = R[sA].xy; res.hasTransformedUV = true; }
         }
-        // (procedural textures 0x58/0x80-0x96 + remaining color ops: Stage 2)
+        // (bump opcodes 0x93 NOISE_BUMP / 0x96 TEX_BUMP: Stage 3 — need bumpGradient output + TBN)
     }
     return res;
 }
@@ -462,6 +606,8 @@ void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
     vec3 wp0 = vec3(0.0), wp1 = vec3(0.0), wp2 = vec3(0.0);
     vec2 uv0_ = vec2(0.0), uv1_ = vec2(0.0), uv2_ = vec2(0.0);
     bool hasTBN = false;
+    // Interpolated positions fed to the Node VM: world space + object ("Generated"/Object) space.
+    vec3 worldPos = vec3(0.0), localPos = vec3(0.0);
     if (gd.idx != 0ul) {
         Indices ib = Indices(gd.idx);
         uint i0 = ib.i[prim*3u+0u], i1 = ib.i[prim*3u+1u], i2 = ib.i[prim*3u+2u];
@@ -469,14 +615,17 @@ void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
         vec3 geoN = -rd;
         if (gd.vtx != 0ul) {
             Verts vb = Verts(gd.vtx);
+            vec3 op0 = v3(vb,i0), op1 = v3(vb,i1), op2 = v3(vb,i2);
             // Raw outward geometric normal (consistent CCW winding) — its sign vs the ray
             // tells us whether we are entering or leaving a closed dielectric (glass).
-            vec3 rawGeoN = normalize(mat3(o2w) * cross(v3(vb,i1)-v3(vb,i0), v3(vb,i2)-v3(vb,i0)));
+            vec3 rawGeoN = normalize(mat3(o2w) * cross(op1-op0, op2-op0));
             frontFace = dot(rd, rawGeoN) < 0.0;
             geoN = frontFace ? rawGeoN : -rawGeoN;   // face toward the ray
-            wp0 = o2w * vec4(v3(vb,i0), 1.0);
-            wp1 = o2w * vec4(v3(vb,i1), 1.0);
-            wp2 = o2w * vec4(v3(vb,i2), 1.0);
+            wp0 = o2w * vec4(op0, 1.0);
+            wp1 = o2w * vec4(op1, 1.0);
+            wp2 = o2w * vec4(op2, 1.0);
+            localPos = op0*w0 + op1*bc.x + op2*bc.y;        // object-space hit position
+            worldPos = wp0*w0 + wp1*bc.x + wp2*bc.y;        // world-space hit position
         }
         if (gd.nrm != 0ul) {
             Norms nb = Norms(gd.nrm);
@@ -511,7 +660,7 @@ void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
         transmission = clamp(mat.multR, 0.0, 1.0);
         // Node VM: its outputs override the constants. Falls back to the direct diffuse
         // texture slot when the program doesn't produce a base color.
-        VmResult vm = executeNodeVm(matId, uvCoord, vec3(0.0), rd, N, vec3(0.0), vec4(1.0), id);
+        VmResult vm = executeNodeVm(matId, uvCoord, worldPos, rd, N, localPos, vec4(1.0), id);
         if (vm.hasBaseColor) albedo = vm.baseColor;
         else if (mat.diffuseTexIndex != 0xFFFFFFFFu) albedo = texture(textures[nonuniformEXT(mat.diffuseTexIndex)], uvCoord).rgb;
         if (vm.hasRoughness) roughness = clamp(vm.roughness, 0.04, 1.0);
