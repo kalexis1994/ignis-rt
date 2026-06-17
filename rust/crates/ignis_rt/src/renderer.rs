@@ -68,7 +68,8 @@ struct CameraPush {
 #[derive(Clone, Copy)]
 struct MaterialGpu {
     albedo: [f32; 4],
-    tex: [u32; 4], // x = diffuseTexIndex (0xFFFFFFFF = none)
+    tex: [u32; 4],    // x = diffuseTexIndex (0xFFFFFFFF = none)
+    params: [f32; 4], // x = roughness, y = metallic
 }
 
 /// TLAS instance as the addon sends it (matches IgnisTLASInstance / TLASInstance, 60 bytes).
@@ -325,10 +326,11 @@ pub fn upload_materials(data: *const u8, count: u32) {
         let base = i * STRIDE;
         let u = |k: usize| u32::from_le_bytes([bytes[base + k], bytes[base + k + 1], bytes[base + k + 2], bytes[base + k + 3]]);
         let f = |k: usize| f32::from_bits(u(k));
-        // diffuseTexIndex at offset 0, base_color at offset 20.
+        // Offsets in GPUMaterial: diffuseTex=0, base_color=20, roughness=32, metallic=48.
         mats.push(MaterialGpu {
             albedo: [f(20), f(24), f(28), 1.0],
             tex: [u(0), 0, 0, 0],
+            params: [f(32), f(48), 0.0, 0.0],
         });
     }
     if let Some(r) = RENDERER.lock().unwrap().as_mut() {
@@ -1434,9 +1436,13 @@ impl Renderer {
         if sc[0] + sc[1] + sc[2] <= 0.0 {
             sc = [1.0, 1.0, 1.0];
         }
+        // Sun angular radius (radians) for soft shadows — packed into the unused cam_pos.w.
+        let sun_size = crate::config::get_float("sun_size");
+        let mut cam = self.cam_pos;
+        cam[3] = if sun_size > 0.0 { sun_size } else { 0.009 };
         let push = CameraPush {
             inv_view_proj: self.inv_view_proj,
-            cam_pos: self.cam_pos,
+            cam_pos: cam,
             dims: [self.width, self.height],
             has_tlas: self.tlas.is_some() as u32,
             num_lights: self.light_count,
