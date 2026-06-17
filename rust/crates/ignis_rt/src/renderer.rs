@@ -63,16 +63,6 @@ struct CameraPush {
     sun_col: [f32; 4], // rgb = color
 } // 128 bytes (== guaranteed push-constant minimum)
 
-/// Compact per-material data for the shader (binding 3). Matches the GLSL struct.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct MaterialGpu {
-    albedo: [f32; 4],
-    tex: [u32; 4],      // x = diffuseTexIndex (0xFFFFFFFF = none)
-    params: [f32; 4],   // x = roughness, y = metallic
-    emission: [f32; 4], // rgb = emissive radiance (color * strength)
-}
-
 /// TLAS instance as the addon sends it (matches IgnisTLASInstance / TLASInstance, 60 bytes).
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -336,25 +326,12 @@ pub fn upload_materials(data: *const u8, count: u32) {
     if data.is_null() || count == 0 {
         return;
     }
+    // Upload the full 2204-byte GPUMaterial structs (incl. the Node VM bytecode) verbatim;
+    // the shader reads the fields + runs the VM (scalar layout matches the C++ struct).
     const STRIDE: usize = 2204;
     let bytes = unsafe { std::slice::from_raw_parts(data, count as usize * STRIDE) };
-    let mut mats: Vec<MaterialGpu> = Vec::with_capacity(count as usize);
-    for i in 0..count as usize {
-        let base = i * STRIDE;
-        let u = |k: usize| u32::from_le_bytes([bytes[base + k], bytes[base + k + 1], bytes[base + k + 2], bytes[base + k + 3]]);
-        let f = |k: usize| f32::from_bits(u(k));
-        // Offsets in GPUMaterial: diffuseTex=0, base_color=20, roughness=32, emission=36,
-        // metallic=48, emission_strength=76.
-        let es = f(76);
-        mats.push(MaterialGpu {
-            albedo: [f(20), f(24), f(28), 1.0],
-            tex: [u(0), 0, 0, 0],
-            params: [f(32), f(48), 0.0, 0.0],
-            emission: [f(36) * es, f(40) * es, f(44) * es, 0.0],
-        });
-    }
     if let Some(r) = RENDERER.lock().unwrap().as_mut() {
-        r.0.set_materials(&mats);
+        r.0.set_materials(bytes);
     }
 }
 
@@ -554,6 +531,10 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
     let mut f_ai =
         vk::PhysicalDeviceShaderAtomicInt64Features::default().shader_buffer_int64_atomics(true);
+    // Scalar block layout: lets the GLSL material struct match the C++ 2204-byte layout exactly
+    // (needed for the Node VM bytecode at offset 156, which std430 would misalign).
+    let mut f_scalar =
+        vk::PhysicalDeviceScalarBlockLayoutFeatures::default().scalar_block_layout(true);
 
     let prio = [1.0f32];
     let q_ci = [vk::DeviceQueueCreateInfo::default()
@@ -571,7 +552,8 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
             .push_next(&mut f_as)
             .push_next(&mut f_di)
             .push_next(&mut f_bda)
-            .push_next(&mut f_ai);
+            .push_next(&mut f_ai)
+            .push_next(&mut f_scalar);
     }
 
     let device = unsafe { instance.create_device(pd, &dci, None) }
@@ -1184,8 +1166,8 @@ impl Renderer {
         log(&format!("geom_table: {} entries", descs.len()));
     }
 
-    fn set_materials(&mut self, mats: &[MaterialGpu]) {
-        if mats.is_empty() || self.accel_ext.is_none() {
+    fn set_materials(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() || self.accel_ext.is_none() {
             return;
         }
         let device = self.device.clone();
@@ -1196,7 +1178,7 @@ impl Renderer {
         let buf = match GpuBuffer::new(
             &device,
             alloc,
-            std::mem::size_of_val(mats) as u64,
+            bytes.len() as u64,
             vk::BufferUsageFlags::STORAGE_BUFFER,
             MemoryLocation::CpuToGpu,
             "materials",
@@ -1207,7 +1189,7 @@ impl Renderer {
                 return;
             }
         };
-        buf.write_bytes(gpu::as_bytes(mats));
+        buf.write_bytes(bytes);
         let info = [vk::DescriptorBufferInfo::default()
             .buffer(buf.buffer)
             .offset(0)
@@ -1220,7 +1202,7 @@ impl Renderer {
         unsafe { device.update_descriptor_sets(&[write], &[]) };
         self.mat_buffer = Some(buf);
         self.accum_frame = 0;
-        log(&format!("materials: {} entries", mats.len()));
+        log(&format!("materials: {} full (2204b each)", bytes.len() / 2204));
     }
 
     fn set_blas_materials(&mut self, handle: i32, ids: &[u32]) {
