@@ -2,6 +2,7 @@
 #extension GL_EXT_ray_query : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
 // RT path: trace the primary camera ray against the TLAS, fetch the hit triangle's per-vertex
 // normals (via buffer_reference into the per-instance geometry table) and interpolate them by
 // barycentrics for smooth shading. Falls back to the geometric (face) normal when a mesh has
@@ -13,11 +14,14 @@ layout(binding = 1) uniform accelerationStructureEXT tlas;
 
 layout(buffer_reference, std430) readonly buffer Verts { float v[]; };
 layout(buffer_reference, std430) readonly buffer Norms { float n[]; };
+layout(buffer_reference, std430) readonly buffer Uvs   { float u[]; };
 layout(buffer_reference, std430) readonly buffer Indices { uint i[]; };
-layout(buffer_reference, std430) readonly buffer MatIds { uint m[]; };
-struct GeomDesc { uint64_t vtx; uint64_t idx; uint64_t nrm; uint64_t mat; };
+layout(buffer_reference, std430) readonly buffer MatIds  { uint m[]; };
+struct GeomDesc { uint64_t vtx; uint64_t idx; uint64_t nrm; uint64_t mat; uint64_t uv; uint64_t pad; };
+struct Material { vec4 albedo; uvec4 tex; }; // tex.x = diffuseTexIndex
 layout(binding = 2, std430) readonly buffer GeomTable { GeomDesc descs[]; };
-layout(binding = 3, std430) readonly buffer Materials { vec4 albedo[]; };
+layout(binding = 3, std430) readonly buffer Materials { Material mats[]; };
+layout(binding = 4) uniform sampler2D textures[];
 
 layout(push_constant) uniform PC {
     mat4  invViewProj;
@@ -43,6 +47,7 @@ vec3 hashColor(uint i) {
 
 vec3 v3(Verts b, uint i) { return vec3(b.v[i*3u], b.v[i*3u+1u], b.v[i*3u+2u]); }
 vec3 n3(Norms b, uint i) { return vec3(b.n[i*3u], b.n[i*3u+1u], b.n[i*3u+2u]); }
+vec2 t2(Uvs   b, uint i) { return vec2(b.u[i*2u], b.u[i*2u+1u]); }
 
 void main() {
     uvec2 p = gl_GlobalInvocationID.xy;
@@ -74,28 +79,44 @@ void main() {
                 vec2 bc   = rayQueryGetIntersectionBarycentricsEXT(rq, true);
                 mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
 
-                vec3 nrm = -dir; // fallback: face the camera
                 GeomDesc gd = descs[id];
-                if (gd.vtx != 0ul && gd.idx != 0ul) {
+                vec3 nrm = -dir;          // fallback: face the camera
+                vec2 uvCoord = vec2(0.0);
+                float w0 = 1.0 - bc.x - bc.y;
+                if (gd.idx != 0ul) {
                     Indices ib = Indices(gd.idx);
                     uint i0 = ib.i[prim*3u+0u], i1 = ib.i[prim*3u+1u], i2 = ib.i[prim*3u+2u];
+                    // Normal: smooth (interpolated) if present, else geometric (face).
                     vec3 no;
                     if (gd.nrm != 0ul) {
                         Norms nb = Norms(gd.nrm);
-                        no = n3(nb,i0)*(1.0-bc.x-bc.y) + n3(nb,i1)*bc.x + n3(nb,i2)*bc.y; // smooth
-                    } else {
+                        no = n3(nb,i0)*w0 + n3(nb,i1)*bc.x + n3(nb,i2)*bc.y;
+                    } else if (gd.vtx != 0ul) {
                         Verts vb = Verts(gd.vtx);
-                        no = cross(v3(vb,i1)-v3(vb,i0), v3(vb,i2)-v3(vb,i0));             // flat
+                        no = cross(v3(vb,i1)-v3(vb,i0), v3(vb,i2)-v3(vb,i0));
+                    } else {
+                        no = -dir;
                     }
                     nrm = normalize(mat3(o2w) * no);
+                    // Interpolated UV. Flip V: Blender UV origin is bottom-left, Vulkan top-left.
+                    if (gd.uv != 0ul) {
+                        Uvs ub = Uvs(gd.uv);
+                        uvCoord = t2(ub,i0)*w0 + t2(ub,i1)*bc.x + t2(ub,i2)*bc.y;
+                        uvCoord.y = 1.0 - uvCoord.y;
+                    }
                 }
                 if (dot(nrm, dir) > 0.0) nrm = -nrm; // face-forward to the viewer
 
-                // Real material albedo (per-triangle material id -> material buffer).
+                // Base color: material albedo, or its diffuse texture sampled at the UV.
                 vec3 base = hashColor(id);
                 if (gd.mat != 0ul) {
-                    MatIds mids = MatIds(gd.mat);
-                    base = albedo[mids.m[prim]].rgb;
+                    uint matId = MatIds(gd.mat).m[prim];
+                    Material mat = mats[matId];
+                    base = mat.albedo.rgb;
+                    uint dt = mat.tex.x;
+                    if (dt != 0xFFFFFFFFu) {
+                        base = texture(textures[nonuniformEXT(dt)], uvCoord).rgb;
+                    }
                 }
 
                 // Real sun (clamped to avoid blowout) + uniform ambient so no face is black.

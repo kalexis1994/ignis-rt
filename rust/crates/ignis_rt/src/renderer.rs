@@ -26,6 +26,30 @@ unsafe impl Send for SyncRenderer {}
 static RENDERER: Mutex<Option<SyncRenderer>> = Mutex::new(None);
 
 const RB_FORMAT: vk::Format = vk::Format::R32G32B32A32_SFLOAT;
+const MAX_TEXTURES: u32 = 1024; // bindless texture array capacity
+
+struct Texture {
+    image: vk::Image,
+    alloc: Option<Allocation>,
+    view: vk::ImageView,
+}
+
+struct PendingTex {
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+}
+
+/// DXGI format code (from the addon) -> Vulkan. The addon only emits uncompressed
+/// R8G8B8A8 (28) and R16G16B16A16_FLOAT (10); default the rest to RGBA8.
+fn dxgi_to_vk(dxgi: u32) -> (vk::Format, u32) {
+    match dxgi {
+        10 => (vk::Format::R16G16B16A16_SFLOAT, 8),
+        87 => (vk::Format::B8G8R8A8_UNORM, 4),
+        _ => (vk::Format::R8G8B8A8_UNORM, 4), // 28 and fallback
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -38,6 +62,14 @@ struct CameraPush {
     sun_dir: [f32; 4], // xyz = world direction, w = intensity
     sun_col: [f32; 4], // rgb = color
 } // 128 bytes (== guaranteed push-constant minimum)
+
+/// Compact per-material data for the shader (binding 3). Matches the GLSL struct.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MaterialGpu {
+    albedo: [f32; 4],
+    tex: [u32; 4], // x = diffuseTexIndex (0xFFFFFFFF = none)
+}
 
 /// TLAS instance as the addon sends it (matches IgnisTLASInstance / TLASInstance, 60 bytes).
 #[repr(C)]
@@ -53,6 +85,7 @@ struct QueuedMesh {
     positions: Vec<f32>, // 3 per vertex
     indices: Vec<u32>,
     normals: Vec<f32>, // 3 per vertex (empty if none)
+    uvs: Vec<f32>,     // 2 per vertex (empty if none)
     vertex_count: u32,
 }
 
@@ -62,6 +95,7 @@ struct Blas {
     vbuf: GpuBuffer,
     ibuf: GpuBuffer,
     nbuf: Option<GpuBuffer>, // per-vertex normals (for smooth shading)
+    ubuf: Option<GpuBuffer>, // per-vertex UVs (for texturing)
     matbuf: Option<GpuBuffer>, // per-triangle material id
     address: vk::DeviceAddress,
 }
@@ -79,8 +113,11 @@ pub struct Renderer {
     queued: Vec<QueuedMesh>,
     blas_list: Vec<Option<Blas>>,
     tlas: Option<Tlas>,
-    geom_table: Option<GpuBuffer>, // per-BLAS [vtx, idx, nrm, matids] addrs, bound at binding 2
-    mat_buffer: Option<GpuBuffer>, // material albedos (vec4 each), bound at binding 3
+    geom_table: Option<GpuBuffer>, // per-BLAS [vtx, idx, nrm, mat, uv] addrs, bound at binding 2
+    mat_buffer: Option<GpuBuffer>, // material {albedo, texIndices}, bound at binding 3
+    pending_tex: Vec<PendingTex>,  // textures staged on CPU, not yet uploaded
+    textures: Vec<Texture>,        // uploaded textures, bound bindless at binding 4
+    tex_sampler: vk::Sampler,      // shared sampler for all textures
 
     // Compute pipeline.
     offscreen_view: vk::ImageView,
@@ -218,9 +255,15 @@ pub fn set_camera(view_inverse: &[f32], proj_inverse: &[f32]) {
     }
 }
 
-pub fn queue_mesh(positions: &[f32], vertex_count: u32, indices: &[u32], normals: &[f32]) -> i32 {
+pub fn queue_mesh(
+    positions: &[f32],
+    vertex_count: u32,
+    indices: &[u32],
+    normals: &[f32],
+    uvs: &[f32],
+) -> i32 {
     match RENDERER.lock().unwrap().as_mut() {
-        Some(r) => r.0.queue_mesh(positions, vertex_count, indices, normals),
+        Some(r) => r.0.queue_mesh(positions, vertex_count, indices, normals, uvs),
         None => -1,
     }
 }
@@ -252,22 +295,70 @@ pub fn upload_materials(data: *const u8, count: u32) {
         return;
     }
     const STRIDE: usize = 2204;
-    const BASE_COLOR_OFF: usize = 20;
     let bytes = unsafe { std::slice::from_raw_parts(data, count as usize * STRIDE) };
-    let mut albedos: Vec<[f32; 4]> = Vec::with_capacity(count as usize);
+    let mut mats: Vec<MaterialGpu> = Vec::with_capacity(count as usize);
     for i in 0..count as usize {
-        let o = i * STRIDE + BASE_COLOR_OFF;
-        let f = |k: usize| f32::from_le_bytes([bytes[o + k], bytes[o + k + 1], bytes[o + k + 2], bytes[o + k + 3]]);
-        albedos.push([f(0), f(4), f(8), 1.0]);
+        let base = i * STRIDE;
+        let u = |k: usize| u32::from_le_bytes([bytes[base + k], bytes[base + k + 1], bytes[base + k + 2], bytes[base + k + 3]]);
+        let f = |k: usize| f32::from_bits(u(k));
+        // diffuseTexIndex at offset 0, base_color at offset 20.
+        mats.push(MaterialGpu {
+            albedo: [f(20), f(24), f(28), 1.0],
+            tex: [u(0), 0, 0, 0],
+        });
     }
     if let Some(r) = RENDERER.lock().unwrap().as_mut() {
-        r.0.set_materials(&albedos);
+        r.0.set_materials(&mats);
     }
 }
 
 pub fn upload_mesh_primitive_materials(handle: i32, ids: &[u32]) {
     if let Some(r) = RENDERER.lock().unwrap().as_mut() {
         r.0.set_blas_materials(handle, ids);
+    }
+}
+
+// --- Texture manager (state lives in the renderer; the addon's mgr handle is ignored) ---
+
+pub fn texture_manager_reset() {
+    if let Some(r) = RENDERER.lock().unwrap().as_mut() {
+        r.0.clear_textures();
+    }
+}
+
+pub fn texture_add(data: &[u8], width: i32, height: i32, dxgi: u32) -> i32 {
+    if width <= 0 || height <= 0 {
+        return -1;
+    }
+    match RENDERER.lock().unwrap().as_mut() {
+        Some(r) => r.0.texture_add(data.to_vec(), width as u32, height as u32, dxgi),
+        None => -1,
+    }
+}
+
+pub fn texture_upload_all() {
+    if let Some(r) = RENDERER.lock().unwrap().as_mut() {
+        r.0.upload_textures();
+    }
+}
+
+pub fn texture_upload_one() -> bool {
+    match RENDERER.lock().unwrap().as_mut() {
+        Some(r) => r.0.upload_one_texture(),
+        None => false,
+    }
+}
+
+pub fn texture_pending_count() -> i32 {
+    match RENDERER.lock().unwrap().as_ref() {
+        Some(r) => r.0.pending_tex.len() as i32,
+        None => 0,
+    }
+}
+
+pub fn update_texture_descriptors() {
+    if let Some(r) = RENDERER.lock().unwrap().as_mut() {
+        r.0.update_texture_descriptors();
     }
 }
 
@@ -390,7 +481,8 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default().acceleration_structure(true);
     let mut f_di = vk::PhysicalDeviceDescriptorIndexingFeatures::default()
         .descriptor_binding_partially_bound(true)
-        .runtime_descriptor_array(true);
+        .runtime_descriptor_array(true)
+        .shader_sampled_image_array_non_uniform_indexing(true);
     let mut f_bda =
         vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
     let mut f_ai =
@@ -542,7 +634,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .ty(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
                 .descriptor_count(1),
         );
-        // Binding 2: per-instance geometry table. Binding 3: material albedos.
+        // Binding 2: geometry table. Binding 3: materials. (storage buffers)
         for binding in [2u32, 3u32] {
             bindings.push(
                 vk::DescriptorSetLayoutBinding::default()
@@ -558,6 +650,20 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                     .descriptor_count(1),
             );
         }
+        // Binding 4: bindless texture array.
+        bindings.push(
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(MAX_TEXTURES)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        );
+        binding_flags.push(vk::DescriptorBindingFlags::PARTIALLY_BOUND);
+        pool_sizes.push(
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(MAX_TEXTURES),
+        );
     }
     let mut flags_info =
         vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
@@ -659,6 +765,20 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
         .map_err(|e| format!("create_fence: {e}"))?;
 
+    let tex_sampler = unsafe {
+        device.create_sampler(
+            &vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::LINEAR)
+                .min_filter(vk::Filter::LINEAR)
+                .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                .address_mode_v(vk::SamplerAddressMode::REPEAT)
+                .address_mode_w(vk::SamplerAddressMode::REPEAT)
+                .max_lod(vk::LOD_CLAMP_NONE),
+            None,
+        )
+    }
+    .map_err(|e| format!("create_sampler: {e}"))?;
+
     log("Vulkan device + compute pipeline + offscreen target ready");
 
     Ok(Renderer {
@@ -669,6 +789,9 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         tlas: None,
         geom_table: None,
         mat_buffer: None,
+        pending_tex: Vec::new(),
+        textures: Vec::new(),
+        tex_sampler,
         offscreen_view,
         ds_layout,
         desc_pool,
@@ -706,12 +829,14 @@ impl Renderer {
         vertex_count: u32,
         indices: &[u32],
         normals: &[f32],
+        uvs: &[f32],
     ) -> i32 {
         let handle = (self.blas_list.len() + self.queued.len()) as i32;
         self.queued.push(QueuedMesh {
             positions: positions.to_vec(),
             indices: indices.to_vec(),
             normals: normals.to_vec(),
+            uvs: uvs.to_vec(),
             vertex_count,
         });
         handle
@@ -757,16 +882,19 @@ impl Renderer {
     /// by BLAS handle = TLAS instanceCustomIndex) and point descriptor binding 2 at it.
     fn update_geom_table(&mut self) {
         let device = self.device.clone();
-        let mut descs: Vec<[u64; 4]> = Vec::with_capacity(self.blas_list.len());
+        let addr = |b: &Option<GpuBuffer>| b.as_ref().map(|x| x.device_address(&device)).unwrap_or(0);
+        let mut descs: Vec<[u64; 6]> = Vec::with_capacity(self.blas_list.len());
         for slot in &self.blas_list {
             match slot {
                 Some(b) => descs.push([
                     b.vbuf.device_address(&device),
                     b.ibuf.device_address(&device),
-                    b.nbuf.as_ref().map(|n| n.device_address(&device)).unwrap_or(0),
-                    b.matbuf.as_ref().map(|m| m.device_address(&device)).unwrap_or(0),
+                    addr(&b.nbuf),
+                    addr(&b.matbuf),
+                    addr(&b.ubuf),
+                    0,
                 ]),
-                None => descs.push([0, 0, 0, 0]),
+                None => descs.push([0; 6]),
             }
         }
         if descs.is_empty() {
@@ -779,7 +907,7 @@ impl Renderer {
         let buf = match GpuBuffer::new(
             &device,
             alloc,
-            (descs.len() * 32) as u64,
+            (descs.len() * 48) as u64,
             vk::BufferUsageFlags::STORAGE_BUFFER,
             MemoryLocation::CpuToGpu,
             "geom_table",
@@ -806,8 +934,8 @@ impl Renderer {
         log(&format!("geom_table: {} entries", descs.len()));
     }
 
-    fn set_materials(&mut self, albedos: &[[f32; 4]]) {
-        if albedos.is_empty() || self.accel_ext.is_none() {
+    fn set_materials(&mut self, mats: &[MaterialGpu]) {
+        if mats.is_empty() || self.accel_ext.is_none() {
             return;
         }
         let device = self.device.clone();
@@ -818,7 +946,7 @@ impl Renderer {
         let buf = match GpuBuffer::new(
             &device,
             alloc,
-            (albedos.len() * 16) as u64,
+            std::mem::size_of_val(mats) as u64,
             vk::BufferUsageFlags::STORAGE_BUFFER,
             MemoryLocation::CpuToGpu,
             "materials",
@@ -829,7 +957,7 @@ impl Renderer {
                 return;
             }
         };
-        buf.write_bytes(gpu::as_bytes(albedos));
+        buf.write_bytes(gpu::as_bytes(mats));
         let info = [vk::DescriptorBufferInfo::default()
             .buffer(buf.buffer)
             .offset(0)
@@ -841,7 +969,7 @@ impl Renderer {
             .buffer_info(&info);
         unsafe { device.update_descriptor_sets(&[write], &[]) };
         self.mat_buffer = Some(buf);
-        log(&format!("materials: {} albedos", albedos.len()));
+        log(&format!("materials: {} entries", mats.len()));
     }
 
     fn set_blas_materials(&mut self, handle: i32, ids: &[u32]) {
@@ -874,6 +1002,99 @@ impl Renderer {
         } else {
             buf.destroy(&device, alloc);
         }
+    }
+
+    fn texture_add(&mut self, data: Vec<u8>, width: u32, height: u32, dxgi: u32) -> i32 {
+        let (format, _bpp) = dxgi_to_vk(dxgi);
+        let idx = (self.pending_tex.len() + self.textures.len()) as i32;
+        self.pending_tex.push(PendingTex { data, width, height, format });
+        idx
+    }
+
+    /// Upload one pending texture (front of the queue) to the GPU. Returns false when empty.
+    fn upload_one_texture(&mut self) -> bool {
+        if self.pending_tex.is_empty() {
+            return false;
+        }
+        if self.accel_ext.is_none() {
+            self.pending_tex.clear();
+            return false;
+        }
+        let pt = self.pending_tex.remove(0);
+        let device = self.device.clone();
+        let (queue, cmd, fence) = (self.queue, self.cmd, self.fence);
+        let alloc = self.allocator.as_mut().unwrap();
+        let tex = upload_texture(&device, alloc, queue, cmd, fence, &pt).or_else(|e| {
+            log(&format!("texture {}x{} upload FAILED: {e} — using 1x1 white", pt.width, pt.height));
+            let white = PendingTex {
+                data: vec![255u8; 4],
+                width: 1,
+                height: 1,
+                format: vk::Format::R8G8B8A8_UNORM,
+            };
+            upload_texture(&device, alloc, queue, cmd, fence, &white)
+        });
+        match tex {
+            Ok(t) => {
+                self.textures.push(t);
+                true
+            }
+            Err(e) => {
+                log(&format!("texture fallback also failed: {e}"));
+                false
+            }
+        }
+    }
+
+    fn upload_textures(&mut self) {
+        let mut n = 0;
+        while self.upload_one_texture() {
+            n += 1;
+        }
+        if n > 0 {
+            log(&format!("textures: {n} uploaded, {} total", self.textures.len()));
+        }
+    }
+
+    fn update_texture_descriptors(&mut self) {
+        if self.textures.is_empty() {
+            return;
+        }
+        let device = self.device.clone();
+        let infos: Vec<vk::DescriptorImageInfo> = self
+            .textures
+            .iter()
+            .map(|t| {
+                vk::DescriptorImageInfo::default()
+                    .image_view(t.view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .sampler(self.tex_sampler)
+            })
+            .collect();
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.desc_set)
+            .dst_binding(4)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&infos);
+        unsafe { device.update_descriptor_sets(&[write], &[]) };
+        log(&format!("texture descriptors: {} bound", infos.len()));
+    }
+
+    fn clear_textures(&mut self) {
+        let device = self.device.clone();
+        if let Some(alloc) = self.allocator.as_mut() {
+            for t in self.textures.drain(..) {
+                unsafe {
+                    device.destroy_image_view(t.view, None);
+                    device.destroy_image(t.image, None);
+                }
+                if let Some(a) = t.alloc {
+                    let _ = alloc.free(a);
+                }
+            }
+        }
+        self.pending_tex.clear();
     }
 
     fn build_tlas(&mut self, instances: *const u8, count: u32) -> bool {
@@ -984,6 +1205,9 @@ impl Renderer {
                     b.ibuf.destroy(&device, alloc);
                     if let Some(n) = b.nbuf {
                         n.destroy(&device, alloc);
+                    }
+                    if let Some(u) = b.ubuf {
+                        u.destroy(&device, alloc);
                     }
                     if let Some(m) = b.matbuf {
                         m.destroy(&device, alloc);
@@ -1261,23 +1485,26 @@ fn build_blas(
     };
     scratch.destroy(device, allocator);
 
-    // Per-vertex normals for smooth shading (read in-shader via buffer_reference).
-    let nbuf = if !mesh.normals.is_empty() {
-        let nb = GpuBuffer::new(
+    // Per-vertex normals + UVs (read in-shader via buffer_reference).
+    let mut mk = |src: &[f32], name: &str| -> Result<Option<GpuBuffer>, String> {
+        if src.is_empty() {
+            return Ok(None);
+        }
+        let b = GpuBuffer::new(
             device,
             allocator,
-            (mesh.normals.len() * 4) as u64,
+            (src.len() * 4) as u64,
             GEOM_REF_USAGE,
             MemoryLocation::CpuToGpu,
-            "blas_normals",
+            name,
         )?;
-        nb.write_bytes(gpu::as_bytes(&mesh.normals));
-        Some(nb)
-    } else {
-        None
+        b.write_bytes(gpu::as_bytes(src));
+        Ok(Some(b))
     };
+    let nbuf = mk(&mesh.normals, "blas_normals")?;
+    let ubuf = mk(&mesh.uvs, "blas_uvs")?;
 
-    Ok(Blas { accel: accel_struct, buf, vbuf, ibuf, nbuf, matbuf: None, address })
+    Ok(Blas { accel: accel_struct, buf, vbuf, ibuf, nbuf, ubuf, matbuf: None, address })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1374,6 +1601,121 @@ fn build_tlas_inner(
     Ok(Tlas { accel: accel_struct, buf, instbuf })
 }
 
+fn upload_texture(
+    device: &ash::Device,
+    allocator: &mut Allocator,
+    queue: vk::Queue,
+    cmd: vk::CommandBuffer,
+    fence: vk::Fence,
+    pt: &PendingTex,
+) -> Result<Texture, String> {
+    let img_ci = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(pt.format)
+        .extent(vk::Extent3D { width: pt.width, height: pt.height, depth: 1 })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let image = unsafe { device.create_image(&img_ci, None) }.map_err(|e| format!("tex image: {e}"))?;
+    let req = unsafe { device.get_image_memory_requirements(image) };
+    let alloc = allocator
+        .allocate(&AllocationCreateDesc {
+            name: "texture",
+            requirements: req,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })
+        .map_err(|e| format!("tex alloc: {e}"))?;
+    unsafe { device.bind_image_memory(image, alloc.memory(), alloc.offset()) }
+        .map_err(|e| format!("tex bind: {e}"))?;
+
+    let staging = GpuBuffer::new(
+        device,
+        allocator,
+        pt.data.len().max(1) as u64,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        MemoryLocation::CpuToGpu,
+        "tex_staging",
+    )?;
+    staging.write_bytes(&pt.data);
+
+    let range = vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .level_count(1)
+        .layer_count(1);
+    submit_oneshot(device, queue, cmd, fence, |d, c| unsafe {
+        let to_dst = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(range);
+        d.cmd_pipeline_barrier(
+            c,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_dst],
+        );
+        let region = vk::BufferImageCopy::default()
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D { width: pt.width, height: pt.height, depth: 1 });
+        d.cmd_copy_buffer_to_image(
+            c,
+            staging.buffer,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[region],
+        );
+        let to_read = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(range);
+        d.cmd_pipeline_barrier(
+            c,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_read],
+        );
+    });
+    staging.destroy(device, allocator);
+
+    let view = unsafe {
+        device.create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(pt.format)
+                .subresource_range(range),
+            None,
+        )
+    }
+    .map_err(|e| format!("tex view: {e}"))?;
+
+    Ok(Texture { image, alloc: Some(alloc), view })
+}
+
 impl Drop for Renderer {
     fn drop(&mut self) {
         let device = self.device.clone();
@@ -1402,6 +1744,9 @@ impl Drop for Renderer {
                     if let Some(n) = b.nbuf {
                         n.destroy(&device, alloc);
                     }
+                    if let Some(u) = b.ubuf {
+                        u.destroy(&device, alloc);
+                    }
                     if let Some(m) = b.matbuf {
                         m.destroy(&device, alloc);
                     }
@@ -1419,6 +1764,13 @@ impl Drop for Renderer {
             device.destroy_image(self.offscreen_image, None);
             device.destroy_buffer(self.readback_buffer, None);
             if let Some(alloc) = &mut self.allocator {
+                for t in self.textures.drain(..) {
+                    device.destroy_image_view(t.view, None);
+                    device.destroy_image(t.image, None);
+                    if let Some(a) = t.alloc {
+                        let _ = alloc.free(a);
+                    }
+                }
                 if let Some(a) = self.offscreen_alloc.take() {
                     let _ = alloc.free(a);
                 }
@@ -1426,6 +1778,7 @@ impl Drop for Renderer {
                     let _ = alloc.free(a);
                 }
             }
+            device.destroy_sampler(self.tex_sampler, None);
             self.allocator = None;
             device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);

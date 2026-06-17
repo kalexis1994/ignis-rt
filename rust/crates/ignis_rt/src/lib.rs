@@ -89,7 +89,7 @@ pub extern "C" fn ignis_upload_mesh(
     }
     let positions = unsafe { std::slice::from_raw_parts(vertices, vertex_count as usize * 3) };
     let idx = unsafe { std::slice::from_raw_parts(indices, index_count as usize) };
-    let handle = renderer::queue_mesh(positions, vertex_count, idx, &[]);
+    let handle = renderer::queue_mesh(positions, vertex_count, idx, &[], &[]);
     renderer::flush_mesh_batch(); // immediate build
     handle
 }
@@ -151,7 +151,7 @@ pub extern "C" fn ignis_queue_mesh(
     indices: *const u32,
     index_count: u32,
     normals: *const f32,
-    _uvs: *const f32,
+    uvs: *const f32,
     attr_vertex_count: u32,
     _colors: *const f32,
 ) -> c_int {
@@ -165,7 +165,12 @@ pub extern "C" fn ignis_queue_mesh(
     } else {
         &[]
     };
-    renderer::queue_mesh(positions, vertex_count, idx, normals)
+    let uvs: &[f32] = if !uvs.is_null() && attr_vertex_count > 0 {
+        unsafe { std::slice::from_raw_parts(uvs, attr_vertex_count as usize * 2) }
+    } else {
+        &[]
+    };
+    renderer::queue_mesh(positions, vertex_count, idx, normals, uvs)
 }
 
 #[no_mangle]
@@ -361,43 +366,54 @@ pub extern "C" fn ignis_get_float(key: *const c_char) -> f32 {
 // Texture management
 // ============================================================================
 
+// Texture state lives in the renderer; the addon's opaque mgr handle is a non-null marker.
 #[no_mangle]
 pub extern "C" fn ignis_create_texture_manager() -> *mut c_void {
-    ptr::null_mut()
+    renderer::texture_manager_reset();
+    1 as *mut c_void
 }
 
 #[no_mangle]
-pub extern "C" fn ignis_destroy_texture_manager(_mgr: *mut c_void) {}
+pub extern "C" fn ignis_destroy_texture_manager(_mgr: *mut c_void) {
+    renderer::texture_manager_reset();
+}
 
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn ignis_texture_manager_add(
     _mgr: *mut c_void,
     _name: *const c_char,
-    _data: *const u8,
-    _data_size: u32,
-    _width: c_int,
-    _height: c_int,
+    data: *const u8,
+    data_size: u32,
+    width: c_int,
+    height: c_int,
     _mip_levels: c_int,
-    _dxgi_format: u32,
+    dxgi_format: u32,
 ) -> c_int {
-    -1
+    if data.is_null() || data_size == 0 {
+        return -1;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(data, data_size as usize) };
+    renderer::texture_add(bytes, width, height, dxgi_format)
 }
 
 #[no_mangle]
 pub extern "C" fn ignis_texture_manager_upload_all(_mgr: *mut c_void) -> bool {
-    false
+    renderer::texture_upload_all();
+    true
 }
 
 #[no_mangle]
 pub extern "C" fn ignis_texture_manager_upload_one(_mgr: *mut c_void) -> bool {
-    false
+    renderer::texture_upload_one()
 }
 
 #[no_mangle]
 pub extern "C" fn ignis_texture_manager_pending_count(_mgr: *mut c_void) -> c_int {
-    0
+    renderer::texture_pending_count()
 }
 
 #[no_mangle]
-pub extern "C" fn ignis_update_texture_descriptors(_mgr: *mut c_void) {}
+pub extern "C" fn ignis_update_texture_descriptors(_mgr: *mut c_void) {
+    renderer::update_texture_descriptors();
+}
