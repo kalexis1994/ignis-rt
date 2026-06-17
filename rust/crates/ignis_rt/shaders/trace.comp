@@ -1,0 +1,111 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// RT path: trace the primary camera ray against the TLAS, fetch the hit triangle's per-vertex
+// normals (via buffer_reference into the per-instance geometry table) and interpolate them by
+// barycentrics for smooth shading. Falls back to the geometric (face) normal when a mesh has
+// no normals. Per-instance hashed base color keeps objects distinguishable.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, rgba32f) uniform image2D outImage;
+layout(binding = 1) uniform accelerationStructureEXT tlas;
+
+layout(buffer_reference, std430) readonly buffer Verts { float v[]; };
+layout(buffer_reference, std430) readonly buffer Norms { float n[]; };
+layout(buffer_reference, std430) readonly buffer Indices { uint i[]; };
+layout(buffer_reference, std430) readonly buffer MatIds { uint m[]; };
+struct GeomDesc { uint64_t vtx; uint64_t idx; uint64_t nrm; uint64_t mat; };
+layout(binding = 2, std430) readonly buffer GeomTable { GeomDesc descs[]; };
+layout(binding = 3, std430) readonly buffer Materials { vec4 albedo[]; };
+
+layout(push_constant) uniform PC {
+    mat4  invViewProj;
+    vec4  camPos;
+    uvec2 dims;
+    uint  hasTlas;
+    uint  pad;
+    vec4  sunDir; // xyz = direction, w = intensity
+    vec4  sunCol; // rgb = color
+} pc;
+
+vec3 sky(vec3 dir) {
+    float t = clamp(dir.z * 0.5 + 0.5, 0.0, 1.0);
+    return mix(vec3(0.90, 0.93, 0.98), vec3(0.22, 0.42, 0.85), t);
+}
+
+vec3 hashColor(uint i) {
+    return 0.35 + 0.55 * vec3(
+        fract(sin(float(i) * 12.9898) * 43758.5453),
+        fract(sin(float(i) * 78.2330) * 43758.5453),
+        fract(sin(float(i) * 37.7190) * 43758.5453));
+}
+
+vec3 v3(Verts b, uint i) { return vec3(b.v[i*3u], b.v[i*3u+1u], b.v[i*3u+2u]); }
+vec3 n3(Norms b, uint i) { return vec3(b.n[i*3u], b.n[i*3u+1u], b.n[i*3u+2u]); }
+
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.dims.x || p.y >= pc.dims.y) return;
+
+    vec2 uv  = (vec2(p) + 0.5) / vec2(pc.dims);
+    vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    vec4 world = pc.invViewProj * vec4(ndc, 1.0, 1.0);
+
+    vec3 col;
+    if (abs(world.w) < 1e-8) {
+        col = vec3(uv, 0.2);
+    } else {
+        world /= world.w;
+        vec3 origin = pc.camPos.xyz;
+        vec3 dir = normalize(world.xyz - origin);
+
+        bool hit = false;
+        if (pc.hasTlas == 1u) {
+            rayQueryEXT rq;
+            rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu,
+                                  origin, 0.001, dir, 10000.0);
+            while (rayQueryProceedEXT(rq)) {}
+            if (rayQueryGetIntersectionTypeEXT(rq, true)
+                    == gl_RayQueryCommittedIntersectionTriangleEXT) {
+                hit = true;
+                uint id   = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
+                uint prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+                vec2 bc   = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+                mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+
+                vec3 nrm = -dir; // fallback: face the camera
+                GeomDesc gd = descs[id];
+                if (gd.vtx != 0ul && gd.idx != 0ul) {
+                    Indices ib = Indices(gd.idx);
+                    uint i0 = ib.i[prim*3u+0u], i1 = ib.i[prim*3u+1u], i2 = ib.i[prim*3u+2u];
+                    vec3 no;
+                    if (gd.nrm != 0ul) {
+                        Norms nb = Norms(gd.nrm);
+                        no = n3(nb,i0)*(1.0-bc.x-bc.y) + n3(nb,i1)*bc.x + n3(nb,i2)*bc.y; // smooth
+                    } else {
+                        Verts vb = Verts(gd.vtx);
+                        no = cross(v3(vb,i1)-v3(vb,i0), v3(vb,i2)-v3(vb,i0));             // flat
+                    }
+                    nrm = normalize(mat3(o2w) * no);
+                }
+                if (dot(nrm, dir) > 0.0) nrm = -nrm; // face-forward to the viewer
+
+                // Real material albedo (per-triangle material id -> material buffer).
+                vec3 base = hashColor(id);
+                if (gd.mat != 0ul) {
+                    MatIds mids = MatIds(gd.mat);
+                    base = albedo[mids.m[prim]].rgb;
+                }
+
+                // Real sun (clamped to avoid blowout) + uniform ambient so no face is black.
+                vec3 sunDir = normalize(pc.sunDir.xyz);
+                vec3 sunRad = pc.sunCol.rgb * min(pc.sunDir.w, 4.0);
+                float ndl = max(dot(nrm, sunDir), 0.0);
+                col = base * (vec3(0.35) + sunRad * ndl);
+            }
+        }
+        if (!hit) col = sky(dir);
+    }
+    imageStore(outImage, ivec2(p), vec4(col, 1.0));
+}

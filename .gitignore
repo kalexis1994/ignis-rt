@@ -9,6 +9,12 @@ deploy.config
 # --- CMake build directory ---
 build/
 
+# --- Rust build artifacts ---
+rust/target/
+
+# --- Deploy log ---
+deploy_remote.log
+
 # --- Compiled SPIR-V shaders (rebuilt from source) ---
 shaders/*.spv
 shaders/fsr3/compiled/*.spv

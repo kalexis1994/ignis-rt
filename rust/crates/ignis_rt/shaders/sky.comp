@@ -1,0 +1,42 @@
+#version 460
+// Non-RT fallback (no ray query): camera ray -> sky color. Used on GPUs without hardware
+// ray tracing so the DLL still brings up and renders (e.g. the dev box's Intel iGPU).
+// Same push-constant block as trace.comp (hasTlas/pad ignored here).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, rgba32f) uniform image2D outImage;
+
+layout(push_constant) uniform PC {
+    mat4  invViewProj;
+    vec4  camPos;
+    uvec2 dims;
+    uint  hasTlas;
+    uint  pad;
+    vec4  sunDir;
+    vec4  sunCol;
+} pc;
+
+vec3 sky(vec3 dir) {
+    float t = clamp(dir.z * 0.5 + 0.5, 0.0, 1.0);
+    return mix(vec3(0.90, 0.93, 0.98), vec3(0.22, 0.42, 0.85), t);
+}
+
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.dims.x || p.y >= pc.dims.y) return;
+
+    vec2 uv  = (vec2(p) + 0.5) / vec2(pc.dims);
+    // Flip Y: image row 0 is top, but the camera's NDC has +Y up.
+    vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    vec4 world = pc.invViewProj * vec4(ndc, 1.0, 1.0);
+
+    vec3 col;
+    if (abs(world.w) < 1e-8) {
+        col = vec3(uv, 0.2);
+    } else {
+        world /= world.w;
+        vec3 dir = normalize(world.xyz - pc.camPos.xyz);
+        col = sky(dir);
+    }
+    imageStore(outImage, ivec2(p), vec4(col, 1.0));
+}

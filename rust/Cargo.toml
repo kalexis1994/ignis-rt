@@ -1,0 +1,10 @@
+# Ignis RT — Rust workspace (strangler migration of the C++ renderer).
+#
+# Phase 0: `ignis_rt` is a cdylib that exports the exact C ABI the Blender addon's
+# ctypes wrapper expects, so it is a drop-in for the C++ ignis_rt.dll. Every export
+# is currently a stub; subsequent phases replace stubs with real Rust implementations
+# (math -> CPU modules -> Vulkan core via `ash`). Future crates (ignis-vk, ignis-math)
+# join as workspace members and `ignis_rt` becomes the thin FFI layer over them.
+[workspace]
+resolver = "2"
+members = ["crates/ignis_rt"]

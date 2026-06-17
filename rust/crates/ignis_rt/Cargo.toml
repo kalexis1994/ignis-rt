@@ -1,0 +1,19 @@
+[package]
+name = "ignis_rt"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "Ignis RT renderer — Rust FFI surface (strangler migration of the C++ Vulkan renderer)"
+
+[lib]
+# Output is ignis_rt.dll — drop-in replacement for the C++ DLL at the C ABI seam.
+name = "ignis_rt"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Thin Vulkan bindings (mirrors the C++ Vulkan calls closely; full RT/extension access).
+ash = "0.38"
+# Pure-Rust GPU memory allocator (replaces VMA).
+gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
+# Math (replaces GLM): mat4/vec ops for camera ray reconstruction.
+glam = "0.29"

@@ -6,6 +6,13 @@
 # Blender version to deploy to (leave empty to auto-detect latest)
 BLENDER_VER=
 
+# Remote deploy (deploy_remote.ps1) — UNC path or mapped drive to the ignis_rt
+# addon folder on the RTX machine. Leave empty if you only deploy locally.
+# Examples:
+#   REMOTE_ADDON_DIR=\\PC-RTX\C$\Users\you\AppData\Roaming\Blender Foundation\Blender\5.1\extensions\user_default\ignis_rt
+#   REMOTE_ADDON_DIR=Z:\extensions\user_default\ignis_rt
+REMOTE_ADDON_DIR=
+
 # Path to NRD SDK (leave empty to skip)
 IGNIS_NRD_ROOT=C:/path/to/NRD
 
