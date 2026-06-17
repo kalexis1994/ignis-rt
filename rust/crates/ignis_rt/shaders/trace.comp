@@ -172,24 +172,29 @@ void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
     if (gd.idx != 0ul) {
         Indices ib = Indices(gd.idx);
         uint i0 = ib.i[prim*3u+0u], i1 = ib.i[prim*3u+1u], i2 = ib.i[prim*3u+2u];
-        vec3 no;
+        // Geometric (face) normal from the triangle, flipped toward the ray.
+        vec3 geoN = -rd;
+        if (gd.vtx != 0ul) {
+            Verts vb = Verts(gd.vtx);
+            geoN = normalize(mat3(o2w) * cross(v3(vb,i1)-v3(vb,i0), v3(vb,i2)-v3(vb,i0)));
+            if (dot(geoN, -rd) < 0.0) geoN = -geoN;
+        }
         if (gd.nrm != 0ul) {
             Norms nb = Norms(gd.nrm);
-            no = n3(nb,i0)*w0 + n3(nb,i1)*bc.x + n3(nb,i2)*bc.y;
-        } else if (gd.vtx != 0ul) {
-            Verts vb = Verts(gd.vtx);
-            no = cross(v3(vb,i1)-v3(vb,i0), v3(vb,i2)-v3(vb,i0));
+            N = normalize(mat3(o2w) * (n3(nb,i0)*w0 + n3(nb,i1)*bc.x + n3(nb,i2)*bc.y));
+            // Shadow terminator fix (Cycles/Appleseed): if the smooth normal dips below
+            // the geometric face plane (grazing angles on smooth meshes), snap to the
+            // geometric normal — prevents black silhouette contours.
+            if (dot(N, geoN) < 0.0) N = geoN;
         } else {
-            no = -rd;
+            N = geoN;
         }
-        N = normalize(mat3(o2w) * no);
         if (gd.uv != 0ul) {
             Uvs ub = Uvs(gd.uv);
             uvCoord = t2(ub,i0)*w0 + t2(ub,i1)*bc.x + t2(ub,i2)*bc.y;
             uvCoord.y = 1.0 - uvCoord.y; // Blender bottom-left -> Vulkan top-left
         }
     }
-    if (dot(N, rd) > 0.0) N = -N; // face-forward to the incoming ray
     albedo = hashColor(id);
     if (gd.mat != 0ul) {
         Material mat = mats[MatIds(gd.mat).m[prim]];
