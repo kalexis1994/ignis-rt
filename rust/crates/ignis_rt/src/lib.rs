@@ -120,13 +120,29 @@ pub extern "C" fn ignis_commit_blas_deform(_blas_handle: c_int) -> bool {
 
 #[no_mangle]
 pub extern "C" fn ignis_upload_mesh_attributes(
-    _blas_handle: c_int,
-    _normals: *const f32,
-    _uvs: *const f32,
-    _vertex_count: u32,
+    blas_handle: c_int,
+    normals: *const f32,
+    uvs: *const f32,
+    vertex_count: u32,
     _colors: *const f32,
 ) -> bool {
-    false
+    // The addon's incremental upload path: ignis_upload_mesh built positions-only, this attaches
+    // the per-vertex normals + UVs so the mesh gets smooth shading and correct texturing.
+    if blas_handle < 0 || vertex_count == 0 {
+        return false;
+    }
+    let normals: &[f32] = if !normals.is_null() {
+        unsafe { std::slice::from_raw_parts(normals, vertex_count as usize * 3) }
+    } else {
+        &[]
+    };
+    let uvs: &[f32] = if !uvs.is_null() {
+        unsafe { std::slice::from_raw_parts(uvs, vertex_count as usize * 2) }
+    } else {
+        &[]
+    };
+    renderer::upload_mesh_attributes(blas_handle, normals, uvs);
+    true
 }
 
 #[no_mangle]

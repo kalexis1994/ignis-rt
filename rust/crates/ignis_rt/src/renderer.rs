@@ -341,6 +341,12 @@ pub fn upload_mesh_primitive_materials(handle: i32, ids: &[u32]) {
     }
 }
 
+pub fn upload_mesh_attributes(handle: i32, normals: &[f32], uvs: &[f32]) {
+    if let Some(r) = RENDERER.lock().unwrap().as_mut() {
+        r.0.set_blas_attributes(handle, normals, uvs);
+    }
+}
+
 /// OCIO view-transform 3D LUT (size^3 RGB). Stored, and uploaded to the GPU now if the
 /// renderer exists (else create() uploads it from config).
 pub fn upload_lut(data: &[f32], size: u32) {
@@ -1236,6 +1242,48 @@ impl Renderer {
         } else {
             buf.destroy(&device, alloc);
         }
+    }
+
+    /// Attach per-vertex normals + UVs to an already-built BLAS (the addon's incremental upload
+    /// path: ignis_upload_mesh builds positions-only, then ignis_upload_mesh_attributes adds
+    /// these). Without this the mesh has no smooth normals (flat/faceted) and no UVs (everything
+    /// samples (0,0) -> badly mapped textures). Rebuilds the geom table so the new addresses bind.
+    fn set_blas_attributes(&mut self, handle: i32, normals: &[f32], uvs: &[f32]) {
+        if handle < 0 || self.accel_ext.is_none() {
+            return;
+        }
+        let idx = handle as usize;
+        if !matches!(self.blas_list.get(idx), Some(Some(_))) {
+            return;
+        }
+        let device = self.device.clone();
+        let alloc = self.allocator.as_mut().unwrap();
+        let mut mk = |src: &[f32], name: &str| -> Option<GpuBuffer> {
+            if src.is_empty() {
+                return None;
+            }
+            match GpuBuffer::new(
+                &device, alloc, (src.len() * 4) as u64,
+                GEOM_REF_USAGE, MemoryLocation::CpuToGpu, name,
+            ) {
+                Ok(b) => { b.write_bytes(gpu::as_bytes(src)); Some(b) }
+                Err(e) => { log(&format!("blas attr alloc FAILED: {e}")); None }
+            }
+        };
+        let nbuf = mk(normals, "blas_normals");
+        let ubuf = mk(uvs, "blas_uvs");
+        if let Some(Some(b)) = self.blas_list.get_mut(idx) {
+            if nbuf.is_some() {
+                if let Some(old) = b.nbuf.take() { old.destroy(&device, alloc); }
+                b.nbuf = nbuf;
+            }
+            if ubuf.is_some() {
+                if let Some(old) = b.ubuf.take() { old.destroy(&device, alloc); }
+                b.ubuf = ubuf;
+            }
+        }
+        self.update_geom_table();
+        self.accum_frame = 0;
     }
 
     fn set_lights(&mut self, floats: &[f32], count: u32) {
