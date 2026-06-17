@@ -18,13 +18,15 @@ layout(buffer_reference, std430) readonly buffer Uvs   { float u[]; };
 layout(buffer_reference, std430) readonly buffer Indices { uint i[]; };
 layout(buffer_reference, std430) readonly buffer MatIds  { uint m[]; };
 struct GeomDesc { uint64_t vtx; uint64_t idx; uint64_t nrm; uint64_t mat; uint64_t uv; uint64_t pad; };
-struct Material { vec4 albedo; uvec4 tex; vec4 params; }; // tex.x=diffTex, params.x=rough, .y=metal
+struct Material { vec4 albedo; uvec4 tex; vec4 params; vec4 emission; }; // params.x=rough,.y=metal
 layout(binding = 2, std430) readonly buffer GeomTable { GeomDesc descs[]; };
 layout(binding = 3, std430) readonly buffer Materials { Material mats[]; };
 layout(binding = 4) uniform sampler2D textures[];
 struct Light { vec4 posRange; vec4 colInt; vec4 dirSizeX; vec4 tanSizeY; };
 layout(binding = 5, std430) readonly buffer Lights { Light lights[]; };
 layout(binding = 6, rgba32f) uniform image2D accumImage; // persistent radiance accumulator
+layout(binding = 7) uniform sampler3D lutTex;            // OCIO view-transform LUT (Blender)
+layout(binding = 8, std430) readonly buffer World { vec4 worldColor; }; // background/sky color
 
 layout(push_constant) uniform PC {
     mat4  invViewProj;
@@ -40,14 +42,27 @@ const float PI = 3.14159265;
 const int   MAX_BOUNCES = 4;
 
 vec3 sky(vec3 dir) {
-    float t = clamp(dir.z * 0.5 + 0.5, 0.0, 1.0);
-    return mix(vec3(0.90, 0.93, 0.98), vec3(0.22, 0.42, 0.85), t);
+    // Blender's world/background color (constant). HDRI worlds come later.
+    return worldColor.rgb;
 }
 vec3 hashColor(uint i) {
     return 0.35 + 0.55 * vec3(
         fract(sin(float(i) * 12.9898) * 43758.5453),
         fract(sin(float(i) * 78.2330) * 43758.5453),
         fract(sin(float(i) * 37.7190) * 43758.5453));
+}
+
+// Blender's runtime OCIO LUT: log2-encode into the LUT's domain, then sample (display-ready).
+// Matches the C++ tonemap.comp runtimeLutTonemap exactly.
+vec3 tonemapLut(vec3 c) {
+    c = max(c, vec3(1e-10));
+    c = clamp(log2(c), -12.47393, 12.52607);
+    c = (c - (-12.47393)) / (12.52607 - (-12.47393));
+    return clamp(texture(lutTex, c).rgb, 0.0, 1.0);
+}
+// Fallback when no LUT is present (e.g. before init): ACES filmic.
+vec3 aces(vec3 x) {
+    return clamp((x*(2.51*x+0.03)) / (x*(2.43*x+0.59)+0.14), 0.0, 1.0);
 }
 
 vec3 v3(Verts b, uint i) { return vec3(b.v[i*3u], b.v[i*3u+1u], b.v[i*3u+2u]); }
@@ -114,9 +129,9 @@ float ggxD(float NdotH, float alpha) {
     return a2 / (PI * d * d);
 }
 
-// Cook-Torrance BRDF value (diffuse + GGX specular) for a light direction. Multiply by
-// (radiance * NdotL) for the contribution. Diffuse keeps the existing (un-divided-by-pi)
-// convention; specular is the standard D*G*F/(4 NdotV NdotL).
+// Cook-Torrance BRDF value (Lambertian diffuse albedo/pi + GGX specular) for a light
+// direction. Multiply by (radiance * NdotL) for the contribution. Physically consistent
+// with the indirect bounce (cosine-sampled diffuse implies the same albedo/pi).
 vec3 brdf(vec3 N, vec3 V, vec3 Ldir, vec3 diffAlbedo, vec3 F0, float alpha) {
     float nl = max(dot(N, Ldir), 1e-4);
     float nv = max(dot(N, V), 1e-4);
@@ -126,7 +141,7 @@ vec3 brdf(vec3 N, vec3 V, vec3 Ldir, vec3 diffAlbedo, vec3 F0, float alpha) {
     vec3 F = F0 + (1.0 - F0) * pow(1.0 - vh, 5.0);
     float G = smithG1(nv, alpha) * smithG1(nl, alpha);
     vec3 spec = ggxD(nh, alpha) * G * F / (4.0 * nv * nl);
-    return diffAlbedo + spec;
+    return diffAlbedo * (1.0 / PI) + spec;
 }
 
 // Sample a direction within a cone of half-angle acos(cosThetaMax) around `axis`.
@@ -146,11 +161,12 @@ bool occluded(vec3 o, vec3 d, float tmax) {
 
 // Surface attributes at a committed triangle hit.
 void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
-                out vec3 N, out vec3 albedo, out float roughness, out float metallic) {
+                out vec3 N, out vec3 albedo, out float roughness, out float metallic, out vec3 emission) {
     GeomDesc gd = descs[id];
     N = -rd;
     roughness = 1.0; // no material -> fully rough (diffuse)
     metallic = 0.0;
+    emission = vec3(0.0);
     vec2 uvCoord = vec2(0.0);
     float w0 = 1.0 - bc.x - bc.y;
     if (gd.idx != 0ul) {
@@ -181,6 +197,7 @@ void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
         if (mat.tex.x != 0xFFFFFFFFu) albedo = texture(textures[nonuniformEXT(mat.tex.x)], uvCoord).rgb;
         roughness = clamp(mat.params.x, 0.04, 1.0);
         metallic = clamp(mat.params.y, 0.0, 1.0);
+        emission = mat.emission.rgb;
     }
 }
 
@@ -225,6 +242,8 @@ void main() {
     uvec2 p = gl_GlobalInvocationID.xy;
     if (p.x >= pc.dims.x || p.y >= pc.dims.y) return;
     uint frame = uint(pc.sunCol.w);
+    bool hasTlas = (pc.hasTlas & 1u) != 0u;
+    bool hasLut  = (pc.hasTlas & 2u) != 0u;
     uint rng = ((p.x * 1973u) ^ (p.y * 9277u) ^ ((frame + 1u) * 26699u)) | 1u;
 
     // Primary ray, with sub-pixel jitter for free anti-aliasing across accumulation.
@@ -234,7 +253,7 @@ void main() {
     vec4 world = pc.invViewProj * vec4(ndc, 1.0, 1.0);
 
     vec3 L = vec3(0.0);
-    if (pc.hasTlas == 1u && abs(world.w) >= 1e-8) {
+    if (hasTlas && abs(world.w) >= 1e-8) {
         world /= world.w;
         vec3 ro = pc.camPos.xyz;
         vec3 rd = normalize(world.xyz - ro);
@@ -254,10 +273,13 @@ void main() {
             float thit = rayQueryGetIntersectionTEXT(rq, true);
             mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
 
-            vec3 N, albedo;
+            vec3 N, albedo, emission;
             float roughness, metallic;
-            getSurface(id, prim, bc, o2w, rd, N, albedo, roughness, metallic);
+            getSurface(id, prim, bc, o2w, rd, N, albedo, roughness, metallic, emission);
             vec3 hitPos = ro + rd * thit;
+
+            // Emitted radiance from this surface (emissive materials light the scene + glow).
+            L += tp * emission;
 
             vec3 diffAlbedo = albedo * (1.0 - metallic);
             vec3 V = -rd;
@@ -307,5 +329,9 @@ void main() {
     // Temporal accumulation: average this frame's estimate into the running sum.
     vec3 accum = (frame == 0u) ? L : imageLoad(accumImage, ivec2(p)).rgb + L;
     imageStore(accumImage, ivec2(p), vec4(accum, 1.0));
-    imageStore(outImage, ivec2(p), vec4(accum / float(frame + 1u), 1.0));
+
+    // Tonemap the averaged (linear) radiance through Blender's view-transform LUT.
+    vec3 hdr = accum / float(frame + 1u);
+    vec3 display = hasLut ? tonemapLut(hdr) : aces(hdr);
+    imageStore(outImage, ivec2(p), vec4(display, 1.0));
 }

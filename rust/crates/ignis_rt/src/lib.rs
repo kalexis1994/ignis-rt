@@ -297,12 +297,12 @@ pub extern "C" fn ignis_upload_emissive_triangles(_data: *const f32, _triangle_c
 /// Accept the baked tonemap LUT (size^3 RGB triples) and stash it for later GPU upload.
 #[no_mangle]
 pub extern "C" fn ignis_upload_lut(rgb_data: *const f32, lut_size: u32) -> bool {
-    if rgb_data.is_null() || lut_size == 0 {
+    if rgb_data.is_null() || lut_size < 2 {
         return false;
     }
     let n = (lut_size as usize).pow(3) * 3;
-    let data = unsafe { std::slice::from_raw_parts(rgb_data, n) }.to_vec();
-    config::store_lut(lut_size, data);
+    let data = unsafe { std::slice::from_raw_parts(rgb_data, n) };
+    renderer::upload_lut(data, lut_size);
     true
 }
 

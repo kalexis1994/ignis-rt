@@ -40,3 +40,7 @@ pub fn set_base_path(path: &str) {
 pub fn store_lut(size: u32, data: Vec<f32>) {
     STATE.lock().unwrap().lut = Some((size, data));
 }
+
+pub fn get_lut() -> Option<(u32, Vec<f32>)> {
+    STATE.lock().unwrap().lut.clone()
+}

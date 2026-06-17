@@ -68,8 +68,9 @@ struct CameraPush {
 #[derive(Clone, Copy)]
 struct MaterialGpu {
     albedo: [f32; 4],
-    tex: [u32; 4],    // x = diffuseTexIndex (0xFFFFFFFF = none)
-    params: [f32; 4], // x = roughness, y = metallic
+    tex: [u32; 4],      // x = diffuseTexIndex (0xFFFFFFFF = none)
+    params: [f32; 4],   // x = roughness, y = metallic
+    emission: [f32; 4], // rgb = emissive radiance (color * strength)
 }
 
 /// TLAS instance as the addon sends it (matches IgnisTLASInstance / TLASInstance, 60 bytes).
@@ -114,6 +115,7 @@ pub struct Renderer {
     queued: Vec<QueuedMesh>,
     blas_list: Vec<Option<Blas>>,
     tlas: Option<Tlas>,
+    tlas_instance_data: Vec<u8>, // last instances (the addon may rebuild every frame)
     geom_table: Option<GpuBuffer>, // per-BLAS [vtx, idx, nrm, mat, uv] addrs, bound at binding 2
     mat_buffer: Option<GpuBuffer>, // material {albedo, texIndices}, bound at binding 3
     pending_tex: Vec<PendingTex>,  // textures staged on CPU, not yet uploaded
@@ -122,6 +124,17 @@ pub struct Renderer {
     light_buffer: Option<GpuBuffer>, // scene point/area lights, bound at binding 5
     light_count: u32,
     light_data: Vec<f32>, // last uploaded light floats (the addon re-sends every frame)
+
+    // OCIO view-transform 3D LUT (Blender's AgX/Filmic/etc.), bound at binding 7.
+    lut_image: vk::Image, // null until a LUT is uploaded
+    lut_alloc: Option<Allocation>,
+    lut_view: vk::ImageView,
+    lut_sampler: vk::Sampler,
+    has_lut: bool,
+
+    // World/background color (the "sky"), bound at binding 8.
+    world_buffer: Option<GpuBuffer>,
+    world_color: [f32; 4],
 
     // Compute pipeline.
     offscreen_view: vk::ImageView,
@@ -231,9 +244,13 @@ pub fn create(width: u32, height: u32) -> bool {
         return true;
     }
     match build(w, h) {
-        Ok(r) => {
+        Ok(mut r) => {
             crate::config::set_int("render_width", r.width as i32);
             crate::config::set_int("render_height", r.height as i32);
+            // Upload the OCIO LUT the addon baked before create (if any).
+            if let Some((size, data)) = crate::config::get_lut() {
+                r.set_lut(&data, size);
+            }
             *guard = Some(SyncRenderer(r));
             log("ignis_create OK");
             true
@@ -326,11 +343,14 @@ pub fn upload_materials(data: *const u8, count: u32) {
         let base = i * STRIDE;
         let u = |k: usize| u32::from_le_bytes([bytes[base + k], bytes[base + k + 1], bytes[base + k + 2], bytes[base + k + 3]]);
         let f = |k: usize| f32::from_bits(u(k));
-        // Offsets in GPUMaterial: diffuseTex=0, base_color=20, roughness=32, metallic=48.
+        // Offsets in GPUMaterial: diffuseTex=0, base_color=20, roughness=32, emission=36,
+        // metallic=48, emission_strength=76.
+        let es = f(76);
         mats.push(MaterialGpu {
             albedo: [f(20), f(24), f(28), 1.0],
             tex: [u(0), 0, 0, 0],
             params: [f(32), f(48), 0.0, 0.0],
+            emission: [f(36) * es, f(40) * es, f(44) * es, 0.0],
         });
     }
     if let Some(r) = RENDERER.lock().unwrap().as_mut() {
@@ -341,6 +361,15 @@ pub fn upload_materials(data: *const u8, count: u32) {
 pub fn upload_mesh_primitive_materials(handle: i32, ids: &[u32]) {
     if let Some(r) = RENDERER.lock().unwrap().as_mut() {
         r.0.set_blas_materials(handle, ids);
+    }
+}
+
+/// OCIO view-transform 3D LUT (size^3 RGB). Stored, and uploaded to the GPU now if the
+/// renderer exists (else create() uploads it from config).
+pub fn upload_lut(data: &[f32], size: u32) {
+    crate::config::store_lut(size, data.to_vec());
+    if let Some(r) = RENDERER.lock().unwrap().as_mut() {
+        r.0.set_lut(data, size);
     }
 }
 
@@ -690,6 +719,13 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         .ok_or("readback buffer not host-mapped")?
         .as_ptr() as usize;
 
+    // World/background color buffer (vec4), bound at binding 8 (RT only).
+    let world_buffer = GpuBuffer::new(
+        &device, &mut allocator, 16,
+        vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "world",
+    )?;
+    world_buffer.write_bytes(gpu::as_bytes(&[0.0f32, 0.0, 0.0, 0.0]));
+
     // Compute pipeline.
     // Binding 0: offscreen storage image (always). Binding 1: TLAS — only on RT devices
     // (partially bound: written after the scene loads, read only when hasTlas == 1). A
@@ -776,6 +812,34 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(1),
         );
+        // Binding 7: OCIO 3D LUT (combined image sampler, uploaded later).
+        bindings.push(
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(7)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        );
+        binding_flags.push(vk::DescriptorBindingFlags::PARTIALLY_BOUND);
+        pool_sizes.push(
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1),
+        );
+        // Binding 8: world/background color (storage buffer).
+        bindings.push(
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(8)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        );
+        binding_flags.push(vk::DescriptorBindingFlags::empty());
+        pool_sizes.push(
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1),
+        );
     }
     let mut flags_info =
         vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
@@ -819,6 +883,10 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         .dst_binding(0)
         .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
         .image_info(&img_info)];
+    let world_info = [vk::DescriptorBufferInfo::default()
+        .buffer(world_buffer.buffer)
+        .offset(0)
+        .range(vk::WHOLE_SIZE)];
     if rt_supported {
         writes.push(
             vk::WriteDescriptorSet::default()
@@ -826,6 +894,13 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .dst_binding(6)
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(&accum_info),
+        );
+        writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(desc_set)
+                .dst_binding(8)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&world_info),
         );
     }
     unsafe { device.update_descriptor_sets(&writes, &[]) };
@@ -899,6 +974,20 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     }
     .map_err(|e| format!("create_sampler: {e}"))?;
 
+    // Clamp sampler for the OCIO LUT (no wrapping at the edges of the cube).
+    let lut_sampler = unsafe {
+        device.create_sampler(
+            &vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::LINEAR)
+                .min_filter(vk::Filter::LINEAR)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+            None,
+        )
+    }
+    .map_err(|e| format!("create_lut_sampler: {e}"))?;
+
     // Put the accumulation image in GENERAL once (contents undefined; frame 0 overwrites them).
     submit_oneshot(&device, queue, cmd, fence, |d, c| unsafe {
         let barrier = vk::ImageMemoryBarrier::default()
@@ -932,6 +1021,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         queued: Vec::new(),
         blas_list: Vec::new(),
         tlas: None,
+        tlas_instance_data: Vec::new(),
         geom_table: None,
         mat_buffer: None,
         pending_tex: Vec::new(),
@@ -940,6 +1030,13 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         light_buffer: None,
         light_count: 0,
         light_data: Vec::new(),
+        lut_image: vk::Image::null(),
+        lut_alloc: None,
+        lut_view: vk::ImageView::null(),
+        lut_sampler,
+        has_lut: false,
+        world_buffer: Some(world_buffer),
+        world_color: [-1.0; 4], // impossible -> first render writes the real value
         offscreen_view,
         ds_layout,
         desc_pool,
@@ -1203,6 +1300,120 @@ impl Renderer {
         log(&format!("lights: {count} uploaded"));
     }
 
+    /// Upload the OCIO view-transform LUT as a 3D texture (RGB -> RGBA) bound at binding 7.
+    fn set_lut(&mut self, data: &[f32], size: u32) {
+        if self.accel_ext.is_none() || size < 2 {
+            return;
+        }
+        let n = (size as usize).pow(3);
+        if data.len() < n * 3 {
+            log("lut: data too small");
+            return;
+        }
+        let mut rgba = vec![0f32; n * 4];
+        for i in 0..n {
+            rgba[i * 4] = data[i * 3];
+            rgba[i * 4 + 1] = data[i * 3 + 1];
+            rgba[i * 4 + 2] = data[i * 3 + 2];
+            rgba[i * 4 + 3] = 1.0;
+        }
+
+        let device = self.device.clone();
+        let (queue, cmd, fence) = (self.queue, self.cmd, self.fence);
+        let alloc = self.allocator.as_mut().unwrap();
+
+        if self.has_lut {
+            unsafe {
+                device.destroy_image_view(self.lut_view, None);
+                device.destroy_image(self.lut_image, None);
+            }
+            if let Some(a) = self.lut_alloc.take() {
+                let _ = alloc.free(a);
+            }
+            self.has_lut = false;
+        }
+
+        let img_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_3D)
+            .format(RB_FORMAT)
+            .extent(vk::Extent3D { width: size, height: size, depth: size })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let image = match unsafe { device.create_image(&img_ci, None) } {
+            Ok(i) => i,
+            Err(e) => { log(&format!("lut image: {e}")); return; }
+        };
+        let req = unsafe { device.get_image_memory_requirements(image) };
+        let ialloc = match alloc.allocate(&AllocationCreateDesc {
+            name: "lut",
+            requirements: req,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        }) {
+            Ok(a) => a,
+            Err(e) => { unsafe { device.destroy_image(image, None) }; log(&format!("lut alloc: {e}")); return; }
+        };
+        unsafe { let _ = device.bind_image_memory(image, ialloc.memory(), ialloc.offset()); }
+
+        let staging = match GpuBuffer::new(
+            &device, alloc, (rgba.len() * 4) as u64,
+            vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu, "lut_staging",
+        ) {
+            Ok(b) => b,
+            Err(e) => { log(&format!("lut staging: {e}")); return; }
+        };
+        staging.write_bytes(gpu::as_bytes(&rgba));
+
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
+        submit_oneshot(&device, queue, cmd, fence, |d, c| unsafe {
+            let to_dst = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image).subresource_range(range);
+            d.cmd_pipeline_barrier(c, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
+                .image_extent(vk::Extent3D { width: size, height: size, depth: size });
+            d.cmd_copy_buffer_to_image(c, staging.buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+            let to_read = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL).new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image).subresource_range(range);
+            d.cmd_pipeline_barrier(c, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(), &[], &[], &[to_read]);
+        });
+        staging.destroy(&device, alloc);
+
+        let view = match unsafe {
+            device.create_image_view(&vk::ImageViewCreateInfo::default()
+                .image(image).view_type(vk::ImageViewType::TYPE_3D).format(RB_FORMAT).subresource_range(range), None)
+        } {
+            Ok(v) => v,
+            Err(e) => { log(&format!("lut view: {e}")); return; }
+        };
+        let info = [vk::DescriptorImageInfo::default()
+            .image_view(view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL).sampler(self.lut_sampler)];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.desc_set).dst_binding(7).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&info);
+        unsafe { device.update_descriptor_sets(&[write], &[]) };
+
+        self.lut_image = image;
+        self.lut_alloc = Some(ialloc);
+        self.lut_view = view;
+        self.has_lut = true;
+        log(&format!("lut: {size}^3 uploaded"));
+    }
+
     fn texture_add(&mut self, data: Vec<u8>, width: u32, height: u32, dxgi: u32) -> i32 {
         let (format, _bpp) = dxgi_to_vk(dxgi);
         let idx = (self.pending_tex.len() + self.textures.len()) as i32;
@@ -1307,6 +1518,14 @@ impl Renderer {
         if instances.is_null() || count == 0 {
             return false;
         }
+        // The addon may rebuild the TLAS every frame; skip if the instances are unchanged
+        // (avoids a per-frame accumulation reset that prevents convergence).
+        let in_bytes = unsafe { std::slice::from_raw_parts(instances, count as usize * 60) };
+        if in_bytes == self.tlas_instance_data.as_slice() {
+            return true;
+        }
+        self.tlas_instance_data = in_bytes.to_vec();
+
         // Refresh the geometry table: per-triangle material ids arrive after flush.
         self.update_geom_table();
         let in_slice =
@@ -1420,6 +1639,21 @@ impl Renderer {
     }
 
     fn render(&mut self) {
+        // World/background color from config (color*strength*0.15, set by the addon).
+        let wc = [
+            crate::config::get_float("world_bg_r"),
+            crate::config::get_float("world_bg_g"),
+            crate::config::get_float("world_bg_b"),
+            0.0,
+        ];
+        if wc != self.world_color {
+            self.world_color = wc;
+            if let Some(b) = &self.world_buffer {
+                b.write_bytes(gpu::as_bytes(&wc));
+            }
+            self.accum_frame = 0; // world changed -> restart accumulation
+        }
+
         let d = &self.device;
         // Sun from scene config (azimuth/elevation -> direction, Y-up, matching the C++).
         let az = crate::config::get_float("sun_azimuth").to_radians();
@@ -1444,7 +1678,7 @@ impl Renderer {
             inv_view_proj: self.inv_view_proj,
             cam_pos: cam,
             dims: [self.width, self.height],
-            has_tlas: self.tlas.is_some() as u32,
+            has_tlas: (self.tlas.is_some() as u32) | (if self.has_lut { 2 } else { 0 }),
             num_lights: self.light_count,
             sun_dir: [az.sin() * el.cos(), el.sin(), az.cos() * el.cos(), intensity],
             sun_col: [sc[0], sc[1], sc[2], self.accum_frame as f32],
@@ -2001,8 +2235,19 @@ impl Drop for Renderer {
                 if let Some(b) = self.light_buffer.take() {
                     b.destroy(&device, alloc);
                 }
+                if let Some(b) = self.world_buffer.take() {
+                    b.destroy(&device, alloc);
+                }
+                if self.has_lut {
+                    device.destroy_image_view(self.lut_view, None);
+                    device.destroy_image(self.lut_image, None);
+                    if let Some(a) = self.lut_alloc.take() {
+                        let _ = alloc.free(a);
+                    }
+                }
             }
             device.destroy_sampler(self.tex_sampler, None);
+            device.destroy_sampler(self.lut_sampler, None);
             self.allocator = None;
             device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
