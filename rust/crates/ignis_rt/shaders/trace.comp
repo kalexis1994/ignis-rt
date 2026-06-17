@@ -352,19 +352,23 @@ vec4 evalColorRamp(uint mi, uint dataOff, uint stopCount, float factor) {
 struct VmResult {
     vec3 baseColor; float roughness; float metallic; vec3 emission; float emissionStrength;
     float alpha; float ior; float transmission; float normalStrength; vec2 transformedUV;
+    vec2 bumpGradient; float bumpStrength; float bumpDistance; float bumpDet;
     bool hasBaseColor; bool hasRoughness; bool hasMetallic; bool hasEmission;
     bool hasAlpha; bool hasIor; bool hasTransmission; bool hasNormalStrength; bool hasTransformedUV;
+    bool hasBump;
 };
 
-VmResult executeNodeVm(uint mi, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 normal, vec3 localPos, vec4 vcol, uint instanceId) {
+VmResult executeNodeVm(uint mi, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 normal, vec3 localPos,
+                       vec4 vcol, uint instanceId, vec3 dPdu, vec3 dPdv) {
     VmResult res;
     res.hasBaseColor = false; res.hasRoughness = false; res.hasMetallic = false; res.hasEmission = false;
     res.hasAlpha = false; res.hasIor = false; res.hasTransmission = false;
-    res.hasNormalStrength = false; res.hasTransformedUV = false;
+    res.hasNormalStrength = false; res.hasTransformedUV = false; res.hasBump = false;
     res.baseColor = vec3(0.8); res.roughness = 0.5; res.metallic = 0.0;
     res.emission = vec3(0.0); res.emissionStrength = 0.0;
     res.alpha = 1.0; res.ior = 1.45; res.transmission = 0.0;
     res.normalStrength = 1.0; res.transformedUV = uv;
+    res.bumpGradient = vec2(0.0); res.bumpStrength = 0.0; res.bumpDistance = 1.0; res.bumpDet = 0.0;
 
     uint instrCount = mats[mi].nodeVmHeader & 0xFFu;
     if (instrCount == 0u) return res; // no VM program -> caller uses constants/direct textures
@@ -572,6 +576,35 @@ VmResult executeNodeVm(uint mi, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 norma
                                   vec3(0.8), vec3(0.4, 0.2, 0.1), vec3(0.1));
             R[dst] = vec4(b, 1.0);
         }
+        else if (op == 0x93u) {                                      // NOISE_BUMP (finite-diff fBM gradient)
+            float scale = uintBitsToFloat(instr.y);
+            float detail = uintBitsToFloat(instr.z);
+            float rough = uintBitsToFloat(instr.w);
+            vec3 p = R[sA].xyz * scale;
+            float eps = 0.01;
+            float h_c = fbm3D(p, detail, rough, 2.0);
+            float h_x = fbm3D(p + vec3(eps,0.0,0.0), detail, rough, 2.0);
+            float h_y = fbm3D(p + vec3(0.0,eps,0.0), detail, rough, 2.0);
+            R[dst] = vec4((h_x-h_c)/eps, (h_y-h_c)/eps, 0.0, 1.0);  // .z=0 -> noise-bump path
+        }
+        else if (op == 0x96u) {                                      // TEX_BUMP (Cycles svm_node_set_bump)
+            vec2 bumpUV = (sA != 0u) ? R[sA].xy : uv;
+            uint texBumpIdx = instr.z;
+            ivec2 td = textureSize(textures[nonuniformEXT(texBumpIdx)], 0);
+            float ts = 1.0 / float(max(td.x, td.y));
+            const vec3 lw = vec3(0.2126, 0.7152, 0.0722);
+            float hc = dot(texture(textures[nonuniformEXT(texBumpIdx)], bumpUV).rgb, lw);
+            float hx = dot(texture(textures[nonuniformEXT(texBumpIdx)], bumpUV + vec2(ts,0.0)).rgb, lw);
+            float hy = dot(texture(textures[nonuniformEXT(texBumpIdx)], bumpUV + vec2(0.0,ts)).rgb, lw);
+            vec3 dPx = dPdu * ts, dPy = dPdv * ts;
+            vec3 Rx = cross(dPy, normal), Ry = cross(normal, dPx);
+            float det = dot(dPx, Rx);
+            vec3 sg = (hx-hc) * Rx + (hy-hc) * Ry;
+            vec3 Tn = normalize(dPdu);
+            vec3 Bn = normalize(dPdv - Tn * dot(dPdv, Tn));
+            float sgSign = sign(det);
+            R[dst] = vec4(sgSign * dot(sg, Tn), sgSign * dot(sg, Bn), abs(det), hc);
+        }
         else if (op >= 0xE0u) {                                      // outputs
             if (op == 0xF0u) { res.baseColor = R[sA].rgb; res.hasBaseColor = true; }
             else if (op == 0xF1u) { res.roughness = R[sA].x; res.hasRoughness = true; }
@@ -582,8 +615,12 @@ VmResult executeNodeVm(uint mi, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 norma
             else if (op == 0xF6u) { res.ior = R[sA].x; res.hasIor = true; }
             else if (op == 0xF7u) { res.transmission = R[sA].x; res.hasTransmission = true; }
             else if (op == 0xEFu) { res.transformedUV = R[sA].xy; res.hasTransformedUV = true; }
+            else if (op == 0xF8u) {                                  // OUTPUT_BUMP
+                res.bumpGradient = R[sA].xy; res.bumpStrength = uintBitsToFloat(instr.y);
+                res.bumpDistance = uintBitsToFloat(instr.z); res.bumpDet = R[sA].z;
+                res.hasBump = true;
+            }
         }
-        // (bump opcodes 0x93 NOISE_BUMP / 0x96 TEX_BUMP: Stage 3 — need bumpGradient output + TBN)
     }
     return res;
 }
@@ -608,6 +645,7 @@ void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
     bool hasTBN = false;
     // Interpolated positions fed to the Node VM: world space + object ("Generated"/Object) space.
     vec3 worldPos = vec3(0.0), localPos = vec3(0.0);
+    vec3 dPdu = vec3(0.0), dPdv = vec3(0.0);   // UV->world differentials for texture bump
     if (gd.idx != 0ul) {
         Indices ib = Indices(gd.idx);
         uint i0 = ib.i[prim*3u+0u], i1 = ib.i[prim*3u+1u], i2 = ib.i[prim*3u+2u];
@@ -647,6 +685,14 @@ void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
         }
         hasTBN = (gd.vtx != 0ul) && (gd.uv != 0ul);
     }
+    if (hasTBN) {
+        vec2 d1 = uv1_ - uv0_, d2 = uv2_ - uv0_;
+        vec3 e1 = wp1 - wp0, e2 = wp2 - wp0;
+        float det = d1.x*d2.y - d1.y*d2.x;
+        float inv = (abs(det) > 1e-8) ? 1.0/det : 0.0;
+        dPdu = (e1*d2.y - e2*d1.y) * inv;
+        dPdv = (e2*d1.x - e1*d2.x) * inv;
+    }
     albedo = hashColor(id);
     if (gd.mat != 0ul) {
         uint matId = MatIds(gd.mat).m[prim];
@@ -660,7 +706,7 @@ void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
         transmission = clamp(mat.multR, 0.0, 1.0);
         // Node VM: its outputs override the constants. Falls back to the direct diffuse
         // texture slot when the program doesn't produce a base color.
-        VmResult vm = executeNodeVm(matId, uvCoord, worldPos, rd, N, localPos, vec4(1.0), id);
+        VmResult vm = executeNodeVm(matId, uvCoord, worldPos, rd, N, localPos, vec4(1.0), id, dPdu, dPdv);
         if (vm.hasBaseColor) albedo = vm.baseColor;
         else if (mat.diffuseTexIndex != 0xFFFFFFFFu) albedo = texture(textures[nonuniformEXT(mat.diffuseTexIndex)], uvCoord).rgb;
         if (vm.hasRoughness) roughness = clamp(vm.roughness, 0.04, 1.0);
@@ -699,6 +745,17 @@ void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
                 float strength = rawStrength > 0.0 ? rawStrength : 1.0;
                 N = applyNormalMap(texN, T, N, B, strength);
             }
+        }
+        // Procedural / texture bump from the VM (Cycles svm_node_set_bump). bumpDet > 0 means
+        // a texture bump with a real UV->world Jacobian; 0 means a noise bump (simplified form).
+        if (hasTBN && vm.hasBump) {
+            vec3 T, B;
+            computeTBN(wp0, wp1, wp2, uv0_, uv1_, uv2_, N, T, B);
+            vec3 surfgrad = vm.bumpGradient.x * normalize(T) + vm.bumpGradient.y * normalize(B);
+            vec3 bumpN = (vm.bumpDet > 1e-6)
+                ? normalize(vm.bumpDet * N - vm.bumpDistance * surfgrad)
+                : normalize(N - vm.bumpDistance * surfgrad);
+            N = normalize(vm.bumpStrength * bumpN + (1.0 - vm.bumpStrength) * N);
         }
     }
 }
