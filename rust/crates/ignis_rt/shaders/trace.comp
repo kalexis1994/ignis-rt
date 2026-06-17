@@ -717,16 +717,44 @@ vec3 directShade(vec3 hitPos, vec3 N, vec3 V, vec3 diffAlbedo, vec3 F0, float al
         vec3 Li = pc.sunCol.rgb * min(pc.sunDir.w, 4.0);
         sum += brdf(N, V, sunDir, diffAlbedo, F0, alpha) * Li * ndl;
     }
-    // Scene lights. Area lights (range < 0) sample a random point on the rectangle for
-    // soft shadows; point lights use the center (hard).
+    // Scene lights, all soft-shadowed by sampling a point on the light's surface (Cycles-style).
+    // Type encoding from the addon (shared with C++): posRange.w < 0 = area OR spot, and the
+    // sign of tanSizeY.w disambiguates — < 0 = spot, >= 0 = area. posRange.w >= 0 = point.
+    //   Area: sample the rectangle.  Spot: cone falloff, hard shadow (matches the original).
+    //   Point: sample a disk of the light's radius (shadow_soft_size in dirSizeX.w).
     for (uint li = 0u; li < pc.numLights; li++) {
         Light L = lights[li];
         vec3 lpos = L.posRange.xyz;
-        if (L.posRange.w < 0.0) {
+        bool isSpecial = L.posRange.w < 0.0;
+        bool isSpot = isSpecial && (L.tanSizeY.w < 0.0);
+        bool isArea = isSpecial && !isSpot;
+        float spotAtten = 1.0;
+        if (isArea) {
             vec3 tang = L.tanSizeY.xyz;
             vec3 bitan = cross(L.dirSizeX.xyz, tang);
             vec2 r = rand2(rng);
             lpos += tang * ((r.x - 0.5) * L.dirSizeX.w) + bitan * ((r.y - 0.5) * L.tanSizeY.w);
+        } else if (isSpot) {
+            // Cone attenuation (Cycles smoothstep): dirSizeX.w = cos(half angle),
+            // abs(tanSizeY.w) = inverse blend width. Outside the cone -> no contribution.
+            vec3 spotDir = L.dirSizeX.xyz;
+            float cosHalfAngle = L.dirSizeX.w;
+            float spotSmooth = abs(L.tanSizeY.w);
+            vec3 Lc = normalize(lpos - o);
+            float t = clamp((dot(-Lc, spotDir) - cosHalfAngle) * spotSmooth, 0.0, 1.0);
+            spotAtten = t * t * (3.0 - 2.0 * t);
+            if (spotAtten <= 0.0) continue;
+        } else {
+            float softRadius = clamp(L.dirSizeX.w * 0.5, 0.0, 2.0);
+            if (softRadius > 1e-4) {
+                vec3 Lc = normalize(lpos - o);
+                vec3 lt = abs(Lc.y) < 0.999 ? normalize(cross(Lc, vec3(0,1,0))) : normalize(cross(Lc, vec3(1,0,0)));
+                vec3 lb = cross(Lc, lt);
+                vec2 ds = rand2(rng);
+                float dr = sqrt(ds.x) * softRadius;
+                float da = ds.y * 2.0 * PI;
+                lpos += lt * (cos(da) * dr) + lb * (sin(da) * dr);
+            }
         }
         vec3 toL = lpos - o;
         float dist = length(toL);
@@ -734,7 +762,7 @@ vec3 directShade(vec3 hitPos, vec3 N, vec3 V, vec3 diffAlbedo, vec3 F0, float al
         vec3 Ldir = toL / max(dist, 1e-4);
         float nl = max(dot(N, Ldir), 0.0);
         if (nl <= 0.0 || occluded(o, Ldir, dist - 0.01)) continue;
-        vec3 Li = L.colInt.rgb * L.colInt.w / (dist*dist + 1e-3);
+        vec3 Li = L.colInt.rgb * L.colInt.w * spotAtten / (dist*dist + 1e-3);
         sum += brdf(N, V, Ldir, diffAlbedo, F0, alpha) * Li * nl;
     }
     return sum;
