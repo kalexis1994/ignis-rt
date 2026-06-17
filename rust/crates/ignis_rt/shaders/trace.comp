@@ -46,7 +46,8 @@ struct Light { vec4 posRange; vec4 colInt; vec4 dirSizeX; vec4 tanSizeY; };
 layout(binding = 5, std430) readonly buffer Lights { Light lights[]; };
 layout(binding = 6, rgba32f) uniform image2D accumImage; // persistent radiance accumulator
 layout(binding = 7) uniform sampler3D lutTex;            // OCIO view-transform LUT (Blender)
-layout(binding = 8, std430) readonly buffer World { vec4 worldColor; }; // background/sky color
+// binding 8: background color + HDRI params (hdriParams.x = env texture index or -1, .y = strength).
+layout(binding = 8, std430) readonly buffer World { vec4 worldColor; vec4 hdriParams; };
 
 layout(push_constant) uniform PC {
     mat4  invViewProj;
@@ -62,8 +63,18 @@ const float PI = 3.14159265;
 const int   MAX_BOUNCES = 8;   // higher than diffuse-only needs: glass enter+exit costs 2 each
 
 vec3 sky(vec3 dir) {
-    // Blender's world/background color (constant). HDRI worlds come later.
-    return worldColor.rgb;
+    // HDRI environment: equirectangular sample of the uploaded env texture (same mapping as
+    // raygen_blender.rgen / Cycles, Y-up). This is what lets grazing reflections pick up the
+    // environment instead of flat dark, fixing the Fresnel edge darkening on smooth meshes.
+    int hdriIdx = int(hdriParams.x);
+    float strength = hdriParams.y;
+    if (hdriIdx >= 0 && strength > 0.0) {
+        float phi = atan(-dir.z, dir.x);
+        float u = 0.5 - phi / (2.0 * PI);
+        float v = acos(clamp(dir.y, -1.0, 1.0)) / PI;
+        return texture(textures[nonuniformEXT(uint(hdriIdx))], vec2(u, v)).rgb * strength;
+    }
+    return worldColor.rgb; // flat background color (no HDRI)
 }
 vec3 hashColor(uint i) {
     return 0.35 + 0.55 * vec3(

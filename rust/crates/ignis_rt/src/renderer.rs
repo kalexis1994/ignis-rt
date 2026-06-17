@@ -124,7 +124,7 @@ pub struct Renderer {
 
     // World/background color (the "sky"), bound at binding 8.
     world_buffer: Option<GpuBuffer>,
-    world_color: [f32; 4],
+    world_data: [f32; 8], // [bg_color.rgb, 0, hdri_index, hdri_strength, 0, 0]
 
     // Compute pipeline.
     offscreen_view: vk::ImageView,
@@ -701,12 +701,13 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         .ok_or("readback buffer not host-mapped")?
         .as_ptr() as usize;
 
-    // World/background color buffer (vec4), bound at binding 8 (RT only).
+    // World buffer (binding 8, RT only): vec4 background color + vec4 HDRI params
+    // (x = environment texture index or -1, y = strength).
     let world_buffer = GpuBuffer::new(
-        &device, &mut allocator, 16,
+        &device, &mut allocator, 32,
         vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "world",
     )?;
-    world_buffer.write_bytes(gpu::as_bytes(&[0.0f32, 0.0, 0.0, 0.0]));
+    world_buffer.write_bytes(gpu::as_bytes(&[0.0f32, 0.0, 0.0, 0.0, -1.0, 1.0, 0.0, 0.0]));
 
     // Compute pipeline.
     // Binding 0: offscreen storage image (always). Binding 1: TLAS — only on RT devices
@@ -1018,7 +1019,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         lut_sampler,
         has_lut: false,
         world_buffer: Some(world_buffer),
-        world_color: [-1.0; 4], // impossible -> first render writes the real value
+        world_data: [-1.0; 8], // impossible -> first render writes the real value
         offscreen_view,
         ds_layout,
         desc_pool,
@@ -1621,17 +1622,22 @@ impl Renderer {
     }
 
     fn render(&mut self) {
-        // World/background color from config (color*strength*0.15, set by the addon).
-        let wc = [
+        // World buffer: background color (color*strength*0.15) + HDRI params, set by the addon.
+        // HDRI is uploaded into the bindless texture array; we just need its index + strength.
+        let wd = [
             crate::config::get_float("world_bg_r"),
             crate::config::get_float("world_bg_g"),
             crate::config::get_float("world_bg_b"),
             0.0,
+            crate::config::get_int("hdri_tex_index") as f32, // -1 = no HDRI
+            crate::config::get_float("hdri_strength"),
+            0.0,
+            0.0,
         ];
-        if wc != self.world_color {
-            self.world_color = wc;
+        if wd != self.world_data {
+            self.world_data = wd;
             if let Some(b) = &self.world_buffer {
-                b.write_bytes(gpu::as_bytes(&wc));
+                b.write_bytes(gpu::as_bytes(&wd));
             }
             self.accum_frame = 0; // world changed -> restart accumulation
         }
