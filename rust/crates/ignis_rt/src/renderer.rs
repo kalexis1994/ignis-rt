@@ -58,7 +58,7 @@ struct CameraPush {
     cam_pos: [f32; 4],
     dims: [u32; 2],
     has_tlas: u32,
-    _pad: u32,
+    num_lights: u32,
     sun_dir: [f32; 4], // xyz = world direction, w = intensity
     sun_col: [f32; 4], // rgb = color
 } // 128 bytes (== guaranteed push-constant minimum)
@@ -118,6 +118,8 @@ pub struct Renderer {
     pending_tex: Vec<PendingTex>,  // textures staged on CPU, not yet uploaded
     textures: Vec<Texture>,        // uploaded textures, bound bindless at binding 4
     tex_sampler: vk::Sampler,      // shared sampler for all textures
+    light_buffer: Option<GpuBuffer>, // scene point/area lights, bound at binding 5
+    light_count: u32,
 
     // Compute pipeline.
     offscreen_view: vk::ImageView,
@@ -315,6 +317,18 @@ pub fn upload_materials(data: *const u8, count: u32) {
 pub fn upload_mesh_primitive_materials(handle: i32, ids: &[u32]) {
     if let Some(r) = RENDERER.lock().unwrap().as_mut() {
         r.0.set_blas_materials(handle, ids);
+    }
+}
+
+/// Scene point/spot/area lights (16 floats each) for direct lighting (NEE).
+pub fn upload_lights(data: *const f32, count: u32) {
+    let floats: &[f32] = if data.is_null() || count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(data, count as usize * 16) }
+    };
+    if let Some(r) = RENDERER.lock().unwrap().as_mut() {
+        r.0.set_lights(floats, count);
     }
 }
 
@@ -664,6 +678,20 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(MAX_TEXTURES),
         );
+        // Binding 5: scene lights (storage buffer).
+        bindings.push(
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        );
+        binding_flags.push(vk::DescriptorBindingFlags::PARTIALLY_BOUND);
+        pool_sizes.push(
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1),
+        );
     }
     let mut flags_info =
         vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
@@ -792,6 +820,8 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         pending_tex: Vec::new(),
         textures: Vec::new(),
         tex_sampler,
+        light_buffer: None,
+        light_count: 0,
         offscreen_view,
         ds_layout,
         desc_pool,
@@ -1002,6 +1032,45 @@ impl Renderer {
         } else {
             buf.destroy(&device, alloc);
         }
+    }
+
+    fn set_lights(&mut self, floats: &[f32], count: u32) {
+        self.light_count = count;
+        if count == 0 || self.accel_ext.is_none() {
+            return;
+        }
+        let device = self.device.clone();
+        let alloc = self.allocator.as_mut().unwrap();
+        if let Some(old) = self.light_buffer.take() {
+            old.destroy(&device, alloc);
+        }
+        let buf = match GpuBuffer::new(
+            &device,
+            alloc,
+            (count as usize * 64) as u64, // 16 floats per light
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            MemoryLocation::CpuToGpu,
+            "lights",
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                log(&format!("lights alloc FAILED: {e}"));
+                return;
+            }
+        };
+        buf.write_bytes(gpu::as_bytes(floats));
+        let info = [vk::DescriptorBufferInfo::default()
+            .buffer(buf.buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.desc_set)
+            .dst_binding(5)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&info);
+        unsafe { device.update_descriptor_sets(&[write], &[]) };
+        self.light_buffer = Some(buf);
+        log(&format!("lights: {count} uploaded"));
     }
 
     fn texture_add(&mut self, data: Vec<u8>, width: u32, height: u32, dxgi: u32) -> i32 {
@@ -1241,7 +1310,7 @@ impl Renderer {
             cam_pos: self.cam_pos,
             dims: [self.width, self.height],
             has_tlas: self.tlas.is_some() as u32,
-            _pad: 0,
+            num_lights: self.light_count,
             sun_dir: [az.sin() * el.cos(), el.sin(), az.cos() * el.cos(), intensity],
             sun_col: [sc[0], sc[1], sc[2], 0.0],
         };
@@ -1776,6 +1845,9 @@ impl Drop for Renderer {
                 }
                 if let Some(a) = self.readback_alloc.take() {
                     let _ = alloc.free(a);
+                }
+                if let Some(b) = self.light_buffer.take() {
+                    b.destroy(&device, alloc);
                 }
             }
             device.destroy_sampler(self.tex_sampler, None);

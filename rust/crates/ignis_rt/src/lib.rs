@@ -287,7 +287,9 @@ pub extern "C" fn ignis_set_camera(
 // ============================================================================
 
 #[no_mangle]
-pub extern "C" fn ignis_upload_lights(_light_data: *const f32, _light_count: u32) {}
+pub extern "C" fn ignis_upload_lights(light_data: *const f32, light_count: u32) {
+    renderer::upload_lights(light_data, light_count);
+}
 
 #[no_mangle]
 pub extern "C" fn ignis_upload_emissive_triangles(_data: *const f32, _triangle_count: u32) {}

@@ -22,13 +22,15 @@ struct Material { vec4 albedo; uvec4 tex; }; // tex.x = diffuseTexIndex
 layout(binding = 2, std430) readonly buffer GeomTable { GeomDesc descs[]; };
 layout(binding = 3, std430) readonly buffer Materials { Material mats[]; };
 layout(binding = 4) uniform sampler2D textures[];
+struct Light { vec4 posRange; vec4 colInt; vec4 dirSizeX; vec4 tanSizeY; };
+layout(binding = 5, std430) readonly buffer Lights { Light lights[]; };
 
 layout(push_constant) uniform PC {
     mat4  invViewProj;
     vec4  camPos;
     uvec2 dims;
     uint  hasTlas;
-    uint  pad;
+    uint  numLights;
     vec4  sunDir; // xyz = direction, w = intensity
     vec4  sunCol; // rgb = color
 } pc;
@@ -48,6 +50,15 @@ vec3 hashColor(uint i) {
 vec3 v3(Verts b, uint i) { return vec3(b.v[i*3u], b.v[i*3u+1u], b.v[i*3u+2u]); }
 vec3 n3(Norms b, uint i) { return vec3(b.n[i*3u], b.n[i*3u+1u], b.n[i*3u+2u]); }
 vec2 t2(Uvs   b, uint i) { return vec2(b.u[i*2u], b.u[i*2u+1u]); }
+
+// Any-hit shadow query: true if something blocks the segment [origin, origin+dir*tmax).
+bool occluded(vec3 o, vec3 d, float tmax) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                          0xFFu, o, 0.001, d, tmax);
+    while (rayQueryProceedEXT(rq)) {}
+    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
 
 void main() {
     uvec2 p = gl_GlobalInvocationID.xy;
@@ -77,6 +88,7 @@ void main() {
                 uint id   = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
                 uint prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
                 vec2 bc   = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+                float thit = rayQueryGetIntersectionTEXT(rq, true);
                 mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
 
                 GeomDesc gd = descs[id];
@@ -119,11 +131,32 @@ void main() {
                     }
                 }
 
-                // Real sun (clamped to avoid blowout) + uniform ambient so no face is black.
+                vec3 hitPos = origin + dir * thit + nrm * 0.002; // shadow-ray origin (offset)
+
+                // Direct sun + shadow.
                 vec3 sunDir = normalize(pc.sunDir.xyz);
                 vec3 sunRad = pc.sunCol.rgb * min(pc.sunDir.w, 4.0);
                 float ndl = max(dot(nrm, sunDir), 0.0);
-                col = base * (vec3(0.35) + sunRad * ndl);
+                if (ndl > 0.0 && occluded(hitPos, sunDir, 10000.0)) ndl = 0.0;
+
+                // Scene point/spot/area lights (NEE) — inverse-square, with shadow rays.
+                vec3 lightSum = vec3(0.0);
+                for (uint li = 0u; li < pc.numLights; li++) {
+                    Light L = lights[li];
+                    vec3 toL = L.posRange.xyz - hitPos;
+                    float dist = length(toL);
+                    if (L.posRange.w > 0.0 && dist > L.posRange.w) continue; // out of range
+                    vec3 Ldir = toL / max(dist, 1e-4);
+                    float nl = max(dot(nrm, Ldir), 0.0);
+                    if (nl <= 0.0) continue;
+                    if (occluded(hitPos, Ldir, dist - 0.01)) continue;
+                    float atten = 1.0 / (dist * dist + 1e-3);
+                    lightSum += L.colInt.rgb * L.colInt.w * nl * atten;
+                }
+
+                // Hemispheric sky ambient (cheap GI stand-in) + direct sun + lights.
+                vec3 ambient = sky(nrm) * 0.4;
+                col = base * (ambient + sunRad * ndl + lightSum);
             }
         }
         if (!hit) col = sky(dir);
