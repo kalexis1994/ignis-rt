@@ -120,6 +120,7 @@ pub struct Renderer {
     tex_sampler: vk::Sampler,      // shared sampler for all textures
     light_buffer: Option<GpuBuffer>, // scene point/area lights, bound at binding 5
     light_count: u32,
+    light_data: Vec<f32>, // last uploaded light floats (the addon re-sends every frame)
 
     // Compute pipeline.
     offscreen_view: vk::ImageView,
@@ -130,6 +131,14 @@ pub struct Renderer {
     pipeline: vk::Pipeline,
     inv_view_proj: [f32; 16],
     cam_pos: [f32; 4],
+
+    // Temporal accumulation (path tracing): a persistent radiance accumulator + frame counter
+    // that resets when the camera or scene changes.
+    accum_image: vk::Image,
+    accum_alloc: Option<Allocation>,
+    accum_view: vk::ImageView,
+    accum_frame: u32,
+    prev_view: [f32; 16], // previous viewInverse (no projection jitter) for move detection
 
     // Offscreen target + readback.
     offscreen_image: vk::Image,
@@ -252,6 +261,19 @@ pub fn set_camera(view_inverse: &[f32], proj_inverse: &[f32]) {
     if let Some(r) = RENDERER.lock().unwrap().as_mut() {
         let vi = glam::Mat4::from_cols_slice(&view_inverse[..16]);
         let pi = glam::Mat4::from_cols_slice(&proj_inverse[..16]);
+        // inverse(proj*view) = viewInverse * projInverse
+        // Reset accumulation only on real camera movement — compare the view-inverse
+        // (camera world transform), NOT invViewProj, which the addon jitters every frame
+        // for sub-pixel sampling. Letting the jitter through actually supersamples (AA).
+        let view = view_inverse[..16].to_vec();
+        if view
+            .iter()
+            .zip(r.0.prev_view.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-6)
+        {
+            r.0.accum_frame = 0;
+            r.0.prev_view.copy_from_slice(&view);
+        }
         r.0.inv_view_proj = (vi * pi).to_cols_array();
         r.0.cam_pos = vi.w_axis.to_array();
     }
@@ -592,6 +614,52 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     }
     .map_err(|e| format!("create_image_view: {e}"))?;
 
+    // Accumulation image (RGBA32F storage, persistent across frames for path-trace averaging).
+    let accum_ci = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(RB_FORMAT)
+        .extent(vk::Extent3D { width, height, depth: 1 })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::STORAGE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let accum_image = unsafe { device.create_image(&accum_ci, None) }
+        .map_err(|e| format!("create accum image: {e}"))?;
+    let accum_req = unsafe { device.get_image_memory_requirements(accum_image) };
+    let accum_alloc = allocator
+        .allocate(&AllocationCreateDesc {
+            name: "accum",
+            requirements: accum_req,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })
+        .map_err(|e| format!("accum alloc: {e}"))?;
+    unsafe {
+        device
+            .bind_image_memory(accum_image, accum_alloc.memory(), accum_alloc.offset())
+            .map_err(|e| format!("bind accum: {e}"))?;
+    }
+    let accum_view = unsafe {
+        device.create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(accum_image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(RB_FORMAT)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                ),
+            None,
+        )
+    }
+    .map_err(|e| format!("accum view: {e}"))?;
+
     // Readback buffer.
     let rb_bytes = (width as u64) * (height as u64) * 16;
     let buf_ci = vk::BufferCreateInfo::default()
@@ -692,6 +760,20 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1),
         );
+        // Binding 6: accumulation image (storage image).
+        bindings.push(
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(6)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        );
+        binding_flags.push(vk::DescriptorBindingFlags::empty());
+        pool_sizes.push(
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1),
+        );
     }
     let mut flags_info =
         vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
@@ -727,16 +809,24 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     let img_info = [vk::DescriptorImageInfo::default()
         .image_view(offscreen_view)
         .image_layout(vk::ImageLayout::GENERAL)];
-    unsafe {
-        device.update_descriptor_sets(
-            &[vk::WriteDescriptorSet::default()
+    let accum_info = [vk::DescriptorImageInfo::default()
+        .image_view(accum_view)
+        .image_layout(vk::ImageLayout::GENERAL)];
+    let mut writes = vec![vk::WriteDescriptorSet::default()
+        .dst_set(desc_set)
+        .dst_binding(0)
+        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+        .image_info(&img_info)];
+    if rt_supported {
+        writes.push(
+            vk::WriteDescriptorSet::default()
                 .dst_set(desc_set)
-                .dst_binding(0)
+                .dst_binding(6)
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&img_info)],
-            &[],
+                .image_info(&accum_info),
         );
     }
+    unsafe { device.update_descriptor_sets(&writes, &[]) };
 
     let push_range = [vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::COMPUTE)
@@ -807,6 +897,31 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     }
     .map_err(|e| format!("create_sampler: {e}"))?;
 
+    // Put the accumulation image in GENERAL once (contents undefined; frame 0 overwrites them).
+    submit_oneshot(&device, queue, cmd, fence, |d, c| unsafe {
+        let barrier = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(accum_image)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1),
+            );
+        d.cmd_pipeline_barrier(
+            c,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier],
+        );
+    });
+
     log("Vulkan device + compute pipeline + offscreen target ready");
 
     Ok(Renderer {
@@ -822,6 +937,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         tex_sampler,
         light_buffer: None,
         light_count: 0,
+        light_data: Vec::new(),
         offscreen_view,
         ds_layout,
         desc_pool,
@@ -830,6 +946,11 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         pipeline,
         inv_view_proj: [0.0; 16],
         cam_pos: [0.0; 4],
+        accum_image,
+        accum_alloc: Some(accum_alloc),
+        accum_view,
+        accum_frame: 0,
+        prev_view: [0.0; 16],
         offscreen_image,
         offscreen_alloc: Some(offscreen_alloc),
         readback_buffer,
@@ -999,6 +1120,7 @@ impl Renderer {
             .buffer_info(&info);
         unsafe { device.update_descriptor_sets(&[write], &[]) };
         self.mat_buffer = Some(buf);
+        self.accum_frame = 0;
         log(&format!("materials: {} entries", mats.len()));
     }
 
@@ -1035,7 +1157,12 @@ impl Renderer {
     }
 
     fn set_lights(&mut self, floats: &[f32], count: u32) {
+        // The addon re-sends lights every frame; skip work + accumulation reset if unchanged.
+        if count == self.light_count && floats == self.light_data.as_slice() {
+            return;
+        }
         self.light_count = count;
+        self.light_data = floats.to_vec();
         if count == 0 || self.accel_ext.is_none() {
             return;
         }
@@ -1070,6 +1197,7 @@ impl Renderer {
             .buffer_info(&info);
         unsafe { device.update_descriptor_sets(&[write], &[]) };
         self.light_buffer = Some(buf);
+        self.accum_frame = 0;
         log(&format!("lights: {count} uploaded"));
     }
 
@@ -1241,6 +1369,7 @@ impl Renderer {
                 unsafe { self.device.update_descriptor_sets(&[write], &[]) };
 
                 self.tlas = Some(t);
+                self.accum_frame = 0; // scene changed -> restart accumulation
                 log(&format!("TLAS built: {count} instances"));
                 true
             }
@@ -1312,7 +1441,7 @@ impl Renderer {
             has_tlas: self.tlas.is_some() as u32,
             num_lights: self.light_count,
             sun_dir: [az.sin() * el.cos(), el.sin(), az.cos() * el.cos(), intensity],
-            sun_col: [sc[0], sc[1], sc[2], 0.0],
+            sun_col: [sc[0], sc[1], sc[2], self.accum_frame as f32],
         };
         let range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1336,6 +1465,17 @@ impl Renderer {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(self.offscreen_image)
                 .subresource_range(range);
+            // Accumulation image stays in GENERAL across frames; this barrier makes the
+            // previous frame's writes available to this frame's read-modify-write.
+            let accum_bar = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.accum_image)
+                .subresource_range(range);
             d.cmd_pipeline_barrier(
                 self.cmd,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -1343,7 +1483,7 @@ impl Renderer {
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &[to_general],
+                &[to_general, accum_bar],
             );
 
             d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
@@ -1411,6 +1551,7 @@ impl Renderer {
             let _ = d.queue_submit(self.queue, &[submit], self.fence);
             let _ = d.wait_for_fences(&[self.fence], true, u64::MAX);
         }
+        self.accum_frame = self.accum_frame.wrapping_add(1);
     }
 
     fn copy_to(&self, out: *mut f32, pixel_count: usize) {
@@ -1829,8 +1970,10 @@ impl Drop for Renderer {
             device.destroy_descriptor_pool(self.desc_pool, None);
             device.destroy_descriptor_set_layout(self.ds_layout, None);
             device.destroy_image_view(self.offscreen_view, None);
+            device.destroy_image_view(self.accum_view, None);
             device.destroy_fence(self.fence, None);
             device.destroy_image(self.offscreen_image, None);
+            device.destroy_image(self.accum_image, None);
             device.destroy_buffer(self.readback_buffer, None);
             if let Some(alloc) = &mut self.allocator {
                 for t in self.textures.drain(..) {
@@ -1839,6 +1982,9 @@ impl Drop for Renderer {
                     if let Some(a) = t.alloc {
                         let _ = alloc.free(a);
                     }
+                }
+                if let Some(a) = self.accum_alloc.take() {
+                    let _ = alloc.free(a);
                 }
                 if let Some(a) = self.offscreen_alloc.take() {
                     let _ = alloc.free(a);

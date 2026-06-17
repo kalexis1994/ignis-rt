@@ -3,10 +3,10 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_nonuniform_qualifier : require
-// RT path: trace the primary camera ray against the TLAS, fetch the hit triangle's per-vertex
-// normals (via buffer_reference into the per-instance geometry table) and interpolate them by
-// barycentrics for smooth shading. Falls back to the geometric (face) normal when a mesh has
-// no normals. Per-instance hashed base color keeps objects distinguishable.
+// Path tracer (RT): multi-bounce GI via ray query, next-event estimation for the sun and
+// scene lights, cosine-weighted diffuse bounces, and temporal accumulation (averaged across
+// frames, reset when the camera moves). The hemispheric ambient is gone — indirect light now
+// comes from real bounces (color bleeding, contact darkening, sky fill via escaping rays).
 
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0, rgba32f) uniform image2D outImage;
@@ -18,12 +18,13 @@ layout(buffer_reference, std430) readonly buffer Uvs   { float u[]; };
 layout(buffer_reference, std430) readonly buffer Indices { uint i[]; };
 layout(buffer_reference, std430) readonly buffer MatIds  { uint m[]; };
 struct GeomDesc { uint64_t vtx; uint64_t idx; uint64_t nrm; uint64_t mat; uint64_t uv; uint64_t pad; };
-struct Material { vec4 albedo; uvec4 tex; }; // tex.x = diffuseTexIndex
+struct Material { vec4 albedo; uvec4 tex; };
 layout(binding = 2, std430) readonly buffer GeomTable { GeomDesc descs[]; };
 layout(binding = 3, std430) readonly buffer Materials { Material mats[]; };
 layout(binding = 4) uniform sampler2D textures[];
 struct Light { vec4 posRange; vec4 colInt; vec4 dirSizeX; vec4 tanSizeY; };
 layout(binding = 5, std430) readonly buffer Lights { Light lights[]; };
+layout(binding = 6, rgba32f) uniform image2D accumImage; // persistent radiance accumulator
 
 layout(push_constant) uniform PC {
     mat4  invViewProj;
@@ -31,15 +32,17 @@ layout(push_constant) uniform PC {
     uvec2 dims;
     uint  hasTlas;
     uint  numLights;
-    vec4  sunDir; // xyz = direction, w = intensity
-    vec4  sunCol; // rgb = color
+    vec4  sunDir; // xyz dir, w intensity
+    vec4  sunCol; // rgb color, w = accumulated frame index
 } pc;
+
+const float PI = 3.14159265;
+const int   MAX_BOUNCES = 4;
 
 vec3 sky(vec3 dir) {
     float t = clamp(dir.z * 0.5 + 0.5, 0.0, 1.0);
     return mix(vec3(0.90, 0.93, 0.98), vec3(0.22, 0.42, 0.85), t);
 }
-
 vec3 hashColor(uint i) {
     return 0.35 + 0.55 * vec3(
         fract(sin(float(i) * 12.9898) * 43758.5453),
@@ -51,115 +54,159 @@ vec3 v3(Verts b, uint i) { return vec3(b.v[i*3u], b.v[i*3u+1u], b.v[i*3u+2u]); }
 vec3 n3(Norms b, uint i) { return vec3(b.n[i*3u], b.n[i*3u+1u], b.n[i*3u+2u]); }
 vec2 t2(Uvs   b, uint i) { return vec2(b.u[i*2u], b.u[i*2u+1u]); }
 
-// Any-hit shadow query: true if something blocks the segment [origin, origin+dir*tmax).
+// PCG hash RNG (scalar).
+uint  pcg(inout uint s) { s = s*747796405u + 2891336453u; uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u; return (w >> 22u) ^ w; }
+float rnd(inout uint s) { return float(pcg(s)) * (1.0 / 4294967296.0); }
+// PCG3D: decorrelated 2D random (less structured noise than scalar PCG pairs) — ignis-web.
+uvec3 pcg3d(uvec3 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y*v.z; v.y += v.z*v.x; v.z += v.x*v.y;
+    v ^= v >> 16u;
+    v.x += v.y*v.z; v.y += v.z*v.x; v.z += v.x*v.y;
+    return v;
+}
+vec2 rand2(inout uint s) {
+    s = s * 747796405u + 2891336453u;
+    uvec3 h = pcg3d(uvec3(s, s*16807u, s*48271u));
+    return vec2(h.xy) * (1.0 / 4294967295.0);
+}
+
+vec3 cosineHemisphere(vec3 N, vec2 u) {
+    float phi = 2.0 * PI * u.x;
+    float sr = sqrt(u.y);
+    vec3 up = abs(N.z) < 0.999 ? vec3(0,0,1) : vec3(1,0,0);
+    vec3 t = normalize(cross(up, N));
+    vec3 bt = cross(N, t);
+    return normalize(t*(cos(phi)*sr) + bt*(sin(phi)*sr) + N*sqrt(max(0.0, 1.0-u.y)));
+}
+
 bool occluded(vec3 o, vec3 d, float tmax) {
     rayQueryEXT rq;
-    rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
-                          0xFFu, o, 0.001, d, tmax);
+    rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFFu, o, 0.001, d, tmax);
     while (rayQueryProceedEXT(rq)) {}
     return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+// Surface attributes at a committed triangle hit.
+void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd, out vec3 N, out vec3 albedo) {
+    GeomDesc gd = descs[id];
+    N = -rd;
+    vec2 uvCoord = vec2(0.0);
+    float w0 = 1.0 - bc.x - bc.y;
+    if (gd.idx != 0ul) {
+        Indices ib = Indices(gd.idx);
+        uint i0 = ib.i[prim*3u+0u], i1 = ib.i[prim*3u+1u], i2 = ib.i[prim*3u+2u];
+        vec3 no;
+        if (gd.nrm != 0ul) {
+            Norms nb = Norms(gd.nrm);
+            no = n3(nb,i0)*w0 + n3(nb,i1)*bc.x + n3(nb,i2)*bc.y;
+        } else if (gd.vtx != 0ul) {
+            Verts vb = Verts(gd.vtx);
+            no = cross(v3(vb,i1)-v3(vb,i0), v3(vb,i2)-v3(vb,i0));
+        } else {
+            no = -rd;
+        }
+        N = normalize(mat3(o2w) * no);
+        if (gd.uv != 0ul) {
+            Uvs ub = Uvs(gd.uv);
+            uvCoord = t2(ub,i0)*w0 + t2(ub,i1)*bc.x + t2(ub,i2)*bc.y;
+            uvCoord.y = 1.0 - uvCoord.y; // Blender bottom-left -> Vulkan top-left
+        }
+    }
+    if (dot(N, rd) > 0.0) N = -N; // face-forward to the incoming ray
+    albedo = hashColor(id);
+    if (gd.mat != 0ul) {
+        Material mat = mats[MatIds(gd.mat).m[prim]];
+        albedo = mat.albedo.rgb;
+        if (mat.tex.x != 0xFFFFFFFFu) albedo = texture(textures[nonuniformEXT(mat.tex.x)], uvCoord).rgb;
+    }
+}
+
+// Direct lighting (NEE) at a surface point: sun + scene lights, each shadow-tested.
+vec3 directLight(vec3 hitPos, vec3 N) {
+    vec3 o = hitPos + N * 0.002;
+    vec3 sum = vec3(0.0);
+    vec3 sunDir = normalize(pc.sunDir.xyz);
+    float ndl = max(dot(N, sunDir), 0.0);
+    if (ndl > 0.0 && !occluded(o, sunDir, 10000.0))
+        sum += pc.sunCol.rgb * min(pc.sunDir.w, 4.0) * ndl;
+    for (uint li = 0u; li < pc.numLights; li++) {
+        Light L = lights[li];
+        vec3 toL = L.posRange.xyz - o;
+        float dist = length(toL);
+        if (L.posRange.w > 0.0 && dist > L.posRange.w) continue;
+        vec3 Ldir = toL / max(dist, 1e-4);
+        float nl = max(dot(N, Ldir), 0.0);
+        if (nl <= 0.0 || occluded(o, Ldir, dist - 0.01)) continue;
+        sum += L.colInt.rgb * L.colInt.w * nl / (dist*dist + 1e-3);
+    }
+    return sum;
 }
 
 void main() {
     uvec2 p = gl_GlobalInvocationID.xy;
     if (p.x >= pc.dims.x || p.y >= pc.dims.y) return;
+    uint frame = uint(pc.sunCol.w);
+    uint rng = ((p.x * 1973u) ^ (p.y * 9277u) ^ ((frame + 1u) * 26699u)) | 1u;
 
-    vec2 uv  = (vec2(p) + 0.5) / vec2(pc.dims);
+    // Primary ray, with sub-pixel jitter for free anti-aliasing across accumulation.
+    vec2 jitter = (frame == 0u) ? vec2(0.5) : rand2(rng);
+    vec2 uv  = (vec2(p) + jitter) / vec2(pc.dims);
     vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     vec4 world = pc.invViewProj * vec4(ndc, 1.0, 1.0);
 
-    vec3 col;
-    if (abs(world.w) < 1e-8) {
-        col = vec3(uv, 0.2);
-    } else {
+    vec3 L = vec3(0.0);
+    if (pc.hasTlas == 1u && abs(world.w) >= 1e-8) {
         world /= world.w;
-        vec3 origin = pc.camPos.xyz;
-        vec3 dir = normalize(world.xyz - origin);
+        vec3 ro = pc.camPos.xyz;
+        vec3 rd = normalize(world.xyz - ro);
+        vec3 tp = vec3(1.0); // throughput
 
-        bool hit = false;
-        if (pc.hasTlas == 1u) {
+        for (int b = 0; b < MAX_BOUNCES; b++) {
             rayQueryEXT rq;
-            rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu,
-                                  origin, 0.001, dir, 10000.0);
+            rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ro, 0.001, rd, 1e30);
             while (rayQueryProceedEXT(rq)) {}
-            if (rayQueryGetIntersectionTypeEXT(rq, true)
-                    == gl_RayQueryCommittedIntersectionTriangleEXT) {
-                hit = true;
-                uint id   = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
-                uint prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
-                vec2 bc   = rayQueryGetIntersectionBarycentricsEXT(rq, true);
-                float thit = rayQueryGetIntersectionTEXT(rq, true);
-                mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+            if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+                L += tp * sky(rd); // ray escaped to the sky
+                break;
+            }
+            uint id   = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
+            uint prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+            vec2 bc   = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+            float thit = rayQueryGetIntersectionTEXT(rq, true);
+            mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
 
-                GeomDesc gd = descs[id];
-                vec3 nrm = -dir;          // fallback: face the camera
-                vec2 uvCoord = vec2(0.0);
-                float w0 = 1.0 - bc.x - bc.y;
-                if (gd.idx != 0ul) {
-                    Indices ib = Indices(gd.idx);
-                    uint i0 = ib.i[prim*3u+0u], i1 = ib.i[prim*3u+1u], i2 = ib.i[prim*3u+2u];
-                    // Normal: smooth (interpolated) if present, else geometric (face).
-                    vec3 no;
-                    if (gd.nrm != 0ul) {
-                        Norms nb = Norms(gd.nrm);
-                        no = n3(nb,i0)*w0 + n3(nb,i1)*bc.x + n3(nb,i2)*bc.y;
-                    } else if (gd.vtx != 0ul) {
-                        Verts vb = Verts(gd.vtx);
-                        no = cross(v3(vb,i1)-v3(vb,i0), v3(vb,i2)-v3(vb,i0));
-                    } else {
-                        no = -dir;
-                    }
-                    nrm = normalize(mat3(o2w) * no);
-                    // Interpolated UV. Flip V: Blender UV origin is bottom-left, Vulkan top-left.
-                    if (gd.uv != 0ul) {
-                        Uvs ub = Uvs(gd.uv);
-                        uvCoord = t2(ub,i0)*w0 + t2(ub,i1)*bc.x + t2(ub,i2)*bc.y;
-                        uvCoord.y = 1.0 - uvCoord.y;
-                    }
-                }
-                if (dot(nrm, dir) > 0.0) nrm = -nrm; // face-forward to the viewer
+            vec3 N, albedo;
+            getSurface(id, prim, bc, o2w, rd, N, albedo);
+            vec3 hitPos = ro + rd * thit;
 
-                // Base color: material albedo, or its diffuse texture sampled at the UV.
-                vec3 base = hashColor(id);
-                if (gd.mat != 0ul) {
-                    uint matId = MatIds(gd.mat).m[prim];
-                    Material mat = mats[matId];
-                    base = mat.albedo.rgb;
-                    uint dt = mat.tex.x;
-                    if (dt != 0xFFFFFFFFu) {
-                        base = texture(textures[nonuniformEXT(dt)], uvCoord).rgb;
-                    }
-                }
+            // Direct lighting (diffuse BRDF) at this vertex.
+            L += tp * albedo * directLight(hitPos, N);
 
-                vec3 hitPos = origin + dir * thit + nrm * 0.002; // shadow-ray origin (offset)
+            // Cosine-weighted diffuse bounce (throughput *= albedo).
+            tp *= albedo;
+            ro = hitPos + N * 0.002;
+            rd = cosineHemisphere(N, rand2(rng));
 
-                // Direct sun + shadow.
-                vec3 sunDir = normalize(pc.sunDir.xyz);
-                vec3 sunRad = pc.sunCol.rgb * min(pc.sunDir.w, 4.0);
-                float ndl = max(dot(nrm, sunDir), 0.0);
-                if (ndl > 0.0 && occluded(hitPos, sunDir, 10000.0)) ndl = 0.0;
-
-                // Scene point/spot/area lights (NEE) — inverse-square, with shadow rays.
-                vec3 lightSum = vec3(0.0);
-                for (uint li = 0u; li < pc.numLights; li++) {
-                    Light L = lights[li];
-                    vec3 toL = L.posRange.xyz - hitPos;
-                    float dist = length(toL);
-                    if (L.posRange.w > 0.0 && dist > L.posRange.w) continue; // out of range
-                    vec3 Ldir = toL / max(dist, 1e-4);
-                    float nl = max(dot(nrm, Ldir), 0.0);
-                    if (nl <= 0.0) continue;
-                    if (occluded(hitPos, Ldir, dist - 0.01)) continue;
-                    float atten = 1.0 / (dist * dist + 1e-3);
-                    lightSum += L.colInt.rgb * L.colInt.w * nl * atten;
-                }
-
-                // Hemispheric sky ambient (cheap GI stand-in) + direct sun + lights.
-                vec3 ambient = sky(nrm) * 0.4;
-                col = base * (ambient + sunRad * ndl + lightSum);
+            // Russian roulette after a couple of bounces.
+            if (b >= 2) {
+                float q = clamp(max(tp.r, max(tp.g, tp.b)), 0.05, 1.0);
+                if (rnd(rng) > q) break;
+                tp /= q;
             }
         }
-        if (!hit) col = sky(dir);
+    } else {
+        // No scene yet: show the sky through the primary ray.
+        vec3 rd = (abs(world.w) >= 1e-8) ? normalize(world.xyz / world.w - pc.camPos.xyz) : vec3(0,0,1);
+        L = sky(rd);
     }
-    imageStore(outImage, ivec2(p), vec4(col, 1.0));
+
+    // Firefly clamp: cap a single sample's radiance so rare bright paths don't dominate
+    // (mild bias, big noise reduction — they converge very slowly otherwise).
+    L = min(L, vec3(16.0));
+
+    // Temporal accumulation: average this frame's estimate into the running sum.
+    vec3 accum = (frame == 0u) ? L : imageLoad(accumImage, ivec2(p)).rgb + L;
+    imageStore(accumImage, ivec2(p), vec4(accum, 1.0));
+    imageStore(outImage, ivec2(p), vec4(accum / float(frame + 1u), 1.0));
 }
