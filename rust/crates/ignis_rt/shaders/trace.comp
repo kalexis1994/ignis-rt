@@ -61,6 +61,9 @@ layout(push_constant) uniform PC {
 
 const float PI = 3.14159265;
 const int   MAX_BOUNCES = 8;   // higher than diffuse-only needs: glass enter+exit costs 2 each
+// DEBUG: when true, the primary hit is painted by path class (red=glass/transmissive,
+// green=opaque, blue=escaped to sky), bypassing accumulation + tonemap. Set false for normal render.
+const bool  DEBUG_PATH = false;
 
 vec3 sky(vec3 dir) {
     // HDRI environment: equirectangular sample of the uploaded env texture (same mapping as
@@ -228,11 +231,36 @@ vec3 sample_cone(vec3 axis, float cosThetaMax, vec2 u) {
     return normalize(build_onb(axis) * vec3(cos(phi)*st, sin(phi)*st, ct));
 }
 
+// Is the material at this hit "see-through" for shadow / indirect rays? Light-path-transparent
+// glass (Blender's Mix(Glass, Transparent, LightPath) window trick, flag bit 256) and clear
+// transmissive glass shouldn't cast opaque shadows or block GI — Blender treats them as
+// transparent for those ray types.
+bool matSeeThrough(uint id, uint prim) {
+    GeomDesc gd = descs[id];
+    if (gd.mat == 0ul) return false;
+    uint matId = MatIds(gd.mat).m[prim];
+    Material mat = mats[matId];
+    // Cycles: shadow transparency follows actual Transparent closures / alpha, NOT solid glass.
+    // So only light-path-transparent (flag 256) or transparent-weighted (multB>0) surfaces pass.
+    return ((mat.flags & 256u) != 0u) || (mat.multB > 0.0);
+}
+
+// Shadow occlusion that passes through see-through glass (loops past up to 8 glass layers),
+// so windows and nearby glass panes don't cast solid black shadows.
 bool occluded(vec3 o, vec3 d, float tmax) {
-    rayQueryEXT rq;
-    rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFFu, o, 0.001, d, tmax);
-    while (rayQueryProceedEXT(rq)) {}
-    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+    float t0 = 0.001;
+    for (int i = 0; i < 8; i++) {
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFFu, o, t0, d, tmax);
+        while (rayQueryProceedEXT(rq)) {}
+        if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT)
+            return false; // reached the light unobstructed
+        uint id   = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
+        uint prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+        if (!matSeeThrough(id, prim)) return true; // opaque surface blocks the light
+        t0 = rayQueryGetIntersectionTEXT(rq, true) + 0.001; // skip this glass layer, keep going
+    }
+    return false;
 }
 
 // ============================================================================
@@ -639,10 +667,13 @@ VmResult executeNodeVm(uint mi, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 norma
 // Surface attributes at a committed triangle hit.
 void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
                 out vec3 N, out vec3 albedo, out float roughness, out float metallic, out vec3 emission,
-                out float ior, out float transmission, out bool frontFace, out vec3 geomN) {
+                out float ior, out float transmission, out bool frontFace, out vec3 geomN,
+                out bool lightPathTransparent, out float transparentProb) {
     GeomDesc gd = descs[id];
     N = -rd;
     geomN = -rd;          // ray-facing geometric normal — used to offset secondary rays robustly
+    lightPathTransparent = false;
+    transparentProb = 0.0;
     roughness = 1.0; // no material -> fully rough (diffuse)
     metallic = 0.0;
     emission = vec3(0.0);
@@ -666,26 +697,27 @@ void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
         if (gd.vtx != 0ul) {
             Verts vb = Verts(gd.vtx);
             vec3 op0 = v3(vb,i0), op1 = v3(vb,i1), op2 = v3(vb,i2);
-            // Raw outward geometric normal (consistent CCW winding) — its sign vs the ray
-            // tells us whether we are entering or leaving a closed dielectric (glass).
-            vec3 rawGeoN = normalize(mat3(o2w) * cross(op1-op0, op2-op0));
-            frontFace = dot(rd, rawGeoN) < 0.0;
-            geoN = frontFace ? rawGeoN : -rawGeoN;   // face toward the ray
             wp0 = o2w * vec4(op0, 1.0);
             wp1 = o2w * vec4(op1, 1.0);
             wp2 = o2w * vec4(op2, 1.0);
+            // Geometric normal from WORLD-space edges (matches raygen_blender.rgen). Computing it
+            // as mat3(o2w)*cross(object edges) is WRONG under mirrored (negative-scale) or
+            // non-uniformly-scaled instances — it skews/flips the normal and corrupts shading.
+            vec3 rawGeoN = normalize(cross(wp1 - wp0, wp2 - wp0));
+            frontFace = dot(rd, rawGeoN) < 0.0;
+            geoN = frontFace ? rawGeoN : -rawGeoN;   // face toward the ray
             localPos = op0*w0 + op1*bc.x + op2*bc.y;        // object-space hit position
             worldPos = wp0*w0 + wp1*bc.x + wp2*bc.y;        // world-space hit position
         }
         if (gd.nrm != 0ul) {
             Norms nb = Norms(gd.nrm);
             N = normalize(mat3(o2w) * (n3(nb,i0)*w0 + n3(nb,i1)*bc.x + n3(nb,i2)*bc.y));
-            // Keep the smooth normal in the geometric upper hemisphere, but CONTINUOUSLY:
-            // project it onto the geometric horizon instead of snapping flat to geoN. The hard
-            // snap caused per-facet shading discontinuities (black edges between triangles) on
-            // smooth-shaded low-poly meshes at grazing camera angles. (Iray-style projection.)
-            float NdotNg = dot(N, geoN);
-            if (NdotNg < 0.0) N = normalize(N - NdotNg * geoN);
+            // Glass entry/exit from the outward smooth normal (ignis-rt mirror-bug fix); glass
+            // refraction itself uses glassDepth so this is only a hint.
+            frontFace = dot(rd, N) < 0.0;
+            // Shadow terminator fix (matches raygen_blender.rgen): if the smooth normal dips below
+            // the geometric face plane, snap to the (ray-facing) geometric normal.
+            if (dot(N, geoN) < 0.0) N = geoN;
         } else {
             N = geoN;
         }
@@ -719,6 +751,8 @@ void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
         emission = vec3(mat.emissiveR, mat.emissiveG, mat.emissiveB) * mat.fresnelMaxLevel;
         ior = mat.detailUVMultiplier;          // refraction index (matches wf_shade.comp)
         transmission = clamp(mat.multR, 0.0, 1.0);
+        lightPathTransparent = (mat.flags & 256u) != 0u; // Mix(Glass,Transparent,LightPath) trick
+        transparentProb = clamp(mat.multB, 0.0, 1.0);     // Transparent BSDF weight (architectural glass)
         // Node VM: its outputs override the constants. Falls back to the direct diffuse
         // texture slot when the program doesn't produce a base color.
         VmResult vm = executeNodeVm(matId, uvCoord, worldPos, rd, N, localPos, vec4(1.0), id, dPdu, dPdv);
@@ -871,12 +905,18 @@ void main() {
         vec3 ro = pc.camPos.xyz;
         vec3 rd = normalize(world.xyz - ro);
         vec3 tp = vec3(1.0); // throughput
+        int glassBounces = 0; // dielectric interfaces don't spend the diffuse/specular budget
+        bool isDiffuse = false; // ray has scattered diffusely -> "Is Diffuse Ray" for Light Path glass
+        int glassDepth = 0;   // how many glass surfaces deep the ray is (0 = outside). Decides
+                              // entering vs exiting WITHOUT trusting the mesh normal, which is
+                              // unreliable on flipped/inconsistent faces (caused blue TIR "mirror" glass).
 
         for (int b = 0; b < MAX_BOUNCES; b++) {
             rayQueryEXT rq;
             rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ro, 0.001, rd, 1e30);
             while (rayQueryProceedEXT(rq)) {}
             if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+                if (DEBUG_PATH && b == 0) { L = vec3(0.0, 0.0, 1.0); break; } // blue = sky
                 L += tp * sky(rd); // ray escaped to the sky
                 break;
             }
@@ -887,10 +927,46 @@ void main() {
             mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
 
             vec3 N, albedo, emission, geoN;
-            float roughness, metallic, ior, transmission;
-            bool frontFace;
-            getSurface(id, prim, bc, o2w, rd, N, albedo, roughness, metallic, emission, ior, transmission, frontFace, geoN);
+            float roughness, metallic, ior, transmission, transparentProb;
+            bool frontFace, lightPathTransparent;
+            getSurface(id, prim, bc, o2w, rd, N, albedo, roughness, metallic, emission, ior, transmission, frontFace, geoN, lightPathTransparent, transparentProb);
             vec3 hitPos = ro + rd * thit;
+
+            // Stochastic transparent passthrough (Cycles Transparent BSDF / architectural glass,
+            // port of raygen_blender.rgen:2163). A Transparent-weighted surface (multB>0) passes
+            // light straight through with NO refraction; the Fresnel reflection fraction falls
+            // through to the glass/BRDF below. This is what makes "Window Glass" look like a clean
+            // window instead of distorted/TIR'd refractive glass.
+            {
+                float tProb = transparentProb;
+                if (tProb > 0.0) {
+                    float cosTheta = abs(dot(N, -rd));
+                    float iorG = max(ior, 1.01);
+                    float f0 = (iorG - 1.0) / (iorG + 1.0); f0 *= f0;
+                    float fresnelRefl = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
+                    tProb = 1.0 - fresnelRefl;   // Fresnel transmission probability
+                }
+                if (tProb > 0.0 && rnd(rng) < tProb) {
+                    ro = hitPos + rd * 0.002;    // straight through, no bend, no shading
+                    if (++glassBounces >= 32) break;
+                    b--;
+                    continue;
+                }
+            }
+            // Light-path-transparent glass: secondary specular/reflection rays pass through cheaply
+            // (camera rays still see the glass). Port of raygen_blender.rgen:2186.
+            if (lightPathTransparent && b > 0 && !isDiffuse) {
+                ro = hitPos + rd * 0.002;
+                if (++glassBounces >= 32) break;
+                b--;
+                continue;
+            }
+
+            // DEBUG: classify the primary hit. red = glass (transmission > 0), green = opaque.
+            if (DEBUG_PATH && b == 0) {
+                L = (transmission * (1.0 - metallic) > 0.001) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+                break;
+            }
 
             // Emitted radiance from this surface (emissive materials light the scene + glow).
             L += tp * emission;
@@ -912,25 +988,34 @@ void main() {
                 // Rough dielectric: sample a microfacet half-vector, then split reflect/refract
                 // by the dielectric Fresnel term (the choice cancels out of the throughput).
                 float iorC = max(ior, 1.001);
+                // Entering = ray currently outside any glass. Robust to flipped/bad mesh normals:
+                // the camera is always outside, so the first glass hit can never be a (TIR-prone) exit.
+                bool entering = (glassDepth == 0);
                 vec3 Hn = (alpha > 1.5e-3) ? sampleGgxVndf(u, V, N, alpha) : N;
-                float etaFresnel = frontFace ? iorC : (1.0 / iorC);   // n_t / n_i
+                float etaFresnel = entering ? iorC : (1.0 / iorC);   // n_t / n_i
                 float F = fresnelDielectric(dot(V, Hn), etaFresnel);
                 vec3 dir;
                 vec3 tint = vec3(1.0);
+                bool crossed = false;
                 if (rnd(rng) < F) {
-                    dir = reflect(rd, Hn);                            // surface reflection
-                    if (dot(dir, N) <= 0.0) break;
+                    dir = reflect(rd, Hn);                            // surface reflection (untinted)
                 } else {
-                    float etaRefract = frontFace ? (1.0 / iorC) : iorC; // n_i / n_t for GLSL refract
+                    float etaRefract = entering ? (1.0 / iorC) : iorC; // n_i / n_t for GLSL refract
                     dir = refract(rd, Hn, etaRefract);
                     if (dot(dir, dir) < 1e-8) dir = reflect(rd, Hn);  // total internal reflection
-                    else tint = albedo;                              // transmitted light is tinted by glass color
+                    else { tint = sqrt(max(albedo, vec3(0.0))); crossed = true; } // transmission (Cycles sqrt tint)
                 }
+                glassDepth = crossed ? (entering ? glassDepth + 1 : max(glassDepth - 1, 0)) : glassDepth;
                 // Fresnel split is unbiased, so only the VNDF masking term G1 remains (1 for smooth glass).
                 float w = (alpha > 1.5e-3) ? smithG1(max(abs(dot(N, dir)), 1e-4), alpha) : 1.0;
                 tp *= tint * w / pTrans;
-                ro = hitPos + dir * 0.002;
+                // Offset toward the side the ray leaves on (robust for close/parallel glass panes).
+                ro = hitPos + ((dot(dir, N) >= 0.0) ? N : -N) * 0.001;
                 rd = dir;
+                // Glass interfaces don't consume the main bounce budget (so stacked/nearby glass
+                // doesn't run out of bounces and turn black); cap total dielectric hops instead.
+                if (++glassBounces >= 32) break;
+                b--;
             } else {
                 float invOpaque = 1.0 / max(1.0 - pTrans, 1e-3);
                 float lumD = dot(diffAlbedo, vec3(0.299, 0.587, 0.114));
@@ -949,6 +1034,7 @@ void main() {
                 } else {
                     rd = cosineHemisphere(N, u);
                     tp *= diffAlbedo * invOpaque / (1.0 - pSpec);
+                    isDiffuse = true; // subsequent hits see this as an "Is Diffuse Ray"
                 }
             }
 
@@ -963,6 +1049,12 @@ void main() {
         // No scene yet: show the sky through the primary ray.
         vec3 rd = (abs(world.w) >= 1e-8) ? normalize(world.xyz / world.w - pc.camPos.xyz) : vec3(0,0,1);
         L = sky(rd);
+    }
+
+    // DEBUG: write the raw path-class color (no accumulation, no tonemap) and stop.
+    if (DEBUG_PATH) {
+        imageStore(outImage, ivec2(p), vec4(L, 1.0));
+        return;
     }
 
     // Firefly clamp: cap a single sample's radiance so rare bright paths don't dominate
