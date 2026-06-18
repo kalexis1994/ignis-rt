@@ -960,6 +960,7 @@ void writeGuidePSR(uvec2 p, vec3 ro, vec3 rd) {
     vec3 primaryRd = rd;
     float pathDist = 0.0;
     mat3 mirrorMat = mat3(1.0);
+    int glassDepth = 0; // entry/exit tracking for refraction (robust to flipped normals)
     for (int b = 0; b < 6; b++) {
         rayQueryEXT rq;
         rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ro, 0.001, rd, 1e30);
@@ -984,14 +985,34 @@ void writeGuidePSR(uvec2 p, vec3 ro, vec3 rd) {
 
         bool smoothSurf = roughness < 0.05;
         bool isMirror = smoothSurf && metallic > 0.9;
-        // Glass/architectural-transparent/alpha-cutout: the visible content is what's behind, so
-        // unfold straight through (the small refraction bend is a refinement we skip for the guide).
-        bool seeThrough = (smoothSurf && transmission > 0.5) || transparentProb > 0.0 || surfAlpha < 0.5;
+        bool isGlass  = smoothSurf && transmission > 0.5;
+        // Architectural window glass / alpha-cutout: genuinely no bend, unfold straight through.
+        bool seeThrough = transparentProb > 0.0 || surfAlpha < 0.5;
 
         if (isMirror) {
             mirrorMat = mirrorMat * mirrorMatrix(N);
             rd = reflect(rd, N);
             ro = hitPos + rd * 0.001;
+            continue;
+        }
+        if (isGlass) {
+            // Follow the *actual* refraction so the guides describe what the colour path sees
+            // through the glass. Straight-through guides made refracted content converge slowly
+            // (depth/motion didn't match the bent view, so DLSS-RR couldn't reproject it). Entry/
+            // exit eta via glassDepth (robust to flipped normals); TIR falls back to reflection.
+            // The virtual position still unfolds straight ahead, but now at the true bent path
+            // length, so depth + the reflected surface attributes line up with the colour.
+            float iorC = max(ior, 1.001);
+            bool entering = (glassDepth == 0);
+            float etaRefract = entering ? (1.0 / iorC) : iorC;
+            vec3 dir = refract(rd, N, etaRefract);
+            if (dot(dir, dir) < 1e-8) {
+                dir = reflect(rd, N); // total internal reflection
+            } else {
+                glassDepth = entering ? glassDepth + 1 : max(glassDepth - 1, 0);
+            }
+            ro = hitPos + ((dot(dir, N) >= 0.0) ? N : -N) * 0.001;
+            rd = dir;
             continue;
         }
         if (seeThrough) {
