@@ -17,3 +17,6 @@ ash = "0.38"
 gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
 # Math (replaces GLM): mat4/vec ops for camera ray reconstruction.
 glam = "0.29"
+# Image decoding (replaces stb_image): the addon sends material textures as encoded
+# PNG/JPEG/BMP file bytes; decode them to RGBA8 before GPU upload.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }

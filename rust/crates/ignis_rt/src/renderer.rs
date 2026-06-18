@@ -51,6 +51,28 @@ fn dxgi_to_vk(dxgi: u32) -> (vk::Format, u32) {
     }
 }
 
+/// Decode a texture payload to GPU-ready pixels. Material textures come from the addon as
+/// ENCODED file bytes (PNG/JPEG/BMP, dxgi 0); decode them to RGBA8 like the C++ stb_image path.
+/// Raw payloads (float16 dxgi 10, raw RGBA8 dxgi 28) pass through unchanged.
+fn decode_texture(data: Vec<u8>, width: u32, height: u32, dxgi: u32) -> (Vec<u8>, u32, u32, vk::Format) {
+    let encoded = data.len() >= 4
+        && (&data[..4] == b"\x89PNG"               // PNG
+            || data[..3] == [0xFF, 0xD8, 0xFF]      // JPEG
+            || &data[..2] == b"BM");                // BMP
+    if encoded {
+        match image::load_from_memory(&data) {
+            Ok(img) => {
+                let rgba = img.to_rgba8();
+                let (w, h) = (rgba.width(), rgba.height());
+                return (rgba.into_raw(), w, h, vk::Format::R8G8B8A8_UNORM);
+            }
+            Err(e) => log(&format!("image decode failed ({} bytes): {e} — using raw", data.len())),
+        }
+    }
+    let (format, _bpp) = dxgi_to_vk(dxgi);
+    (data, width, height, format)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CameraPush {
@@ -1446,7 +1468,10 @@ impl Renderer {
     }
 
     fn texture_add(&mut self, data: Vec<u8>, width: u32, height: u32, dxgi: u32) -> i32 {
-        let (format, _bpp) = dxgi_to_vk(dxgi);
+        // Material textures arrive as ENCODED file bytes (PNG/JPEG/BMP) with dxgi 0 — the C++
+        // decodes them with stb_image. Decode here too; otherwise the compressed bytes get
+        // uploaded as raw RGBA8 and render as garbage (a dotted/noise pattern).
+        let (data, width, height, format) = decode_texture(data, width, height, dxgi);
         let idx = (self.pending_tex.len() + self.textures.len()) as i32;
         self.pending_tex.push(PendingTex { data, width, height, format });
         idx
