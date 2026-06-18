@@ -196,6 +196,17 @@ pub fn create_rr(device: u64, cmd: u64, width: u32, height: u32) -> Option<RrFea
     set_i("DLSS.Denoise.Mode", DENOISE_MODE_DL_UNIFIED);
     set_ui("DLSS.Roughness.Mode", ROUGHNESS_MODE_PACKED);
     set_ui("DLSS.Use.HW.Depth", 0);
+    // RR model preset: E (5) = latest transformer model. Without an explicit preset NGX falls back
+    // to a *different* default RR model that boils/shimmers noticeably on a static camera — this is
+    // why our static image wavered where the C++/RTXPT reference stays calm. D (4) for perf modes.
+    // Must be set before CreateFeature. Matches the C++ create exactly.
+    set_ui("RayReconstruction.Hint.Render.Preset.DLAA", 5);
+    set_ui("RayReconstruction.Hint.Render.Preset.Quality", 5);
+    set_ui("RayReconstruction.Hint.Render.Preset.Balanced", 5);
+    set_ui("RayReconstruction.Hint.Render.Preset.Performance", 4);
+    set_ui("RayReconstruction.Hint.Render.Preset.UltraPerformance", 4);
+    set_ui("RayReconstruction.Hint.Render.Preset.UltraQuality", 5);
+    set_i("DLSS.Enable.Output.Subrects", 0);
     let mut handle: *mut c_void = std::ptr::null_mut();
     let res = unsafe {
         NVSDK_NGX_VULKAN_CreateFeature1(
@@ -295,6 +306,11 @@ pub fn evaluate_rr(
     set_ui("DLSS.Render.Subrect.Dimensions.Width", width);
     set_ui("DLSS.Render.Subrect.Dimensions.Height", height);
     set_f("FrameTimeDeltaInMsec", frame_delta_ms);
+    // Pre-exposure / exposure scale MUST be set: NGX reads an unset param as 0, and DLSS then tries
+    // to un-apply a pre-exposure of 0 (divide by zero) -> normalization blows up / temporal boiling.
+    // The helper guards 0 -> 1.0 for exactly this reason; we set params by hand, so do it ourselves.
+    set_f("DLSS.Pre.Exposure", 1.0);
+    set_f("DLSS.Exposure.Scale", 1.0);
 
     let res = unsafe { NVSDK_NGX_VULKAN_EvaluateFeature_C(cmd as VkHandle, rr.handle, p, std::ptr::null()) };
     if res != NGX_SUCCESS {

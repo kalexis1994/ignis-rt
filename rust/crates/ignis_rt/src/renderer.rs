@@ -2007,11 +2007,10 @@ impl Renderer {
             && write_guide
             && crate::config::get_int("dlss_rr_enabled") != 0;
         crate::config::set_int("dlss_rr_active", use_rr as i32);
-        // Deterministic Halton(2,3) sub-pixel jitter, scaled by camera_jitter_scale (C++ default
-        // 0.75 — full 1.0 leaves a visible surface shimmer DLSS-RR can't fully resolve). The ray gen
-        // uses (jx, jy); NGX is told (jx, -jy) because the shader flips Y going screen-UV -> NDC
-        // (1 - uv.y*2). Matches the C++: jitterData = (jitterX, -jitterY), same value to projection
-        // and NGX. `jitter` -> shader push, `ngx_jitter` -> NGX eval.
+        // Deterministic Halton(2,3) sub-pixel jitter, scaled by camera_jitter_scale (default 0.75 —
+        // full 1.0 leaves visible shimmer). The shader samples at pixel-center + (jx, jy) in y-down
+        // screen space; NGX is told (jx, -jy) — the projection-space jitter, since the shader's
+        // screen-UV -> NDC step flips Y (1 - uv.y*2). Matches the C++ jitterData = (jx, -jy).
         let (jitter, ngx_jitter) = if use_rr {
             let scale = {
                 let s = crate::config::get_float("camera_jitter_scale");
