@@ -73,17 +73,71 @@ fn decode_texture(data: Vec<u8>, width: u32, height: u32, dxgi: u32) -> (Vec<u8>
     (data, width, height, format)
 }
 
+/// Create a GPU-only 2D storage image + view (UNDEFINED layout). Used for the DLSS guide buffers
+/// (depth / normal+roughness / albedo / motion vectors) written by the path tracer.
+fn create_storage_image(
+    device: &ash::Device,
+    allocator: &mut Allocator,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    name: &'static str,
+) -> Result<(vk::Image, Allocation, vk::ImageView), String> {
+    let ci = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D { width, height, depth: 1 })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let image = unsafe { device.create_image(&ci, None) }.map_err(|e| format!("{name} image: {e}"))?;
+    let req = unsafe { device.get_image_memory_requirements(image) };
+    let alloc = allocator
+        .allocate(&AllocationCreateDesc {
+            name,
+            requirements: req,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })
+        .map_err(|e| format!("{name} alloc: {e}"))?;
+    unsafe { device.bind_image_memory(image, alloc.memory(), alloc.offset()) }
+        .map_err(|e| format!("{name} bind: {e}"))?;
+    let view = unsafe {
+        device.create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                ),
+            None,
+        )
+    }
+    .map_err(|e| format!("{name} view: {e}"))?;
+    Ok((image, alloc, view))
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CameraPush {
     inv_view_proj: [f32; 16],
     cam_pos: [f32; 4],
     dims: [u32; 2],
-    has_tlas: u32,
+    has_tlas: u32,   // bit0 = hasTlas, bit1 = hasLut, bit2 = write DLSS guide buffers
     num_lights: u32,
     sun_dir: [f32; 4], // xyz = world direction, w = intensity
     sun_col: [f32; 4], // rgb = color
-} // 128 bytes (== guaranteed push-constant minimum)
+    prev_view_proj: [f32; 16], // forward view-proj of the previous frame (DLSS motion vectors)
+} // 192 bytes (push-constant max is 256 on the target GPUs)
 
 /// TLAS instance as the addon sends it (matches IgnisTLASInstance / TLASInstance, 60 bytes).
 #[repr(C)]
@@ -118,6 +172,14 @@ struct Tlas {
     accel: vk::AccelerationStructureKHR,
     buf: GpuBuffer,
     instbuf: GpuBuffer,
+}
+
+/// DLSS Ray Reconstruction guide buffers — written by trace.comp at the primary hit, read by NGX.
+struct GuideBuffers {
+    depth: (vk::Image, Allocation, vk::ImageView),        // R32F linear view-space depth (binding 9)
+    normal_rough: (vk::Image, Allocation, vk::ImageView), // RGBA16F rgb=normal, a=roughness (binding 10)
+    albedo: (vk::Image, Allocation, vk::ImageView),       // RGBA16F diffuse albedo (binding 11)
+    motion: (vk::Image, Allocation, vk::ImageView),       // RGBA16F pixel-space motion vectors (binding 12)
 }
 
 pub struct Renderer {
@@ -165,6 +227,10 @@ pub struct Renderer {
     accum_view: vk::ImageView,
     accum_frame: u32,
     prev_view: [f32; 16], // previous viewInverse (no projection jitter) for move detection
+
+    // DLSS guide buffers (bindings 9-12), written by the path tracer at the primary hit.
+    guide: Option<GuideBuffers>,
+    prev_view_proj: [f32; 16], // forward view-proj of the previous frame (motion vectors)
 
     // Offscreen target + readback.
     offscreen_image: vk::Image,
@@ -716,6 +782,19 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     }
     .map_err(|e| format!("accum view: {e}"))?;
 
+    // DLSS guide buffers (RT devices only — DLSS-RR needs ray tracing). Written by the path tracer.
+    let guide = if rt_supported {
+        let f16 = vk::Format::R16G16B16A16_SFLOAT;
+        Some(GuideBuffers {
+            depth: create_storage_image(&device, &mut allocator, width, height, vk::Format::R32_SFLOAT, "g_depth")?,
+            normal_rough: create_storage_image(&device, &mut allocator, width, height, f16, "g_normal")?,
+            albedo: create_storage_image(&device, &mut allocator, width, height, f16, "g_albedo")?,
+            motion: create_storage_image(&device, &mut allocator, width, height, f16, "g_motion")?,
+        })
+    } else {
+        None
+    };
+
     // Readback buffer.
     let rb_bytes = (width as u64) * (height as u64) * 16;
     let buf_ci = vk::BufferCreateInfo::default()
@@ -866,6 +945,22 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1),
         );
+        // Bindings 9-12: DLSS guide buffers (depth, normal+rough, albedo, motion) — storage images.
+        for b in 9u32..=12u32 {
+            bindings.push(
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(b)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            );
+            binding_flags.push(vk::DescriptorBindingFlags::empty());
+            pool_sizes.push(
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::STORAGE_IMAGE)
+                    .descriptor_count(1),
+            );
+        }
     }
     let mut flags_info =
         vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
@@ -913,6 +1008,13 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         .buffer(world_buffer.buffer)
         .offset(0)
         .range(vk::WHOLE_SIZE)];
+    let gi = |v: vk::ImageView| [vk::DescriptorImageInfo::default()
+        .image_view(v)
+        .image_layout(vk::ImageLayout::GENERAL)];
+    let guide_infos: [[vk::DescriptorImageInfo; 1]; 4] = match guide.as_ref() {
+        Some(g) => [gi(g.depth.2), gi(g.normal_rough.2), gi(g.albedo.2), gi(g.motion.2)],
+        None => Default::default(),
+    };
     if rt_supported {
         writes.push(
             vk::WriteDescriptorSet::default()
@@ -928,6 +1030,15 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&world_info),
         );
+        for (i, info) in guide_infos.iter().enumerate() {
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(desc_set)
+                    .dst_binding(9 + i as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(info),
+            );
+        }
     }
     unsafe { device.update_descriptor_sets(&writes, &[]) };
 
@@ -1076,6 +1187,8 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         accum_view,
         accum_frame: 0,
         prev_view: [0.0; 16],
+        guide,
+        prev_view_proj: [0.0; 16],
         offscreen_image,
         offscreen_alloc: Some(offscreen_alloc),
         readback_buffer,
@@ -1750,15 +1863,23 @@ impl Renderer {
         let sun_size = crate::config::get_float("sun_size");
         let mut cam = self.cam_pos;
         cam[3] = if sun_size > 0.0 { sun_size } else { 0.009 };
+        // Forward view-proj this frame (= inverse of inv_view_proj) for DLSS motion vectors.
+        let cur_vp = glam::Mat4::from_cols_array(&self.inv_view_proj).inverse().to_cols_array();
+        let prev_vp = if self.accum_frame == 0 { cur_vp } else { self.prev_view_proj };
+        let write_guide = self.guide.is_some();
         let push = CameraPush {
             inv_view_proj: self.inv_view_proj,
             cam_pos: cam,
             dims: [self.width, self.height],
-            has_tlas: (self.tlas.is_some() as u32) | (if self.has_lut { 2 } else { 0 }),
+            has_tlas: (self.tlas.is_some() as u32)
+                | (if self.has_lut { 2 } else { 0 })
+                | (if write_guide { 4 } else { 0 }), // bit2 = emit DLSS guide buffers
             num_lights: self.light_count,
             sun_dir: [az.sin() * el.cos(), el.sin(), az.cos() * el.cos(), intensity],
             sun_col: [sc[0], sc[1], sc[2], self.accum_frame as f32],
+            prev_view_proj: prev_vp,
         };
+        self.prev_view_proj = cur_vp;
         let range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .level_count(1)
@@ -1792,6 +1913,23 @@ impl Renderer {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(self.accum_image)
                 .subresource_range(range);
+            // Guide buffers: discard last frame and make them writable (regenerated every frame).
+            let mut barriers = vec![to_general, accum_bar];
+            if let Some(g) = &self.guide {
+                for img in [g.depth.0, g.normal_rough.0, g.albedo.0, g.motion.0] {
+                    barriers.push(
+                        vk::ImageMemoryBarrier::default()
+                            .old_layout(vk::ImageLayout::UNDEFINED)
+                            .new_layout(vk::ImageLayout::GENERAL)
+                            .src_access_mask(vk::AccessFlags::empty())
+                            .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .image(img)
+                            .subresource_range(range),
+                    );
+                }
+            }
             d.cmd_pipeline_barrier(
                 self.cmd,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -1799,7 +1937,7 @@ impl Renderer {
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &[to_general, accum_bar],
+                &barriers,
             );
 
             d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
@@ -2307,6 +2445,13 @@ impl Drop for Renderer {
                 }
                 if let Some(a) = self.readback_alloc.take() {
                     let _ = alloc.free(a);
+                }
+                if let Some(g) = self.guide.take() {
+                    for (image, galloc, view) in [g.depth, g.normal_rough, g.albedo, g.motion] {
+                        device.destroy_image_view(view, None);
+                        device.destroy_image(image, None);
+                        let _ = alloc.free(galloc);
+                    }
                 }
                 if let Some(b) = self.light_buffer.take() {
                     b.destroy(&device, alloc);

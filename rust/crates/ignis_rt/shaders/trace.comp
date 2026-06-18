@@ -48,6 +48,11 @@ layout(binding = 6, rgba32f) uniform image2D accumImage; // persistent radiance 
 layout(binding = 7) uniform sampler3D lutTex;            // OCIO view-transform LUT (Blender)
 // binding 8: background color + HDRI params (hdriParams.x = env texture index or -1, .y = strength).
 layout(binding = 8, std430) readonly buffer World { vec4 worldColor; vec4 hdriParams; };
+// DLSS guide buffers, written at the primary hit (hasTlas bit2). r32f depth = linear view-space.
+layout(binding = 9,  r32f)    uniform image2D gDepth;
+layout(binding = 10, rgba16f) uniform image2D gNormalRough; // rgb = world normal, a = roughness
+layout(binding = 11, rgba16f) uniform image2D gAlbedo;      // diffuse albedo
+layout(binding = 12, rgba16f) uniform image2D gMotion;      // pixel-space backward motion vectors
 
 layout(push_constant) uniform PC {
     mat4  invViewProj;
@@ -57,7 +62,29 @@ layout(push_constant) uniform PC {
     uint  numLights;
     vec4  sunDir; // xyz dir, w intensity
     vec4  sunCol; // rgb color, w = accumulated frame index
+    mat4  prevViewProj; // forward view-proj of the previous frame (DLSS motion vectors)
 } pc;
+
+// Write the DLSS guide buffers for the primary hit at pixel p. depth = linear view-space distance
+// (projection of the hit onto the camera forward); motion = where this world point was last frame.
+void writeGuide(uvec2 p, vec3 worldPos, vec3 N, float roughness, vec3 albedo) {
+    if ((pc.hasTlas & 4u) == 0u) return;
+    vec4 cf = pc.invViewProj * vec4(0.0, 0.0, 1.0, 1.0);
+    vec3 fwd = normalize(cf.xyz / cf.w - pc.camPos.xyz);
+    float depth = max(dot(worldPos - pc.camPos.xyz, fwd), 0.0);
+    vec2 mv = vec2(0.0);
+    vec4 pp = pc.prevViewProj * vec4(worldPos, 1.0);
+    if (pp.w > 1e-6) {
+        vec2 prevNdc = pp.xy / pp.w;
+        vec2 prevUV  = vec2(prevNdc.x * 0.5 + 0.5, 0.5 - prevNdc.y * 0.5);
+        vec2 currUV  = (vec2(p) + 0.5) / vec2(pc.dims);
+        mv = (prevUV - currUV) * vec2(pc.dims); // pixel-space backward motion vector
+    }
+    imageStore(gDepth,      ivec2(p), vec4(depth));
+    imageStore(gNormalRough,ivec2(p), vec4(N, roughness));
+    imageStore(gAlbedo,     ivec2(p), vec4(albedo, 1.0));
+    imageStore(gMotion,     ivec2(p), vec4(mv, 0.0, 0.0));
+}
 
 const float PI = 3.14159265;
 const int   MAX_BOUNCES = 8;   // higher than diffuse-only needs: glass enter+exit costs 2 each
@@ -924,6 +951,7 @@ void main() {
             rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ro, 0.001, rd, 1e30);
             while (rayQueryProceedEXT(rq)) {}
             if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+                if (b == 0) writeGuide(p, pc.camPos.xyz + rd * 1e5, -rd, 1.0, vec3(0.0)); // sky: far depth
                 if (DEBUG_PATH && b == 0) { L = vec3(0.0, 0.0, 1.0); break; } // blue = sky
                 L += tp * sky(rd); // ray escaped to the sky
                 break;
@@ -980,6 +1008,9 @@ void main() {
                 b--;
                 continue;
             }
+
+            // DLSS guide buffers: this is the first visible opaque surface (the primary hit).
+            if (b == 0) writeGuide(p, hitPos, N, roughness, albedo);
 
             // DEBUG: visualize the surface UV of the primary hit (red=U, green=V, tiled). A clean
             // per-island gradient = correct UVs; noise/garbage = wrong UV layer or broken UV data.
