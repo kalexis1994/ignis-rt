@@ -119,6 +119,39 @@ def dump_material(mat):
                 continue
             src = _socket_src(inp)
             print(f"    {name:22} = {_val(inp)}" + (f"   <- {src}" if src else ""))
+    # UV layers de los objetos que usan este material (clave para texturas "mal mapeadas":
+    # assets "baked" suelen tener 2 capas UV y la ACTIVA puede no ser la de textura).
+    print("\n  ── CAPAS UV de los objetos que usan este material ──")
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH':
+            continue
+        if not any(s.material == mat for s in obj.material_slots):
+            continue
+        me = obj.data
+        layers = []
+        for uvl in me.uv_layers:
+            tag = []
+            if uvl.active: tag.append("ACTIVA")
+            if getattr(uvl, "active_render", False): tag.append("RENDER")
+            layers.append(f"'{uvl.name}'" + ("(" + ",".join(tag) + ")" if tag else ""))
+        print(f"    {obj.name}: {len(me.uv_layers)} capas -> {layers}")
+    # Fuente UV de cada nodo Image Texture (UVMap node? Mapping? directo?)
+    if mat.use_nodes and mat.node_tree:
+        print("\n  ── Fuente de coordenadas de cada Image Texture ──")
+        for n in mat.node_tree.nodes:
+            if n.bl_idname != "ShaderNodeTexImage":
+                continue
+            vinp = n.inputs.get("Vector")
+            if vinp and vinp.is_linked:
+                src = vinp.links[0].from_node
+                detail = ""
+                if src.bl_idname == "ShaderNodeUVMap":
+                    detail = f" uv_map='{src.uv_map}'"
+                elif src.bl_idname == "ShaderNodeAttribute":
+                    detail = f" attr='{getattr(src,'attribute_name','?')}'"
+                print(f"    '{n.name}' <- {src.bl_idname}{detail}")
+            else:
+                print(f"    '{n.name}' <- (UV activa por defecto)")
     print("=" * 70)
     print("FIN — copiá todo lo de arriba.")
     print("=" * 70)

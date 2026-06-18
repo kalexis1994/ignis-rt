@@ -668,12 +668,13 @@ VmResult executeNodeVm(uint mi, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 norma
 void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
                 out vec3 N, out vec3 albedo, out float roughness, out float metallic, out vec3 emission,
                 out float ior, out float transmission, out bool frontFace, out vec3 geomN,
-                out bool lightPathTransparent, out float transparentProb) {
+                out bool lightPathTransparent, out float transparentProb, out vec2 surfUV) {
     GeomDesc gd = descs[id];
     N = -rd;
     geomN = -rd;          // ray-facing geometric normal — used to offset secondary rays robustly
     lightPathTransparent = false;
     transparentProb = 0.0;
+    surfUV = vec2(0.0);
     roughness = 1.0; // no material -> fully rough (diffuse)
     metallic = 0.0;
     emission = vec3(0.0);
@@ -740,6 +741,7 @@ void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
         dPdu = (e1*d2.y - e2*d1.y) * inv;
         dPdv = (e2*d1.x - e1*d2.x) * inv;
     }
+    surfUV = uvCoord;
     albedo = hashColor(id);
     if (gd.mat != 0ul) {
         uint matId = MatIds(gd.mat).m[prim];
@@ -929,7 +931,8 @@ void main() {
             vec3 N, albedo, emission, geoN;
             float roughness, metallic, ior, transmission, transparentProb;
             bool frontFace, lightPathTransparent;
-            getSurface(id, prim, bc, o2w, rd, N, albedo, roughness, metallic, emission, ior, transmission, frontFace, geoN, lightPathTransparent, transparentProb);
+            vec2 surfUV;
+            getSurface(id, prim, bc, o2w, rd, N, albedo, roughness, metallic, emission, ior, transmission, frontFace, geoN, lightPathTransparent, transparentProb, surfUV);
             vec3 hitPos = ro + rd * thit;
 
             // Stochastic transparent passthrough (Cycles Transparent BSDF / architectural glass,
@@ -962,9 +965,10 @@ void main() {
                 continue;
             }
 
-            // DEBUG: classify the primary hit. red = glass (transmission > 0), green = opaque.
+            // DEBUG: visualize the surface UV of the primary hit (red=U, green=V, tiled). A clean
+            // per-island gradient = correct UVs; noise/garbage = wrong UV layer or broken UV data.
             if (DEBUG_PATH && b == 0) {
-                L = (transmission * (1.0 - metallic) > 0.001) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+                L = vec3(fract(surfUV.x), fract(surfUV.y), 0.0);
                 break;
             }
 
