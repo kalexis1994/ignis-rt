@@ -16,6 +16,7 @@ use std::ptr;
 mod config;
 mod gpu;
 mod log;
+mod ngx;
 mod renderer;
 
 /// Borrow a C string as a Rust &str (lossy). Returns "" on null.

@@ -6,6 +6,8 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    link_ngx();
+
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let shader_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders");
     println!("cargo:rerun-if-changed=shaders");
@@ -26,6 +28,30 @@ fn main() {
             assert!(status.success(), "glslangValidator failed for {name}");
         }
     }
+}
+
+/// Link the NVIDIA NGX SDK (nvsdk_ngx_d.lib) for the DLSS Ray Reconstruction FFI. The lib is a
+/// static loader that pulls in the nvngx_dlss*.dll runtime at execution time (present on the RTX
+/// box). Path from IGNIS_NGX_ROOT (CMake-compatible: <root>/lib) or the cloned DLSS SDK fallback.
+fn link_ngx() {
+    println!("cargo:rustc-check-cfg=cfg(have_ngx)"); // declare the cfg (Rust 1.80+ lint)
+    println!("cargo:rerun-if-env-changed=IGNIS_NGX_ROOT");
+    let candidates = [
+        std::env::var("IGNIS_NGX_ROOT").ok().map(|r| format!("{r}/lib")),
+        Some(r"C:/Users/Administrator/DLSS/lib/Windows_x86_64/x64".to_string()),
+    ];
+    for cand in candidates.into_iter().flatten() {
+        if Path::new(&cand).join("nvsdk_ngx_d.lib").exists() {
+            println!("cargo:rustc-link-search=native={cand}");
+            println!("cargo:rustc-link-lib=static=nvsdk_ngx_d");
+            // System libs the NGX static loader pulls in (registry path lookup + message box).
+            println!("cargo:rustc-link-lib=dylib=advapi32");
+            println!("cargo:rustc-link-lib=dylib=user32");
+            println!("cargo:rustc-cfg=have_ngx");
+            return;
+        }
+    }
+    println!("cargo:warning=NGX SDK (nvsdk_ngx_d.lib) not found — DLSS RR disabled in this build");
 }
 
 fn find_glslang() -> String {

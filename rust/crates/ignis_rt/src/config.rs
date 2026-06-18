@@ -37,6 +37,9 @@ pub fn get_float(key: &str) -> f32 {
 pub fn set_base_path(path: &str) {
     STATE.lock().unwrap().base_path = path.to_string();
 }
+pub fn base_path() -> String {
+    STATE.lock().unwrap().base_path.clone()
+}
 pub fn store_lut(size: u32, data: Vec<f32>) {
     STATE.lock().unwrap().lut = Some((size, data));
 }

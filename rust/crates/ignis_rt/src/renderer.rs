@@ -275,7 +275,9 @@ pub fn create(width: u32, height: u32) -> bool {
 }
 
 pub fn destroy() {
-    if RENDERER.lock().unwrap().take().is_some() {
+    if let Some(r) = RENDERER.lock().unwrap().take() {
+        use ash::vk::Handle;
+        crate::ngx::shutdown(r.0.device.handle().as_raw()); // before the device is destroyed
         log("ignis_destroy: renderer torn down");
     }
 }
@@ -587,6 +589,19 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     let device = unsafe { instance.create_device(pd, &dci, None) }
         .map_err(|e| format!("create_device: {e}"))?;
     let queue = unsafe { device.get_device_queue(queue_family, 0) };
+
+    // DLSS / NGX init (Stage 0): verify the runtime chain on the RTX. Harmless on non-RTX
+    // (returns a failure result, logged). Uses raw Vulkan handles. base_path holds the log dir.
+    {
+        use ash::vk::Handle;
+        let base = crate::config::base_path();
+        crate::ngx::init(
+            instance.handle().as_raw(),
+            pd.as_raw(),
+            device.handle().as_raw(),
+            if base.is_empty() { "." } else { &base },
+        );
+    }
     let accel_ext = if rt_supported {
         Some(AccelExt::new(&instance, &device))
     } else {
