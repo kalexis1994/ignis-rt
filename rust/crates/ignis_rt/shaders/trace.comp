@@ -241,8 +241,8 @@ bool matSeeThrough(uint id, uint prim) {
     uint matId = MatIds(gd.mat).m[prim];
     Material mat = mats[matId];
     // Cycles: shadow transparency follows actual Transparent closures / alpha, NOT solid glass.
-    // So only light-path-transparent (flag 256) or transparent-weighted (multB>0) surfaces pass.
-    return ((mat.flags & 256u) != 0u) || (mat.multB > 0.0);
+    // Light-path-transparent (256), transparent-weighted (multB>0), or alpha-masked (bit0) pass.
+    return ((mat.flags & 257u) != 0u) || (mat.multB > 0.0);
 }
 
 // Shadow occlusion that passes through see-through glass (loops past up to 8 glass layers),
@@ -668,13 +668,15 @@ VmResult executeNodeVm(uint mi, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 norma
 void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
                 out vec3 N, out vec3 albedo, out float roughness, out float metallic, out vec3 emission,
                 out float ior, out float transmission, out bool frontFace, out vec3 geomN,
-                out bool lightPathTransparent, out float transparentProb, out vec2 surfUV) {
+                out bool lightPathTransparent, out float transparentProb, out vec2 surfUV,
+                out float surfAlpha) {
     GeomDesc gd = descs[id];
     N = -rd;
     geomN = -rd;          // ray-facing geometric normal — used to offset secondary rays robustly
     lightPathTransparent = false;
     transparentProb = 0.0;
     surfUV = vec2(0.0);
+    surfAlpha = 1.0;      // opaque unless the material is alpha-tested / has a per-pixel alpha
     roughness = 1.0; // no material -> fully rough (diffuse)
     metallic = 0.0;
     emission = vec3(0.0);
@@ -765,6 +767,10 @@ void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
         if (vm.hasEmission) emission = vm.emission * vm.emissionStrength;
         if (vm.hasIor) ior = vm.ior;
         if (vm.hasTransmission) transmission = clamp(vm.transmission, 0.0, 1.0);
+        // Per-pixel alpha for alpha-tested/blended materials (flag bit0). From the VM (texture
+        // alpha) or the constant multG; opaque materials stay surfAlpha = 1.
+        if (vm.hasAlpha) surfAlpha = clamp(vm.alpha, 0.0, 1.0);
+        else if ((mat.flags & 1u) != 0u) surfAlpha = clamp(mat.multG, 0.0, 1.0);
         // Normal / height-map perturbation (port of wf_shade.comp). The sign of
         // detailNormalBlend selects the mode: < 0 = bump/height map, >= 0 = tangent normal map.
         if (hasTBN && mat.normalTexIndex != 0xFFFFFFFFu) {
@@ -932,7 +938,8 @@ void main() {
             float roughness, metallic, ior, transmission, transparentProb;
             bool frontFace, lightPathTransparent;
             vec2 surfUV;
-            getSurface(id, prim, bc, o2w, rd, N, albedo, roughness, metallic, emission, ior, transmission, frontFace, geoN, lightPathTransparent, transparentProb, surfUV);
+            float surfAlpha;
+            getSurface(id, prim, bc, o2w, rd, N, albedo, roughness, metallic, emission, ior, transmission, frontFace, geoN, lightPathTransparent, transparentProb, surfUV, surfAlpha);
             vec3 hitPos = ro + rd * thit;
 
             // Stochastic transparent passthrough (Cycles Transparent BSDF / architectural glass,
@@ -961,6 +968,15 @@ void main() {
             if (lightPathTransparent && b > 0 && !isDiffuse) {
                 ro = hitPos + rd * 0.002;
                 if (++glassBounces >= 32) break;
+                b--;
+                continue;
+            }
+            // Alpha transparency (Cycles BLEND, stochastic): with probability (1 - alpha) the ray
+            // passes straight through without shading. Makes alpha-masked billboards (fire/leaves/
+            // decals) transparent where the texture alpha is ~0, instead of opaque squares.
+            if (surfAlpha < 0.999 && rnd(rng) >= surfAlpha) {
+                ro = hitPos + rd * 0.0005;
+                if (++glassBounces >= 64) break;
                 b--;
                 continue;
             }
