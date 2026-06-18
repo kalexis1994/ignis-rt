@@ -16,11 +16,14 @@ fn main() {
 
     for entry in std::fs::read_dir(&shader_dir).expect("shaders/ dir") {
         let path = entry.unwrap().path();
-        if path.extension().and_then(|e| e.to_str()) == Some("comp") {
+        let ext = path.extension().and_then(|e| e.to_str());
+        // .comp = compute (ray query). .rgen = ray generation (ray query + Shader Execution
+        // Reordering). glslang infers the stage from the extension.
+        if matches!(ext, Some("comp") | Some("rgen")) {
             let name = path.file_name().unwrap().to_str().unwrap();
             let out_spv = format!("{out_dir}/{name}.spv");
             println!("cargo:rerun-if-changed={}", path.display());
-            // target-env vulkan1.2 -> SPIR-V 1.5, required for GL_EXT_ray_query.
+            // target-env vulkan1.2 -> SPIR-V 1.5, required for GL_EXT_ray_query / ray tracing.
             let status = Command::new(&glslang)
                 .args(["-V", "--target-env", "vulkan1.2", path.to_str().unwrap(), "-o", &out_spv])
                 .status()

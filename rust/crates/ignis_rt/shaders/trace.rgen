@@ -1,15 +1,15 @@
 #version 460
+#extension GL_EXT_ray_tracing : require
 #extension GL_EXT_ray_query : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_scalar_block_layout : require
-// Path tracer (RT): multi-bounce GI via ray query, next-event estimation for the sun and
-// scene lights, cosine-weighted diffuse bounces, and temporal accumulation (averaged across
-// frames, reset when the camera moves). The hemispheric ambient is gone — indirect light now
-// comes from real bounces (color bleeding, contact darkening, sky fill via escaping rays).
+// Path tracer (RT): a ray-generation shader using inline ray query traversal — moved off the
+// compute megakernel so it can use Shader Execution Reordering (SER). Multi-bounce GI, NEE for the
+// sun + scene lights + emissive triangles, cosine/GGX bounces, DLSS-RR guide buffers, temporal
+// accumulation. One invocation per pixel via vkCmdTraceRaysKHR.
 
-layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0, rgba32f) uniform image2D outImage;
 layout(binding = 1) uniform accelerationStructureEXT tlas;
 
@@ -1129,7 +1129,7 @@ void writeGuidePSR(uvec2 p, vec3 ro, vec3 rd) {
 }
 
 void main() {
-    uvec2 p = gl_GlobalInvocationID.xy;
+    uvec2 p = gl_LaunchIDEXT.xy;
     if (p.x >= pc.dims.x || p.y >= pc.dims.y) return;
     uint frame = uint(pc.sunCol.w);
     bool hasTlas = (pc.hasTlas & 1u) != 0u;

@@ -225,8 +225,11 @@ pub struct Renderer {
     desc_pool: vk::DescriptorPool,
     desc_set: vk::DescriptorSet,
     pipeline_layout: vk::PipelineLayout,
-    pipeline: vk::Pipeline,
-    tonemap_pipeline: Option<vk::Pipeline>, // DLSS-RR clean->display tonemap (shares pipeline_layout)
+    pipeline: vk::Pipeline, // trace ray-generation pipeline (RT pipeline; ray query inline)
+    tonemap_pipeline: Option<vk::Pipeline>, // DLSS-RR clean->display tonemap (compute, shares layout)
+    rt_pipeline_ext: Option<ash::khr::ray_tracing_pipeline::Device>, // vkCmdTraceRaysKHR etc.
+    sbt_buffer: Option<GpuBuffer>, // shader binding table (one raygen record)
+    sbt_region: vk::StridedDeviceAddressRegionKHR, // raygen region for traceRays
     inv_view_proj: [f32; 16],
     cam_pos: [f32; 4],
 
@@ -902,7 +905,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         .binding(0)
         .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
         .descriptor_count(1)
-        .stage_flags(vk::ShaderStageFlags::COMPUTE)];
+        .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::COMPUTE)];
     let mut binding_flags = vec![vk::DescriptorBindingFlags::empty()];
     let mut pool_sizes = vec![vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::STORAGE_IMAGE)
@@ -913,7 +916,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .binding(1)
                 .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
                 .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::COMPUTE),
         );
         binding_flags.push(vk::DescriptorBindingFlags::PARTIALLY_BOUND);
         pool_sizes.push(
@@ -928,7 +931,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                     .binding(binding)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                    .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::COMPUTE),
             );
             binding_flags.push(vk::DescriptorBindingFlags::PARTIALLY_BOUND);
             pool_sizes.push(
@@ -943,7 +946,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .binding(4)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(MAX_TEXTURES)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::COMPUTE),
         );
         binding_flags.push(vk::DescriptorBindingFlags::PARTIALLY_BOUND);
         pool_sizes.push(
@@ -957,7 +960,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .binding(5)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::COMPUTE),
         );
         binding_flags.push(vk::DescriptorBindingFlags::PARTIALLY_BOUND);
         pool_sizes.push(
@@ -971,7 +974,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .binding(6)
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::COMPUTE),
         );
         binding_flags.push(vk::DescriptorBindingFlags::empty());
         pool_sizes.push(
@@ -985,7 +988,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .binding(7)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::COMPUTE),
         );
         binding_flags.push(vk::DescriptorBindingFlags::PARTIALLY_BOUND);
         pool_sizes.push(
@@ -999,7 +1002,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .binding(8)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::COMPUTE),
         );
         binding_flags.push(vk::DescriptorBindingFlags::empty());
         pool_sizes.push(
@@ -1016,7 +1019,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                     .binding(b)
                     .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                     .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                    .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::COMPUTE),
             );
             binding_flags.push(vk::DescriptorBindingFlags::empty());
             pool_sizes.push(
@@ -1031,7 +1034,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .binding(16)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::COMPUTE),
         );
         binding_flags.push(vk::DescriptorBindingFlags::PARTIALLY_BOUND);
         pool_sizes.push(
@@ -1145,7 +1148,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     unsafe { device.update_descriptor_sets(&writes, &[]) };
 
     let push_range = [vk::PushConstantRange::default()
-        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::COMPUTE)
         .offset(0)
         .size(std::mem::size_of::<CameraPush>() as u32)];
     let pipeline_layout = unsafe {
@@ -1158,34 +1161,90 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     }
     .map_err(|e| format!("pipeline layout: {e}"))?;
 
-    // Ray-query shader on RT devices, sky fallback otherwise (both embedded at build time).
-    let spv_bytes: &[u8] = if rt_supported {
-        &include_bytes!(concat!(env!("OUT_DIR"), "/trace.comp.spv"))[..]
-    } else {
-        &include_bytes!(concat!(env!("OUT_DIR"), "/sky.comp.spv"))[..]
-    };
-    let spv = ash::util::read_spv(&mut std::io::Cursor::new(spv_bytes))
-        .map_err(|e| format!("read shader spv: {e}"))?;
-    let shader_module = unsafe {
-        device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None)
-    }
-    .map_err(|e| format!("shader module: {e}"))?;
+    // RT devices: the path tracer is a ray-generation pipeline (trace.rgen, ray query inline) so it
+    // can use Shader Execution Reordering. Non-RT devices keep the sky.comp compute fallback.
+    let (pipeline, rt_pipeline_ext, sbt_buffer, sbt_region) = if rt_supported {
+        let rt_ext = ash::khr::ray_tracing_pipeline::Device::new(&instance, &device);
+        let spv = ash::util::read_spv(&mut std::io::Cursor::new(
+            &include_bytes!(concat!(env!("OUT_DIR"), "/trace.rgen.spv"))[..],
+        ))
+        .map_err(|e| format!("read rgen spv: {e}"))?;
+        let module = unsafe {
+            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None)
+        }
+        .map_err(|e| format!("rgen module: {e}"))?;
+        let stages = [vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::RAYGEN_KHR)
+            .module(module)
+            .name(c"main")];
+        let groups = [vk::RayTracingShaderGroupCreateInfoKHR::default()
+            .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
+            .general_shader(0)
+            .closest_hit_shader(vk::SHADER_UNUSED_KHR)
+            .any_hit_shader(vk::SHADER_UNUSED_KHR)
+            .intersection_shader(vk::SHADER_UNUSED_KHR)];
+        let pipe = unsafe {
+            rt_ext.create_ray_tracing_pipelines(
+                vk::DeferredOperationKHR::null(),
+                vk::PipelineCache::null(),
+                &[vk::RayTracingPipelineCreateInfoKHR::default()
+                    .stages(&stages)
+                    .groups(&groups)
+                    .max_pipeline_ray_recursion_depth(1)
+                    .layout(pipeline_layout)],
+                None,
+            )
+        }
+        .map_err(|(_, e)| format!("rt pipeline: {e}"))?[0];
+        unsafe { device.destroy_shader_module(module, None) };
 
-    let stage = vk::PipelineShaderStageCreateInfo::default()
-        .stage(vk::ShaderStageFlags::COMPUTE)
-        .module(shader_module)
-        .name(c"main");
-    let pipeline = unsafe {
-        device.create_compute_pipelines(
-            vk::PipelineCache::null(),
-            &[vk::ComputePipelineCreateInfo::default()
-                .stage(stage)
-                .layout(pipeline_layout)],
-            None,
+        // Shader binding table: one raygen record. Aligned to shaderGroupBaseAlignment.
+        let mut rt_props = vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut rt_props);
+        unsafe { instance.get_physical_device_properties2(pd, &mut props2) };
+        let handle_size = rt_props.shader_group_handle_size as usize;
+        let handles = unsafe { rt_ext.get_ray_tracing_shader_group_handles(pipe, 0, 1, handle_size) }
+            .map_err(|e| format!("sbt handles: {e}"))?;
+        let stride = align_up(handle_size as u64, rt_props.shader_group_base_alignment as u64);
+        let sbt = GpuBuffer::new(
+            &device,
+            &mut allocator,
+            stride,
+            vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            MemoryLocation::CpuToGpu,
+            "sbt",
         )
-    }
-    .map_err(|(_, e)| format!("compute pipeline: {e}"))?[0];
-    unsafe { device.destroy_shader_module(shader_module, None) };
+        .map_err(|e| format!("sbt buffer: {e}"))?;
+        sbt.write_bytes(&handles[..handle_size]);
+        let region = vk::StridedDeviceAddressRegionKHR::default()
+            .device_address(sbt.device_address(&device))
+            .stride(stride)
+            .size(stride);
+        (pipe, Some(rt_ext), Some(sbt), region)
+    } else {
+        let spv = ash::util::read_spv(&mut std::io::Cursor::new(
+            &include_bytes!(concat!(env!("OUT_DIR"), "/sky.comp.spv"))[..],
+        ))
+        .map_err(|e| format!("read sky spv: {e}"))?;
+        let module = unsafe {
+            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None)
+        }
+        .map_err(|e| format!("sky module: {e}"))?;
+        let stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(module)
+            .name(c"main");
+        let pipe = unsafe {
+            device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(pipeline_layout)],
+                None,
+            )
+        }
+        .map_err(|(_, e)| format!("sky pipeline: {e}"))?[0];
+        unsafe { device.destroy_shader_module(module, None) };
+        (pipe, None, None, vk::StridedDeviceAddressRegionKHR::default())
+    };
 
     // DLSS-RR final tonemap pass — reads NGX's clean output, writes the display offscreen. Shares
     // the trace pipeline layout (same descriptor set + push constants). RT devices only.
@@ -1346,6 +1405,9 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         pipeline_layout,
         pipeline,
         tonemap_pipeline,
+        rt_pipeline_ext,
+        sbt_buffer,
+        sbt_region,
         inv_view_proj: [0.0; 16],
         cam_pos: [0.0; 4],
         accum_image,
@@ -2124,6 +2186,15 @@ impl Renderer {
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .level_count(1)
             .layer_count(1);
+        // The path trace writes its images from the ray-generation stage (RT pipeline) or the
+        // compute stage (sky fallback); the NGX eval + tonemap are compute. Bracket-barriers that
+        // touch the trace's outputs use this combined mask so no dependency is missed either way.
+        let trace_stage = if self.rt_pipeline_ext.is_some() {
+            vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR
+        } else {
+            vk::PipelineStageFlags::COMPUTE_SHADER
+        };
+        let trace_or_compute = trace_stage | vk::PipelineStageFlags::COMPUTE_SHADER;
 
         unsafe {
             let _ = d.reset_fences(&[self.fence]);
@@ -2173,34 +2244,70 @@ impl Renderer {
             d.cmd_pipeline_barrier(
                 self.cmd,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
+                trace_or_compute,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
                 &barriers,
             );
 
-            d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
-            d.cmd_bind_descriptor_sets(
-                self.cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                self.pipeline_layout,
-                0,
-                &[self.desc_set],
-                &[],
-            );
             let bytes = std::slice::from_raw_parts(
                 &push as *const CameraPush as *const u8,
                 std::mem::size_of::<CameraPush>(),
             );
-            d.cmd_push_constants(
-                self.cmd,
-                self.pipeline_layout,
-                vk::ShaderStageFlags::COMPUTE,
-                0,
-                bytes,
-            );
-            d.cmd_dispatch(self.cmd, self.width.div_ceil(8), self.height.div_ceil(8), 1);
+            // Path trace: ray-generation pipeline (vkCmdTraceRaysKHR) on RT devices, sky compute
+            // dispatch on the fallback.
+            if let Some(rt) = self.rt_pipeline_ext.clone() {
+                d.cmd_bind_pipeline(
+                    self.cmd,
+                    vk::PipelineBindPoint::RAY_TRACING_KHR,
+                    self.pipeline,
+                );
+                d.cmd_bind_descriptor_sets(
+                    self.cmd,
+                    vk::PipelineBindPoint::RAY_TRACING_KHR,
+                    self.pipeline_layout,
+                    0,
+                    &[self.desc_set],
+                    &[],
+                );
+                d.cmd_push_constants(
+                    self.cmd,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::RAYGEN_KHR,
+                    0,
+                    bytes,
+                );
+                let empty = vk::StridedDeviceAddressRegionKHR::default();
+                rt.cmd_trace_rays(
+                    self.cmd,
+                    &self.sbt_region,
+                    &empty,
+                    &empty,
+                    &empty,
+                    self.width,
+                    self.height,
+                    1,
+                );
+            } else {
+                d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+                d.cmd_bind_descriptor_sets(
+                    self.cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.pipeline_layout,
+                    0,
+                    &[self.desc_set],
+                    &[],
+                );
+                d.cmd_push_constants(
+                    self.cmd,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    bytes,
+                );
+                d.cmd_dispatch(self.cmd, self.width.div_ceil(8), self.height.div_ceil(8), 1);
+            }
 
             // DLSS Ray Reconstruction: denoise the noisy 1-spp color (with the guide buffers) into
             // the clean image, then tonemap that to the display offscreen. NGX records its own
@@ -2213,10 +2320,10 @@ impl Renderer {
                 let wr_to_rd = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ);
-                // Trace's noisy-color + guide writes -> NGX reads.
+                // Trace's noisy-color + guide writes (ray-gen stage) -> NGX reads (compute).
                 d.cmd_pipeline_barrier(
                     self.cmd,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    trace_stage,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::DependencyFlags::empty(),
                     &[wr_to_rd],
@@ -2291,7 +2398,7 @@ impl Renderer {
                 .subresource_range(range);
             d.cmd_pipeline_barrier(
                 self.cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
+                trace_or_compute,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -2780,6 +2887,9 @@ impl Drop for Renderer {
                     b.destroy(&device, alloc);
                 }
                 if let Some(b) = self.emissive_buffer.take() {
+                    b.destroy(&device, alloc);
+                }
+                if let Some(b) = self.sbt_buffer.take() {
                     b.destroy(&device, alloc);
                 }
                 if let Some(b) = self.world_buffer.take() {
