@@ -137,7 +137,8 @@ struct CameraPush {
     sun_dir: [f32; 4], // xyz = world direction, w = intensity
     sun_col: [f32; 4], // rgb = color
     prev_view_proj: [f32; 16], // forward view-proj of the previous frame (DLSS motion vectors)
-} // 192 bytes (push-constant max is 256 on the target GPUs)
+    jitter: [f32; 2],  // DLSS-RR sub-pixel offset from pixel center [-0.5,0.5]; 0 when RR inactive
+} // 200 bytes (push-constant max is 256 on the target GPUs)
 
 /// TLAS instance as the addon sends it (matches IgnisTLASInstance / TLASInstance, 60 bytes).
 #[repr(C)]
@@ -180,6 +181,8 @@ struct GuideBuffers {
     normal_rough: (vk::Image, Allocation, vk::ImageView), // RGBA16F rgb=normal, a=roughness (binding 10)
     albedo: (vk::Image, Allocation, vk::ImageView),       // RGBA16F diffuse albedo (binding 11)
     motion: (vk::Image, Allocation, vk::ImageView),       // RGBA16F pixel-space motion vectors (binding 12)
+    noisy: (vk::Image, Allocation, vk::ImageView),        // RGBA16F noisy 1-spp linear color (binding 13)
+    clean: (vk::Image, Allocation, vk::ImageView),        // RGBA16F NGX denoised linear color (binding 14)
 }
 
 pub struct Renderer {
@@ -217,6 +220,7 @@ pub struct Renderer {
     desc_set: vk::DescriptorSet,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    tonemap_pipeline: Option<vk::Pipeline>, // DLSS-RR clean->display tonemap (shares pipeline_layout)
     inv_view_proj: [f32; 16],
     cam_pos: [f32; 4],
 
@@ -256,6 +260,18 @@ pub struct Renderer {
     rtx_series: u32,
     width: u32,
     height: u32,
+}
+
+/// Halton low-discrepancy sequence value (radical inverse) — used for DLSS-RR sub-pixel jitter.
+fn halton(mut i: u32, base: u32) -> f32 {
+    let mut f = 1.0f32;
+    let mut r = 0.0f32;
+    while i > 0 {
+        f /= base as f32;
+        r += f * (i % base) as f32;
+        i /= base;
+    }
+    r
 }
 
 fn enforce_min(width: u32, height: u32) -> (u32, u32) {
@@ -806,6 +822,8 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
             normal_rough: create_storage_image(&device, &mut allocator, width, height, f16, "g_normal")?,
             albedo: create_storage_image(&device, &mut allocator, width, height, f16, "g_albedo")?,
             motion: create_storage_image(&device, &mut allocator, width, height, f16, "g_motion")?,
+            noisy: create_storage_image(&device, &mut allocator, width, height, f16, "g_noisy")?,
+            clean: create_storage_image(&device, &mut allocator, width, height, f16, "g_clean")?,
         })
     } else {
         None
@@ -961,8 +979,9 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1),
         );
-        // Bindings 9-12: DLSS guide buffers (depth, normal+rough, albedo, motion) — storage images.
-        for b in 9u32..=12u32 {
+        // Bindings 9-12: DLSS guide buffers (depth, normal+rough, albedo, motion); 13 = noisy color
+        // (trace writes, NGX reads); 14 = clean color (NGX writes, tonemap reads). All storage images.
+        for b in 9u32..=14u32 {
             bindings.push(
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(b)
@@ -1031,6 +1050,8 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         Some(g) => [gi(g.depth.2), gi(g.normal_rough.2), gi(g.albedo.2), gi(g.motion.2)],
         None => Default::default(),
     };
+    let noisy_info = guide.as_ref().map(|g| gi(g.noisy.2)).unwrap_or_default();
+    let clean_info = guide.as_ref().map(|g| gi(g.clean.2)).unwrap_or_default();
     if rt_supported {
         writes.push(
             vk::WriteDescriptorSet::default()
@@ -1055,6 +1076,20 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                     .image_info(info),
             );
         }
+        writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(desc_set)
+                .dst_binding(13)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&noisy_info),
+        );
+        writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(desc_set)
+                .dst_binding(14)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&clean_info),
+        );
     }
     unsafe { device.update_descriptor_sets(&writes, &[]) };
 
@@ -1100,6 +1135,36 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     }
     .map_err(|(_, e)| format!("compute pipeline: {e}"))?[0];
     unsafe { device.destroy_shader_module(shader_module, None) };
+
+    // DLSS-RR final tonemap pass — reads NGX's clean output, writes the display offscreen. Shares
+    // the trace pipeline layout (same descriptor set + push constants). RT devices only.
+    let tonemap_pipeline = if rt_supported {
+        let tspv_bytes: &[u8] = &include_bytes!(concat!(env!("OUT_DIR"), "/tonemap.comp.spv"))[..];
+        let tspv = ash::util::read_spv(&mut std::io::Cursor::new(tspv_bytes))
+            .map_err(|e| format!("read tonemap spv: {e}"))?;
+        let tmod = unsafe {
+            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&tspv), None)
+        }
+        .map_err(|e| format!("tonemap module: {e}"))?;
+        let tstage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(tmod)
+            .name(c"main");
+        let tp = unsafe {
+            device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default()
+                    .stage(tstage)
+                    .layout(pipeline_layout)],
+                None,
+            )
+        }
+        .map_err(|(_, e)| format!("tonemap pipeline: {e}"))?[0];
+        unsafe { device.destroy_shader_module(tmod, None) };
+        Some(tp)
+    } else {
+        None
+    };
 
     let cmd = unsafe {
         device.allocate_command_buffers(
@@ -1226,6 +1291,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         desc_set,
         pipeline_layout,
         pipeline,
+        tonemap_pipeline,
         inv_view_proj: [0.0; 16],
         cam_pos: [0.0; 4],
         accum_image,
@@ -1914,17 +1980,35 @@ impl Renderer {
         let cur_vp = glam::Mat4::from_cols_array(&self.inv_view_proj).inverse().to_cols_array();
         let prev_vp = if self.accum_frame == 0 { cur_vp } else { self.prev_view_proj };
         let write_guide = self.guide.is_some();
+        // DLSS Ray Reconstruction runs when the feature created, the tonemap pass exists, and the
+        // addon enabled it. When active the path tracer emits 1-spp noisy linear color (no accum),
+        // NGX denoises, and a separate pass tonemaps the clean output.
+        let use_rr = self.rr.is_some()
+            && self.tonemap_pipeline.is_some()
+            && write_guide
+            && crate::config::get_int("dlss_rr_enabled") != 0;
+        crate::config::set_int("dlss_rr_active", use_rr as i32);
+        // Deterministic Halton(2,3) sub-pixel jitter (offset from pixel center), fed to both the ray
+        // generation and NGX so the denoiser knows the exact sample positions.
+        let jitter = if use_rr {
+            let idx = self.accum_frame % 16 + 1;
+            [halton(idx, 2) - 0.5, halton(idx, 3) - 0.5]
+        } else {
+            [0.0, 0.0]
+        };
         let push = CameraPush {
             inv_view_proj: self.inv_view_proj,
             cam_pos: cam,
             dims: [self.width, self.height],
             has_tlas: (self.tlas.is_some() as u32)
                 | (if self.has_lut { 2 } else { 0 })
-                | (if write_guide { 4 } else { 0 }), // bit2 = emit DLSS guide buffers
+                | (if write_guide { 4 } else { 0 }) // bit2 = emit DLSS guide buffers
+                | (if use_rr { 8 } else { 0 }),     // bit3 = DLSS-RR mode (noisy linear out)
             num_lights: self.light_count,
             sun_dir: [az.sin() * el.cos(), el.sin(), az.cos() * el.cos(), intensity],
             sun_col: [sc[0], sc[1], sc[2], self.accum_frame as f32],
             prev_view_proj: prev_vp,
+            jitter,
         };
         self.prev_view_proj = cur_vp;
         let range = vk::ImageSubresourceRange::default()
@@ -1963,7 +2047,7 @@ impl Renderer {
             // Guide buffers: discard last frame and make them writable (regenerated every frame).
             let mut barriers = vec![to_general, accum_bar];
             if let Some(g) = &self.guide {
-                for img in [g.depth.0, g.normal_rough.0, g.albedo.0, g.motion.0] {
+                for img in [g.depth.0, g.normal_rough.0, g.albedo.0, g.motion.0, g.noisy.0, g.clean.0] {
                     barriers.push(
                         vk::ImageMemoryBarrier::default()
                             .old_layout(vk::ImageLayout::UNDEFINED)
@@ -2008,6 +2092,83 @@ impl Renderer {
                 bytes,
             );
             d.cmd_dispatch(self.cmd, self.width.div_ceil(8), self.height.div_ceil(8), 1);
+
+            // DLSS Ray Reconstruction: denoise the noisy 1-spp color (with the guide buffers) into
+            // the clean image, then tonemap that to the display offscreen. NGX records its own
+            // compute work into self.cmd; all its resources stay in GENERAL, so plain memory
+            // barriers (not layout transitions) bracket it.
+            if use_rr {
+                use ash::vk::Handle;
+                let g = self.guide.as_ref().unwrap();
+                let rr = self.rr.as_ref().unwrap();
+                let wr_to_rd = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ);
+                // Trace's noisy-color + guide writes -> NGX reads.
+                d.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[wr_to_rd],
+                    &[],
+                    &[],
+                );
+                let f16 = vk::Format::R16G16B16A16_SFLOAT.as_raw();
+                let r32 = vk::Format::R32_SFLOAT.as_raw();
+                let img = |t: &(vk::Image, Allocation, vk::ImageView), fmt: i32| crate::ngx::RrImage {
+                    view: t.2.as_raw(),
+                    image: t.0.as_raw(),
+                    format: fmt,
+                };
+                crate::ngx::evaluate_rr(
+                    self.cmd.as_raw(),
+                    rr,
+                    img(&g.noisy, f16),
+                    img(&g.clean, f16),
+                    img(&g.depth, r32),
+                    img(&g.motion, f16),
+                    img(&g.normal_rough, f16),
+                    img(&g.albedo, f16),
+                    self.width,
+                    self.height,
+                    jitter[0],
+                    jitter[1],
+                    self.accum_frame <= 1, // reset history on a fresh accumulation (matches C++)
+                    16.6,                   // nominal frame delta (ms); static viewport accumulation
+                );
+                // NGX's clean output -> tonemap reads.
+                d.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[wr_to_rd],
+                    &[],
+                    &[],
+                );
+                d.cmd_bind_pipeline(
+                    self.cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.tonemap_pipeline.unwrap(),
+                );
+                d.cmd_bind_descriptor_sets(
+                    self.cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.pipeline_layout,
+                    0,
+                    &[self.desc_set],
+                    &[],
+                );
+                d.cmd_push_constants(
+                    self.cmd,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    bytes,
+                );
+                d.cmd_dispatch(self.cmd, self.width.div_ceil(8), self.height.div_ceil(8), 1);
+            }
 
             let to_src = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::GENERAL)
@@ -2467,6 +2628,9 @@ impl Drop for Renderer {
 
         unsafe {
             device.destroy_pipeline(self.pipeline, None);
+            if let Some(tp) = self.tonemap_pipeline.take() {
+                device.destroy_pipeline(tp, None);
+            }
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_descriptor_pool(self.desc_pool, None);
             device.destroy_descriptor_set_layout(self.ds_layout, None);
@@ -2494,7 +2658,9 @@ impl Drop for Renderer {
                     let _ = alloc.free(a);
                 }
                 if let Some(g) = self.guide.take() {
-                    for (image, galloc, view) in [g.depth, g.normal_rough, g.albedo, g.motion] {
+                    for (image, galloc, view) in
+                        [g.depth, g.normal_rough, g.albedo, g.motion, g.noisy, g.clean]
+                    {
                         device.destroy_image_view(view, None);
                         device.destroy_image(image, None);
                         let _ = alloc.free(galloc);

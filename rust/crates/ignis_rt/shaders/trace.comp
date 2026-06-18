@@ -53,6 +53,7 @@ layout(binding = 9,  r32f)    uniform image2D gDepth;
 layout(binding = 10, rgba16f) uniform image2D gNormalRough; // rgb = world normal, a = roughness
 layout(binding = 11, rgba16f) uniform image2D gAlbedo;      // diffuse albedo
 layout(binding = 12, rgba16f) uniform image2D gMotion;      // pixel-space backward motion vectors
+layout(binding = 13, rgba16f) uniform image2D gNoisy;       // noisy 1-spp linear color (DLSS-RR input)
 
 layout(push_constant) uniform PC {
     mat4  invViewProj;
@@ -63,12 +64,16 @@ layout(push_constant) uniform PC {
     vec4  sunDir; // xyz dir, w intensity
     vec4  sunCol; // rgb color, w = accumulated frame index
     mat4  prevViewProj; // forward view-proj of the previous frame (DLSS motion vectors)
+    vec2  jitter;       // DLSS-RR: deterministic sub-pixel offset from pixel center [-0.5,0.5]
 } pc;
 
 // Write the DLSS guide buffers for the primary hit at pixel p. depth = linear view-space distance
 // (projection of the hit onto the camera forward); motion = where this world point was last frame.
 void writeGuide(uvec2 p, vec3 worldPos, vec3 N, float roughness, vec3 albedo) {
     if ((pc.hasTlas & 4u) == 0u) return;
+    // DLSS-RR depth: linear view-space depth (distance along the camera forward axis). The RR path
+    // uses linear depth (Use_HW_Depth=0), unlike DLSS-SR which uses NDC depth. Matches the C++
+    // GetViewDepthImage that EvaluateRR consumes.
     vec4 cf = pc.invViewProj * vec4(0.0, 0.0, 1.0, 1.0);
     vec3 fwd = normalize(cf.xyz / cf.w - pc.camPos.xyz);
     float depth = max(dot(worldPos - pc.camPos.xyz, fwd), 0.0);
@@ -926,10 +931,14 @@ void main() {
     uint frame = uint(pc.sunCol.w);
     bool hasTlas = (pc.hasTlas & 1u) != 0u;
     bool hasLut  = (pc.hasTlas & 2u) != 0u;
+    bool rrMode  = (pc.hasTlas & 8u) != 0u; // DLSS Ray Reconstruction active this frame
     uint rng = ((p.x * 1973u) ^ (p.y * 9277u) ^ ((frame + 1u) * 26699u)) | 1u;
 
-    // Primary ray, with sub-pixel jitter for free anti-aliasing across accumulation.
-    vec2 jitter = (frame == 0u) ? vec2(0.5) : rand2(rng);
+    // Primary ray, with sub-pixel jitter. In RR mode the jitter is the deterministic Halton offset
+    // the CPU also feeds to NGX (so the denoiser knows the exact sample positions); otherwise it's a
+    // random offset for free anti-aliasing across temporal accumulation.
+    vec2 jitter = rrMode ? (vec2(0.5) + pc.jitter)
+                         : ((frame == 0u) ? vec2(0.5) : rand2(rng));
     vec2 uv  = (vec2(p) + jitter) / vec2(pc.dims);
     vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     vec4 world = pc.invViewProj * vec4(ndc, 1.0, 1.0);
@@ -1105,6 +1114,18 @@ void main() {
     // DEBUG: write the raw path-class color (no accumulation, no tonemap) and stop.
     if (DEBUG_PATH) {
         imageStore(outImage, ivec2(p), vec4(L, 1.0));
+        return;
+    }
+
+    // DLSS Ray Reconstruction: emit the noisy 1-spp *linear* radiance (no accumulation, no tonemap).
+    // NGX denoises temporally using the guide buffers + motion vectors; we tonemap its clean output
+    // in a separate pass. Sanitize NaN/Inf and clamp to the fp16 range the RR input image holds.
+    if (rrMode) {
+        vec3 c = L;
+        c = mix(c, vec3(0.0), isnan(c));
+        c = mix(c, vec3(0.0), isinf(c));
+        c = clamp(c, vec3(0.0), vec3(65504.0));
+        imageStore(gNoisy, ivec2(p), vec4(c, 1.0));
         return;
     }
 

@@ -212,6 +212,96 @@ pub fn create_rr(device: u64, cmd: u64, width: u32, height: u32) -> Option<RrFea
     }
 }
 
+/// One input/output image for the RR evaluate (raw `as_raw()` view+image handles + VkFormat).
+#[cfg(have_ngx)]
+#[derive(Clone, Copy)]
+pub struct RrImage {
+    pub view: u64,
+    pub image: u64,
+    pub format: i32,
+}
+
+/// Run DLSS Ray Reconstruction for one frame. Wraps each image in an NVSDK_NGX_Resource_VK, sets
+/// the essential eval parameters (the helper sets many more, but they are optional/null), and
+/// dispatches EvaluateFeature_C on `cmd`. `width`/`height` are the render (== output, DLAA) size.
+#[cfg(have_ngx)]
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_rr(
+    cmd: u64,
+    rr: &RrFeature,
+    color: RrImage,    // noisy 1-spp linear color (input)
+    output: RrImage,   // clean denoised color (output, read-write)
+    depth: RrImage,
+    motion: RrImage,
+    normal_rough: RrImage, // normals (rgb) + roughness packed in .a
+    albedo: RrImage,       // diffuse albedo
+    width: u32,
+    height: u32,
+    jitter_x: f32,
+    jitter_y: f32,
+    reset: bool,
+    frame_delta_ms: f32,
+) -> bool {
+    use ffi::*;
+    use std::ffi::CString;
+    use std::os::raw::c_void;
+
+    let range = ash::vk::ImageSubresourceRange {
+        aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    let mk = |img: RrImage, rw: bool| ResourceVk {
+        image_view: img.view,
+        image: img.image,
+        subresource: range,
+        format: img.format,
+        width,
+        height,
+        res_type: 0, // IMAGEVIEW
+        read_write: rw as u8,
+    };
+    // These must outlive the EvaluateFeature_C call (referenced by pointer).
+    let mut r_color = mk(color, false);
+    let mut r_output = mk(output, true);
+    let mut r_depth = mk(depth, false);
+    let mut r_motion = mk(motion, false);
+    let mut r_normal = mk(normal_rough, false);
+    let mut r_albedo = mk(albedo, false);
+
+    let p = rr.params;
+    let set_ptr = |n: &str, r: *mut ResourceVk| { let c = CString::new(n).unwrap(); unsafe { NVSDK_NGX_Parameter_SetVoidPointer(p, c.as_ptr(), r as *mut c_void) }; };
+    let set_f = |n: &str, v: f32| { let c = CString::new(n).unwrap(); unsafe { NVSDK_NGX_Parameter_SetF(p, c.as_ptr(), v) }; };
+    let set_i = |n: &str, v: i32| { let c = CString::new(n).unwrap(); unsafe { NVSDK_NGX_Parameter_SetI(p, c.as_ptr(), v) }; };
+    let set_ui = |n: &str, v: u32| { let c = CString::new(n).unwrap(); unsafe { NVSDK_NGX_Parameter_SetUI(p, c.as_ptr(), v) }; };
+
+    set_ptr("Color", &mut r_color);
+    set_ptr("Output", &mut r_output);
+    set_ptr("Depth", &mut r_depth);
+    set_ptr("MotionVectors", &mut r_motion);
+    set_ptr("GBuffer.Normals", &mut r_normal);
+    set_ptr("GBuffer.Roughness", &mut r_normal);      // roughness packed in normals.a
+    set_ptr("DLSS.Input.DiffuseAlbedo", &mut r_albedo);
+    set_ptr("DLSS.Input.SpecularAlbedo", &mut r_albedo); // no separate spec albedo yet: reuse diffuse
+    set_f("Jitter.Offset.X", jitter_x);
+    set_f("Jitter.Offset.Y", jitter_y);
+    set_i("Reset", reset as i32);
+    set_f("MV.Scale.X", 1.0);
+    set_f("MV.Scale.Y", 1.0);
+    set_ui("DLSS.Render.Subrect.Dimensions.Width", width);
+    set_ui("DLSS.Render.Subrect.Dimensions.Height", height);
+    set_f("FrameTimeDeltaInMsec", frame_delta_ms);
+
+    let res = unsafe { NVSDK_NGX_VULKAN_EvaluateFeature_C(cmd as VkHandle, rr.handle, p, std::ptr::null()) };
+    if res != NGX_SUCCESS {
+        log(&format!("NGX: EvaluateFeature RR failed (result {res:#x})"));
+        return false;
+    }
+    true
+}
+
 #[cfg(have_ngx)]
 pub fn release_rr(rr: RrFeature) {
     unsafe {
@@ -248,3 +338,15 @@ pub struct RrFeature;
 pub fn create_rr(_device: u64, _cmd: u64, _w: u32, _h: u32) -> Option<RrFeature> { None }
 #[cfg(not(have_ngx))]
 pub fn release_rr(_rr: RrFeature) {}
+
+#[cfg(not(have_ngx))]
+#[derive(Clone, Copy)]
+pub struct RrImage { pub view: u64, pub image: u64, pub format: i32 }
+#[cfg(not(have_ngx))]
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_rr(
+    _cmd: u64, _rr: &RrFeature,
+    _color: RrImage, _output: RrImage, _depth: RrImage, _motion: RrImage,
+    _normal_rough: RrImage, _albedo: RrImage,
+    _w: u32, _h: u32, _jx: f32, _jy: f32, _reset: bool, _delta: f32,
+) -> bool { false }
