@@ -1102,6 +1102,7 @@ void main() {
         // and refracted content gets correct virtual depth/motion and stops shimmering.
         if (rrMode) writeGuidePSR(p, ro, rd);
         vec3 tp = vec3(1.0); // throughput
+        float pathRough = 0.0; // max surface roughness seen so far (path roughness regularization)
         int glassBounces = 0; // dielectric interfaces don't spend the diffuse/specular budget
         bool isDiffuse = false; // ray has scattered diffusely -> "Is Diffuse Ray" for Light Path glass
         int glassDepth = 0;   // how many glass surfaces deep the ray is (0 = outside). Decides
@@ -1187,7 +1188,14 @@ void main() {
             vec3 diffAlbedo = albedo * (1.0 - metallic) * (1.0 - transmission);
             vec3 V = -rd;
             vec3 F0 = mix(vec3(0.04), albedo, metallic);
-            float alpha = max(roughness * roughness, 1e-3);
+            // Path roughness regularization (RTXPT-style): a glossy lobe that follows a rougher path
+            // vertex is widened to at least that roughness. Kills caustic-like firefly paths (diffuse
+            // -> glossy -> bright light) and cleans the noisy reflected content inside glossy metals,
+            // at the cost of slight bias. The primary hit (pathRough == 0) is untouched, so direct
+            // highlights and true mirrors stay sharp; only indirect glossy bounces get regularized.
+            float regRough = max(roughness, pathRough);
+            pathRough = max(pathRough, roughness); // propagate to subsequent bounces
+            float alpha = max(regRough * regRough, 1e-3);
 
             // Direct lighting (diffuse + specular glints from sun/lights, soft shadows).
             L += tp * directShade(hitPos, N, geoN, V, diffAlbedo, F0, alpha, rng);
