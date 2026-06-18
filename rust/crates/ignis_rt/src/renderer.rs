@@ -138,7 +138,9 @@ struct CameraPush {
     sun_col: [f32; 4], // rgb = color
     prev_view_proj: [f32; 16], // forward view-proj of the previous frame (DLSS motion vectors)
     jitter: [f32; 2],  // DLSS-RR sub-pixel offset from pixel center [-0.5,0.5]; 0 when RR inactive
-} // 200 bytes (push-constant max is 256 on the target GPUs)
+    emissive_count: u32, // emissive triangle count for NEE (0 = none)
+    _pad: u32,
+} // 208 bytes (push-constant max is 256 on the target GPUs)
 
 /// TLAS instance as the addon sends it (matches IgnisTLASInstance / TLASInstance, 60 bytes).
 #[repr(C)]
@@ -202,6 +204,9 @@ pub struct Renderer {
     light_buffer: Option<GpuBuffer>, // scene point/area lights, bound at binding 5
     light_count: u32,
     light_data: Vec<f32>, // last uploaded light floats (the addon re-sends every frame)
+    emissive_buffer: Option<GpuBuffer>, // emissive triangles (NEE area lights), bound at binding 16
+    emissive_count: u32,
+    emissive_data: Vec<f32>, // last uploaded emissive-tri floats (16 per tri; dedup like lights)
 
     // OCIO view-transform 3D LUT (Blender's AgX/Filmic/etc.), bound at binding 7.
     lut_image: vk::Image, // null until a LUT is uploaded
@@ -485,6 +490,19 @@ pub fn upload_lights(data: *const f32, count: u32) {
     };
     if let Some(r) = RENDERER.lock().unwrap().as_mut() {
         r.0.set_lights(floats, count);
+    }
+}
+
+/// Emissive triangles for NEE area lighting — 16 floats each, importance-sampling CDF already baked
+/// by the addon: [v0.xyz, area, v1.xyz, cdf, v2.xyz, totalPower, emission.rgb, pad].
+pub fn upload_emissive_triangles(data: *const f32, count: u32) {
+    let floats: &[f32] = if data.is_null() || count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(data, count as usize * 16) }
+    };
+    if let Some(r) = RENDERER.lock().unwrap().as_mut() {
+        r.0.set_emissive_triangles(floats, count);
     }
 }
 
@@ -1007,6 +1025,20 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                     .descriptor_count(1),
             );
         }
+        // Binding 16: emissive triangles (NEE area lights) — storage buffer, written when present.
+        bindings.push(
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(16)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        );
+        binding_flags.push(vk::DescriptorBindingFlags::PARTIALLY_BOUND);
+        pool_sizes.push(
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1),
+        );
     }
     let mut flags_info =
         vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
@@ -1297,6 +1329,9 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         light_buffer: None,
         light_count: 0,
         light_data: Vec::new(),
+        emissive_buffer: None,
+        emissive_count: 0,
+        emissive_data: Vec::new(),
         lut_image: vk::Image::null(),
         lut_alloc: None,
         lut_view: vk::ImageView::null(),
@@ -1611,6 +1646,51 @@ impl Renderer {
         self.light_buffer = Some(buf);
         self.accum_frame = 0;
         log(&format!("lights: {count} uploaded"));
+    }
+
+    fn set_emissive_triangles(&mut self, floats: &[f32], count: u32) {
+        // Re-sent every frame; skip work + accumulation reset if unchanged.
+        if count == self.emissive_count && floats == self.emissive_data.as_slice() {
+            return;
+        }
+        self.emissive_count = count;
+        self.emissive_data = floats.to_vec();
+        if count == 0 || self.accel_ext.is_none() {
+            return;
+        }
+        let device = self.device.clone();
+        let alloc = self.allocator.as_mut().unwrap();
+        if let Some(old) = self.emissive_buffer.take() {
+            old.destroy(&device, alloc);
+        }
+        let buf = match GpuBuffer::new(
+            &device,
+            alloc,
+            (count as usize * 64) as u64, // 16 floats per triangle
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            MemoryLocation::CpuToGpu,
+            "emissive_tris",
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                log(&format!("emissive alloc FAILED: {e}"));
+                return;
+            }
+        };
+        buf.write_bytes(gpu::as_bytes(floats));
+        let info = [vk::DescriptorBufferInfo::default()
+            .buffer(buf.buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.desc_set)
+            .dst_binding(16)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&info);
+        unsafe { device.update_descriptor_sets(&[write], &[]) };
+        self.emissive_buffer = Some(buf);
+        self.accum_frame = 0;
+        log(&format!("emissive triangles: {count} uploaded"));
     }
 
     /// Upload the OCIO view-transform LUT as a 3D texture (RGB -> RGBA) bound at binding 7.
@@ -2036,6 +2116,8 @@ impl Renderer {
             sun_col: [sc[0], sc[1], sc[2], self.accum_frame as f32],
             prev_view_proj: prev_vp,
             jitter,
+            emissive_count: self.emissive_count,
+            _pad: 0,
         };
         self.prev_view_proj = cur_vp;
         let range = vk::ImageSubresourceRange::default()
@@ -2695,6 +2777,9 @@ impl Drop for Renderer {
                     }
                 }
                 if let Some(b) = self.light_buffer.take() {
+                    b.destroy(&device, alloc);
+                }
+                if let Some(b) = self.emissive_buffer.take() {
                     b.destroy(&device, alloc);
                 }
                 if let Some(b) = self.world_buffer.take() {

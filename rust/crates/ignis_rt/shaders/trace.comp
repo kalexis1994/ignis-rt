@@ -55,6 +55,9 @@ layout(binding = 11, rgba16f) uniform image2D gAlbedo;      // diffuse albedo
 layout(binding = 12, rgba16f) uniform image2D gMotion;      // pixel-space backward motion vectors
 layout(binding = 13, rgba16f) uniform image2D gNoisy;       // noisy 1-spp linear color (DLSS-RR input)
 layout(binding = 15, rgba16f) uniform image2D gSpecAlbedo;  // specular albedo (EnvBRDFApprox, DLSS-RR)
+// Emissive triangles for NEE (area lights from geometry); 4 vec4 per tri, CDF baked by the addon:
+// [0]=(v0.xyz, area) [1]=(v1.xyz, cdf) [2]=(v2.xyz, totalPower) [3]=(emission.xyz, pad).
+layout(binding = 16, std430) readonly buffer EmissiveTris { vec4 data[]; } emissiveTris;
 
 layout(push_constant) uniform PC {
     mat4  invViewProj;
@@ -66,6 +69,7 @@ layout(push_constant) uniform PC {
     vec4  sunCol; // rgb color, w = accumulated frame index
     mat4  prevViewProj; // forward view-proj of the previous frame (DLSS motion vectors)
     vec2  jitter;       // DLSS-RR: deterministic sub-pixel offset from pixel center [-0.5,0.5]
+    uint  emissiveCount; // number of emissive triangles for NEE (0 = none)
 } pc;
 
 // Write the DLSS guide buffers for the primary hit at pixel p. depth = linear view-space distance
@@ -919,6 +923,37 @@ void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
     }
 }
 
+// One sampled point on an emissive triangle (area-measure pdf), for NEE area lighting.
+struct EmissiveSample { vec3 position; vec3 emission; vec3 normal; float pdf; float area; };
+
+// Importance-sample an emissive triangle by power (CDF baked by the addon), then a uniform point on
+// it. pdf is in area measure (triProb / area). Ported from the C++ sampleEmissiveTriangle.
+EmissiveSample sampleEmissiveTriangle(uint triCount, float r, vec2 baryRnd) {
+    EmissiveSample s;
+    s.pdf = 0.0; s.emission = vec3(0.0); s.normal = vec3(0,1,0); s.position = vec3(0.0); s.area = 0.0;
+    if (triCount == 0u) return s;
+    uint lo = 0u, hi = triCount - 1u;
+    while (lo < hi) {
+        uint mid = (lo + hi) / 2u;
+        if (r <= emissiveTris.data[mid * 4u + 1u].w) hi = mid; else lo = mid + 1u; // .w = cdf
+    }
+    uint base = lo * 4u;
+    vec4 d0 = emissiveTris.data[base + 0u]; // v0.xyz, area
+    vec4 d1 = emissiveTris.data[base + 1u]; // v1.xyz, cdf
+    vec4 d2 = emissiveTris.data[base + 2u]; // v2.xyz, totalPower
+    vec3 v0 = d0.xyz, v1 = d1.xyz, v2 = d2.xyz;
+    s.area = d0.w;
+    s.emission = emissiveTris.data[base + 3u].xyz;
+    float prevCdf = (lo > 0u) ? emissiveTris.data[(lo - 1u) * 4u + 1u].w : 0.0;
+    float triProb = d1.w - prevCdf;
+    float u = baryRnd.x, v = baryRnd.y;
+    if (u + v > 1.0) { u = 1.0 - u; v = 1.0 - v; }
+    s.position = v0 * (1.0 - u - v) + v1 * u + v2 * v;
+    s.normal = normalize(cross(v1 - v0, v2 - v0));
+    s.pdf = (s.area > 0.0) ? triProb / s.area : 0.0;
+    return s;
+}
+
 // Direct lighting (NEE): sun + scene lights, each shadow-tested, with full diffuse+GGX BRDF
 // so glossy/metal surfaces get specular highlights (glints) from the lights.
 vec3 directShade(vec3 hitPos, vec3 N, vec3 geoN, vec3 V, vec3 diffAlbedo, vec3 F0, float alpha, inout uint rng) {
@@ -983,6 +1018,27 @@ vec3 directShade(vec3 hitPos, vec3 N, vec3 geoN, vec3 V, vec3 diffAlbedo, vec3 F
         if (nl <= 0.0 || occluded(o, Ldir, dist - 0.01)) continue;
         vec3 Li = L.colInt.rgb * L.colInt.w * spotAtten / (dist*dist + 1e-3);
         sum += brdf(N, V, Ldir, diffAlbedo, F0, alpha) * Li * nl;
+    }
+    // Emissive triangle NEE (area lights from geometry), power-importance-sampled with a power-
+    // heuristic MIS against the BSDF. Without this, an emissive panel is only seen when a path ray
+    // randomly hits it -> very noisy. The BSDF-side emission stays unweighted (matches the C++); the
+    // light-side MIS weight cancels most of the resulting double count.
+    if (pc.emissiveCount > 0u) {
+        EmissiveSample es = sampleEmissiveTriangle(pc.emissiveCount, rnd(rng), rand2(rng));
+        if (es.pdf > 0.0) {
+            vec3 toE = es.position - o;
+            float eDist = length(toE);
+            vec3 eDir = toE / max(eDist, 1e-4);
+            float eNdotL = max(dot(N, eDir), 0.0);
+            float eCos = dot(-eDir, es.normal); // emitter facing the shading point
+            if (eNdotL > 0.0 && eCos > 0.0 && eDist > 0.01 && !occluded(o, eDir, eDist - 0.01)) {
+                vec3 eRadiance = es.emission * eCos / (eDist * eDist);
+                float bsdfPdf  = eNdotL / PI;                       // diffuse cosine pdf
+                float lightPdf = es.pdf * eDist * eDist / eCos;     // area -> solid-angle pdf
+                float mis = (lightPdf * lightPdf) / (lightPdf * lightPdf + bsdfPdf * bsdfPdf + 1e-8);
+                sum += brdf(N, V, eDir, diffAlbedo, F0, alpha) * eNdotL * eRadiance * mis / max(es.pdf, 1e-6);
+            }
+        }
     }
     return sum;
 }

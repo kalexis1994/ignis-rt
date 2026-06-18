@@ -309,7 +309,9 @@ pub extern "C" fn ignis_upload_lights(light_data: *const f32, light_count: u32) 
 }
 
 #[no_mangle]
-pub extern "C" fn ignis_upload_emissive_triangles(_data: *const f32, _triangle_count: u32) {}
+pub extern "C" fn ignis_upload_emissive_triangles(data: *const f32, triangle_count: u32) {
+    renderer::upload_emissive_triangles(data, triangle_count);
+}
 
 /// Accept the baked tonemap LUT (size^3 RGB triples) and stash it for later GPU upload.
 #[no_mangle]
