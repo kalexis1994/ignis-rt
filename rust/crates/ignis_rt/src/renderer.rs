@@ -267,6 +267,9 @@ pub struct Renderer {
     queue_family: u32,
     rt_supported: bool,
     rtx_series: u32,
+    ser: bool, // Shader Execution Reordering active (sets hasTlas bit4)
+    ft_ema: f32, // GPU frame time EMA (ms), for perf measurement
+    ft_count: u32,
     width: u32,
     height: u32,
 }
@@ -658,12 +661,15 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
             c"VK_KHR_push_descriptor",
             c"VK_NVX_binary_import",
             c"VK_NVX_image_view_handle",
+            // Shader Execution Reordering (perf): required by trace.rgen's reorderThreadNV.
+            c"VK_NV_ray_tracing_invocation_reorder",
         ] {
             if has(n) {
                 dev_ext_ptrs.push(n.as_ptr());
             }
         }
     }
+    let has_ser = rt_supported && has(c"VK_NV_ray_tracing_invocation_reorder");
 
     let supported = unsafe { instance.get_physical_device_features(pd) };
     let mut base = vk::PhysicalDeviceFeatures::default();
@@ -689,6 +695,8 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     // (needed for the Node VM bytecode at offset 156, which std430 would misalign).
     let mut f_scalar =
         vk::PhysicalDeviceScalarBlockLayoutFeatures::default().scalar_block_layout(true);
+    let mut f_ser = vk::PhysicalDeviceRayTracingInvocationReorderFeaturesNV::default()
+        .ray_tracing_invocation_reorder(true);
 
     let prio = [1.0f32];
     let q_ci = [vk::DeviceQueueCreateInfo::default()
@@ -708,6 +716,9 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
             .push_next(&mut f_bda)
             .push_next(&mut f_ai)
             .push_next(&mut f_scalar);
+        if has_ser {
+            dci = dci.push_next(&mut f_ser);
+        }
     }
 
     let device = unsafe { instance.create_device(pd, &dci, None) }
@@ -1435,10 +1446,17 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         queue_family,
         rt_supported,
         rtx_series,
+        // Toggle to A/B the Shader Execution Reordering perf (no shader recompile — gates the bit).
+        ser: has_ser && SER_ENABLED,
+        ft_ema: 0.0,
+        ft_count: 0,
         width,
         height,
     })
 }
+
+/// Master switch for Shader Execution Reordering — flip to false to measure the baseline.
+const SER_ENABLED: bool = true;
 
 impl Renderer {
     fn queue_mesh(
@@ -2172,7 +2190,8 @@ impl Renderer {
             has_tlas: (self.tlas.is_some() as u32)
                 | (if self.has_lut { 2 } else { 0 })
                 | (if write_guide { 4 } else { 0 }) // bit2 = emit DLSS guide buffers
-                | (if use_rr { 8 } else { 0 }),     // bit3 = DLSS-RR mode (noisy linear out)
+                | (if use_rr { 8 } else { 0 })      // bit3 = DLSS-RR mode (noisy linear out)
+                | (if self.ser { 16 } else { 0 }),  // bit4 = Shader Execution Reordering
             num_lights: self.light_count,
             sun_dir: [az.sin() * el.cos(), el.sin(), az.cos() * el.cos(), intensity],
             sun_col: [sc[0], sc[1], sc[2], self.accum_frame as f32],
@@ -2427,8 +2446,22 @@ impl Renderer {
 
             let _ = d.end_command_buffer(self.cmd);
             let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd));
+            // GPU frame time: render() submits then blocks on the fence, so wall-clock around the
+            // wait ~= GPU work. EMA-smoothed; logged periodically to compare SER on vs off.
+            let t0 = std::time::Instant::now();
             let _ = d.queue_submit(self.queue, &[submit], self.fence);
             let _ = d.wait_for_fences(&[self.fence], true, u64::MAX);
+            let ms = t0.elapsed().as_secs_f32() * 1000.0;
+            self.ft_ema = if self.ft_ema <= 0.0 { ms } else { self.ft_ema * 0.9 + ms * 0.1 };
+            self.ft_count = self.ft_count.wrapping_add(1);
+            if self.ft_count % 60 == 0 {
+                log(&format!(
+                    "frame time: {:.2} ms ({:.0} fps), SER {}",
+                    self.ft_ema,
+                    1000.0 / self.ft_ema.max(1e-3),
+                    if self.ser { "on" } else { "off" }
+                ));
+            }
         }
         self.accum_frame = self.accum_frame.wrapping_add(1);
     }
