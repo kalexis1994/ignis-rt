@@ -231,6 +231,7 @@ pub struct Renderer {
     // DLSS guide buffers (bindings 9-12), written by the path tracer at the primary hit.
     guide: Option<GuideBuffers>,
     prev_view_proj: [f32; 16], // forward view-proj of the previous frame (motion vectors)
+    rr: Option<crate::ngx::RrFeature>, // DLSS Ray Reconstruction feature (None if unsupported)
 
     // Offscreen target + readback.
     offscreen_image: vk::Image,
@@ -341,9 +342,13 @@ pub fn create(width: u32, height: u32) -> bool {
 }
 
 pub fn destroy() {
-    if let Some(r) = RENDERER.lock().unwrap().take() {
+    if let Some(mut r) = RENDERER.lock().unwrap().take() {
         use ash::vk::Handle;
-        crate::ngx::shutdown(r.0.device.handle().as_raw()); // before the device is destroyed
+        unsafe { let _ = r.0.device.device_wait_idle(); }
+        if let Some(rr) = r.0.rr.take() {
+            crate::ngx::release_rr(rr); // release the RR feature before NGX shutdown / device destroy
+        }
+        crate::ngx::shutdown(r.0.device.handle().as_raw());
         log("ignis_destroy: renderer torn down");
     }
 }
@@ -600,6 +605,13 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
             ash::ext::descriptor_indexing::NAME,
             ash::khr::spirv_1_4::NAME,
             ash::khr::shader_float_controls::NAME,
+            // NGX/DLSS required device extensions (CUDA interop) — without these, NGX feature
+            // creation fails with NotInitialized. Match vk_context.cpp.
+            c"VK_KHR_external_memory",
+            c"VK_KHR_external_memory_win32",
+            c"VK_KHR_push_descriptor",
+            c"VK_NVX_binary_import",
+            c"VK_NVX_image_view_handle",
         ] {
             if has(n) {
                 dev_ext_ptrs.push(n.as_ptr());
@@ -661,10 +673,14 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     {
         use ash::vk::Handle;
         let base = crate::config::base_path();
+        let gipa = entry.static_fn().get_instance_proc_addr as *const std::ffi::c_void;
+        let gdpa = instance.fp_v1_0().get_device_proc_addr as *const std::ffi::c_void;
         crate::ngx::init(
             instance.handle().as_raw(),
             pd.as_raw(),
             device.handle().as_raw(),
+            gipa,
+            gdpa,
             if base.is_empty() { "." } else { &base },
         );
     }
@@ -1097,6 +1113,36 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
         .map_err(|e| format!("create_fence: {e}"))?;
 
+    // Create the DLSS Ray Reconstruction feature (RT devices only). NGX records initialization
+    // into a one-shot command buffer that we submit + wait on here. Falls back to None on failure.
+    let rr = if rt_supported {
+        use ash::vk::Handle;
+        unsafe {
+            let _ = device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            );
+            let feat = crate::ngx::create_rr(
+                device.handle().as_raw(),
+                cmd.as_raw(),
+                width,
+                height,
+            );
+            let _ = device.end_command_buffer(cmd);
+            let _ = device.reset_fences(&[fence]);
+            let _ = device.queue_submit(
+                queue,
+                &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))],
+                fence,
+            );
+            let _ = device.wait_for_fences(&[fence], true, u64::MAX);
+            feat
+        }
+    } else {
+        None
+    };
+
     let tex_sampler = unsafe {
         device.create_sampler(
             &vk::SamplerCreateInfo::default()
@@ -1189,6 +1235,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         prev_view: [0.0; 16],
         guide,
         prev_view_proj: [0.0; 16],
+        rr,
         offscreen_image,
         offscreen_alloc: Some(offscreen_alloc),
         readback_buffer,
