@@ -183,6 +183,7 @@ struct GuideBuffers {
     motion: (vk::Image, Allocation, vk::ImageView),       // RGBA16F pixel-space motion vectors (binding 12)
     noisy: (vk::Image, Allocation, vk::ImageView),        // RGBA16F noisy 1-spp linear color (binding 13)
     clean: (vk::Image, Allocation, vk::ImageView),        // RGBA16F NGX denoised linear color (binding 14)
+    spec_albedo: (vk::Image, Allocation, vk::ImageView),  // RGBA16F specular albedo / EnvBRDF (binding 15)
 }
 
 pub struct Renderer {
@@ -381,17 +382,25 @@ pub fn set_camera(view_inverse: &[f32], proj_inverse: &[f32]) {
         let vi = glam::Mat4::from_cols_slice(&view_inverse[..16]);
         let pi = glam::Mat4::from_cols_slice(&proj_inverse[..16]);
         // inverse(proj*view) = viewInverse * projInverse
-        // Reset accumulation only on real camera movement — compare the view-inverse
-        // (camera world transform), NOT invViewProj, which the addon jitters every frame
-        // for sub-pixel sampling. Letting the jitter through actually supersamples (AA).
+        // Compare the view-inverse (camera world transform), NOT invViewProj, which the addon
+        // jitters every frame for sub-pixel sampling.
         let view = view_inverse[..16].to_vec();
-        if view
+        let moved = view
             .iter()
             .zip(r.0.prev_view.iter())
-            .any(|(a, b)| (a - b).abs() > 1e-6)
-        {
-            r.0.accum_frame = 0;
+            .any(|(a, b)| (a - b).abs() > 1e-6);
+        if moved {
             r.0.prev_view.copy_from_slice(&view);
+            // With DLSS-RR driving the image, camera motion is handled by the motion vectors + the
+            // denoiser's internal disocclusion (RTXDI just increments frameIndex — it never resets
+            // accumulation on camera movement). Resetting here would (a) discard RR history AND
+            // (b) force prev_view_proj == current, zeroing the motion vectors, so the frame visibly
+            // rebuilds while moving. Genuine discontinuities (geometry/material/world changes) still
+            // reset elsewhere. Only the non-RR accumulation path needs the per-move reset.
+            let rr_active = r.0.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0;
+            if !rr_active {
+                r.0.accum_frame = 0;
+            }
         }
         r.0.inv_view_proj = (vi * pi).to_cols_array();
         r.0.cam_pos = vi.w_axis.to_array();
@@ -824,6 +833,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
             motion: create_storage_image(&device, &mut allocator, width, height, f16, "g_motion")?,
             noisy: create_storage_image(&device, &mut allocator, width, height, f16, "g_noisy")?,
             clean: create_storage_image(&device, &mut allocator, width, height, f16, "g_clean")?,
+            spec_albedo: create_storage_image(&device, &mut allocator, width, height, f16, "g_specalb")?,
         })
     } else {
         None
@@ -980,8 +990,9 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .descriptor_count(1),
         );
         // Bindings 9-12: DLSS guide buffers (depth, normal+rough, albedo, motion); 13 = noisy color
-        // (trace writes, NGX reads); 14 = clean color (NGX writes, tonemap reads). All storage images.
-        for b in 9u32..=14u32 {
+        // (trace writes, NGX reads); 14 = clean color (NGX writes, tonemap reads); 15 = specular
+        // albedo (trace writes, NGX reads). All storage images.
+        for b in 9u32..=15u32 {
             bindings.push(
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(b)
@@ -1052,6 +1063,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     };
     let noisy_info = guide.as_ref().map(|g| gi(g.noisy.2)).unwrap_or_default();
     let clean_info = guide.as_ref().map(|g| gi(g.clean.2)).unwrap_or_default();
+    let specalb_info = guide.as_ref().map(|g| gi(g.spec_albedo.2)).unwrap_or_default();
     if rt_supported {
         writes.push(
             vk::WriteDescriptorSet::default()
@@ -1089,6 +1101,13 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .dst_binding(14)
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(&clean_info),
+        );
+        writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(desc_set)
+                .dst_binding(15)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&specalb_info),
         );
     }
     unsafe { device.update_descriptor_sets(&writes, &[]) };
@@ -1988,13 +2007,22 @@ impl Renderer {
             && write_guide
             && crate::config::get_int("dlss_rr_enabled") != 0;
         crate::config::set_int("dlss_rr_active", use_rr as i32);
-        // Deterministic Halton(2,3) sub-pixel jitter (offset from pixel center), fed to both the ray
-        // generation and NGX so the denoiser knows the exact sample positions.
-        let jitter = if use_rr {
-            let idx = self.accum_frame % 16 + 1;
-            [halton(idx, 2) - 0.5, halton(idx, 3) - 0.5]
+        // Deterministic Halton(2,3) sub-pixel jitter, scaled by camera_jitter_scale (C++ default
+        // 0.75 — full 1.0 leaves a visible surface shimmer DLSS-RR can't fully resolve). The ray gen
+        // uses (jx, jy); NGX is told (jx, -jy) because the shader flips Y going screen-UV -> NDC
+        // (1 - uv.y*2). Matches the C++: jitterData = (jitterX, -jitterY), same value to projection
+        // and NGX. `jitter` -> shader push, `ngx_jitter` -> NGX eval.
+        let (jitter, ngx_jitter) = if use_rr {
+            let scale = {
+                let s = crate::config::get_float("camera_jitter_scale");
+                if s <= 0.0 { 0.75 } else { s.min(1.0) }
+            };
+            let idx = self.accum_frame % 256 + 1;
+            let jx = (halton(idx, 2) - 0.5) * scale;
+            let jy = (halton(idx, 3) - 0.5) * scale;
+            ([jx, jy], [jx, -jy])
         } else {
-            [0.0, 0.0]
+            ([0.0, 0.0], [0.0, 0.0])
         };
         let push = CameraPush {
             inv_view_proj: self.inv_view_proj,
@@ -2047,7 +2075,7 @@ impl Renderer {
             // Guide buffers: discard last frame and make them writable (regenerated every frame).
             let mut barriers = vec![to_general, accum_bar];
             if let Some(g) = &self.guide {
-                for img in [g.depth.0, g.normal_rough.0, g.albedo.0, g.motion.0, g.noisy.0, g.clean.0] {
+                for img in [g.depth.0, g.normal_rough.0, g.albedo.0, g.motion.0, g.noisy.0, g.clean.0, g.spec_albedo.0] {
                     barriers.push(
                         vk::ImageMemoryBarrier::default()
                             .old_layout(vk::ImageLayout::UNDEFINED)
@@ -2130,10 +2158,11 @@ impl Renderer {
                     img(&g.motion, f16),
                     img(&g.normal_rough, f16),
                     img(&g.albedo, f16),
+                    img(&g.spec_albedo, f16),
                     self.width,
                     self.height,
-                    jitter[0],
-                    jitter[1],
+                    ngx_jitter[0],
+                    ngx_jitter[1],
                     self.accum_frame <= 1, // reset history on a fresh accumulation (matches C++)
                     16.6,                   // nominal frame delta (ms); static viewport accumulation
                 );
@@ -2659,7 +2688,7 @@ impl Drop for Renderer {
                 }
                 if let Some(g) = self.guide.take() {
                     for (image, galloc, view) in
-                        [g.depth, g.normal_rough, g.albedo, g.motion, g.noisy, g.clean]
+                        [g.depth, g.normal_rough, g.albedo, g.motion, g.noisy, g.clean, g.spec_albedo]
                     {
                         device.destroy_image_view(view, None);
                         device.destroy_image(image, None);

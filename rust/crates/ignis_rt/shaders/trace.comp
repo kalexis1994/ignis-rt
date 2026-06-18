@@ -54,6 +54,7 @@ layout(binding = 10, rgba16f) uniform image2D gNormalRough; // rgb = world norma
 layout(binding = 11, rgba16f) uniform image2D gAlbedo;      // diffuse albedo
 layout(binding = 12, rgba16f) uniform image2D gMotion;      // pixel-space backward motion vectors
 layout(binding = 13, rgba16f) uniform image2D gNoisy;       // noisy 1-spp linear color (DLSS-RR input)
+layout(binding = 15, rgba16f) uniform image2D gSpecAlbedo;  // specular albedo (EnvBRDFApprox, DLSS-RR)
 
 layout(push_constant) uniform PC {
     mat4  invViewProj;
@@ -69,7 +70,27 @@ layout(push_constant) uniform PC {
 
 // Write the DLSS guide buffers for the primary hit at pixel p. depth = linear view-space distance
 // (projection of the hit onto the camera forward); motion = where this world point was last frame.
-void writeGuide(uvec2 p, vec3 worldPos, vec3 N, float roughness, vec3 albedo) {
+// EnvBRDFApprox — Epic/Karis split-sum specular albedo. DLSS-RR demodulates the specular lobe by
+// this; without it (or with diffuse albedo as a stand-in) specular/glass reflections shimmer.
+vec3 EnvBRDFApprox(vec3 F0, float roughness, float NdotV) {
+    const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+    const vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
+    vec4 r = roughness * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * NdotV)) * r.x + r.y;
+    vec2 AB = vec2(-1.04, 1.04) * a004 + r.zw;
+    return F0 * AB.x + vec3(AB.y);
+}
+
+// Householder reflection matrix I - 2*n*n^T (symmetric, so column/row major agree). Accumulated
+// across mirror bounces in PSR so the reflected surface's normal is transformed into virtual space.
+mat3 mirrorMatrix(vec3 n) {
+    return mat3(
+        1.0 - 2.0*n.x*n.x,      -2.0*n.x*n.y,      -2.0*n.x*n.z,
+             -2.0*n.x*n.y, 1.0 - 2.0*n.y*n.y,      -2.0*n.y*n.z,
+             -2.0*n.x*n.z,      -2.0*n.y*n.z, 1.0 - 2.0*n.z*n.z);
+}
+
+void writeGuide(uvec2 p, vec3 worldPos, vec3 N, float roughness, vec3 albedo, vec3 specAlbedo) {
     if ((pc.hasTlas & 4u) == 0u) return;
     // DLSS-RR depth: linear view-space depth (distance along the camera forward axis). The RR path
     // uses linear depth (Use_HW_Depth=0), unlike DLSS-SR which uses NDC depth. Matches the C++
@@ -89,6 +110,7 @@ void writeGuide(uvec2 p, vec3 worldPos, vec3 N, float roughness, vec3 albedo) {
     imageStore(gNormalRough,ivec2(p), vec4(N, roughness));
     imageStore(gAlbedo,     ivec2(p), vec4(albedo, 1.0));
     imageStore(gMotion,     ivec2(p), vec4(mv, 0.0, 0.0));
+    imageStore(gSpecAlbedo, ivec2(p), vec4(specAlbedo, 0.0));
 }
 
 const float PI = 3.14159265;
@@ -925,6 +947,70 @@ vec3 directShade(vec3 hitPos, vec3 N, vec3 geoN, vec3 V, vec3 diffAlbedo, vec3 F
     return sum;
 }
 
+// Primary Surface Replacement (PSR) for the DLSS-RR guides. A deterministic walk of the mirror/
+// glass chain from the camera: while the surface is a smooth delta (perfect mirror or glass/
+// transparent), keep following the reflection/refraction without recording; record the guides at
+// the first non-delta (diffuse/rough) surface, at the *virtual* unfolded position
+// (camPos + totalPathDistance * primaryRayDir). Because writeGuide() derives depth + motion from
+// that world position, the denoiser then reprojects the reflected content (noisy) instead of the
+// static mirror (which made reflections shimmer). Ported in spirit from RTXDI PSRUtils.hlsli.
+// Kept separate from the stochastic colour path: PSR must be deterministic or it jitters itself.
+void writeGuidePSR(uvec2 p, vec3 ro, vec3 rd) {
+    if ((pc.hasTlas & 4u) == 0u) return;
+    vec3 primaryRd = rd;
+    float pathDist = 0.0;
+    mat3 mirrorMat = mat3(1.0);
+    for (int b = 0; b < 6; b++) {
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ro, 0.001, rd, 1e30);
+        while (rayQueryProceedEXT(rq)) {}
+        if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+            // Escaped to the sky: a far virtual surface straight along the unfolded direction.
+            writeGuide(p, pc.camPos.xyz + (pathDist + 1e5) * primaryRd, -primaryRd, 1.0, vec3(0.0), vec3(0.0));
+            return;
+        }
+        uint id   = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
+        uint prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+        vec2 bc   = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+        float thit = rayQueryGetIntersectionTEXT(rq, true);
+        mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+        vec3 N, albedo, emission, geoN;
+        float roughness, metallic, ior, transmission, transparentProb;
+        bool frontFace, lightPathTransparent;
+        vec2 surfUV; float surfAlpha;
+        getSurface(id, prim, bc, o2w, rd, N, albedo, roughness, metallic, emission, ior, transmission, frontFace, geoN, lightPathTransparent, transparentProb, surfUV, surfAlpha);
+        vec3 hitPos = ro + rd * thit;
+        pathDist += thit;
+
+        bool smoothSurf = roughness < 0.05;
+        bool isMirror = smoothSurf && metallic > 0.9;
+        // Glass/architectural-transparent/alpha-cutout: the visible content is what's behind, so
+        // unfold straight through (the small refraction bend is a refinement we skip for the guide).
+        bool seeThrough = (smoothSurf && transmission > 0.5) || transparentProb > 0.0 || surfAlpha < 0.5;
+
+        if (isMirror) {
+            mirrorMat = mirrorMat * mirrorMatrix(N);
+            rd = reflect(rd, N);
+            ro = hitPos + rd * 0.001;
+            continue;
+        }
+        if (seeThrough) {
+            ro = hitPos + rd * 0.001; // straight through, keep direction
+            continue;
+        }
+        // First non-delta surface: record the guides at the virtual (unfolded) position.
+        vec3 vpos = pc.camPos.xyz + pathDist * primaryRd;
+        vec3 vN = normalize(mirrorMat * N);
+        vec3 F0 = mix(vec3(0.04), albedo, metallic);
+        float NdotV = max(dot(N, -rd), 1e-3);
+        vec3 specAlb = EnvBRDFApprox(F0, roughness, NdotV);
+        writeGuide(p, vpos, vN, roughness, albedo, specAlb);
+        return;
+    }
+    // Too many delta bounces: fall back to the deepest virtual position (rough/far).
+    writeGuide(p, pc.camPos.xyz + pathDist * primaryRd, -primaryRd, 1.0, vec3(0.0), vec3(0.0));
+}
+
 void main() {
     uvec2 p = gl_GlobalInvocationID.xy;
     if (p.x >= pc.dims.x || p.y >= pc.dims.y) return;
@@ -948,6 +1034,9 @@ void main() {
         world /= world.w;
         vec3 ro = pc.camPos.xyz;
         vec3 rd = normalize(world.xyz - ro);
+        // DLSS-RR guide buffers: a separate deterministic PSR walk (mirror/glass aware), so reflected
+        // and refracted content gets correct virtual depth/motion and stops shimmering.
+        if (rrMode) writeGuidePSR(p, ro, rd);
         vec3 tp = vec3(1.0); // throughput
         int glassBounces = 0; // dielectric interfaces don't spend the diffuse/specular budget
         bool isDiffuse = false; // ray has scattered diffusely -> "Is Diffuse Ray" for Light Path glass
@@ -960,7 +1049,6 @@ void main() {
             rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ro, 0.001, rd, 1e30);
             while (rayQueryProceedEXT(rq)) {}
             if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
-                if (b == 0) writeGuide(p, pc.camPos.xyz + rd * 1e5, -rd, 1.0, vec3(0.0)); // sky: far depth
                 if (DEBUG_PATH && b == 0) { L = vec3(0.0, 0.0, 1.0); break; } // blue = sky
                 L += tp * sky(rd); // ray escaped to the sky
                 break;
@@ -1018,8 +1106,8 @@ void main() {
                 continue;
             }
 
-            // DLSS guide buffers: this is the first visible opaque surface (the primary hit).
-            if (b == 0) writeGuide(p, hitPos, N, roughness, albedo);
+            // DLSS-RR guide buffers are written by writeGuidePSR (a separate deterministic PSR walk
+            // started before this loop), not here — the stochastic colour path would jitter them.
 
             // DEBUG: visualize the surface UV of the primary hit (red=U, green=V, tiled). A clean
             // per-island gradient = correct UVs; noise/garbage = wrong UV layer or broken UV data.

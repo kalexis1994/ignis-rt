@@ -235,6 +235,7 @@ pub fn evaluate_rr(
     motion: RrImage,
     normal_rough: RrImage, // normals (rgb) + roughness packed in .a
     albedo: RrImage,       // diffuse albedo
+    spec_albedo: RrImage,  // specular albedo (EnvBRDFApprox)
     width: u32,
     height: u32,
     jitter_x: f32,
@@ -270,6 +271,7 @@ pub fn evaluate_rr(
     let mut r_motion = mk(motion, false);
     let mut r_normal = mk(normal_rough, false);
     let mut r_albedo = mk(albedo, false);
+    let mut r_specalb = mk(spec_albedo, false);
 
     let p = rr.params;
     let set_ptr = |n: &str, r: *mut ResourceVk| { let c = CString::new(n).unwrap(); unsafe { NVSDK_NGX_Parameter_SetVoidPointer(p, c.as_ptr(), r as *mut c_void) }; };
@@ -284,7 +286,7 @@ pub fn evaluate_rr(
     set_ptr("GBuffer.Normals", &mut r_normal);
     set_ptr("GBuffer.Roughness", &mut r_normal);      // roughness packed in normals.a
     set_ptr("DLSS.Input.DiffuseAlbedo", &mut r_albedo);
-    set_ptr("DLSS.Input.SpecularAlbedo", &mut r_albedo); // no separate spec albedo yet: reuse diffuse
+    set_ptr("DLSS.Input.SpecularAlbedo", &mut r_specalb); // EnvBRDFApprox specular albedo
     set_f("Jitter.Offset.X", jitter_x);
     set_f("Jitter.Offset.Y", jitter_y);
     set_i("Reset", reset as i32);
@@ -347,6 +349,6 @@ pub struct RrImage { pub view: u64, pub image: u64, pub format: i32 }
 pub fn evaluate_rr(
     _cmd: u64, _rr: &RrFeature,
     _color: RrImage, _output: RrImage, _depth: RrImage, _motion: RrImage,
-    _normal_rough: RrImage, _albedo: RrImage,
+    _normal_rough: RrImage, _albedo: RrImage, _spec_albedo: RrImage,
     _w: u32, _h: u32, _jx: f32, _jy: f32, _reset: bool, _delta: f32,
 ) -> bool { false }
