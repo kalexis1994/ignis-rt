@@ -273,6 +273,7 @@ pub struct Renderer {
     ser: bool, // Shader Execution Reordering active (sets hasTlas bit4)
     ft_ema: f32, // GPU frame time EMA (ms), for perf measurement
     ft_count: u32,
+    last_render: Option<std::time::Instant>, // for the real frame delta fed to DLSS-RR
     width: u32,
     height: u32,
 }
@@ -1516,6 +1517,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         ser: has_ser && SER_ENABLED,
         ft_ema: 0.0,
         ft_count: 0,
+        last_render: None,
         width,
         height,
     })
@@ -2184,6 +2186,14 @@ impl Renderer {
     }
 
     fn render(&mut self) {
+        // Real frame-to-frame delta for DLSS-RR's temporal feedback. A constant value (we used 16.6)
+        // mistunes the denoiser when the actual frame time is much larger -> contributes to boiling.
+        let now = std::time::Instant::now();
+        let frame_delta_ms = self
+            .last_render
+            .map(|t| (now.duration_since(t).as_secs_f32() * 1000.0).clamp(1.0, 200.0))
+            .unwrap_or(16.6);
+        self.last_render = Some(now);
         // World buffer: background color (color*strength*0.15) + HDRI params, set by the addon.
         // HDRI is uploaded into the bindless texture array; we just need its index + strength.
         let wd = [
@@ -2472,7 +2482,7 @@ impl Renderer {
                     ngx_jitter[0],
                     ngx_jitter[1],
                     self.accum_frame <= 1, // reset history on a fresh accumulation (matches C++)
-                    16.6,                   // nominal frame delta (ms); static viewport accumulation
+                    frame_delta_ms,         // real frame delta (ms) for DLSS-RR temporal feedback
                 );
                 // NGX's clean output -> tonemap reads.
                 d.cmd_pipeline_barrier(
