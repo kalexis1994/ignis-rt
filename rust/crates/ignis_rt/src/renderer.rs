@@ -230,6 +230,9 @@ pub struct Renderer {
     rt_pipeline_ext: Option<ash::khr::ray_tracing_pipeline::Device>, // vkCmdTraceRaysKHR etc.
     sbt_buffer: Option<GpuBuffer>, // shader binding table (one raygen record)
     sbt_region: vk::StridedDeviceAddressRegionKHR, // raygen region for traceRays
+    env_buffer: Option<GpuBuffer>, // HDRI luminance distribution (binding 16->17), env importance sampling
+    env_pipeline: Option<vk::Pipeline>, // env_cdf.comp prepass (compute, shares pipeline_layout)
+    env_dirty: bool, // rebuild the env distribution before the next trace (world/HDRI changed)
     inv_view_proj: [f32; 16],
     cam_pos: [f32; 4],
 
@@ -1040,19 +1043,22 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
             );
         }
         // Binding 16: emissive triangles (NEE area lights) — storage buffer, written when present.
-        bindings.push(
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(16)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::COMPUTE),
-        );
-        binding_flags.push(vk::DescriptorBindingFlags::PARTIALLY_BOUND);
-        pool_sizes.push(
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1),
-        );
+        // Binding 17: environment (HDRI) luminance distribution — built by env_cdf.comp, read by trace.
+        for b in 16u32..=17u32 {
+            bindings.push(
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(b)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::COMPUTE),
+            );
+            binding_flags.push(vk::DescriptorBindingFlags::PARTIALLY_BOUND);
+            pool_sizes.push(
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1),
+            );
+        }
     }
     let mut flags_info =
         vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
@@ -1292,6 +1298,58 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         None
     };
 
+    // Environment (HDRI) importance-sampling distribution: a storage buffer (binding 17) built by the
+    // env_cdf.comp prepass (compute, shares the pipeline layout). Sized for the 256x128 Distribution2D.
+    let (env_buffer, env_pipeline) = if rt_supported {
+        const ENV_W: u64 = 256;
+        const ENV_H: u64 = 128;
+        let env_floats = 1 + ENV_H + ENV_H * ENV_W + ENV_H * ENV_W;
+        let buf = GpuBuffer::new(
+            &device,
+            &mut allocator,
+            env_floats * 4,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            MemoryLocation::GpuOnly,
+            "env_dist",
+        )
+        .map_err(|e| format!("env buffer: {e}"))?;
+        let info = [vk::DescriptorBufferInfo::default()
+            .buffer(buf.buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(17)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&info);
+        unsafe { device.update_descriptor_sets(&[write], &[]) };
+
+        let espv = ash::util::read_spv(&mut std::io::Cursor::new(
+            &include_bytes!(concat!(env!("OUT_DIR"), "/env_cdf.comp.spv"))[..],
+        ))
+        .map_err(|e| format!("read env_cdf spv: {e}"))?;
+        let emod = unsafe {
+            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&espv), None)
+        }
+        .map_err(|e| format!("env_cdf module: {e}"))?;
+        let estage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(emod)
+            .name(c"main");
+        let ep = unsafe {
+            device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo::default().stage(estage).layout(pipeline_layout)],
+                None,
+            )
+        }
+        .map_err(|(_, e)| format!("env_cdf pipeline: {e}"))?[0];
+        unsafe { device.destroy_shader_module(emod, None) };
+        (Some(buf), Some(ep))
+    } else {
+        (None, None)
+    };
+
     let cmd = unsafe {
         device.allocate_command_buffers(
             &vk::CommandBufferAllocateInfo::default()
@@ -1424,6 +1482,9 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         rt_pipeline_ext,
         sbt_buffer,
         sbt_region,
+        env_buffer,
+        env_pipeline,
+        env_dirty: true, // build the env distribution before the first frame
         inv_view_proj: [0.0; 16],
         cam_pos: [0.0; 4],
         accum_image,
@@ -1462,6 +1523,9 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
 
 /// Master switch for Shader Execution Reordering — flip to false to measure the baseline.
 const SER_ENABLED: bool = true;
+/// HDRI environment importance sampling (cleaner HDRI lighting). Cheap in practice (limited to the
+/// first two bounces); kept as a toggle for a future viewport-vs-final-render distinction.
+const ENV_IS_ENABLED: bool = true;
 
 impl Renderer {
     fn queue_mesh(
@@ -2138,6 +2202,7 @@ impl Renderer {
                 b.write_bytes(gpu::as_bytes(&wd));
             }
             self.accum_frame = 0; // world changed -> restart accumulation
+            self.env_dirty = true; // rebuild the HDRI importance-sampling distribution
         }
 
         let d = &self.device;
@@ -2196,7 +2261,8 @@ impl Renderer {
                 | (if self.has_lut { 2 } else { 0 })
                 | (if write_guide { 4 } else { 0 }) // bit2 = emit DLSS guide buffers
                 | (if use_rr { 8 } else { 0 })      // bit3 = DLSS-RR mode (noisy linear out)
-                | (if self.ser { 16 } else { 0 }),  // bit4 = Shader Execution Reordering
+                | (if self.ser { 16 } else { 0 })   // bit4 = Shader Execution Reordering
+                | (if ENV_IS_ENABLED { 32 } else { 0 }), // bit5 = HDRI environment importance sampling
             num_lights: self.light_count,
             sun_dir: [az.sin() * el.cos(), el.sin(), az.cos() * el.cos(), intensity],
             sun_col: [sc[0], sc[1], sc[2], self.accum_frame as f32],
@@ -2227,6 +2293,36 @@ impl Renderer {
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             );
+
+            // Rebuild the HDRI importance-sampling distribution when the world/HDRI changed (rare).
+            // One workgroup; barrier so the trace sees the written buffer.
+            if self.env_dirty {
+                if let Some(ep) = self.env_pipeline {
+                    d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, ep);
+                    d.cmd_bind_descriptor_sets(
+                        self.cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        self.pipeline_layout,
+                        0,
+                        &[self.desc_set],
+                        &[],
+                    );
+                    d.cmd_dispatch(self.cmd, 1, 1, 1);
+                    let mem = vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ);
+                    d.cmd_pipeline_barrier(
+                        self.cmd,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        trace_stage,
+                        vk::DependencyFlags::empty(),
+                        &[mem],
+                        &[],
+                        &[],
+                    );
+                }
+                self.env_dirty = false;
+            }
 
             let to_general = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::UNDEFINED)
@@ -2886,6 +2982,9 @@ impl Drop for Renderer {
             if let Some(tp) = self.tonemap_pipeline.take() {
                 device.destroy_pipeline(tp, None);
             }
+            if let Some(ep) = self.env_pipeline.take() {
+                device.destroy_pipeline(ep, None);
+            }
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_descriptor_pool(self.desc_pool, None);
             device.destroy_descriptor_set_layout(self.ds_layout, None);
@@ -2928,6 +3027,9 @@ impl Drop for Renderer {
                     b.destroy(&device, alloc);
                 }
                 if let Some(b) = self.sbt_buffer.take() {
+                    b.destroy(&device, alloc);
+                }
+                if let Some(b) = self.env_buffer.take() {
                     b.destroy(&device, alloc);
                 }
                 if let Some(b) = self.world_buffer.take() {

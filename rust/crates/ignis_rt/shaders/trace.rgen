@@ -61,6 +61,9 @@ layout(binding = 15, rgba16f) uniform image2D gSpecAlbedo;  // specular albedo (
 // Emissive triangles for NEE (area lights from geometry); 4 vec4 per tri, CDF baked by the addon:
 // [0]=(v0.xyz, area) [1]=(v1.xyz, cdf) [2]=(v2.xyz, totalPower) [3]=(emission.xyz, pad).
 layout(binding = 16, std430) readonly buffer EmissiveTris { vec4 data[]; } emissiveTris;
+// Environment (HDRI) luminance distribution for importance sampling — built by env_cdf.comp. Layout
+// matches that shader: [0]=funcInt, marginal CDF, conditional CDFs, func values.
+layout(binding = 17, std430) readonly buffer EnvDist { float data[]; } envDist;
 
 layout(push_constant) uniform PC {
     mat4  invViewProj;
@@ -144,6 +147,58 @@ vec3 sky(vec3 dir) {
     }
     return worldColor.rgb; // flat background color (no HDRI)
 }
+
+// ── Environment (HDRI) importance sampling — pbrt Distribution2D over envDist ──
+const uint ENV_W = 256u, ENV_H = 128u;
+struct EnvSample { vec3 dir; vec3 radiance; float pdf; }; // pdf in solid-angle measure
+
+// Inverse of the sky() equirect mapping: (u,v) in [0,1]^2 -> world direction (Y-up).
+vec3 envUvToDir(float u, float v, out float sinT) {
+    float theta = v * PI;
+    float phi = (0.5 - u) * 2.0 * PI;
+    sinT = sin(theta);
+    return vec3(sinT * cos(phi), cos(theta), -sinT * sin(phi));
+}
+
+// Sample a direction proportional to environment luminance (binary-search the marginal then the
+// conditional CDF). Piecewise-constant over cells. Returns the solid-angle pdf.
+EnvSample sampleEnvironment(vec2 r) {
+    EnvSample s; s.dir = vec3(0,1,0); s.radiance = vec3(0.0); s.pdf = 0.0;
+    float funcInt = envDist.data[0];
+    if (funcInt <= 0.0) return s;
+    uint condBase = 1u + ENV_H;
+    uint funcBase = 1u + ENV_H + ENV_H * ENV_W;
+    uint lo = 0u, hi = ENV_H - 1u;
+    while (lo < hi) { uint m = (lo + hi) / 2u; if (r.y <= envDist.data[1u + m]) hi = m; else lo = m + 1u; }
+    uint vrow = lo;
+    lo = 0u; hi = ENV_W - 1u;
+    while (lo < hi) { uint m = (lo + hi) / 2u; if (r.x <= envDist.data[condBase + vrow * ENV_W + m]) hi = m; else lo = m + 1u; }
+    uint ucol = lo;
+    float uu = (float(ucol) + 0.5) / float(ENV_W);
+    float vv = (float(vrow) + 0.5) / float(ENV_H);
+    float sinT;
+    s.dir = envUvToDir(uu, vv, sinT);
+    s.radiance = sky(s.dir);
+    float f = envDist.data[funcBase + vrow * ENV_W + ucol]; // already includes sinT
+    s.pdf = (sinT > 1e-4) ? (f / funcInt) / (2.0 * PI * PI * sinT) : 0.0;
+    return s;
+}
+
+// Solid-angle pdf the environment sampler would assign to an arbitrary direction (for MIS).
+float envPdf(vec3 dir) {
+    float funcInt = envDist.data[0];
+    if (funcInt <= 0.0) return 0.0;
+    float phi = atan(-dir.z, dir.x);
+    float u = fract(0.5 - phi / (2.0 * PI));
+    float v = clamp(acos(clamp(dir.y, -1.0, 1.0)) / PI, 0.0, 0.999999);
+    uint ucol = min(uint(u * float(ENV_W)), ENV_W - 1u);
+    uint vrow = min(uint(v * float(ENV_H)), ENV_H - 1u);
+    float sinT = sin(v * PI);
+    uint funcBase = 1u + ENV_H + ENV_H * ENV_W;
+    float f = envDist.data[funcBase + vrow * ENV_W + ucol];
+    return (sinT > 1e-4) ? (f / funcInt) / (2.0 * PI * PI * sinT) : 0.0;
+}
+
 vec3 hashColor(uint i) {
     return 0.35 + 0.55 * vec3(
         fract(sin(float(i) * 12.9898) * 43758.5453),
@@ -959,7 +1014,7 @@ EmissiveSample sampleEmissiveTriangle(uint triCount, float r, vec2 baryRnd) {
 
 // Direct lighting (NEE): sun + scene lights, each shadow-tested, with full diffuse+GGX BRDF
 // so glossy/metal surfaces get specular highlights (glints) from the lights.
-vec3 directShade(vec3 hitPos, vec3 N, vec3 geoN, vec3 V, vec3 diffAlbedo, vec3 F0, float alpha, inout uint rng) {
+vec3 directShade(vec3 hitPos, vec3 N, vec3 geoN, vec3 V, vec3 diffAlbedo, vec3 F0, float alpha, int bounce, inout uint rng) {
     // Offset along the geometric normal (not the shading normal): on smooth-shaded silhouettes
     // the shading normal is nearly tangent, so offsetting along it leaves the shadow-ray origin
     // on the surface -> self-occlusion -> black terminator. geoN always faces the ray.
@@ -1040,6 +1095,20 @@ vec3 directShade(vec3 hitPos, vec3 N, vec3 geoN, vec3 V, vec3 diffAlbedo, vec3 F
                 float lightPdf = es.pdf * eDist * eDist / eCos;     // area -> solid-angle pdf
                 float mis = (lightPdf * lightPdf) / (lightPdf * lightPdf + bsdfPdf * bsdfPdf + 1e-8);
                 sum += brdf(N, V, eDir, diffAlbedo, F0, alpha) * eNdotL * eRadiance * mis / max(es.pdf, 1e-6);
+            }
+        }
+    }
+    // Environment (HDRI/sky) NEE — importance-sampled by luminance (env_cdf.comp). Light-sampling
+    // strategy for the environment; the BSDF samples it on specular/glass escapes (the bounce loop
+    // skips the sky on a diffuse-bounce escape so the env isn't double counted). funcInt>0 means the
+    // distribution is built and non-black. Limited to the first couple of bounces: the env shadow
+    // ray reaches to infinity (expensive), and deep-bounce env lighting is low and gets denoised.
+    if (bounce <= 1 && (pc.hasTlas & 32u) != 0u && envDist.data[0] > 0.0) {
+        EnvSample en = sampleEnvironment(rand2(rng));
+        if (en.pdf > 0.0) {
+            float eNdotL = max(dot(N, en.dir), 0.0);
+            if (eNdotL > 0.0 && !occluded(o, en.dir, 1e30)) {
+                sum += brdf(N, V, en.dir, diffAlbedo, F0, alpha) * eNdotL * en.radiance / en.pdf;
             }
         }
     }
@@ -1162,6 +1231,7 @@ void main() {
         if (rrMode) writeGuidePSR(p, ro, rd);
         vec3 tp = vec3(1.0); // throughput
         float pathRough = 0.0; // max surface roughness seen so far (path roughness regularization)
+        bool lastDiffuse = false; // was the previous bounce a diffuse scatter? (env NEE double-count)
         int glassBounces = 0; // dielectric interfaces don't spend the diffuse/specular budget
         bool isDiffuse = false; // ray has scattered diffusely -> "Is Diffuse Ray" for Light Path glass
         int glassDepth = 0;   // how many glass surfaces deep the ray is (0 = outside). Decides
@@ -1174,7 +1244,11 @@ void main() {
             while (rayQueryProceedEXT(rq)) {}
             if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
                 if (DEBUG_PATH && b == 0) { L = vec3(0.0, 0.0, 1.0); break; } // blue = sky
-                L += tp * sky(rd); // ray escaped to the sky
+                // Add the sky unless it was reached by a diffuse bounce while env NEE is active —
+                // that vertex's environment NEE already accounted for it (avoids double counting).
+                if (b == 0 || !lastDiffuse || envDist.data[0] <= 0.0) {
+                    L += tp * sky(rd);
+                }
                 break;
             }
             uint id   = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
@@ -1269,10 +1343,11 @@ void main() {
             float alpha = max(regRough * regRough, 1e-3);
 
             // Direct lighting (diffuse + specular glints from sun/lights, soft shadows).
-            L += tp * directShade(hitPos, N, geoN, V, diffAlbedo, F0, alpha, rng);
+            L += tp * directShade(hitPos, N, geoN, V, diffAlbedo, F0, alpha, b, rng);
 
             // BRDF bounce. A transmissive (glass) interaction is chosen with probability
             // pTrans; otherwise we pick the diffuse or the GGX specular lobe.
+            lastDiffuse = false;
             vec2 u = rand2(rng);
             float pTrans = clamp(transmission, 0.0, 1.0) * (1.0 - metallic);
             if (pTrans > 0.001 && rnd(rng) < pTrans) {
@@ -1326,6 +1401,7 @@ void main() {
                     rd = cosineHemisphere(N, u);
                     tp *= diffAlbedo * invOpaque / (1.0 - pSpec);
                     isDiffuse = true; // subsequent hits see this as an "Is Diffuse Ray"
+                    lastDiffuse = (b <= 1) && ((pc.hasTlas & 32u) != 0u); // env NEE ran -> skip sky on escape
                 }
             }
 

@@ -1,0 +1,61 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_scalar_block_layout : require
+// Build a 2D luminance distribution (pbrt Distribution2D) over the HDRI for environment importance
+// sampling + MIS. One workgroup, one thread per row: each builds its row's conditional CDF (prefix
+// sum of luminance * sinTheta), then thread 0 builds the marginal CDF over the row integrals. Runs
+// once whenever the HDRI changes — not per frame.
+
+const uint EW = 256u, EH = 128u;
+const float PI = 3.14159265;
+layout(local_size_x = 128) in; // EH threads, one per row
+
+layout(binding = 4) uniform sampler2D textures[];
+layout(binding = 8, std430) readonly buffer World { vec4 worldColor; vec4 hdriParams; };
+// Layout (float[]):
+//   [0]                              = funcInt (average of func over [0,1]^2)
+//   [1 .. 1+EH)                      = marginal CDF (over rows)
+//   [1+EH + r*EW .. )                = conditional CDF of row r (EW entries, normalized)
+//   [1+EH + EH*EW + r*EW .. )        = func of row r (luminance*sinTheta, for the pdf)
+layout(binding = 17, std430) buffer EnvDist { float data[]; } envDist;
+
+shared float rowIntegral[128];
+
+void main() {
+    uint v = gl_LocalInvocationID.x;
+    int hdriIdx = int(hdriParams.x);
+    float strength = hdriParams.y;
+    uint condBase = 1u + EH;
+    uint funcBase = 1u + EH + EH * EW;
+    float theta = PI * (float(v) + 0.5) / float(EH);
+    float sinT = sin(theta);
+
+    float sum = 0.0;
+    for (uint u = 0u; u < EW; u++) {
+        vec2 uv = (vec2(u, v) + 0.5) / vec2(EW, EH);
+        vec3 c = (hdriIdx >= 0 && strength > 0.0)
+            ? texture(textures[nonuniformEXT(uint(hdriIdx))], uv).rgb * strength
+            : worldColor.rgb;
+        float f = max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0) * sinT;
+        envDist.data[funcBase + v * EW + u] = f;
+        sum += f;
+        envDist.data[condBase + v * EW + u] = sum; // unnormalized CDF
+    }
+    rowIntegral[v] = sum;
+    float inv = (sum > 0.0) ? 1.0 / sum : 0.0;
+    for (uint u = 0u; u < EW; u++) envDist.data[condBase + v * EW + u] *= inv;
+
+    barrier();
+
+    if (v == 0u) {
+        float total = 0.0;
+        for (uint r = 0u; r < EH; r++) total += rowIntegral[r];
+        envDist.data[0] = total / float(EW * EH); // funcInt
+        float acc = 0.0;
+        float invT = (total > 0.0) ? 1.0 / total : 0.0;
+        for (uint r = 0u; r < EH; r++) {
+            acc += rowIntegral[r];
+            envDist.data[1u + r] = (total > 0.0) ? acc * invT : float(r + 1u) / float(EH);
+        }
+    }
+}
