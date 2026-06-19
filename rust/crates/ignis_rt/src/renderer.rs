@@ -1176,10 +1176,15 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     // can use Shader Execution Reordering. Non-RT devices keep the sky.comp compute fallback.
     let (pipeline, rt_pipeline_ext, sbt_buffer, sbt_region) = if rt_supported {
         let rt_ext = ash::khr::ray_tracing_pipeline::Device::new(&instance, &device);
-        let spv = ash::util::read_spv(&mut std::io::Cursor::new(
-            &include_bytes!(concat!(env!("OUT_DIR"), "/trace.rgen.spv"))[..],
-        ))
-        .map_err(|e| format!("read rgen spv: {e}"))?;
+        // SER variant (trace_ser.spv) only where VK_NV_ray_tracing_invocation_reorder is available
+        // (Ada+); the plain trace.rgen.spv carries no SER capability and runs on any RT GPU.
+        let rgen_spv: &[u8] = if has_ser {
+            &include_bytes!(concat!(env!("OUT_DIR"), "/trace_ser.spv"))[..]
+        } else {
+            &include_bytes!(concat!(env!("OUT_DIR"), "/trace.rgen.spv"))[..]
+        };
+        let spv = ash::util::read_spv(&mut std::io::Cursor::new(rgen_spv))
+            .map_err(|e| format!("read rgen spv: {e}"))?;
         let module = unsafe {
             device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None)
         }

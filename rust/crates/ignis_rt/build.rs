@@ -31,6 +31,22 @@ fn main() {
             assert!(status.success(), "glslangValidator failed for {name}");
         }
     }
+
+    // Second variant of trace.rgen WITH Shader Execution Reordering (-DUSE_SER -> trace_ser.spv).
+    // The plain trace.rgen.spv (compiled above without the define) carries no SER capability and
+    // runs on any RT GPU; the renderer picks trace_ser.spv only when the SER extension is available.
+    let trace_rgen = shader_dir.join("trace.rgen");
+    if trace_rgen.exists() {
+        let out_ser = format!("{out_dir}/trace_ser.spv");
+        let status = Command::new(&glslang)
+            .args([
+                "-V", "--target-env", "vulkan1.2", "-DUSE_SER",
+                trace_rgen.to_str().unwrap(), "-o", &out_ser,
+            ])
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run {glslang}: {e}"));
+        assert!(status.success(), "glslangValidator failed for trace_ser");
+    }
 }
 
 /// Link the NVIDIA NGX SDK (nvsdk_ngx_d.lib) for the DLSS Ray Reconstruction FFI. The lib is a
