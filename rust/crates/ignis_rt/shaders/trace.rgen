@@ -295,6 +295,10 @@ uint owenScramble(uint x, uint seed) {
 }
 
 uint g_sampleIdx; // temporal sample index (accumulation frame); set in main()
+// Ray-cone texture LOD base (texture-independent part of the mip level): per-texture sampling adds
+// 0.5*log2(texW*texH). Set in getSurface from the ray cone; read by the diffuse + Node VM samples.
+// A very negative value (cone width 0) means "no LOD" -> mip 0 (sharp), the pre-ray-cones behaviour.
+float g_texLodBase = -1e30;
 
 float rnd(inout uint s) {
     uint seed = pcg(s); // advance the per-pixel, per-dimension scramble seed
@@ -553,6 +557,14 @@ struct VmResult {
     bool hasBump;
 };
 
+// Sample a material texture at the ray-cone mip level (g_texLodBase + the per-texture term). Falls
+// back to mip 0 (plain texture()) when there's no cone, matching the pre-ray-cones behaviour.
+vec4 texLodSample(uint idx, vec2 uv) {
+    if (g_texLodBase <= -1e29) return texture(textures[nonuniformEXT(idx)], uv);
+    ivec2 d = textureSize(textures[nonuniformEXT(idx)], 0);
+    return textureLod(textures[nonuniformEXT(idx)], uv, g_texLodBase + 0.5 * log2(float(d.x * d.y)));
+}
+
 VmResult executeNodeVm(uint mi, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 normal, vec3 localPos,
                        vec4 vcol, uint instanceId, vec3 dPdu, vec3 dPdv) {
     VmResult res;
@@ -581,7 +593,7 @@ VmResult executeNodeVm(uint mi, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 norma
 
         if (op == 0x00u) continue;                                   // NOP
         else if (op == 0x01u) {                                      // SAMPLE_TEX
-            R[dst] = texture(textures[nonuniformEXT(instr.z)], R[sA].xy);
+            R[dst] = texLodSample(instr.z, R[sA].xy);
             if (instr.y != 0u) R[dst].rgb = srgbToLinear(max(R[dst].rgb, vec3(0.0)));
         }
         else if (op == 0x10u) {                                      // UV_TRANSFORM
@@ -820,12 +832,14 @@ VmResult executeNodeVm(uint mi, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 norma
     return res;
 }
 
-// Surface attributes at a committed triangle hit.
-void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
+// Surface attributes at a committed triangle hit. coneWidth = ray-cone width at the hit (for
+// texture LOD; 0 disables it -> mip 0).
+void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd, float coneWidth,
                 out vec3 N, out vec3 albedo, out float roughness, out float metallic, out vec3 emission,
                 out float ior, out float transmission, out bool frontFace, out vec3 geomN,
                 out bool lightPathTransparent, out float transparentProb, out vec2 surfUV,
                 out float surfAlpha) {
+    g_texLodBase = -1e30; // reset per hit; set below from the ray cone (mip 0 until then)
     GeomDesc gd = descs[id];
     N = -rd;
     geomN = -rd;          // ray-facing geometric normal — used to offset secondary rays robustly
@@ -887,6 +901,18 @@ void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
             uv1_ = vec2(t2(ub,i1).x, 1.0 - t2(ub,i1).y);
             uv2_ = vec2(t2(ub,i2).x, 1.0 - t2(ub,i2).y);
             uvCoord = uv0_*w0 + uv1_*bc.x + uv2_*bc.y;
+            // Ray-cone texture LOD (Akenine-Möller 2021): the triangle's UV-area / world-area ratio,
+            // the cone width at the hit, and the angle of incidence give the mip level (per texture,
+            // add 0.5*log2(texW*texH) where it's sampled). Texture lookups in a ray shader have no
+            // screen-space derivatives, so without this they always read mip 0 and alias at distance.
+            if (coneWidth > 0.0) {
+                float uvArea = abs((uv1_.x - uv0_.x) * (uv2_.y - uv0_.y) - (uv2_.x - uv0_.x) * (uv1_.y - uv0_.y));
+                float wArea = length(cross(wp1 - wp0, wp2 - wp0));
+                if (uvArea > 1e-12 && wArea > 1e-12) {
+                    g_texLodBase = log2(coneWidth) - log2(max(abs(dot(rd, N)), 1e-3))
+                                 + 0.5 * log2(uvArea / wArea);
+                }
+            }
         }
         hasTBN = (gd.vtx != 0ul) && (gd.uv != 0ul);
         geomN = geoN;          // ray-facing geometric normal for robust ray offsets
@@ -917,7 +943,7 @@ void getSurface(uint id, uint prim, vec2 bc, mat4x3 o2w, vec3 rd,
         // texture slot when the program doesn't produce a base color.
         VmResult vm = executeNodeVm(matId, uvCoord, worldPos, rd, N, localPos, vec4(1.0), id, dPdu, dPdv);
         if (vm.hasBaseColor) albedo = vm.baseColor;
-        else if (mat.diffuseTexIndex != 0xFFFFFFFFu) albedo = texture(textures[nonuniformEXT(mat.diffuseTexIndex)], uvCoord).rgb;
+        else if (mat.diffuseTexIndex != 0xFFFFFFFFu) albedo = texLodSample(mat.diffuseTexIndex, uvCoord).rgb;
         if (vm.hasRoughness) roughness = clamp(vm.roughness, 0.04, 1.0);
         if (vm.hasMetallic) metallic = clamp(vm.metallic, 0.0, 1.0);
         if (vm.hasEmission) emission = vm.emission * vm.emissionStrength;
@@ -1128,6 +1154,7 @@ void writeGuidePSR(uvec2 p, vec3 ro, vec3 rd) {
     vec3 primaryRd = rd;
     float pathDist = 0.0;
     mat3 mirrorMat = mat3(1.0);
+    float chainRough = 0.0; // max roughness of the reflectors in the chain = the reflection's blur
     int glassDepth = 0; // entry/exit tracking for refraction (robust to flipped normals)
     for (int b = 0; b < 6; b++) {
         rayQueryEXT rq;
@@ -1147,17 +1174,22 @@ void writeGuidePSR(uvec2 p, vec3 ro, vec3 rd) {
         float roughness, metallic, ior, transmission, transparentProb;
         bool frontFace, lightPathTransparent;
         vec2 surfUV; float surfAlpha;
-        getSurface(id, prim, bc, o2w, rd, N, albedo, roughness, metallic, emission, ior, transmission, frontFace, geoN, lightPathTransparent, transparentProb, surfUV, surfAlpha);
+        getSurface(id, prim, bc, o2w, rd, 0.0, N, albedo, roughness, metallic, emission, ior, transmission, frontFace, geoN, lightPathTransparent, transparentProb, surfUV, surfAlpha);
         vec3 hitPos = ro + rd * thit;
         pathDist += thit;
 
         bool smoothSurf = roughness < 0.05;
-        bool isMirror = smoothSurf && metallic > 0.9;
+        // PSR follows not just perfect mirrors but moderately glossy metals (the lobe centre is the
+        // mirror direction): their reflection moves with the reflected content, so writing the guide
+        // at the reflected (virtual) hit instead of the metal surface is what stops the glossy-metal
+        // jitter. The reflection's blur is carried in chainRough and written as the guide roughness.
+        bool isMirror = (roughness < 0.2) && (metallic > 0.7);
         bool isGlass  = smoothSurf && transmission > 0.5;
         // Architectural window glass / alpha-cutout: genuinely no bend, unfold straight through.
         bool seeThrough = transparentProb > 0.0 || surfAlpha < 0.5;
 
         if (isMirror) {
+            chainRough = max(chainRough, roughness); // accumulate the reflection blur
             mirrorMat = mirrorMat * mirrorMatrix(N);
             rd = reflect(rd, N);
             ro = hitPos + rd * 0.001;
@@ -1187,13 +1219,14 @@ void writeGuidePSR(uvec2 p, vec3 ro, vec3 rd) {
             ro = hitPos + rd * 0.001; // straight through, keep direction
             continue;
         }
-        // First non-delta surface: record the guides at the virtual (unfolded) position.
+        // First non-delta surface: record the guides at the virtual (unfolded) position. The guide
+        // roughness is max(surface, chain) so DLSS-RR blurs the reflection by the metal's glossiness.
         vec3 vpos = pc.camPos.xyz + pathDist * primaryRd;
         vec3 vN = normalize(mirrorMat * N);
         vec3 F0 = mix(vec3(0.04), albedo, metallic);
         float NdotV = max(dot(N, -rd), 1e-3);
         vec3 specAlb = EnvBRDFApprox(F0, roughness, NdotV);
-        writeGuide(p, vpos, vN, roughness, albedo, specAlb);
+        writeGuide(p, vpos, vN, max(roughness, chainRough), albedo, specAlb);
         return;
     }
     // Too many delta bounces: fall back to the deepest virtual position (rough/far).
@@ -1226,6 +1259,12 @@ void main() {
         world /= world.w;
         vec3 ro = pc.camPos.xyz;
         vec3 rd = normalize(world.xyz - ro);
+        // Ray cone for texture LOD: the angular size of one pixel (from the y-neighbour primary ray).
+        // The cone width accumulates with path distance; getSurface turns it into a mip level.
+        vec2 uvY = (vec2(p) + jitter + vec2(0.0, 1.0)) / vec2(pc.dims);
+        vec4 wY = pc.invViewProj * vec4(uvY.x * 2.0 - 1.0, 1.0 - uvY.y * 2.0, 1.0, 1.0);
+        float spreadAngle = length(normalize(wY.xyz / wY.w - ro) - rd);
+        float coneWidth = 0.0;
         // DLSS-RR guide buffers: a separate deterministic PSR walk (mirror/glass aware), so reflected
         // and refracted content gets correct virtual depth/motion and stops shimmering.
         if (rrMode) writeGuidePSR(p, ro, rd);
@@ -1269,12 +1308,13 @@ void main() {
             }
 #endif
 
+            coneWidth += thit * spreadAngle; // ray-cone width at this hit (for texture LOD)
             vec3 N, albedo, emission, geoN;
             float roughness, metallic, ior, transmission, transparentProb;
             bool frontFace, lightPathTransparent;
             vec2 surfUV;
             float surfAlpha;
-            getSurface(id, prim, bc, o2w, rd, N, albedo, roughness, metallic, emission, ior, transmission, frontFace, geoN, lightPathTransparent, transparentProb, surfUV, surfAlpha);
+            getSurface(id, prim, bc, o2w, rd, coneWidth, N, albedo, roughness, metallic, emission, ior, transmission, frontFace, geoN, lightPathTransparent, transparentProb, surfUV, surfAlpha);
             vec3 hitPos = ro + rd * thit;
 
             // Stochastic transparent passthrough (Cycles Transparent BSDF / architectural glass,
