@@ -1683,6 +1683,18 @@ impl Renderer {
         log(&format!("geom_table: {} entries", descs.len()));
     }
 
+    /// Restart the accumulator on an incremental edit (light/material/mesh/world change) — but only
+    /// outside DLSS-RR. In RR mode the denoiser absorbs the change via motion vectors + history
+    /// clamping, so a reset would just flash a denoiser restart (the noise/blotches seen when moving
+    /// or toggling lights). This mirrors shipping path tracers (e.g. Cyberpunk RT Overdrive), which
+    /// never hard-reset on edits — ReSTIR + the denoiser re-converge continuously.
+    fn reset_accum_for_edit(&mut self) {
+        let rr_active = self.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0;
+        if !rr_active {
+            self.accum_frame = 0;
+        }
+    }
+
     fn set_materials(&mut self, bytes: &[u8]) {
         if bytes.is_empty() || self.accel_ext.is_none() {
             return;
@@ -1718,7 +1730,7 @@ impl Renderer {
             .buffer_info(&info);
         unsafe { device.update_descriptor_sets(&[write], &[]) };
         self.mat_buffer = Some(buf);
-        self.accum_frame = 0;
+        self.reset_accum_for_edit();
         log(&format!("materials: {} full (2204b each)", bytes.len() / 2204));
     }
 
@@ -1793,7 +1805,7 @@ impl Renderer {
             }
         }
         self.update_geom_table();
-        self.accum_frame = 0;
+        self.reset_accum_for_edit();
     }
 
     fn set_lights(&mut self, floats: &[f32], count: u32) {
@@ -1837,7 +1849,7 @@ impl Renderer {
             .buffer_info(&info);
         unsafe { device.update_descriptor_sets(&[write], &[]) };
         self.light_buffer = Some(buf);
-        self.accum_frame = 0;
+        self.reset_accum_for_edit();
         log(&format!("lights: {count} uploaded"));
     }
 
@@ -1882,7 +1894,7 @@ impl Renderer {
             .buffer_info(&info);
         unsafe { device.update_descriptor_sets(&[write], &[]) };
         self.emissive_buffer = Some(buf);
-        self.accum_frame = 0;
+        self.reset_accum_for_edit();
         log(&format!("emissive triangles: {count} uploaded"));
     }
 
@@ -2114,7 +2126,11 @@ impl Renderer {
 
         // Refresh the geometry table: per-triangle material ids arrive after flush.
         self.update_geom_table();
-        self.rebuild_tlas(true)
+        // In DLSS-RR mode let the denoiser + motion vectors absorb the change (don't reset the
+        // accumulator) — otherwise undo/redo and live edits flash a denoiser restart. Non-RR keeps
+        // the per-change reset its accumulation needs.
+        let rr_active = self.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0;
+        self.rebuild_tlas(!rr_active)
     }
 
     /// Rebuild the TLAS from the stored instance bytes (tlas_instance_data). Shared by the full
@@ -2300,7 +2316,7 @@ impl Renderer {
             if let Some(b) = &self.world_buffer {
                 b.write_bytes(gpu::as_bytes(&wd));
             }
-            self.accum_frame = 0; // world changed -> restart accumulation
+            self.reset_accum_for_edit(); // world/HDRI changed (no reset in RR — denoiser adapts)
             self.env_dirty = true; // rebuild the HDRI importance-sampling distribution
         }
 
@@ -2310,13 +2326,18 @@ impl Renderer {
         let n = self.instance_transforms.len();
         let have_motion = self.tlas.is_some() && n > 0 && n <= MAX_INSTANCES as usize;
         if have_motion {
+            // If the instance count changed since last frame the order likely shifted (object added or
+            // removed), so the stored previous transforms no longer line up with gl_InstanceID. Fall
+            // back to zero object motion this frame, otherwise meshes get reprojected with another
+            // object's motion and briefly smear/vanish until the snapshot catches up next frame.
+            let order_stable = n == self.prev_instance_transforms.len();
             let mut data: Vec<f32> = Vec::with_capacity(n * 12);
             for i in 0..n {
-                let t = self
-                    .prev_instance_transforms
-                    .get(i)
-                    .copied()
-                    .unwrap_or(self.instance_transforms[i]);
+                let t = if order_stable {
+                    self.prev_instance_transforms[i]
+                } else {
+                    self.instance_transforms[i]
+                };
                 data.extend_from_slice(&t);
             }
             if let Some(b) = &self.prev_xform_buffer {
