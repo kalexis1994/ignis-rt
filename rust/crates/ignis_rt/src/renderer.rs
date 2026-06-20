@@ -73,6 +73,35 @@ fn decode_texture(data: Vec<u8>, width: u32, height: u32, dxgi: u32) -> (Vec<u8>
     (data, width, height, format)
 }
 
+/// DLSS render (trace) resolution for a display size + quality mode (addon enum 1..6). Matches the
+/// C++ fallback ratios; DLAA (6) and unknown = native (render == display, no upscaling). Rounded up
+/// to even and clamped to the display size.
+fn dlss_render_res(display_w: u32, display_h: u32, quality: i32) -> (u32, u32) {
+    let ratio: f32 = match quality {
+        1 => 3.0, // Ultra Performance
+        2 => 2.0, // Performance
+        3 => 1.7, // Balanced
+        4 => 1.5, // Quality
+        5 => 1.3, // Ultra Quality
+        _ => 1.0, // DLAA / native
+    };
+    let scale = |d: u32| -> u32 { (((d as f32 / ratio) as u32 + 1) & !1u32).clamp(2, d) };
+    (scale(display_w), scale(display_h))
+}
+
+/// NGX PerfQuality value for the addon quality enum (NGX: MaxPerf=0, Balanced=1, MaxQuality=2,
+/// UltraPerformance=3, UltraQuality=4, DLAA=5).
+fn dlss_perf_quality(quality: i32) -> i32 {
+    match quality {
+        1 => 3, // Ultra Performance
+        2 => 0, // Performance (MaxPerf)
+        3 => 1, // Balanced
+        4 => 2, // Quality (MaxQuality)
+        5 => 4, // Ultra Quality
+        _ => 5, // DLAA
+    }
+}
+
 /// Create a GPU-only 2D storage image + view (UNDEFINED layout). Used for the DLSS guide buffers
 /// (depth / normal+roughness / albedo / motion vectors) written by the path tracer.
 fn create_storage_image(
@@ -286,8 +315,11 @@ pub struct Renderer {
     ft_ema: f32, // GPU frame time EMA (ms), for perf measurement
     ft_count: u32,
     last_render: Option<std::time::Instant>, // for the real frame delta fed to DLSS-RR
-    width: u32,
+    width: u32,        // display (output) resolution — readback + DLSS-RR output
     height: u32,
+    trace_width: u32,  // path-tracer / guide resolution — DLSS-RR upscales this to width/height
+    trace_height: u32, // (== width/height for DLAA / no DLSS)
+    dlss_quality: i32, // quality mode the DLSS feature + guides were last built for (live re-init)
 }
 
 /// Halton low-discrepancy sequence value (radical inverse) — used for DLSS-RR sub-pixel jitter.
@@ -598,6 +630,20 @@ pub fn readback(out: *mut f32, pixel_count: u32) -> bool {
 // ===================== Build / device setup =====================
 
 fn build(width: u32, height: u32) -> Result<Renderer, String> {
+    // DLSS render (trace) resolution: lower than the display size for the upscaling quality modes,
+    // equal to it for DLAA / no DLSS. The guide buffers + path tracer run at this size; DLSS-RR
+    // upscales to the display (width/height). Read from config at create — changing quality at
+    // runtime needs a renderer recreate (the addon restarts the engine on a quality change).
+    let dlss_rr = crate::config::get_int("dlss_rr_enabled") != 0;
+    let quality = crate::config::get_int("dlss_quality");
+    let (trace_width, trace_height) = if dlss_rr && (1..=5).contains(&quality) {
+        dlss_render_res(width, height, quality)
+    } else {
+        (width, height)
+    };
+    log(&format!(
+        "ignis build: display {width}x{height}, trace {trace_width}x{trace_height} (dlss_rr={dlss_rr}, q={quality})"
+    ));
     let entry = unsafe { ash::Entry::load() }
         .map_err(|e| format!("Entry::load (vulkan-1.dll missing?): {e}"))?;
 
@@ -832,7 +878,9 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     }
     .map_err(|e| format!("create_image_view: {e}"))?;
 
-    // Accumulation image (RGBA32F storage, persistent across frames for path-trace averaging).
+    // Accumulation image (RGBA32F storage, persistent across frames for path-trace averaging). Only
+    // the non-RR path uses it (and there trace == display), so it stays at display resolution and is
+    // untouched by a DLSS quality change.
     let accum_ci = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(RB_FORMAT)
@@ -882,13 +930,14 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     let guide = if rt_supported {
         let f16 = vk::Format::R16G16B16A16_SFLOAT;
         Some(GuideBuffers {
-            depth: create_storage_image(&device, &mut allocator, width, height, vk::Format::R32_SFLOAT, "g_depth")?,
-            normal_rough: create_storage_image(&device, &mut allocator, width, height, f16, "g_normal")?,
-            albedo: create_storage_image(&device, &mut allocator, width, height, f16, "g_albedo")?,
-            motion: create_storage_image(&device, &mut allocator, width, height, f16, "g_motion")?,
-            noisy: create_storage_image(&device, &mut allocator, width, height, f16, "g_noisy")?,
+            // Guides are DLSS-RR *inputs* → trace resolution. clean is the DLSS *output* → display.
+            depth: create_storage_image(&device, &mut allocator, trace_width, trace_height, vk::Format::R32_SFLOAT, "g_depth")?,
+            normal_rough: create_storage_image(&device, &mut allocator, trace_width, trace_height, f16, "g_normal")?,
+            albedo: create_storage_image(&device, &mut allocator, trace_width, trace_height, f16, "g_albedo")?,
+            motion: create_storage_image(&device, &mut allocator, trace_width, trace_height, f16, "g_motion")?,
+            noisy: create_storage_image(&device, &mut allocator, trace_width, trace_height, f16, "g_noisy")?,
             clean: create_storage_image(&device, &mut allocator, width, height, f16, "g_clean")?,
-            spec_albedo: create_storage_image(&device, &mut allocator, width, height, f16, "g_specalb")?,
+            spec_albedo: create_storage_image(&device, &mut allocator, trace_width, trace_height, f16, "g_specalb")?,
         })
     } else {
         None
@@ -1415,8 +1464,11 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
             let feat = crate::ngx::create_rr(
                 device.handle().as_raw(),
                 cmd.as_raw(),
+                trace_width,
+                trace_height,
                 width,
                 height,
+                dlss_perf_quality(quality),
             );
             let _ = device.end_command_buffer(cmd);
             let _ = device.reset_fences(&[fence]);
@@ -1562,6 +1614,9 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         last_render: None,
         width,
         height,
+        trace_width,
+        trace_height,
+        dlss_quality: quality,
     })
 }
 
@@ -2290,7 +2345,142 @@ impl Renderer {
         log("clear_geometry: all BLAS/TLAS released");
     }
 
+    /// Re-initialise the DLSS pipeline for a new quality / RR-enabled state WITHOUT reloading geometry:
+    /// re-allocate the guide buffers at the new trace resolution, rebind them, and recreate the NGX
+    /// feature. Triggered live from render() when the addon changes the DLSS settings.
+    fn reinit_dlss(&mut self, quality: i32) {
+        self.dlss_quality = quality;
+        if self.rr.is_none() || self.guide.is_none() {
+            return;
+        }
+        let rr_enabled = crate::config::get_int("dlss_rr_enabled") != 0;
+        let (tw, th) = if rr_enabled && (1..=5).contains(&quality) {
+            dlss_render_res(self.width, self.height, quality)
+        } else {
+            (self.width, self.height)
+        };
+        let device = self.device.clone();
+        let (dw, dh) = (self.width, self.height);
+        let desc_set = self.desc_set;
+        let (cmd, queue, fence) = (self.cmd, self.queue, self.fence);
+        let perf_q = dlss_perf_quality(quality);
+        unsafe {
+            let _ = device.device_wait_idle();
+        }
+
+        // Re-allocate the guide buffers at the new trace resolution (inputs); clean stays display res.
+        let new_guide = {
+            let alloc = match self.allocator.as_mut() {
+                Some(a) => a,
+                None => return,
+            };
+            if let Some(old) = self.guide.take() {
+                for (img, a, view) in [
+                    old.depth, old.normal_rough, old.albedo, old.motion, old.noisy, old.clean, old.spec_albedo,
+                ] {
+                    unsafe {
+                        device.destroy_image_view(view, None);
+                        device.destroy_image(img, None);
+                    }
+                    let _ = alloc.free(a);
+                }
+            }
+            let f16 = vk::Format::R16G16B16A16_SFLOAT;
+            (|| -> Result<GuideBuffers, String> {
+                Ok(GuideBuffers {
+                    depth: create_storage_image(&device, alloc, tw, th, vk::Format::R32_SFLOAT, "g_depth")?,
+                    normal_rough: create_storage_image(&device, alloc, tw, th, f16, "g_normal")?,
+                    albedo: create_storage_image(&device, alloc, tw, th, f16, "g_albedo")?,
+                    motion: create_storage_image(&device, alloc, tw, th, f16, "g_motion")?,
+                    noisy: create_storage_image(&device, alloc, tw, th, f16, "g_noisy")?,
+                    clean: create_storage_image(&device, alloc, dw, dh, f16, "g_clean")?,
+                    spec_albedo: create_storage_image(&device, alloc, tw, th, f16, "g_specalb")?,
+                })
+            })()
+        };
+        let g = match new_guide {
+            Ok(g) => g,
+            Err(e) => {
+                log(&format!("DLSS re-init: guide realloc failed: {e}"));
+                return;
+            }
+        };
+
+        // Rebind bindings 9..=15 (depth, normal, albedo, motion, noisy, clean, spec).
+        let gi = |v: vk::ImageView| {
+            [vk::DescriptorImageInfo::default()
+                .image_view(v)
+                .image_layout(vk::ImageLayout::GENERAL)]
+        };
+        let infos = [
+            gi(g.depth.2), gi(g.normal_rough.2), gi(g.albedo.2), gi(g.motion.2),
+            gi(g.noisy.2), gi(g.clean.2), gi(g.spec_albedo.2),
+        ];
+        let writes: Vec<_> = infos
+            .iter()
+            .enumerate()
+            .map(|(i, info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(desc_set)
+                    .dst_binding(9 + i as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(info)
+            })
+            .collect();
+        unsafe {
+            device.update_descriptor_sets(&writes, &[]);
+        }
+        self.guide = Some(g);
+
+        // Recreate the NGX feature at the new render/display resolution.
+        if let Some(old) = self.rr.take() {
+            crate::ngx::release_rr(old);
+        }
+        {
+            use ash::vk::Handle;
+            unsafe {
+                let _ = device.begin_command_buffer(
+                    cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                );
+                let feat = crate::ngx::create_rr(
+                    device.handle().as_raw(),
+                    cmd.as_raw(),
+                    tw, th, dw, dh, perf_q,
+                );
+                let _ = device.end_command_buffer(cmd);
+                let _ = device.reset_fences(&[fence]);
+                let _ = device.queue_submit(
+                    queue,
+                    &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))],
+                    fence,
+                );
+                let _ = device.wait_for_fences(&[fence], true, u64::MAX);
+                self.rr = feat;
+            }
+        }
+        self.trace_width = tw;
+        self.trace_height = th;
+        self.accum_frame = 0;
+        log(&format!("DLSS re-init: trace {tw}x{th} -> display {dw}x{dh} (q={quality})"));
+    }
+
     fn render(&mut self) {
+        // Live DLSS quality / RR-enable change: re-init the DLSS pipeline (re-allocate guides +
+        // recreate the NGX feature at the new trace resolution) without reloading geometry.
+        if self.rr.is_some() {
+            let cfg_q = crate::config::get_int("dlss_quality");
+            let cfg_rr = crate::config::get_int("dlss_rr_enabled") != 0;
+            let (want_tw, want_th) = if cfg_rr && (1..=5).contains(&cfg_q) {
+                dlss_render_res(self.width, self.height, cfg_q)
+            } else {
+                (self.width, self.height)
+            };
+            if (want_tw, want_th) != (self.trace_width, self.trace_height) {
+                self.reinit_dlss(cfg_q);
+            }
+        }
         // Real frame-to-frame delta for DLSS-RR's temporal feedback. A constant value (we used 16.6)
         // mistunes the denoiser when the actual frame time is much larger -> contributes to boiling.
         let now = std::time::Instant::now();
@@ -2397,7 +2587,7 @@ impl Renderer {
         let push = CameraPush {
             inv_view_proj: self.inv_view_proj,
             cam_pos: cam,
-            dims: [self.width, self.height],
+            dims: [self.trace_width, self.trace_height], // path tracer runs at trace (render) res
             has_tlas: (self.tlas.is_some() as u32)
                 | (if self.has_lut { 2 } else { 0 })
                 | (if write_guide { 4 } else { 0 }) // bit2 = emit DLSS guide buffers
@@ -2547,8 +2737,8 @@ impl Renderer {
                     &empty,
                     &empty,
                     &empty,
-                    self.width,
-                    self.height,
+                    self.trace_width,
+                    self.trace_height,
                     1,
                 );
             } else {
@@ -2568,7 +2758,7 @@ impl Renderer {
                     0,
                     bytes,
                 );
-                d.cmd_dispatch(self.cmd, self.width.div_ceil(8), self.height.div_ceil(8), 1);
+                d.cmd_dispatch(self.cmd, self.trace_width.div_ceil(8), self.trace_height.div_ceil(8), 1);
             }
 
             // DLSS Ray Reconstruction: denoise the noisy 1-spp color (with the guide buffers) into
@@ -2609,7 +2799,9 @@ impl Renderer {
                     img(&g.normal_rough, f16),
                     img(&g.albedo, f16),
                     img(&g.spec_albedo, f16),
-                    self.width,
+                    self.trace_width,  // inputs at trace (render) resolution
+                    self.trace_height,
+                    self.width,        // output (clean) at display resolution
                     self.height,
                     ngx_jitter[0],
                     ngx_jitter[1],
@@ -2639,12 +2831,21 @@ impl Renderer {
                     &[self.desc_set],
                     &[],
                 );
+                // The tonemap runs at DISPLAY resolution (it reads the upscaled clean image), so the
+                // shared push's dims — set to the trace resolution for the path tracer — would clip
+                // the output to the top-left trace-res region. Override them with the display size.
+                let mut tm_push = push;
+                tm_push.dims = [self.width, self.height];
+                let tm_bytes = std::slice::from_raw_parts(
+                    &tm_push as *const CameraPush as *const u8,
+                    std::mem::size_of::<CameraPush>(),
+                );
                 d.cmd_push_constants(
                     self.cmd,
                     self.pipeline_layout,
                     vk::ShaderStageFlags::COMPUTE,
                     0,
-                    bytes,
+                    tm_bytes,
                 );
                 d.cmd_dispatch(self.cmd, self.width.div_ceil(8), self.height.div_ceil(8), 1);
             }

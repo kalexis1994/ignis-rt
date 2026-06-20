@@ -174,7 +174,15 @@ unsafe impl Send for RrFeature {} // raw NGX pointers; only touched from the ren
 /// command buffer in the recording state (NGX records initialization into it); the caller
 /// submits + waits. Returns None on failure (logged).
 #[cfg(have_ngx)]
-pub fn create_rr(device: u64, cmd: u64, width: u32, height: u32) -> Option<RrFeature> {
+pub fn create_rr(
+    device: u64,
+    cmd: u64,
+    render_w: u32,
+    render_h: u32,
+    display_w: u32,
+    display_h: u32,
+    perf_quality: i32,
+) -> Option<RrFeature> {
     use ffi::*;
     use std::ffi::CString;
     use std::os::raw::c_void;
@@ -187,11 +195,11 @@ pub fn create_rr(device: u64, cmd: u64, width: u32, height: u32) -> Option<RrFea
     let set_i  = |n: &str, v: i32| { let c = CString::new(n).unwrap(); unsafe { NVSDK_NGX_Parameter_SetI(params, c.as_ptr(), v) }; };
     set_ui("CreationNodeMask", 1);
     set_ui("VisibilityNodeMask", 1);
-    set_ui("Width", width);
-    set_ui("Height", height);
-    set_ui("OutWidth", width);   // DLAA: render resolution == output resolution
-    set_ui("OutHeight", height);
-    set_i("PerfQualityValue", PERF_QUALITY_DLAA);
+    set_ui("Width", render_w);   // render (trace) resolution — DLSS upscales from this
+    set_ui("Height", render_h);
+    set_ui("OutWidth", display_w); // output (display) resolution
+    set_ui("OutHeight", display_h);
+    set_i("PerfQualityValue", perf_quality);
     set_i("DLSS.Feature.Create.Flags", DLSS_FLAG_IS_HDR | DLSS_FLAG_MV_LOWRES | DLSS_FLAG_AUTO_EXPOSURE);
     set_i("DLSS.Denoise.Mode", DENOISE_MODE_DL_UNIFIED);
     set_ui("DLSS.Roughness.Mode", ROUGHNESS_MODE_PACKED);
@@ -214,7 +222,7 @@ pub fn create_rr(device: u64, cmd: u64, width: u32, height: u32) -> Option<RrFea
         )
     };
     if res == NGX_SUCCESS && !handle.is_null() {
-        log(&format!("NGX: DLSS-RR feature created OK ({width}x{height}, DLAA)"));
+        log(&format!("NGX: DLSS-RR feature created OK (render {render_w}x{render_h} -> display {display_w}x{display_h}, q={perf_quality})"));
         Some(RrFeature { handle, params })
     } else {
         log(&format!("NGX: CreateFeature RR FAILED (result {res:#x})"));
@@ -247,8 +255,10 @@ pub fn evaluate_rr(
     normal_rough: RrImage, // normals (rgb) + roughness packed in .a
     albedo: RrImage,       // diffuse albedo
     spec_albedo: RrImage,  // specular albedo (EnvBRDFApprox)
-    width: u32,
-    height: u32,
+    render_w: u32,  // trace resolution — inputs (color/depth/motion/normals/albedo)
+    render_h: u32,
+    display_w: u32, // output resolution — the upscaled clean image
+    display_h: u32,
     jitter_x: f32,
     jitter_y: f32,
     reset: bool,
@@ -265,24 +275,25 @@ pub fn evaluate_rr(
         base_array_layer: 0,
         layer_count: 1,
     };
-    let mk = |img: RrImage, rw: bool| ResourceVk {
+    let mk = |img: RrImage, rw: bool, w: u32, h: u32| ResourceVk {
         image_view: img.view,
         image: img.image,
         subresource: range,
         format: img.format,
-        width,
-        height,
+        width: w,
+        height: h,
         res_type: 0, // IMAGEVIEW
         read_write: rw as u8,
     };
-    // These must outlive the EvaluateFeature_C call (referenced by pointer).
-    let mut r_color = mk(color, false);
-    let mut r_output = mk(output, true);
-    let mut r_depth = mk(depth, false);
-    let mut r_motion = mk(motion, false);
-    let mut r_normal = mk(normal_rough, false);
-    let mut r_albedo = mk(albedo, false);
-    let mut r_specalb = mk(spec_albedo, false);
+    // These must outlive the EvaluateFeature_C call (referenced by pointer). Inputs are at the trace
+    // resolution; the output (clean) is the full display resolution that DLSS upscales into.
+    let mut r_color = mk(color, false, render_w, render_h);
+    let mut r_output = mk(output, true, display_w, display_h);
+    let mut r_depth = mk(depth, false, render_w, render_h);
+    let mut r_motion = mk(motion, false, render_w, render_h);
+    let mut r_normal = mk(normal_rough, false, render_w, render_h);
+    let mut r_albedo = mk(albedo, false, render_w, render_h);
+    let mut r_specalb = mk(spec_albedo, false, render_w, render_h);
 
     let p = rr.params;
     let set_ptr = |n: &str, r: *mut ResourceVk| { let c = CString::new(n).unwrap(); unsafe { NVSDK_NGX_Parameter_SetVoidPointer(p, c.as_ptr(), r as *mut c_void) }; };
@@ -303,8 +314,8 @@ pub fn evaluate_rr(
     set_i("Reset", reset as i32);
     set_f("MV.Scale.X", 1.0);
     set_f("MV.Scale.Y", 1.0);
-    set_ui("DLSS.Render.Subrect.Dimensions.Width", width);
-    set_ui("DLSS.Render.Subrect.Dimensions.Height", height);
+    set_ui("DLSS.Render.Subrect.Dimensions.Width", render_w);
+    set_ui("DLSS.Render.Subrect.Dimensions.Height", render_h);
     set_f("FrameTimeDeltaInMsec", frame_delta_ms);
     // Pre-exposure / exposure scale MUST be set: NGX reads an unset param as 0, and DLSS then tries
     // to un-apply a pre-exposure of 0 (divide by zero) -> normalization blows up / temporal boiling.
@@ -353,7 +364,7 @@ pub fn shutdown(_device: u64) {}
 #[cfg(not(have_ngx))]
 pub struct RrFeature;
 #[cfg(not(have_ngx))]
-pub fn create_rr(_device: u64, _cmd: u64, _w: u32, _h: u32) -> Option<RrFeature> { None }
+pub fn create_rr(_device: u64, _cmd: u64, _rw: u32, _rh: u32, _dw: u32, _dh: u32, _q: i32) -> Option<RrFeature> { None }
 #[cfg(not(have_ngx))]
 pub fn release_rr(_rr: RrFeature) {}
 
@@ -366,5 +377,5 @@ pub fn evaluate_rr(
     _cmd: u64, _rr: &RrFeature,
     _color: RrImage, _output: RrImage, _depth: RrImage, _motion: RrImage,
     _normal_rough: RrImage, _albedo: RrImage, _spec_albedo: RrImage,
-    _w: u32, _h: u32, _jx: f32, _jy: f32, _reset: bool, _delta: f32,
+    _rw: u32, _rh: u32, _dw: u32, _dh: u32, _jx: f32, _jy: f32, _reset: bool, _delta: f32,
 ) -> bool { false }
