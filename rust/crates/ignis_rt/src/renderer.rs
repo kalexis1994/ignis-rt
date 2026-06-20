@@ -315,6 +315,7 @@ pub struct Renderer {
     ft_ema: f32, // GPU frame time EMA (ms), for perf measurement
     ft_count: u32,
     last_render: Option<std::time::Instant>, // for the real frame delta fed to DLSS-RR
+    pending_reset: bool, // a hard cut (object/camera teleport) -> reset DLSS history next frame
     width: u32,        // display (output) resolution — readback + DLSS-RR output
     height: u32,
     trace_width: u32,  // path-tracer / guide resolution — DLSS-RR upscales this to width/height
@@ -1612,6 +1613,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         ft_ema: 0.0,
         ft_count: 0,
         last_render: None,
+        pending_reset: false,
         width,
         height,
         trace_width,
@@ -2292,15 +2294,33 @@ impl Renderer {
             return false;
         }
         let n_inst = self.tlas_instance_data.len() / 60;
+        let mut hard_cut = false;
         for (k, &idx) in indices.iter().enumerate() {
             let idx = idx as usize;
             if idx >= n_inst || (k + 1) * 12 > transforms.len() {
                 continue;
             }
+            let nt = &transforms[k * 12..k * 12 + 12];
+            // Teleport detection: the translation jump (row-major 3x4 -> indices 3/7/11) relative to
+            // the camera distance ~= its screen-space size. A fast drag stays small; a Ctrl+Z snap is
+            // a large instant jump whose stale DLSS history would ghost -> flag a hard cut (reset).
+            if let Some(old) = self.instance_transforms.get(idx) {
+                let (dx, dy, dz) = (nt[3] - old[3], nt[7] - old[7], nt[11] - old[11]);
+                let disp = (dx * dx + dy * dy + dz * dz).sqrt();
+                let (cx, cy, cz) = (self.cam_pos[0], self.cam_pos[1], self.cam_pos[2]);
+                let dist = ((nt[3] - cx).powi(2) + (nt[7] - cy).powi(2) + (nt[11] - cz).powi(2))
+                    .sqrt()
+                    .max(0.1);
+                if disp / dist > 0.25 {
+                    hard_cut = true;
+                }
+            }
             // The transform is a 48-byte [f32;12] at offset 4 within the 60-byte TlasInstanceIn.
             let off = idx * 60 + 4;
-            self.tlas_instance_data[off..off + 48]
-                .copy_from_slice(gpu::as_bytes(&transforms[k * 12..k * 12 + 12]));
+            self.tlas_instance_data[off..off + 48].copy_from_slice(gpu::as_bytes(nt));
+        }
+        if hard_cut {
+            self.pending_reset = true; // reset DLSS history next frame to drop the teleported ghost
         }
         // In DLSS-RR mode the motion vectors carry the object motion, so don't reset accumulation
         // (that would discard the denoiser history and zero the very motion vectors we just wrote).
@@ -2489,6 +2509,10 @@ impl Renderer {
             .map(|t| (now.duration_since(t).as_secs_f32() * 1000.0).clamp(1.0, 200.0))
             .unwrap_or(16.6);
         self.last_render = Some(now);
+        // DLSS history reset: on a fresh accumulation OR a detected hard cut (object/camera teleport).
+        // Smooth motion is carried by the motion vectors; a sudden jump would otherwise leave a ghost.
+        let dlss_reset = self.accum_frame <= 1 || self.pending_reset;
+        self.pending_reset = false;
         // World buffer: background color (color*strength*0.15) + HDRI params, set by the addon.
         // HDRI is uploaded into the bindless texture array; we just need its index + strength.
         let wd = [
@@ -2805,7 +2829,7 @@ impl Renderer {
                     self.height,
                     ngx_jitter[0],
                     ngx_jitter[1],
-                    self.accum_frame <= 1, // reset history on a fresh accumulation (matches C++)
+                    dlss_reset,             // fresh accumulation or a detected hard cut (teleport)
                     frame_delta_ms,         // real frame delta (ms) for DLSS-RR temporal feedback
                 );
                 // NGX's clean output -> tonemap reads.
