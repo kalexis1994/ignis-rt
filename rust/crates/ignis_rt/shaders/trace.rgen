@@ -64,6 +64,10 @@ layout(binding = 16, std430) readonly buffer EmissiveTris { vec4 data[]; } emiss
 // Environment (HDRI) luminance distribution for importance sampling — built by env_cdf.comp. Layout
 // matches that shader: [0]=funcInt, marginal CDF, conditional CDFs, func values.
 layout(binding = 17, std430) readonly buffer EnvDist { float data[]; } envDist;
+// Previous-frame object-to-world transforms, one per TLAS instance (3 vec4 = 3x4 row-major), indexed
+// by gl_InstanceID. Lets writeGuide place a moving object's surface point where it was last frame so
+// its motion vector tracks the object, not just the camera. Valid only when hasTlas bit6 is set.
+layout(binding = 18, std430) readonly buffer PrevXforms { vec4 rows[]; } prevXforms;
 
 layout(push_constant) uniform PC {
     mat4  invViewProj;
@@ -100,7 +104,10 @@ mat3 mirrorMatrix(vec3 n) {
              -2.0*n.x*n.z,      -2.0*n.y*n.z, 1.0 - 2.0*n.z*n.z);
 }
 
-void writeGuide(uvec2 p, vec3 worldPos, vec3 N, float roughness, vec3 albedo, vec3 specAlbedo) {
+// prevWorldPos = where this surface point was last frame. For a static object it equals worldPos
+// (camera-only motion); for a moving object it is the point transformed by the object's PREVIOUS
+// object-to-world, so the motion vector tracks the object and DLSS-RR can reproject it cleanly.
+void writeGuide(uvec2 p, vec3 worldPos, vec3 prevWorldPos, vec3 N, float roughness, vec3 albedo, vec3 specAlbedo) {
     if ((pc.hasTlas & 4u) == 0u) return;
     // DLSS-RR depth: linear view-space depth (distance along the camera forward axis). The RR path
     // uses linear depth (Use_HW_Depth=0), unlike DLSS-SR which uses NDC depth. Matches the C++
@@ -109,7 +116,7 @@ void writeGuide(uvec2 p, vec3 worldPos, vec3 N, float roughness, vec3 albedo, ve
     vec3 fwd = normalize(cf.xyz / cf.w - pc.camPos.xyz);
     float depth = max(dot(worldPos - pc.camPos.xyz, fwd), 0.0);
     vec2 mv = vec2(0.0);
-    vec4 pp = pc.prevViewProj * vec4(worldPos, 1.0);
+    vec4 pp = pc.prevViewProj * vec4(prevWorldPos, 1.0);
     if (pp.w > 1e-6) {
         vec2 prevNdc = pp.xy / pp.w;
         vec2 prevUV  = vec2(prevNdc.x * 0.5 + 0.5, 0.5 - prevNdc.y * 0.5);
@@ -125,6 +132,14 @@ void writeGuide(uvec2 p, vec3 worldPos, vec3 N, float roughness, vec3 albedo, ve
     imageStore(gAlbedo,     ivec2(p), vec4(albedo, 1.0));
     imageStore(gMotion,     ivec2(p), vec4(mv, 0.0, 0.0));
     imageStore(gSpecAlbedo, ivec2(p), vec4(specAlbedo, 0.0));
+}
+
+// Apply a previous-frame instance transform (3x4 row-major, 3 vec4) to an object-space point.
+vec3 prevObjToWorld(uint iid, vec3 localPos) {
+    vec4 lp = vec4(localPos, 1.0);
+    return vec3(dot(prevXforms.rows[iid*3u + 0u], lp),
+                dot(prevXforms.rows[iid*3u + 1u], lp),
+                dot(prevXforms.rows[iid*3u + 2u], lp));
 }
 
 const float PI = 3.14159265;
@@ -1162,7 +1177,8 @@ void writeGuidePSR(uvec2 p, vec3 ro, vec3 rd) {
         while (rayQueryProceedEXT(rq)) {}
         if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
             // Escaped to the sky: a far virtual surface straight along the unfolded direction.
-            writeGuide(p, pc.camPos.xyz + (pathDist + 1e5) * primaryRd, -primaryRd, 1.0, vec3(0.0), vec3(0.0));
+            vec3 skyPos = pc.camPos.xyz + (pathDist + 1e5) * primaryRd;
+            writeGuide(p, skyPos, skyPos, -primaryRd, 1.0, vec3(0.0), vec3(0.0));
             return;
         }
         uint id   = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
@@ -1170,6 +1186,8 @@ void writeGuidePSR(uvec2 p, vec3 ro, vec3 rd) {
         vec2 bc   = rayQueryGetIntersectionBarycentricsEXT(rq, true);
         float thit = rayQueryGetIntersectionTEXT(rq, true);
         mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+        uint iid = uint(rayQueryGetIntersectionInstanceIdEXT(rq, true)); // per-instance (prev xform)
+        mat4x3 w2o = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
         vec3 N, albedo, emission, geoN;
         float roughness, metallic, ior, transmission, transparentProb;
         bool frontFace, lightPathTransparent;
@@ -1223,14 +1241,24 @@ void writeGuidePSR(uvec2 p, vec3 ro, vec3 rd) {
         // roughness is max(surface, chain) so DLSS-RR blurs the reflection by the metal's glossiness.
         vec3 vpos = pc.camPos.xyz + pathDist * primaryRd;
         vec3 vN = normalize(mirrorMat * N);
+        // Object motion: shift the (virtual) position by this surface point's object-space displacement
+        // between frames, so a moving object's motion vector tracks it. For a direct hit vpos == hitPos
+        // so prevVpos lands exactly on the previous-frame surface point; through a delta chain it is an
+        // approximation. hasTlas bit6 = previous transforms uploaded.
+        vec3 prevVpos = vpos;
+        if ((pc.hasTlas & 64u) != 0u) {
+            vec3 localPos = w2o * vec4(hitPos, 1.0);
+            prevVpos = vpos + (prevObjToWorld(iid, localPos) - hitPos);
+        }
         vec3 F0 = mix(vec3(0.04), albedo, metallic);
         float NdotV = max(dot(N, -rd), 1e-3);
         vec3 specAlb = EnvBRDFApprox(F0, roughness, NdotV);
-        writeGuide(p, vpos, vN, max(roughness, chainRough), albedo, specAlb);
+        writeGuide(p, vpos, prevVpos, vN, max(roughness, chainRough), albedo, specAlb);
         return;
     }
     // Too many delta bounces: fall back to the deepest virtual position (rough/far).
-    writeGuide(p, pc.camPos.xyz + pathDist * primaryRd, -primaryRd, 1.0, vec3(0.0), vec3(0.0));
+    vec3 deepPos = pc.camPos.xyz + pathDist * primaryRd;
+    writeGuide(p, deepPos, deepPos, -primaryRd, 1.0, vec3(0.0), vec3(0.0));
 }
 
 void main() {

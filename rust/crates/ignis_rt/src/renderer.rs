@@ -142,6 +142,10 @@ struct CameraPush {
     _pad: u32,
 } // 208 bytes (push-constant max is 256 on the target GPUs)
 
+/// Upper bound on TLAS instances for the previous-transform buffer (object motion vectors). The
+/// shader only reads indices below the live instance count, so this is a hard allocation cap.
+const MAX_INSTANCES: u32 = 65536;
+
 /// TLAS instance as the addon sends it (matches IgnisTLASInstance / TLASInstance, 60 bytes).
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -218,6 +222,14 @@ pub struct Renderer {
     // World/background color (the "sky"), bound at binding 8.
     world_buffer: Option<GpuBuffer>,
     world_data: [f32; 8], // [bg_color.rgb, 0, hdri_index, hdri_strength, 0, 0]
+
+    // Object motion vectors (binding 18): previous-frame instance transforms so moving objects
+    // get correct motion vectors. instance_transforms = current (parsed in build_tlas);
+    // prev_instance_transforms = as of the last render. Each is a flat [f32;12] (3x4 row-major) per
+    // instance, indexed by gl_InstanceID.
+    prev_xform_buffer: Option<GpuBuffer>,
+    instance_transforms: Vec<[f32; 12]>,
+    prev_instance_transforms: Vec<[f32; 12]>,
 
     // Compute pipeline.
     offscreen_view: vk::ImageView,
@@ -445,6 +457,13 @@ pub fn flush_mesh_batch() -> i32 {
 pub fn build_tlas(instances: *const u8, count: u32) -> bool {
     match RENDERER.lock().unwrap().as_mut() {
         Some(r) => r.0.build_tlas(instances, count),
+        None => false,
+    }
+}
+
+pub fn update_instance_transforms(indices: &[u32], transforms: &[f32]) -> bool {
+    match RENDERER.lock().unwrap().as_mut() {
+        Some(r) => r.0.update_instance_transforms(indices, transforms),
         None => false,
     }
 }
@@ -911,6 +930,14 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     )?;
     world_buffer.write_bytes(gpu::as_bytes(&[0.0f32, 0.0, 0.0, 0.0, -1.0, 1.0, 0.0, 0.0]));
 
+    // Previous-frame instance transforms (binding 18, object motion vectors): 3 vec4 (48 bytes) per
+    // TLAS instance, host-visible so it can be rewritten each frame. Sized for a generous instance
+    // cap; the shader only reads indices < instance count, which never exceeds it.
+    let prev_xform_buffer = GpuBuffer::new(
+        &device, &mut allocator, (MAX_INSTANCES as u64) * 48,
+        vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "prev_xforms",
+    )?;
+
     // Compute pipeline.
     // Binding 0: offscreen storage image (always). Binding 1: TLAS — only on RT devices
     // (partially bound: written after the scene loads, read only when hasTlas == 1). A
@@ -1045,7 +1072,8 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         }
         // Binding 16: emissive triangles (NEE area lights) — storage buffer, written when present.
         // Binding 17: environment (HDRI) luminance distribution — built by env_cdf.comp, read by trace.
-        for b in 16u32..=17u32 {
+        // Binding 18: previous-frame instance transforms (object motion vectors), written per frame.
+        for b in 16u32..=18u32 {
             bindings.push(
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(b)
@@ -1107,6 +1135,10 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         .buffer(world_buffer.buffer)
         .offset(0)
         .range(vk::WHOLE_SIZE)];
+    let prev_xform_info = [vk::DescriptorBufferInfo::default()
+        .buffer(prev_xform_buffer.buffer)
+        .offset(0)
+        .range(vk::WHOLE_SIZE)];
     let gi = |v: vk::ImageView| [vk::DescriptorImageInfo::default()
         .image_view(v)
         .image_layout(vk::ImageLayout::GENERAL)];
@@ -1161,6 +1193,13 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .dst_binding(15)
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(&specalb_info),
+        );
+        writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(desc_set)
+                .dst_binding(18)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&prev_xform_info),
         );
     }
     unsafe { device.update_descriptor_sets(&writes, &[]) };
@@ -1473,6 +1512,9 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         has_lut: false,
         world_buffer: Some(world_buffer),
         world_data: [-1.0; 8], // impossible -> first render writes the real value
+        prev_xform_buffer: Some(prev_xform_buffer),
+        instance_transforms: Vec::new(),
+        prev_instance_transforms: Vec::new(),
         offscreen_view,
         ds_layout,
         desc_pool,
@@ -2055,13 +2097,10 @@ impl Renderer {
     }
 
     fn build_tlas(&mut self, instances: *const u8, count: u32) -> bool {
-        let accel = match self.accel_ext.clone() {
-            Some(a) => a,
-            None => {
-                log("build_tlas: RT not supported, skipping");
-                return false;
-            }
-        };
+        if self.accel_ext.is_none() {
+            log("build_tlas: RT not supported, skipping");
+            return false;
+        }
         if instances.is_null() || count == 0 {
             return false;
         }
@@ -2075,8 +2114,32 @@ impl Renderer {
 
         // Refresh the geometry table: per-triangle material ids arrive after flush.
         self.update_geom_table();
-        let in_slice =
-            unsafe { std::slice::from_raw_parts(instances as *const TlasInstanceIn, count as usize) };
+        self.rebuild_tlas(true)
+    }
+
+    /// Rebuild the TLAS from the stored instance bytes (tlas_instance_data). Shared by the full
+    /// build_tlas and the live transform sync (update_instance_transforms). reset_accum restarts the
+    /// accumulator; the live sync skips it in DLSS-RR mode, where the motion vectors carry the object
+    /// motion so the denoiser need not reset. Also refreshes the motion-vector transform snapshot.
+    fn rebuild_tlas(&mut self, reset_accum: bool) -> bool {
+        let accel = match self.accel_ext.clone() {
+            Some(a) => a,
+            None => return false,
+        };
+        let count = (self.tlas_instance_data.len() / 60) as u32;
+        if count == 0 {
+            return false;
+        }
+        let in_slice = unsafe {
+            std::slice::from_raw_parts(
+                self.tlas_instance_data.as_ptr() as *const TlasInstanceIn,
+                count as usize,
+            )
+        };
+
+        // Snapshot the current instance transforms (object motion vectors). gl_InstanceID in the
+        // shader is this array order, so the previous-transform buffer is indexed the same way.
+        self.instance_transforms = in_slice.iter().map(|i| i.transform).collect();
 
         // Convert to VkAccelerationStructureInstanceKHR.
         let mut vk_instances: Vec<vk::AccelerationStructureInstanceKHR> = Vec::with_capacity(count as usize);
@@ -2137,8 +2200,9 @@ impl Renderer {
                 unsafe { self.device.update_descriptor_sets(&[write], &[]) };
 
                 self.tlas = Some(t);
-                self.accum_frame = 0; // scene changed -> restart accumulation
-                log(&format!("TLAS built: {count} instances"));
+                if reset_accum {
+                    self.accum_frame = 0; // scene/transform changed -> restart accumulation
+                }
                 true
             }
             Err(e) => {
@@ -2146,6 +2210,31 @@ impl Renderer {
                 false
             }
         }
+    }
+
+    /// Live transform sync (the fast path the addon calls while dragging an object): patch the given
+    /// instances' transforms in the stored instance bytes and rebuild the TLAS, without re-collecting
+    /// geometry or materials. This was a no-op stub before — moving an object only updated on the next
+    /// full build_tlas (i.e. after deselecting), so the render appeared frozen mid-drag.
+    fn update_instance_transforms(&mut self, indices: &[u32], transforms: &[f32]) -> bool {
+        if self.tlas_instance_data.is_empty() {
+            return false;
+        }
+        let n_inst = self.tlas_instance_data.len() / 60;
+        for (k, &idx) in indices.iter().enumerate() {
+            let idx = idx as usize;
+            if idx >= n_inst || (k + 1) * 12 > transforms.len() {
+                continue;
+            }
+            // The transform is a 48-byte [f32;12] at offset 4 within the 60-byte TlasInstanceIn.
+            let off = idx * 60 + 4;
+            self.tlas_instance_data[off..off + 48]
+                .copy_from_slice(gpu::as_bytes(&transforms[k * 12..k * 12 + 12]));
+        }
+        // In DLSS-RR mode the motion vectors carry the object motion, so don't reset accumulation
+        // (that would discard the denoiser history and zero the very motion vectors we just wrote).
+        let rr_active = self.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0;
+        self.rebuild_tlas(!rr_active)
     }
 
     fn clear_geometry(&mut self) {
@@ -2215,6 +2304,27 @@ impl Renderer {
             self.env_dirty = true; // rebuild the HDRI importance-sampling distribution
         }
 
+        // Object motion vectors: upload each current instance's PREVIOUS-frame transform to binding 18,
+        // then snapshot the current set for next frame. New instances default to their current transform
+        // (zero motion). bit6 of has_tlas gates the shader on a populated buffer.
+        let n = self.instance_transforms.len();
+        let have_motion = self.tlas.is_some() && n > 0 && n <= MAX_INSTANCES as usize;
+        if have_motion {
+            let mut data: Vec<f32> = Vec::with_capacity(n * 12);
+            for i in 0..n {
+                let t = self
+                    .prev_instance_transforms
+                    .get(i)
+                    .copied()
+                    .unwrap_or(self.instance_transforms[i]);
+                data.extend_from_slice(&t);
+            }
+            if let Some(b) = &self.prev_xform_buffer {
+                b.write_bytes(gpu::as_bytes(&data));
+            }
+            self.prev_instance_transforms = self.instance_transforms.clone();
+        }
+
         let d = &self.device;
         // Sun from scene config (azimuth/elevation -> direction, Y-up, matching the C++).
         let az = crate::config::get_float("sun_azimuth").to_radians();
@@ -2272,7 +2382,8 @@ impl Renderer {
                 | (if write_guide { 4 } else { 0 }) // bit2 = emit DLSS guide buffers
                 | (if use_rr { 8 } else { 0 })      // bit3 = DLSS-RR mode (noisy linear out)
                 | (if self.ser { 16 } else { 0 })   // bit4 = Shader Execution Reordering
-                | (if ENV_IS_ENABLED { 32 } else { 0 }), // bit5 = HDRI environment importance sampling
+                | (if ENV_IS_ENABLED { 32 } else { 0 }) // bit5 = HDRI environment importance sampling
+                | (if have_motion { 64 } else { 0 }), // bit6 = object motion vectors (prev transforms)
             num_lights: self.light_count,
             sun_dir: [az.sin() * el.cos(), el.sin(), az.cos() * el.cos(), intensity],
             sun_col: [sc[0], sc[1], sc[2], self.accum_frame as f32],
@@ -3043,6 +3154,9 @@ impl Drop for Renderer {
                     b.destroy(&device, alloc);
                 }
                 if let Some(b) = self.world_buffer.take() {
+                    b.destroy(&device, alloc);
+                }
+                if let Some(b) = self.prev_xform_buffer.take() {
                     b.destroy(&device, alloc);
                 }
                 if self.has_lut {

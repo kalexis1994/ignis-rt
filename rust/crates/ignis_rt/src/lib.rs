@@ -272,11 +272,16 @@ pub extern "C" fn ignis_build_tlas(instances: *const c_void, count: u32) -> bool
 
 #[no_mangle]
 pub extern "C" fn ignis_update_instance_transforms(
-    _indices: *const u32,
-    _transforms: *const f32,
-    _count: u32,
+    indices: *const u32,
+    transforms: *const f32,
+    count: u32,
 ) -> bool {
-    false
+    if indices.is_null() || transforms.is_null() || count == 0 {
+        return false;
+    }
+    let idx = unsafe { std::slice::from_raw_parts(indices, count as usize) };
+    let xf = unsafe { std::slice::from_raw_parts(transforms, count as usize * 12) };
+    renderer::update_instance_transforms(idx, xf)
 }
 
 // ============================================================================
