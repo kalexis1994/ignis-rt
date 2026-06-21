@@ -25,11 +25,20 @@ _lib = None  # type: ctypes.CDLL | None
 
 
 def _find_dll():
-    """Locate ignis_rt.dll in lib/ next to this file."""
+    """Locate the native library in lib/ next to this file. The filename is platform-specific:
+    ignis_rt.dll (Windows), libignis_rt.so (Linux, cargo cdylib), libignis_rt.dylib (macOS)."""
     here = os.path.dirname(os.path.abspath(__file__))
-    candidate = os.path.join(here, "lib", "ignis_rt.dll")
-    if os.path.isfile(candidate):
-        return candidate
+    lib_dir = os.path.join(here, "lib")
+    if sys.platform.startswith("win"):
+        names = ("ignis_rt.dll",)
+    elif sys.platform == "darwin":
+        names = ("libignis_rt.dylib", "ignis_rt.dylib")
+    else:
+        names = ("libignis_rt.so", "ignis_rt.so")
+    for name in names:
+        candidate = os.path.join(lib_dir, name)
+        if os.path.isfile(candidate):
+            return candidate
     return None
 
 
@@ -55,7 +64,7 @@ def load():
 
     path = _find_dll()
     if path is None:
-        print("[ignis_rt] ERROR: ignis_rt.dll not found in lib/ subfolder")
+        print("[ignis_rt] ERROR: native library (ignis_rt.dll / libignis_rt.so) not found in lib/ subfolder")
         return False
 
     # Add DLL directory so dependent DLLs (vulkan-1.dll etc.) can be found

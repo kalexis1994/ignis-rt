@@ -25,13 +25,20 @@ blender/ignis_rt/shaders/
 
 # --- Addon zip (build artifact) ---
 ignis_rt_addon.zip
+ignis_rt-*.zip
 
 # --- Deployed binaries in Blender addon ---
 blender/ignis_rt/lib/ignis_rt.dll
+blender/ignis_rt/lib/libignis_rt.so
+blender/ignis_rt/lib/libnvidia-ngx-*.so*
 blender/ignis_rt/lib/NRD.dll
 blender/ignis_rt/lib/nvngx_dlss.dll
 blender/ignis_rt/lib/nvngx_dlssd.dll
 blender/ignis_rt/lib/nrd_composite.spv
+
+# --- Runtime logs (renderer + NGX) ---
+blender/ignis_rt/ignis-rs.log
+blender/ignis_rt/lib/*.log
 
 # --- Python bytecode ---
 __pycache__/

@@ -12,7 +12,7 @@ website = "https://github.com/kalexis1994/ignis-rt"
 
 blender_version_min = "5.0.0"
 
-platforms = ["windows-x64"]
+platforms = ["windows-x64", "linux-x64"]
 
 [permissions]
 files = "Read/write log files and load shaders from disk"
