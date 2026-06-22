@@ -1,0 +1,71 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+#include "pathtracer_common.glsl"
+// ── SHARC resolve ───────────────────────────────────────────────────────────────────────────────
+// Temporal blend of this frame's accumulated radiance into the persistent resolved cache + stale
+// eviction. One thread per cache slot; runs after the path trace populated the accum region.
+// data layout: [accum: cap*4 uint][resolved: cap*4 uint]. accum slot = [Rscaled,Gscaled,Bscaled,count]
+// (uint, ×SHARC_RADIANCE_SCALE); resolved slot = [Rf,Gf,Bf,meta] (RGB float-bits; meta low16 = sample
+// count, high16 = stale-frame counter). The ray_query extension is only on because the shared include
+// declares it — this stage never traces.
+
+layout(local_size_x = 256) in;
+
+const uint SHARC_ACCUM_FRAME_MAX = 256u; // temporal window cap (more = cleaner, slower to respond)
+const uint SHARC_STALE_FRAME_MAX = 128u; // evict a cell after this many frames with no new samples
+
+void main() {
+    uint cap = pc.sharcCapacity;
+    uint idx = gl_GlobalInvocationID.x;
+    if (cap == 0u || idx >= cap) return;
+    if (_sharcKeys.keys[idx] == uint64_t(0u)) return; // empty slot
+
+    uint aBase = idx * 4u;
+    uint rBase = sharcResolvedOffset(idx, cap);
+
+    uint sampleCount = _sharcData.data[aBase + 3u];
+    uint meta = _sharcData.data[rBase + 3u];
+    float prevSamples = float(meta & 0xFFFFu);
+    uint  staleFrames = (meta >> 16u) & 0xFFFFu;
+
+    if (sampleCount > 0u) {
+        // New samples this frame: blend their mean into the resolved radiance (running average).
+        float invScale = 1.0 / SHARC_RADIANCE_SCALE;
+        vec3 newRadiance = vec3(float(_sharcData.data[aBase + 0u]),
+                                float(_sharcData.data[aBase + 1u]),
+                                float(_sharcData.data[aBase + 2u])) * invScale / float(sampleCount);
+        vec3 prev = vec3(uintBitsToFloat(_sharcData.data[rBase + 0u]),
+                         uintBitsToFloat(_sharcData.data[rBase + 1u]),
+                         uintBitsToFloat(_sharcData.data[rBase + 2u]));
+        float total = prevSamples + float(sampleCount);
+        vec3 blended = (prevSamples > 0.0)
+            ? prev * (prevSamples / total) + newRadiance * (float(sampleCount) / total)
+            : newRadiance;
+        _sharcData.data[rBase + 0u] = floatBitsToUint(blended.r);
+        _sharcData.data[rBase + 1u] = floatBitsToUint(blended.g);
+        _sharcData.data[rBase + 2u] = floatBitsToUint(blended.b);
+        _sharcData.data[rBase + 3u] = uint(min(total, float(SHARC_ACCUM_FRAME_MAX))) & 0xFFFFu; // stale -> 0
+        // Reset the accumulators for the next frame.
+        _sharcData.data[aBase + 0u] = 0u;
+        _sharcData.data[aBase + 1u] = 0u;
+        _sharcData.data[aBase + 2u] = 0u;
+        _sharcData.data[aBase + 3u] = 0u;
+    } else {
+        // No new samples: age the cell; free the slot once it's been stale too long.
+        staleFrames += 1u;
+        if (staleFrames > SHARC_STALE_FRAME_MAX) {
+            _sharcKeys.keys[idx] = uint64_t(0u);
+            _sharcData.data[rBase + 0u] = 0u;
+            _sharcData.data[rBase + 1u] = 0u;
+            _sharcData.data[rBase + 2u] = 0u;
+            _sharcData.data[rBase + 3u] = 0u;
+        } else {
+            _sharcData.data[rBase + 3u] = (staleFrames << 16u) | (uint(prevSamples) & 0xFFFFu);
+        }
+    }
+}

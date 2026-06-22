@@ -440,7 +440,9 @@ struct CameraPush {
     max_bounces: u32,    // path-tracing bounce budget (Max Bounces selector)
     spp: u32,            // samples per pixel per frame (Samples/Pixel selector; wavefront loops this)
     sample_idx: u32,     // current sample 0..spp-1, set per round in the wavefront dispatch loop
-} // 224 bytes (push-constant max is 256 on the target GPUs)
+    sharc_capacity: u32, // SHARC radiance-cache slots; 0 = cache disabled
+    sharc_scene_scale: f32, // SHARC world-space -> voxel scale
+} // 232 bytes (push-constant max is 256 on the target GPUs)
 
 // SHARC (Spatial Hash Radiance Cache) world-space cache size, in voxels/slots. Power of two. The basic
 // phase uses 1M (~40 MiB: keys = cap*8, data = cap*32). NVIDIA's baseline is 2^22; bump once it works.
@@ -548,6 +550,8 @@ pub struct Renderer {
     wf_extend_pipeline: Option<vk::Pipeline>,
     wf_resolve_pipeline: Option<vk::Pipeline>,
     wf_compact_pipeline: Option<vk::Pipeline>,
+    sharc_resolve_pipeline: Option<vk::Pipeline>, // SHARC temporal resolve (post-trace compute)
+    sharc_init: bool, // whether the SHARC buffers have been zero-filled yet
     // Hybrid rasterization (primary-visibility G-buffer). Off by default; feeds wf_gen when enabled.
     raster: Option<RasterRes>,
     raster_debug_pipeline: Option<vk::Pipeline>, // R1 visualization (hashColor of the hit G-buffer)
@@ -1863,7 +1867,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     };
 
     // Wavefront path tracer pipelines (compute, share the pipeline layout). Phase 0: gen + extend/shade.
-    let (wf_gen_pipeline, wf_extend_pipeline, wf_resolve_pipeline, wf_compact_pipeline, raster_debug_pipeline) = if rt_supported {
+    let (wf_gen_pipeline, wf_extend_pipeline, wf_resolve_pipeline, wf_compact_pipeline, raster_debug_pipeline, sharc_resolve_pipeline) = if rt_supported {
         let mk = |spv_bytes: &[u8], name: &str| -> Result<vk::Pipeline, String> {
             let spv = ash::util::read_spv(&mut std::io::Cursor::new(spv_bytes))
                 .map_err(|e| format!("read {name} spv: {e}"))?;
@@ -1891,9 +1895,10 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         let r = mk(&include_bytes!(concat!(env!("OUT_DIR"), "/wf_resolve.comp.spv"))[..], "wf_resolve")?;
         let c = mk(&include_bytes!(concat!(env!("OUT_DIR"), "/wf_compact.comp.spv"))[..], "wf_compact")?;
         let dbg = mk(&include_bytes!(concat!(env!("OUT_DIR"), "/raster_debug.comp.spv"))[..], "raster_debug")?;
-        (Some(g), Some(e), Some(r), Some(c), Some(dbg))
+        let sr = mk(&include_bytes!(concat!(env!("OUT_DIR"), "/sharc_resolve.comp.spv"))[..], "sharc_resolve")?;
+        (Some(g), Some(e), Some(r), Some(c), Some(dbg), Some(sr))
     } else {
-        (None, None, None, None, None)
+        (None, None, None, None, None, None)
     };
 
     // Hybrid-raster G-buffer + graphics pipeline (primary visibility). Allocated at display res; the
@@ -2144,6 +2149,8 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         wf_extend_pipeline,
         wf_resolve_pipeline,
         wf_compact_pipeline,
+        sharc_resolve_pipeline,
+        sharc_init: false,
         raster,
         raster_debug_pipeline,
         raster_inst_buffer,
@@ -3251,6 +3258,10 @@ impl Renderer {
             v if v <= 0 => 1u32,
             v => (v as u32).clamp(1, 16),
         };
+        // SHARC radiance cache (Blender "sharc_enabled"). 0 capacity disables it in-shader. Scene scale
+        // sets the voxel sizing (camera-relative LOD grid); 1.0 ~= 1-unit voxels near the camera.
+        let sharc_capacity = if crate::config::get_int("sharc_enabled") != 0 { SHARC_CAPACITY } else { 0 };
+        let sharc_scene_scale = 1.0f32; // TODO SHARC-3: derive from the scene AABB
         let push = CameraPush {
             inv_view_proj: self.inv_view_proj,
             cam_pos: cam,
@@ -3274,6 +3285,8 @@ impl Renderer {
             max_bounces,
             spp,
             sample_idx: 0, // set per sample in the wavefront dispatch loop
+            sharc_capacity,
+            sharc_scene_scale,
         };
         self.prev_view_proj = cur_vp;
         let range = vk::ImageSubresourceRange::default()
@@ -3328,6 +3341,24 @@ impl Renderer {
                 let _ = d.queue_submit(self.queue, &[submit], self.fence);
                 let _ = d.wait_for_fences(&[self.fence], true, u64::MAX);
                 return;
+            }
+
+            // SHARC: one-time zero-fill of the cache buffers (keys + data) before first use. After this
+            // the cache persists + ages out across frames (the resolve pass handles eviction).
+            if sharc_capacity > 0 && !self.sharc_init {
+                if let (Some(k), Some(da)) = (self.sharc_keys_buffer.as_ref(), self.sharc_data_buffer.as_ref()) {
+                    d.cmd_fill_buffer(self.cmd, k.buffer, 0, vk::WHOLE_SIZE, 0);
+                    d.cmd_fill_buffer(self.cmd, da.buffer, 0, vk::WHOLE_SIZE, 0);
+                    let mb = vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+                    d.cmd_pipeline_barrier(
+                        self.cmd, vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                        vk::DependencyFlags::empty(), &[mb], &[], &[],
+                    );
+                }
+                self.sharc_init = true;
             }
 
             // Rebuild the HDRI importance-sampling distribution when the world/HDRI changed (rare).
@@ -3600,6 +3631,29 @@ impl Renderer {
                     bytes,
                 );
                 d.cmd_dispatch(self.cmd, self.trace_width.div_ceil(8), self.trace_height.div_ceil(8), 1);
+            }
+
+            // SHARC resolve: blend this frame's accumulated radiance into the persistent cache + age
+            // out stale cells (one thread per slot). The trace's atomic updates (SHARC-1) wrote the
+            // accum region; a barrier makes them visible. No-op while the cache is empty. Bind the
+            // descriptor set to COMPUTE (the megakernel left it on RAY_TRACING); pc.sharcCapacity is
+            // already pushed by the trace.
+            if sharc_capacity > 0 {
+                if let Some(p) = self.sharc_resolve_pipeline {
+                    let mb = vk::MemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+                    d.cmd_pipeline_barrier(
+                        self.cmd,
+                        vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                        vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[mb], &[], &[],
+                    );
+                    d.cmd_bind_descriptor_sets(
+                        self.cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout, 0, &[self.desc_set], &[],
+                    );
+                    d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, p);
+                    d.cmd_dispatch(self.cmd, SHARC_CAPACITY.div_ceil(256), 1, 1);
+                }
             }
 
             // DLSS Ray Reconstruction: denoise the noisy 1-spp color (with the guide buffers) into
@@ -4257,6 +4311,9 @@ impl Drop for Renderer {
                 device.destroy_pipeline(p, None);
             }
             if let Some(p) = self.wf_compact_pipeline.take() {
+                device.destroy_pipeline(p, None);
+            }
+            if let Some(p) = self.sharc_resolve_pipeline.take() {
                 device.destroy_pipeline(p, None);
             }
             if let Some(p) = self.raster_debug_pipeline.take() {

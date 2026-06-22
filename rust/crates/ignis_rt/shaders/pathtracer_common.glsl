@@ -73,6 +73,8 @@ layout(push_constant) uniform PC {
     uint  maxBounces;    // path-tracing bounce budget (Max Bounces selector; was the const MAX_BOUNCES)
     uint  spp;           // samples per pixel per frame (Samples/Pixel selector; wavefront loops this)
     uint  sampleIdx;     // current sample 0..spp-1 within this frame
+    uint  sharcCapacity;   // SHARC radiance-cache slots; 0 = cache disabled
+    float sharcSceneScale; // SHARC world-space -> voxel scale (camera-relative logarithmic-LOD grid)
 } pc;
 
 // Per-instance raster data (binding 23): objectToWorld (3 vec4 rows) + customIndex, indexed by the
@@ -80,6 +82,10 @@ layout(push_constant) uniform PC {
 // and the ray-traced wavefront paths never touch it.
 struct RasterInst { vec4 o2w0; vec4 o2w1; vec4 o2w2; uint customIndex; uint rpad0, rpad1, rpad2; };
 layout(binding = 23, std430) readonly buffer RasterInsts { RasterInst data[]; } rasterInsts;
+
+// SHARC world-space radiance cache (bindings 25-26). Declared after the pc block (uses pc.camPos +
+// pc.sharcSceneScale + pc.sharcCapacity). Read-only here; the atomic update half comes in SHARC-1.
+#include "sharc.glsl"
 
 // objectToWorld (mat4x3, matching the ray query's) for raster instance instId.
 mat4x3 rasterO2W(uint instId) {
