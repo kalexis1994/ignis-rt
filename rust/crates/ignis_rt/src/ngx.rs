@@ -222,7 +222,7 @@ pub fn init(
         internal_data: std::ptr::null_mut(),
         logging: LoggingInfo {
             callback: Some(ngx_log_callback),
-            min_level: NGX_LOGGING_LEVEL_ON,
+            min_level: NGX_LOGGING_LEVEL_VERBOSE,
             disable_other_sinks: 0,
         },
     };
@@ -515,7 +515,8 @@ pub fn evaluate_fg(
     width: u32,
     height: u32,
     multi_frame_count: u32,
-    clip_to_prev_clip: [f32; 16],
+    clip_to_prev_clip: [f32; 16], // row-major (NGX convention), current clip -> previous clip
+    prev_clip_to_clip: [f32; 16], // row-major, previous clip -> current clip (the inverse)
     cam_near: f32,
     cam_far: f32,
     reset: bool,
@@ -536,6 +537,7 @@ pub fn evaluate_fg(
     let mut r_interp = mk(out_interp, true);
     let mut r_real = mk(out_real, true);
     let mut m_clip_prev = clip_to_prev_clip;
+    let mut m_prev_clip = prev_clip_to_clip;
 
     let p = fg.params;
     let set_ptr = |n: &str, r: *mut c_void| { let c = CString::new(n).unwrap(); unsafe { NVSDK_NGX_Parameter_SetVoidPointer(p, c.as_ptr(), r) }; };
@@ -548,6 +550,7 @@ pub fn evaluate_fg(
     set_ptr("DLSSG.OutputInterpolated", &mut r_interp as *mut _ as *mut c_void);
     set_ptr("DLSSG.OutputReal", &mut r_real as *mut _ as *mut c_void);
     set_ptr("DLSSG.ClipToPrevClip", m_clip_prev.as_mut_ptr() as *mut c_void);
+    set_ptr("DLSSG.PrevClipToClip", m_prev_clip.as_mut_ptr() as *mut c_void);
     set_ui("DLSSG.MultiFrameCount", multi_frame_count.max(1));
     set_ui("DLSSG.MultiFrameIndex", 1);
     set_f("DLSSG.CameraNear", cam_near);
@@ -555,7 +558,7 @@ pub fn evaluate_fg(
     set_f("DLSSG.MvecScaleX", 1.0);
     set_f("DLSSG.MvecScaleY", 1.0);
     set_ui("DLSSG.DepthInverted", 0);
-    set_ui("DLSSG.ColorBuffersHDR", 1);
+    set_ui("DLSSG.ColorBuffersHDR", 0); // the backbuffer is tonemapped display (LDR), not full HDR
     set_ui("DLSSG.CameraMotionIncluded", 1); // our motion vectors include camera motion
     set_ui("DLSSG.Reset", reset as u32);
 
@@ -626,5 +629,5 @@ pub fn release_fg(_fg: FgFeature) {}
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_fg(
     _cmd: u64, _fg: &FgFeature, _color: RrImage, _mvec: RrImage, _depth: RrImage,
-    _oi: RrImage, _or: RrImage, _w: u32, _h: u32, _mfc: u32, _m: [f32; 16], _n: f32, _f: f32, _r: bool,
+    _oi: RrImage, _or: RrImage, _w: u32, _h: u32, _mfc: u32, _m: [f32; 16], _m2: [f32; 16], _n: f32, _f: f32, _r: bool,
 ) -> bool { false }

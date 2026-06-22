@@ -70,6 +70,9 @@ layout(push_constant) uniform PC {
     uint  emissiveCount; // number of emissive triangles for NEE (0 = none)
     uint  wfIn;          // wavefront compaction: read side (0/1) of the ping-pong live-path queue
     uint  wfOut;         // wavefront compaction: write side (0/1)
+    uint  maxBounces;    // path-tracing bounce budget (Max Bounces selector; was the const MAX_BOUNCES)
+    uint  spp;           // samples per pixel per frame (Samples/Pixel selector; wavefront loops this)
+    uint  sampleIdx;     // current sample 0..spp-1 within this frame
 } pc;
 
 // Per-instance raster data (binding 23): objectToWorld (3 vec4 rows) + customIndex, indexed by the
@@ -1481,7 +1484,7 @@ bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng,
             c.tp /= q;
         }
         c.b++;
-        if (c.b >= MAX_BOUNCES) return false;
+        if (c.b >= int(pc.maxBounces)) return false;
         return true;   // real bounce taken; the path continues
     }
     return false;       // inner loop overflow (pathological glass/alpha stack)

@@ -109,15 +109,60 @@ def _tag_redraw(self, context):
 
 
 # Frame Generation selector — the options depend on what the GPU supports (DLSS-G max generated-frame
-# count, queried from NGX at init). Ada (40-series) = 2x; Blackwell (50-series) = up to 4x.
+# count). NGX can only report it once a Vulkan device exists (created at the first render), so we
+# persist the detected value: after the first-ever render the dropdown is correct in every later
+# session without rendering first. Ada (40-series) = 2x; Blackwell (50-series) = up to 4x.
+_fg_max_cached = -1  # -1 = not loaded from disk yet
+
+
+def _fg_cache_file():
+    try:
+        d = bpy.utils.user_resource('CONFIG', path="ignis_rt", create=True)
+        return os.path.join(d, "dlssg_max.txt")
+    except Exception:
+        return None
+
+
+def _fg_get_cached():
+    global _fg_max_cached
+    if _fg_max_cached < 0:
+        _fg_max_cached = 0
+        p = _fg_cache_file()
+        if p and os.path.exists(p):
+            try:
+                _fg_max_cached = max(0, int(open(p).read().strip()))
+            except Exception:
+                pass
+    return _fg_max_cached
+
+
+def _fg_set_cached(v):
+    global _fg_max_cached
+    if v == _fg_max_cached:
+        return
+    _fg_max_cached = v
+    p = _fg_cache_file()
+    if p:
+        try:
+            with open(p, "w") as f:
+                f.write(str(v))
+        except Exception:
+            pass
+
+
 _fg_items_cache = []
 def _frame_gen_items(self, context):
     global _fg_items_cache
     try:
         from . import dll_wrapper
-        mx = dll_wrapper.dlssg_max_frames()
+        live = dll_wrapper.dlssg_max_frames()  # 0 until NGX inits at the first render
     except Exception:
-        mx = 0
+        live = 0
+    if live > 0:
+        _fg_set_cached(live)
+        mx = live
+    else:
+        mx = _fg_get_cached()  # last-known, so the dropdown is right before this session renders
     items = [('OFF', 'Off', 'No frame generation')]
     if mx >= 1:
         items.append(('2X', '2x  (1 generated)', 'DLSS Frame Generation — 1 interpolated frame'))

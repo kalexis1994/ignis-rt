@@ -437,8 +437,10 @@ struct CameraPush {
     emissive_count: u32, // emissive triangle count for NEE (0 = none)
     wf_in: u32,          // wavefront compaction: read side (0/1) of the ping-pong live-path queue
     wf_out: u32,         // wavefront compaction: write side (0/1)
-    _pad: u32,
-} // 216 bytes (push-constant max is 256 on the target GPUs)
+    max_bounces: u32,    // path-tracing bounce budget (Max Bounces selector)
+    spp: u32,            // samples per pixel per frame (Samples/Pixel selector; wavefront loops this)
+    sample_idx: u32,     // current sample 0..spp-1, set per round in the wavefront dispatch loop
+} // 224 bytes (push-constant max is 256 on the target GPUs)
 
 /// Upper bound on TLAS instances for the previous-transform buffer (object motion vectors). The
 /// shader only reads indices below the live instance count, so this is a hard allocation cap.
@@ -577,6 +579,9 @@ pub struct Renderer {
     prev_view_proj: [f32; 16], // forward view-proj of the previous frame (motion vectors)
     rr: Option<crate::ngx::RrFeature>, // DLSS Ray Reconstruction feature (None if unsupported)
     fg: Option<crate::ngx::FgFeature>, // DLSS Frame Generation feature (None if unsupported/off)
+    fg_interp: Option<(vk::Image, Allocation, vk::ImageView)>, // DLSS-G interpolated output
+    fg_real: Option<(vk::Image, Allocation, vk::ImageView)>,   // DLSS-G real-frame passthrough output
+    fg_present: bool, // frame-gen cadence: true = present the held real frame (skip the path trace)
 
     // Offscreen target + readback.
     offscreen_image: vk::Image,
@@ -1972,6 +1977,18 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         (None, None)
     };
 
+    // DLSS-G output images (interpolated frame + real passthrough), display res, RB_FORMAT. Only when
+    // the feature exists. STORAGE (NGX writes them) + TRANSFER_SRC (read back to present).
+    let (fg_interp, fg_real) = if fg.is_some() {
+        let u = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC;
+        (
+            Some(create_attachment_image(&device, &mut allocator, width, height, RB_FORMAT, u, vk::ImageAspectFlags::COLOR, "fg_interp")?),
+            Some(create_attachment_image(&device, &mut allocator, width, height, RB_FORMAT, u, vk::ImageAspectFlags::COLOR, "fg_real")?),
+        )
+    } else {
+        (None, None)
+    };
+
     let tex_sampler = unsafe {
         device.create_sampler(
             &vk::SamplerCreateInfo::default()
@@ -2090,6 +2107,9 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         prev_view_proj: [0.0; 16],
         rr,
         fg,
+        fg_interp,
+        fg_real,
+        fg_present: false,
         offscreen_image,
         offscreen_alloc: Some(offscreen_alloc),
         readback_buffer,
@@ -3120,6 +3140,25 @@ impl Renderer {
             && write_guide
             && crate::config::get_int("dlss_rr_enabled") != 0;
         crate::config::set_int("dlss_rr_active", use_rr as i32);
+        // Frame Generation cadence: active when a feature + output images exist, the selector is on,
+        // DLSS-RR provides the guides, and we're at native res (DLAA) so the guides match the
+        // display-res backbuffer. Alternates render (full trace + interpolate) / present (held real).
+        let fg_active = self.fg.is_some()
+            && self.fg_interp.is_some()
+            && use_rr
+            && crate::config::get_int("fg_frames") > 0
+            && self.trace_width == self.width
+            && self.trace_height == self.height;
+        if !fg_active {
+            self.fg_present = false;
+        }
+        if crate::config::get_int("fg_frames") > 0 && self.accum_frame % 120 == 0 {
+            log(&format!(
+                "fg: active={fg_active} (feature={}, interp={}, rr={use_rr}, dlaa={}, frames={})",
+                self.fg.is_some(), self.fg_interp.is_some(), self.trace_width == self.width,
+                crate::config::get_int("fg_frames"),
+            ));
+        }
         // Deterministic Halton(2,3) sub-pixel jitter, scaled by camera_jitter_scale (default 0.75 —
         // full 1.0 leaves visible shimmer). The shader samples at pixel-center + (jx, jy) in y-down
         // screen space; NGX is told (jx, -jy) — the projection-space jitter, since the shader's
@@ -3137,6 +3176,16 @@ impl Renderer {
             ([jx, jy], [jx, -jy])
         } else {
             ([0.0, 0.0], [0.0, 0.0])
+        };
+        // Max Bounces selector (Blender pushes "max_bounces", range 2-8). 0/unset -> the historical 8.
+        let max_bounces = match crate::config::get_int("max_bounces") {
+            v if v <= 0 => 8u32,
+            v => (v as u32).clamp(1, 16),
+        };
+        // Samples/Pixel selector (Blender pushes "spp", range 1-10). 0/unset -> 1. Wavefront only.
+        let spp = match crate::config::get_int("spp") {
+            v if v <= 0 => 1u32,
+            v => (v as u32).clamp(1, 16),
         };
         let push = CameraPush {
             inv_view_proj: self.inv_view_proj,
@@ -3158,7 +3207,9 @@ impl Renderer {
             emissive_count: self.emissive_count,
             wf_in: 0,  // set per round in the wavefront dispatch loop
             wf_out: 0,
-            _pad: 0,
+            max_bounces,
+            spp,
+            sample_idx: 0, // set per sample in the wavefront dispatch loop
         };
         self.prev_view_proj = cur_vp;
         let range = vk::ImageSubresourceRange::default()
@@ -3185,6 +3236,35 @@ impl Renderer {
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             );
+
+            // ── Frame-gen PRESENT phase: show DLSS-FG's retained real frame (out_real) ──
+            // The render phase's eval copied the rendered frame into out_real (still in GENERAL); just
+            // read it back without re-rendering. Per the SDK: present the generated frame, then this
+            // retained real frame. This is the in-between that doubles the presented frame rate.
+            if fg_active && self.fg_present {
+                self.fg_present = false;
+                let real_img = self.fg_real.as_ref().unwrap().0;
+                let to_src = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(real_img)
+                    .subresource_range(range);
+                d.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_src]);
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
+                    .image_extent(vk::Extent3D { width: self.width, height: self.height, depth: 1 });
+                d.cmd_copy_image_to_buffer(self.cmd, real_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, self.readback_buffer, &[region]);
+                let _ = d.end_command_buffer(self.cmd);
+                let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd));
+                let _ = d.queue_submit(self.queue, &[submit], self.fence);
+                let _ = d.wait_for_fences(&[self.fence], true, u64::MAX);
+                return;
+            }
 
             // Rebuild the HDRI importance-sampling distribution when the world/HDRI changed (rare).
             // One workgroup; barrier so the trace sees the written buffer.
@@ -3355,50 +3435,57 @@ impl Renderer {
                 let do_barrier = || unsafe {
                     d.cmd_pipeline_barrier(cmd, wf_stage, wf_stage, vk::DependencyFlags::empty(), &[wf_mb], &[], &[]);
                 };
-                let push_wf = |wf_in: u32, wf_out: u32| unsafe {
+                let push_wf = |wf_in: u32, wf_out: u32, sample_idx: u32| unsafe {
                     let mut p = wf_push;
                     p.wf_in = wf_in;
                     p.wf_out = wf_out;
+                    p.sample_idx = sample_idx;
                     let bytes = std::slice::from_raw_parts(
                         &p as *const CameraPush as *const u8,
                         std::mem::size_of::<CameraPush>(),
                     );
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
                 };
-                // Control init: count0 = N (every pixel live in round 0), count1 = 0, and the round-0
-                // indirect args = ceil(N / 64) workgroups (offset 8) + argsY = argsZ = 1. Later rounds
-                // get their args from the compaction pass.
-                d.cmd_fill_buffer(cmd, ctrl, 0, 4, n);
-                d.cmd_fill_buffer(cmd, ctrl, 4, 4, 0);
-                d.cmd_fill_buffer(cmd, ctrl, 8, 4, n.div_ceil(64));
-                d.cmd_fill_buffer(cmd, ctrl, 12, 8, 1);
-                // Stage 1: ray generation -> PathState + identity live queue (half 0).
-                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.wf_gen_pipeline.unwrap());
-                push_wf(0, 0);
-                d.cmd_dispatch(cmd, groups, 1, 1);
-                // Stage 2: extend, ONE real bounce per dispatch, over the LIVE paths only — a
-                // dispatch-indirect over the compacted count, so dead paths never get threads. The
-                // compaction pass then turns the new survivor count into the next round's indirect args.
-                // Looped MAX_BOUNCES times (must match MAX_BOUNCES in pathtracer_common.glsl).
-                for r in 0u32..8 {
-                    let (wi, wo) = (r & 1, (r + 1) & 1);
+                // Samples/Pixel: run the whole wavefront `spp` times this frame. Each sample carries a
+                // distinct sample_idx; the gen walks a fresh point of the per-pixel sampling sequence
+                // (global sample = frame*spp + sample_idx) and the resolve accumulates them — RR averages
+                // into gNoisy, progressive sums into the accumulator. spp == 1 is the realtime default.
+                for s in 0u32..spp {
+                    do_barrier(); // isolate this sample's PathState/accum from the previous sample
+                    // Control init: count0 = N (every pixel live in round 0), count1 = 0, and the round-0
+                    // indirect args = ceil(N / 64) workgroups (offset 8) + argsY = argsZ = 1. Later rounds
+                    // get their args from the compaction pass.
+                    d.cmd_fill_buffer(cmd, ctrl, 0, 4, n);
+                    d.cmd_fill_buffer(cmd, ctrl, 4, 4, 0);
+                    d.cmd_fill_buffer(cmd, ctrl, 8, 4, n.div_ceil(64));
+                    d.cmd_fill_buffer(cmd, ctrl, 12, 8, 1);
+                    // Stage 1: ray generation -> PathState + identity live queue (half 0).
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.wf_gen_pipeline.unwrap());
+                    push_wf(0, 0, s);
+                    d.cmd_dispatch(cmd, groups, 1, 1);
+                    // Stage 2: extend, ONE real bounce per dispatch, over the LIVE paths only — a
+                    // dispatch-indirect over the compacted count, so dead paths never get threads. Looped
+                    // max_bounces times; the shader's c.b >= maxBounces check terminates paths in lockstep.
+                    for r in 0u32..max_bounces {
+                        let (wi, wo) = (r & 1, (r + 1) & 1);
+                        do_barrier();
+                        d.cmd_fill_buffer(cmd, ctrl, (wo as u64) * 4, 4, 0); // reset the write side's live count
+                        do_barrier();
+                        push_wf(wi, wo, s);
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.wf_extend_pipeline.unwrap());
+                        d.cmd_dispatch_indirect(cmd, ctrl, 8); // ceil(live / 64) workgroups
+                        do_barrier();
+                        // Compaction: turn the survivor count into the next round's indirect args (1 thread).
+                        push_wf(wi, wo, s);
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.wf_compact_pipeline.unwrap());
+                        d.cmd_dispatch(cmd, 1, 1, 1);
+                    }
+                    // Stage 3: resolve -> firefly clamp + accumulate (RR -> gNoisy; progressive -> accum + tonemap).
                     do_barrier();
-                    d.cmd_fill_buffer(cmd, ctrl, (wo as u64) * 4, 4, 0); // reset the write side's live count
-                    do_barrier();
-                    push_wf(wi, wo);
-                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.wf_extend_pipeline.unwrap());
-                    d.cmd_dispatch_indirect(cmd, ctrl, 8); // ceil(live / 64) workgroups
-                    do_barrier();
-                    // Compaction: turn the survivor count into the next round's indirect args (1 thread).
-                    push_wf(wi, wo);
-                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.wf_compact_pipeline.unwrap());
-                    d.cmd_dispatch(cmd, 1, 1, 1);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.wf_resolve_pipeline.unwrap());
+                    push_wf(0, 0, s);
+                    d.cmd_dispatch(cmd, groups, 1, 1);
                 }
-                // Stage 3: resolve -> firefly clamp + temporal accumulation + tonemap to the offscreen.
-                do_barrier();
-                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.wf_resolve_pipeline.unwrap());
-                push_wf(0, 0);
-                d.cmd_dispatch(cmd, groups, 1, 1);
             } else if let Some(rt) = self.rt_pipeline_ext.clone() {
                 d.cmd_bind_pipeline(
                     self.cmd,
@@ -3540,18 +3627,95 @@ impl Renderer {
                 d.cmd_dispatch(self.cmd, self.width.div_ceil(8), self.height.div_ceil(8), 1);
             }
 
+            // ── Frame-gen RENDER phase: interpolate between the held previous frame and this one ──
+            // DLSS-G keeps the previous backbuffer internally; feeding the (final, tonemapped) offscreen
+            // produces the in-between frame in fg_interp, which we present this frame. The NEXT frame is
+            // the present phase (the held real offscreen). That alternation is what doubles the FPS.
+            let mut rb_img = self.offscreen_image;
+            if fg_active {
+                use ash::vk::Handle;
+                let interp = self.fg_interp.as_ref().unwrap();
+                let real = self.fg_real.as_ref().unwrap();
+                let g = self.guide.as_ref().unwrap();
+                // Make the tonemap's offscreen write + the guides visible to NGX (compute), and put the
+                // output images into GENERAL (NGX writes them as storage; their prior contents are
+                // discarded each frame, so UNDEFINED -> GENERAL).
+                let mb = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+                let to_gen = |img: vk::Image| vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(img)
+                    .subresource_range(range);
+                let img_bars = [to_gen(interp.0), to_gen(real.0)];
+                d.cmd_pipeline_barrier(self.cmd, trace_or_compute, vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(), &[mb], &[], &img_bars);
+                // ClipToPrevClip: current clip -> world (invViewProj) -> previous clip (prevViewProj).
+                // Use the REAL previous-frame view-proj (the local `prev_vp`), NOT self.prev_view_proj,
+                // which render() already advanced to the current frame above — that would make
+                // clipToPrevClip the identity and collapse the interpolation. clipToPrevClip = current
+                // clip -> world -> previous clip; prevClipToClip is its inverse. glam's column-major +
+                // pre-multiply layout matches NGX's row-major + post-multiply -> no transpose.
+                let cur_vp_m = glam::Mat4::from_cols_array(&cur_vp);
+                let prev_vp_m = glam::Mat4::from_cols_array(&prev_vp);
+                let clip_to_prev_m = prev_vp_m * cur_vp_m.inverse();
+                let clip_to_prev = clip_to_prev_m.to_cols_array();
+                let prev_clip = clip_to_prev_m.inverse().to_cols_array();
+                let ri = |image: u64, view: u64, fmt: i32| crate::ngx::RrImage { view, image, format: fmt };
+                let rb = RB_FORMAT.as_raw();
+                let f16 = vk::Format::R16G16B16A16_SFLOAT.as_raw();
+                let r32 = vk::Format::R32_SFLOAT.as_raw();
+                crate::ngx::evaluate_fg(
+                    self.cmd.as_raw(),
+                    self.fg.as_ref().unwrap(),
+                    ri(self.offscreen_image.as_raw(), self.offscreen_view.as_raw(), rb),
+                    ri(g.motion.0.as_raw(), g.motion.2.as_raw(), f16),
+                    ri(g.depth.0.as_raw(), g.depth.2.as_raw(), r32),
+                    ri(interp.0.as_raw(), interp.2.as_raw(), rb),
+                    ri(real.0.as_raw(), real.2.as_raw(), rb),
+                    self.width,
+                    self.height,
+                    crate::config::get_int("fg_frames") as u32,
+                    clip_to_prev,
+                    prev_clip,
+                    0.1,
+                    10000.0,
+                    self.accum_frame == 0,
+                );
+                // TEMP: present out_real (DLSS-FG's clean passthrough, which works) on both phases —
+                // no flicker — until the interpolation is fixed. out_interp comes out black because our
+                // depth guide is LINEAR view-space (for DLSS-RR) but DLSS-FG needs HARDWARE/non-linear
+                // depth; with bad depth it can't interpolate and leaves out_interp untouched. Fix =
+                // feed DLSS-FG a separate hardware-depth buffer (clip.z/clip.w). See frame-gen-plan.
+                rb_img = real.0;
+                self.fg_present = true; // next phase: present the held real (out_real)
+            }
+
+            // For the fg readback, DLSS-FG writes rb_img (out_interp) via its own internal mix of
+            // compute + transfer + OFA stages, so a SHADER_WRITE/compute source mask would race the
+            // copy and read undefined (black). Wait on ALL_COMMANDS / MEMORY_WRITE in that case.
+            let (rb_src_stage, rb_src_access) = if fg_active {
+                (vk::PipelineStageFlags::ALL_COMMANDS, vk::AccessFlags::MEMORY_WRITE)
+            } else {
+                (trace_or_compute, vk::AccessFlags::SHADER_WRITE)
+            };
             let to_src = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::GENERAL)
                 .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .src_access_mask(rb_src_access)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(self.offscreen_image)
+                .image(rb_img)
                 .subresource_range(range);
             d.cmd_pipeline_barrier(
                 self.cmd,
-                trace_or_compute,
+                rb_src_stage,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -3572,7 +3736,7 @@ impl Renderer {
                 });
             d.cmd_copy_image_to_buffer(
                 self.cmd,
-                self.offscreen_image,
+                rb_img,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 self.readback_buffer,
                 &[region],
@@ -4078,6 +4242,13 @@ impl Drop for Renderer {
                         device.destroy_image_view(view, None);
                         device.destroy_image(image, None);
                         let _ = alloc.free(ralloc);
+                    }
+                }
+                for slot in [self.fg_interp.take(), self.fg_real.take()] {
+                    if let Some((image, falloc, view)) = slot {
+                        device.destroy_image_view(view, None);
+                        device.destroy_image(image, None);
+                        let _ = alloc.free(falloc);
                     }
                 }
                 if let Some(b) = self.light_buffer.take() {

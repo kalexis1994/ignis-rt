@@ -21,7 +21,7 @@ void main() {
     uint frame = uint(pc.sunCol.w);
     bool rrMode = (pc.hasTlas & 8u) != 0u;    // DLSS Ray Reconstruction active this frame
     bool useRaster = (pc.hasTlas & 128u) != 0u; // bit7: a rasterized primary hit is available
-    g_sampleIdx = frame;
+    g_sampleIdx = frame * max(pc.spp, 1u) + pc.sampleIdx; // global sample: walks a fresh sequence point per SPP sample
     uint px = idx % dims.x, py = idx / dims.x;
 
     // Sub-pixel jitter. Hybrid raster rasterizes at pixel centres (no jitter) so we match it; else in
