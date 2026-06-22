@@ -1275,12 +1275,12 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "prev_xforms",
     )?;
 
-    // Wavefront PathState buffer (binding 19): one path in flight per pixel, 80 bytes (5 vec4) holding
-    // the serialized PathCtx + rng + spreadAngle + flags. Only used when use_wavefront is on; the
-    // megakernel ignores it. Sized at display res (the wavefront runs at display res, bypassing DLSS).
+    // Wavefront PathState buffer (binding 19): one path in flight per pixel, 112 bytes (7 vec4) — the
+    // serialized PathCtx + rng + spreadAngle + flags (s0..s4) + the injected raster primary hit
+    // (s5..s6). Only used when use_wavefront is on; the megakernel ignores it. Sized at display res.
     let wf_pathstate_buffer = if rt_supported {
         Some(GpuBuffer::new(
-            &device, &mut allocator, (width as u64) * (height as u64) * 80,
+            &device, &mut allocator, (width as u64) * (height as u64) * 112,
             vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuOnly, "wf_pathstate",
         )?)
     } else {
@@ -3096,15 +3096,14 @@ impl Renderer {
             && self.wf_resolve_pipeline.is_some()
             && self.wf_compact_pipeline.is_some()
             && crate::config::get_int("use_wavefront") != 0;
-        // Hybrid raster (R1 debug): rasterize primary visibility into the G-buffer and hashColor it to
-        // the offscreen, bypassing the path tracer + DLSS. R2 will instead feed wf_gen the hit.
+        // Hybrid raster: rasterize primary visibility into the G-buffer so wf_gen skips the primary ray
+        // query. It feeds the wavefront, so it only does anything when the wavefront is also on.
         let use_raster = self.raster.is_some()
-            && self.raster_debug_pipeline.is_some()
             && crate::config::get_int("hybrid_rasterization") != 0;
+        let raster_active = use_raster && use_wavefront;
         // The wavefront feeds DLSS the same way the megakernel does (gNoisy + guides at trace res),
         // so RR runs for both. When RR is off, the path tracer writes the offscreen directly.
-        let use_rr = !use_raster
-            && self.rr.is_some()
+        let use_rr = self.rr.is_some()
             && self.tonemap_pipeline.is_some()
             && write_guide
             && crate::config::get_int("dlss_rr_enabled") != 0;
@@ -3113,7 +3112,9 @@ impl Renderer {
         // full 1.0 leaves visible shimmer). The shader samples at pixel-center + (jx, jy) in y-down
         // screen space; NGX is told (jx, -jy) — the projection-space jitter, since the shader's
         // screen-UV -> NDC step flips Y (1 - uv.y*2). Matches the C++ jitterData = (jx, -jy).
-        let (jitter, ngx_jitter) = if use_rr {
+        // Hybrid raster rasterizes at pixel centres (no jitter yet), so feed DLSS zero jitter when it's
+        // active — otherwise the guide motion vectors (which use pc.jitter) wouldn't match the rays.
+        let (jitter, ngx_jitter) = if use_rr && !raster_active {
             let scale = {
                 let s = crate::config::get_float("camera_jitter_scale");
                 if s <= 0.0 { 0.75 } else { s.min(1.0) }
@@ -3135,7 +3136,8 @@ impl Renderer {
                 | (if use_rr { 8 } else { 0 })      // bit3 = DLSS-RR mode (noisy linear out)
                 | (if self.ser { 16 } else { 0 })   // bit4 = Shader Execution Reordering
                 | (if ENV_IS_ENABLED { 32 } else { 0 }) // bit5 = HDRI environment importance sampling
-                | (if have_motion { 64 } else { 0 }), // bit6 = object motion vectors (prev transforms)
+                | (if have_motion { 64 } else { 0 }) // bit6 = object motion vectors (prev transforms)
+                | (if raster_active { 128 } else { 0 }), // bit7 = hybrid-raster primary hit available
             num_lights: self.light_count,
             sun_dir: [az.sin() * el.cos(), el.sin(), az.cos() * el.cos(), intensity],
             sun_col: [sc[0], sc[1], sc[2], self.accum_frame as f32],
@@ -3255,12 +3257,12 @@ impl Renderer {
             );
             // Path trace: hybrid-raster debug (R1) when use_raster; else the wavefront (writes the
             // offscreen) when enabled; else the megakernel ray-gen (RT) or the sky compute fallback.
-            if use_raster {
-                // ── R1: rasterize primary visibility into the G-buffer, then hashColor it ──
-                // The R1 debug bypasses DLSS, so render at full display res (no upscaling subregion) —
-                // works regardless of the DLSS setting. R2 will switch to trace res (DLSS upscales it).
+            if use_wavefront {
+                // Hybrid raster (R2): rasterize primary visibility into the G-buffer at trace res, so
+                // wf_gen resolves the primary hit without a ray query. Runs only when both toggles on.
+                if raster_active {
                 let r = self.raster.as_ref().unwrap();
-                let (tw, th) = (self.width, self.height);
+                let (tw, th) = (self.trace_width, self.trace_height);
                 let extent = vk::Extent2D { width: tw, height: th };
                 let clear = [
                     vk::ClearValue { color: vk::ClearColorValue { uint32: [0xFFFF_FFFF, 0, 0, 0] } }, // hit (miss)
@@ -3310,19 +3312,10 @@ impl Renderer {
                     .dst_access_mask(vk::AccessFlags::SHADER_READ);
                 d.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                     vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
-                // Debug viz: hashColor the G-buffer to the offscreen at trace res.
-                let mut dbg_push = push;
-                dbg_push.dims = [tw, th];
-                let dbg_bytes = std::slice::from_raw_parts(
-                    &dbg_push as *const CameraPush as *const u8, std::mem::size_of::<CameraPush>());
-                d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.raster_debug_pipeline.unwrap());
-                d.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout, 0, &[self.desc_set], &[]);
-                d.cmd_push_constants(self.cmd, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, dbg_bytes);
-                d.cmd_dispatch(self.cmd, tw.div_ceil(8), th.div_ceil(8), 1);
-            } else if use_wavefront {
+                }
                 // The wavefront runs at trace (render) resolution = push.dims. In RR mode it emits
                 // gNoisy + guides there for DLSS to upscale; with RR off, trace res == display res and
-                // resolve writes the offscreen directly.
+                // resolve writes the offscreen directly. wf_gen reads the raster G-buffer when present.
                 let wf_push = push;
                 let groups = (self.trace_width * self.trace_height).div_ceil(64);
                 d.cmd_bind_descriptor_sets(

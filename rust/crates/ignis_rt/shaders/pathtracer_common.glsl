@@ -78,6 +78,15 @@ layout(push_constant) uniform PC {
 struct RasterInst { vec4 o2w0; vec4 o2w1; vec4 o2w2; uint customIndex; uint rpad0, rpad1, rpad2; };
 layout(binding = 23, std430) readonly buffer RasterInsts { RasterInst data[]; } rasterInsts;
 
+// objectToWorld (mat4x3, matching the ray query's) for raster instance instId.
+mat4x3 rasterO2W(uint instId) {
+    RasterInst ri = rasterInsts.data[instId];
+    return mat4x3(vec3(ri.o2w0.x, ri.o2w1.x, ri.o2w2.x),
+                  vec3(ri.o2w0.y, ri.o2w1.y, ri.o2w2.y),
+                  vec3(ri.o2w0.z, ri.o2w1.z, ri.o2w2.z),
+                  vec3(ri.o2w0.w, ri.o2w1.w, ri.o2w2.w));
+}
+
 // Write the DLSS guide buffers for the primary hit at pixel p. depth = linear view-space distance
 // (projection of the hit onto the camera forward); motion = where this world point was last frame.
 // EnvBRDFApprox — Epic/Karis split-sum specular albedo. DLSS-RR demodulates the specular lobe by
@@ -232,6 +241,26 @@ vec3 aces(vec3 x) {
 
 vec3 v3(Verts b, uint i) { return vec3(b.v[i*3u], b.v[i*3u+1u], b.v[i*3u+2u]); }
 vec3 n3(Norms b, uint i) { return vec3(b.n[i*3u], b.n[i*3u+1u], b.n[i*3u+2u]); }
+
+// Reconstruct the barycentrics (u, v) of worldPos inside triangle `prim` of geometry `id` under the
+// instance transform o2w — used by the hybrid raster to feed getSurface the same bc a ray query would.
+// Matches getSurface's convention: worldPos = w0*(1-u-v) + w1*u + w2*v.
+vec2 reconstructBary(uint id, uint prim, mat4x3 o2w, vec3 worldPos) {
+    GeomDesc gd = descs[id];
+    if (gd.idx == 0ul || gd.vtx == 0ul) return vec2(0.0);
+    Indices ib = Indices(gd.idx);
+    Verts vb = Verts(gd.vtx);
+    uint i0 = ib.i[prim*3u+0u], i1 = ib.i[prim*3u+1u], i2 = ib.i[prim*3u+2u];
+    vec3 wp0 = o2w * vec4(v3(vb, i0), 1.0);
+    vec3 wp1 = o2w * vec4(v3(vb, i1), 1.0);
+    vec3 wp2 = o2w * vec4(v3(vb, i2), 1.0);
+    vec3 e1 = wp1 - wp0, e2 = wp2 - wp0, p = worldPos - wp0;
+    float d11 = dot(e1, e1), d12 = dot(e1, e2), d22 = dot(e2, e2);
+    float dp1 = dot(p, e1), dp2 = dot(p, e2);
+    float denom = d11 * d22 - d12 * d12;
+    if (abs(denom) < 1e-20) return vec2(0.0);
+    return vec2((d22 * dp1 - d12 * dp2) / denom, (d11 * dp2 - d12 * dp1) / denom);
+}
 vec2 t2(Uvs   b, uint i) { return vec2(b.u[i*2u], b.u[i*2u+1u]); }
 
 // Tangent basis from the triangle's world-space positions and UVs (ported from
@@ -1287,12 +1316,8 @@ bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng,
             // Injected rasterized primary hit — skip the ray query (hybrid raster). It's the same
             // closest hit the opaque-flagged ray query would return; transparency is still handled,
             // because the inner loop re-traces from here onward via the ray query.
-            RasterInst ri = rasterInsts.data[rInst];
-            id = ri.customIndex; prim = rPrim; bc = rBc;
-            o2w = mat4x3(vec3(ri.o2w0.x, ri.o2w1.x, ri.o2w2.x),
-                         vec3(ri.o2w0.y, ri.o2w1.y, ri.o2w2.y),
-                         vec3(ri.o2w0.z, ri.o2w1.z, ri.o2w2.z),
-                         vec3(ri.o2w0.w, ri.o2w1.w, ri.o2w2.w));
+            id = rasterInsts.data[rInst].customIndex; prim = rPrim; bc = rBc;
+            o2w = rasterO2W(rInst);
             hitPos = rPos;
             thit = length(rPos - c.ro);
         } else {

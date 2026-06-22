@@ -27,7 +27,10 @@ void main() {
     if (dead) return; // born-dead (empty scene): nothing to do, and don't re-append
 
     g_sampleIdx = uint(pc.sunCol.w);
-    bool alive = traceBounce(c, spreadAngle, rng, false, 0u, 0u, vec2(0.0), vec3(0.0));
+    // The injected raster primary hit applies only to the first real bounce (c.b == 0).
+    uint rInst = 0u, rPrim = 0u; vec2 rBc = vec2(0.0); vec3 rPos = vec3(0.0);
+    bool rasterFirst = (c.b == 0) && loadRasterHit(pixel, rInst, rPrim, rBc, rPos);
+    bool alive = traceBounce(c, spreadAngle, rng, rasterFirst, rInst, rPrim, rBc, rPos);
     storePath(pixel, c, rng, spreadAngle, !alive);
 
     if (alive) {                                  // survivor → append to the next round's queue

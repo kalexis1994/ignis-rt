@@ -19,14 +19,16 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= dims.x * dims.y) return;
     uint frame = uint(pc.sunCol.w);
-    bool rrMode = (pc.hasTlas & 8u) != 0u; // DLSS Ray Reconstruction active this frame
+    bool rrMode = (pc.hasTlas & 8u) != 0u;    // DLSS Ray Reconstruction active this frame
+    bool useRaster = (pc.hasTlas & 128u) != 0u; // bit7: a rasterized primary hit is available
     g_sampleIdx = frame;
     uint px = idx % dims.x, py = idx / dims.x;
 
-    // Sub-pixel jitter: in RR mode the deterministic Halton offset the CPU also feeds NGX (so the
-    // denoiser knows the sample positions); otherwise a random offset for temporal-accumulation AA.
+    // Sub-pixel jitter. Hybrid raster rasterizes at pixel centres (no jitter) so we match it; else in
+    // RR mode the deterministic Halton offset NGX also gets, otherwise a random offset for AA.
     uint jrng = ((px * 1973u) ^ (py * 9277u) ^ 0x9e3779b9u) | 1u;
-    vec2 jitter = rrMode ? (vec2(0.5) + pc.jitter) : ((frame == 0u) ? vec2(0.5) : rand2(jrng));
+    vec2 jitter = useRaster ? vec2(0.5)
+                : (rrMode ? (vec2(0.5) + pc.jitter) : ((frame == 0u) ? vec2(0.5) : rand2(jrng)));
     vec2 uv  = (vec2(px, py) + jitter) / vec2(dims);
     vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     vec4 world = pc.invViewProj * vec4(ndc, 1.0, 1.0);
@@ -50,8 +52,27 @@ void main() {
     uint rng = ((px * 1973u) ^ (py * 9277u) ^ 0x68bc21ebu) | 1u;
 
     bool noScene = (pc.hasTlas & 1u) == 0u;
-    if (noScene) c.L = sky(rd); // empty scene: born dead carrying the sky
-    storePath(idx, c, rng, spreadAngle, noScene);
+    bool dead = noScene;
+    if (noScene) {
+        c.L = sky(rd);             // empty scene: born dead carrying the sky
+        noRasterHit(idx);
+    } else if (useRaster) {
+        // Read the rasterized primary hit; reconstruct its barycentrics so traceBounce can skip the
+        // primary ray query. A cleared hit (0xFFFFFFFF) means the primary escaped -> sky, born dead.
+        uvec2 hit = imageLoad(gHit, ivec2(px, py)).xy;
+        if (hit.x == 0xFFFFFFFFu) {
+            c.L = sky(rd); dead = true;
+            noRasterHit(idx);
+        } else {
+            vec3 wpos = imageLoad(gPos, ivec2(px, py)).xyz;
+            mat4x3 o2w = rasterO2W(hit.x);
+            vec2 bc = reconstructBary(rasterInsts.data[hit.x].customIndex, hit.y, o2w, wpos);
+            storeRasterHit(idx, hit.x, hit.y, bc, wpos);
+        }
+    } else {
+        noRasterHit(idx);
+    }
+    storePath(idx, c, rng, spreadAngle, dead);
 
     // Seed round 0's live queue (half 0) with the identity mapping; the CPU sets count0 = N. Dead
     // (empty-scene) paths stay in the queue but early-out in extend, so they never get re-appended.
