@@ -2,8 +2,9 @@
 //!
 //! Stage 0: just initialize NGX after device creation and log whether it (and DLSS-RR) is
 //! available on the GPU. The heavy machinery (RR feature create + per-frame evaluate with the
-//! guide buffers) lands in later stages. The lib links a static loader that pulls in
-//! nvngx_dlss*.dll at runtime — those DLLs ship next to ignis_rt.dll on the RTX box.
+//! guide buffers) lands in later stages. The lib links a static loader that pulls in the DLSS
+//! snippets at runtime (nvngx_dlss*.dll on Windows, libnvidia-ngx-dlss*.so on Linux), shipped next
+//! to the renderer's own shared library.
 //!
 //! Compiled only when build.rs found the NGX SDK (`have_ngx` cfg). When absent, `init()` is a
 //! no-op stub so non-RTX / SDK-less builds still work.
@@ -20,6 +21,37 @@ mod ffi {
     pub const NGX_VERSION_API: i32 = 0x0000015;
 
     pub type VkHandle = *const c_void; // dispatchable Vulkan handle (instance/physdev/device)
+    // wchar_t is 2 bytes (UTF-16) on Windows but 4 bytes (UTF-32) on Linux. NGX's app-data-path
+    // argument is wchar_t*, so its element width must follow the platform.
+    #[cfg(windows)] pub type WChar = u16;
+    #[cfg(not(windows))] pub type WChar = u32;
+
+    // NVSDK_NGX_Logging_Level
+    pub const NGX_LOGGING_LEVEL_ON: i32 = 1;
+    pub const NGX_LOGGING_LEVEL_VERBOSE: i32 = 2;
+    pub type AppLogCallback = extern "C" fn(message: *const c_char, level: i32, feature: i32);
+    // NVSDK_NGX_PathListInfo — extra directories NGX searches for the feature snippet (.so/.dll),
+    // besides the default (the executable's folder).
+    #[repr(C)]
+    pub struct PathListInfo {
+        pub path: *const *const WChar, // wchar_t const* const*
+        pub length: u32,
+    }
+    // NVSDK_NGX_LoggingInfo — app logging callback + minimum level.
+    #[repr(C)]
+    pub struct LoggingInfo {
+        pub callback: Option<AppLogCallback>,
+        pub min_level: i32,
+        pub disable_other_sinks: u8, // bool
+    }
+    // NVSDK_NGX_FeatureCommonInfo — passed to Init so NGX can find the snippet via PathListInfo
+    // and pipe its diagnostics through our callback.
+    #[repr(C)]
+    pub struct FeatureCommonInfo {
+        pub path_list: PathListInfo,
+        pub internal_data: *mut c_void,
+        pub logging: LoggingInfo,
+    }
 
     pub const NGX_FEATURE_RAY_RECONSTRUCTION: i32 = 13;
     // Create params.
@@ -50,7 +82,7 @@ mod ffi {
         // already-loaded Vulkan loader. Matches the non-NGX_SNIPPET_BUILD declaration.
         pub fn NVSDK_NGX_VULKAN_Init(
             app_id: u64,
-            app_data_path: *const u16, // wchar_t* (UTF-16 on Windows)
+            app_data_path: *const WChar, // wchar_t* (UTF-16 Windows / UTF-32 Linux)
             instance: VkHandle,
             phys_device: VkHandle,
             device: VkHandle,
@@ -81,10 +113,20 @@ mod ffi {
     }
 }
 
-/// Directory containing THIS dll (ignis_rt.dll) — that's where the nvngx_dlss*.dll snippets ship,
-/// and where NGX must look to find them. Uses GetModuleHandleEx(FROM_ADDRESS) on an in-module
-/// symbol so we get our own module regardless of the loading executable.
+/// Encode a filesystem path as a platform `wchar_t` string (NUL-terminated): UTF-16 on Windows,
+/// UTF-32 on Linux. NGX's app-data-path argument is `wchar_t*`, whose element width is platform-set.
 #[cfg(have_ngx)]
+fn encode_wide(s: &str) -> Vec<ffi::WChar> {
+    #[cfg(windows)]
+    { s.encode_utf16().chain(std::iter::once(0u16)).collect() }
+    #[cfg(not(windows))]
+    { s.chars().map(|c| c as u32).chain(std::iter::once(0u32)).collect() }
+}
+
+/// Directory containing THIS module's shared library — that's where the DLSS snippets ship
+/// (nvngx_dlss*.dll on Windows, libnvidia-ngx-dlss*.so on Linux) and where NGX must look to find
+/// them. Resolved from an in-module symbol so we get our own library regardless of the host process.
+#[cfg(all(have_ngx, windows))]
 fn dll_dir() -> Option<String> {
     use std::os::raw::c_void;
     extern "system" {
@@ -109,6 +151,40 @@ fn dll_dir() -> Option<String> {
     }
 }
 
+/// Linux: `dladdr` on an in-module symbol yields the path of the .so that contains it.
+#[cfg(all(have_ngx, unix))]
+fn dll_dir() -> Option<String> {
+    use std::os::raw::{c_char, c_int, c_void};
+    #[repr(C)]
+    struct DlInfo {
+        dli_fname: *const c_char,
+        dli_fbase: *mut c_void,
+        dli_sname: *const c_char,
+        dli_saddr: *mut c_void,
+    }
+    extern "C" {
+        fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
+    }
+    static ANCHOR: u8 = 0; // a symbol guaranteed to live in this shared object
+    unsafe {
+        let mut info: DlInfo = std::mem::zeroed();
+        if dladdr(&ANCHOR as *const u8 as *const c_void, &mut info) == 0 || info.dli_fname.is_null() {
+            return None;
+        }
+        let path = std::ffi::CStr::from_ptr(info.dli_fname).to_string_lossy().into_owned();
+        std::path::Path::new(&path).parent().map(|p| p.to_string_lossy().into_owned())
+    }
+}
+
+/// NGX's internal logging callback — forwards NGX's own diagnostics into our log so a failure to
+/// locate/validate the DLSS snippet is visible. Called from arbitrary threads; must be thread-safe.
+#[cfg(have_ngx)]
+extern "C" fn ngx_log_callback(message: *const std::os::raw::c_char, _level: i32, _feature: i32) {
+    if message.is_null() { return; }
+    let s = unsafe { std::ffi::CStr::from_ptr(message) }.to_string_lossy();
+    log(&format!("NGX[core]: {}", s.trim_end()));
+}
+
 /// Initialize NGX for the given Vulkan handles (raw `as_raw()` pointers). Logs the outcome.
 /// Returns true if NGX initialized successfully (RTX + driver + runtime DLLs present).
 #[cfg(have_ngx)]
@@ -125,20 +201,32 @@ pub fn init(
     // at this DLL's own directory (where the snippets are deployed), not the caller's path.
     let app_data = dll_dir().unwrap_or_else(|| ".".to_string());
     log(&format!("NGX: app data path = {app_data}"));
-    let mut path16: Vec<u16> = app_data.encode_utf16().collect();
-    path16.push(0);
+    let path_w = encode_wide(&app_data);
+    // NGX looks for the DLSS snippet next to the *executable* (Blender) or in the paths listed in
+    // FeatureCommonInfo.PathListInfo — NOT in the app-data-path (that's only for logs/temp). Point
+    // PathListInfo at our own lib dir (where the snippets are deployed) and install the log callback.
+    let path_list: [*const WChar; 1] = [path_w.as_ptr()];
+    let common = FeatureCommonInfo {
+        path_list: PathListInfo { path: path_list.as_ptr(), length: 1 },
+        internal_data: std::ptr::null_mut(),
+        logging: LoggingInfo {
+            callback: Some(ngx_log_callback),
+            min_level: NGX_LOGGING_LEVEL_ON,
+            disable_other_sinks: 0,
+        },
+    };
     // Application id used by the C++ build (arbitrary but stable).
     const APP_ID: u64 = 0x1337BEEF;
     let res = unsafe {
         NVSDK_NGX_VULKAN_Init(
             APP_ID,
-            path16.as_ptr(),
+            path_w.as_ptr(),
             instance as VkHandle,
             phys_device as VkHandle,
             device as VkHandle,
             gipa, // real proc-addrs: NGX needs these to set up feature creation
             gdpa,
-            std::ptr::null(), // feature_info
+            &common as *const FeatureCommonInfo as *const std::os::raw::c_void, // feature_info (snippet path + logging)
             NGX_VERSION_API,
         )
     };

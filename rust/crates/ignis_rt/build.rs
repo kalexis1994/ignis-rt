@@ -55,22 +55,47 @@ fn main() {
 fn link_ngx() {
     println!("cargo:rustc-check-cfg=cfg(have_ngx)"); // declare the cfg (Rust 1.80+ lint)
     println!("cargo:rerun-if-env-changed=IGNIS_NGX_ROOT");
-    let candidates = [
-        std::env::var("IGNIS_NGX_ROOT").ok().map(|r| format!("{r}/lib")),
-        Some(r"C:/Users/Administrator/DLSS/lib/Windows_x86_64/x64".to_string()),
-    ];
-    for cand in candidates.into_iter().flatten() {
-        if Path::new(&cand).join("nvsdk_ngx_d.lib").exists() {
-            println!("cargo:rustc-link-search=native={cand}");
-            println!("cargo:rustc-link-lib=static=nvsdk_ngx_d");
-            // System libs the NGX static loader pulls in (registry path lookup + message box).
-            println!("cargo:rustc-link-lib=dylib=advapi32");
-            println!("cargo:rustc-link-lib=dylib=user32");
-            println!("cargo:rustc-cfg=have_ngx");
-            return;
+    let root = std::env::var("IGNIS_NGX_ROOT").ok();
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    if target_os == "windows" {
+        // Windows: nvsdk_ngx_d.lib is a static loader that pulls in nvngx_dlss*.dll at runtime.
+        let candidates = [
+            root.as_deref().map(|r| format!("{r}/lib")),
+            Some(r"C:/Users/Administrator/DLSS/lib/Windows_x86_64/x64".to_string()),
+        ];
+        for cand in candidates.into_iter().flatten() {
+            if Path::new(&cand).join("nvsdk_ngx_d.lib").exists() {
+                println!("cargo:rustc-link-search=native={cand}");
+                println!("cargo:rustc-link-lib=static=nvsdk_ngx_d");
+                // System libs the NGX static loader pulls in (registry path lookup + message box).
+                println!("cargo:rustc-link-lib=dylib=advapi32");
+                println!("cargo:rustc-link-lib=dylib=user32");
+                println!("cargo:rustc-cfg=have_ngx");
+                return;
+            }
+        }
+    } else {
+        // Linux: libnvsdk_ngx.a is the static loader; it dlopen's libnvidia-ngx-dlss*.so at runtime.
+        // The DLSS SDK ships it under lib/Linux_x86_64.
+        let candidates = [
+            root.as_deref().map(|r| format!("{r}/lib/Linux_x86_64")),
+            root.as_deref().map(|r| format!("{r}/lib")),
+        ];
+        for cand in candidates.into_iter().flatten() {
+            if Path::new(&cand).join("libnvsdk_ngx.a").exists() {
+                println!("cargo:rustc-link-search=native={cand}");
+                println!("cargo:rustc-link-lib=static=nvsdk_ngx");
+                // The NGX static loader pulls in libdl (dlopen/dladdr), pthread, and the C++ runtime.
+                println!("cargo:rustc-link-lib=dylib=dl");
+                println!("cargo:rustc-link-lib=dylib=pthread");
+                println!("cargo:rustc-link-lib=dylib=stdc++");
+                println!("cargo:rustc-cfg=have_ngx");
+                return;
+            }
         }
     }
-    println!("cargo:warning=NGX SDK (nvsdk_ngx_d.lib) not found — DLSS RR disabled in this build");
+    println!("cargo:warning=NGX SDK not found — DLSS RR disabled in this build");
 }
 
 fn find_glslang() -> String {
