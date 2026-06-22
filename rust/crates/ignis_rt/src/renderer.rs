@@ -576,6 +576,7 @@ pub struct Renderer {
     guide: Option<GuideBuffers>,
     prev_view_proj: [f32; 16], // forward view-proj of the previous frame (motion vectors)
     rr: Option<crate::ngx::RrFeature>, // DLSS Ray Reconstruction feature (None if unsupported)
+    fg: Option<crate::ngx::FgFeature>, // DLSS Frame Generation feature (None if unsupported/off)
 
     // Offscreen target + readback.
     offscreen_image: vk::Image,
@@ -711,6 +712,9 @@ pub fn destroy() {
         unsafe { let _ = r.0.device.device_wait_idle(); }
         if let Some(rr) = r.0.rr.take() {
             crate::ngx::release_rr(rr); // release the RR feature before NGX shutdown / device destroy
+        }
+        if let Some(fg) = r.0.fg.take() {
+            crate::ngx::release_fg(fg);
         }
         crate::ngx::shutdown(r.0.device.handle().as_raw());
         log("ignis_destroy: renderer torn down");
@@ -1930,7 +1934,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
 
     // Create the DLSS Ray Reconstruction feature (RT devices only). NGX records initialization
     // into a one-shot command buffer that we submit + wait on here. Falls back to None on failure.
-    let rr = if rt_supported {
+    let (rr, fg) = if rt_supported {
         use ash::vk::Handle;
         unsafe {
             let _ = device.begin_command_buffer(
@@ -1947,6 +1951,13 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 height,
                 dlss_perf_quality(quality),
             );
+            // DLSS Frame Generation feature (if the GPU supports it) — recorded into the same one-shot
+            // init command buffer. The backbuffer is the display-res offscreen (RB_FORMAT).
+            let fg_feat = if crate::ngx::dlssg_max_frames() > 0 {
+                crate::ngx::create_fg(device.handle().as_raw(), cmd.as_raw(), width, height, RB_FORMAT.as_raw())
+            } else {
+                None
+            };
             let _ = device.end_command_buffer(cmd);
             let _ = device.reset_fences(&[fence]);
             let _ = device.queue_submit(
@@ -1955,10 +1966,10 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 fence,
             );
             let _ = device.wait_for_fences(&[fence], true, u64::MAX);
-            feat
+            (feat, fg_feat)
         }
     } else {
-        None
+        (None, None)
     };
 
     let tex_sampler = unsafe {
@@ -2078,6 +2089,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         guide,
         prev_view_proj: [0.0; 16],
         rr,
+        fg,
         offscreen_image,
         offscreen_alloc: Some(offscreen_alloc),
         readback_buffer,
