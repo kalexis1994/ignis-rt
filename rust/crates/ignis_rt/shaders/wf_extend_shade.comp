@@ -1,0 +1,56 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_scalar_block_layout : require
+// ── Wavefront path tracer — Stage 2: extend + shade ─────────────────────────────────────────────
+// Phase 0 scaffolding: one thread per path traces the primary ray and writes a flat hit/miss colour
+// to the offscreen image. This only proves the wavefront pipeline runs end-to-end (gen -> trace ->
+// output); real material/NEE/bounce shading (reusing the megakernel's functions via a shared include)
+// lands in Phase 1, where the goal is image parity with trace.rgen. See [[wavefront-plan]].
+
+layout(local_size_x = 64) in;
+
+struct PathState {
+    vec4 ro;   // xyz origin, w = pixel index
+    vec4 rd;   // xyz direction, w = flags
+    vec4 tp;   // xyz throughput, w = pathRough
+    vec4 rad;  // xyz radiance, w = rng seed
+};
+layout(binding = 19, std430) buffer PathStates { PathState s[]; } paths;
+layout(binding = 1) uniform accelerationStructureEXT tlas;
+layout(binding = 0, rgba32f) uniform image2D outImage;
+
+layout(push_constant) uniform PC {
+    mat4  invViewProj;
+    vec4  camPos;
+    uvec2 dims;
+} pc;
+
+vec3 hashColor(uint i) {
+    uint h = i * 2654435761u; h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
+    return vec3(float(h & 255u), float((h >> 8) & 255u), float((h >> 16) & 255u)) / 255.0;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.dims.x * pc.dims.y;
+    if (idx >= total) return;
+
+    PathState st = paths.s[idx];
+    vec3 ro = st.ro.xyz;
+    vec3 rd = st.rd.xyz;
+    uint px = floatBitsToUint(st.ro.w);
+    ivec2 p = ivec2(px % pc.dims.x, px / pc.dims.x);
+
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ro, 0.001, rd, 1e30);
+    while (rayQueryProceedEXT(rq)) {}
+
+    vec3 col;
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+        uint inst = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
+        col = hashColor(inst); // Phase 0 placeholder: per-instance colour (no lighting yet)
+    } else {
+        col = vec3(0.05, 0.10, 0.20); // sky placeholder
+    }
+    imageStore(outImage, p, vec4(col, 1.0));
+}

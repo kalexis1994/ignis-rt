@@ -2278,6 +2278,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         # DLSS quality + RR toggle pushed every frame so the renderer can re-init live when changed.
         dll_wrapper.set_int("dlss_quality", int(props.dlss_quality))
         dll_wrapper.set_int("dlss_rr_enabled", 1 if props.dlss_rr_enabled else 0)
+        dll_wrapper.set_int("use_wavefront", 1 if props.use_wavefront else 0)
         dll_wrapper.set_int("hybrid_rasterization", 1 if props.hybrid_rasterization else 0)
         dll_wrapper.set_int("backface_culling", 1 if props.backface_culling else 0)
         dll_wrapper.set_int("restir_di", 1 if props.restir_di else 0)

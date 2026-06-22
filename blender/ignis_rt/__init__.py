@@ -443,7 +443,7 @@ class IGNIS_PT_advanced(bpy.types.Panel):
         layout.prop(props, "restir_gi")
         layout.prop(props, "material_sort")
         layout.prop(props, "sharc_enabled")
-        # layout.prop(props, "use_wavefront")  # TODO: not ready yet
+        layout.prop(props, "use_wavefront")  # wavefront path tracer (Phase 0: flat per-instance preview)
         layout.separator()
         layout.prop(props, "debug_view")
         layout.separator()
