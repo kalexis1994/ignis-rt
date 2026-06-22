@@ -103,4 +103,82 @@ struct SharcState {
 };
 void SharcInit(out SharcState s) { s.pathLength = 0u; }
 
+// ── Update half (atomic) — requires GL_EXT_shader_atomic_int64 in the including shader ──────────────
+
+// Insert a key (atomic CAS, linear probe). Returns the claimed/existing slot, or 0xFFFFFFFF if full.
+uint sharcInsert(uint64_t key, uint capacity) {
+    uint baseSlot = sharcGetSlot(key, capacity);
+    for (uint i = 0u; i < SHARC_BUCKET_SIZE; i++) {
+        uint slot = (baseSlot + i) % capacity;
+        uint64_t prev = atomicCompSwap(_sharcKeys.keys[slot], uint64_t(0u), key);
+        if (prev == uint64_t(0u) || prev == key) return slot;
+    }
+    return 0xFFFFFFFFu;
+}
+
+// Atomic-add quantized (radiance * weight) into a slot's accum region + bump its sample count.
+void sharcAccumulate(uint slot, vec3 radiance, vec3 weight) {
+    vec3 scaled = radiance * weight * SHARC_RADIANCE_SCALE;
+    uvec3 u = uvec3(max(scaled, vec3(0.0)));
+    if (u.x > 0u) atomicAdd(_sharcData.data[slot * 4u + 0u], u.x);
+    if (u.y > 0u) atomicAdd(_sharcData.data[slot * 4u + 1u], u.y);
+    if (u.z > 0u) atomicAdd(_sharcData.data[slot * 4u + 2u], u.z);
+    atomicAdd(_sharcData.data[slot * 4u + 3u], 1u);
+}
+
+// On a sky/miss: backpropagate the sky radiance to every vertex in the path history.
+void SharcUpdateMiss(SharcState state, vec3 skyRadiance) {
+    for (uint i = 0u; i < state.pathLength; i++)
+        sharcAccumulate(state.cacheIndices[i], skyRadiance, state.sampleWeights[i]);
+}
+
+// On a surface hit: insert the voxel, write its direct lighting, backpropagate to prior vertices, and
+// push it onto the path history. Returns false if a well-sampled resolved cell lets the path early-out.
+bool SharcUpdateHit(SharcGrid grid, inout SharcState state, vec3 worldPos, vec3 normal,
+                    vec3 directLighting, float rnd, uint capacity, float hitDist) {
+    uint level = sharcGetLevel(worldPos, grid);
+    float voxelSize = sharcVoxelSize(level, grid);
+    if (hitDist < voxelSize && state.pathLength > 0u) return true; // segment shorter than a voxel
+    uint64_t key = sharcHashKey(worldPos, normal, grid);
+    uint slot = sharcInsert(key, capacity);
+    if (slot == 0xFFFFFFFFu) return true; // bucket full, keep tracing
+    sharcAccumulate(slot, directLighting, vec3(1.0));
+    for (uint i = 0u; i < state.pathLength; i++)
+        sharcAccumulate(state.cacheIndices[i], directLighting, state.sampleWeights[i]);
+    // Stochastically early-out using the resolved cache once a cell is well-sampled.
+    if (state.pathLength >= 1u) {
+        uint rOff = sharcResolvedOffset(slot, capacity);
+        uint sampleCount = _sharcData.data[rOff + 3u] & 0xFFFFu;
+        if (sampleCount > 8u && rnd < 0.25) {
+            vec3 cached = vec3(uintBitsToFloat(_sharcData.data[rOff + 0u]),
+                               uintBitsToFloat(_sharcData.data[rOff + 1u]),
+                               uintBitsToFloat(_sharcData.data[rOff + 2u]));
+            for (uint i = 0u; i < state.pathLength; i++)
+                sharcAccumulate(state.cacheIndices[i], cached, state.sampleWeights[i]);
+            return false;
+        }
+    }
+    for (uint i = min(state.pathLength, SHARC_PROPAGATION_DEPTH - 1u); i > 0u; i--) {
+        state.cacheIndices[i] = state.cacheIndices[i - 1u];
+        state.sampleWeights[i] = state.sampleWeights[i - 1u];
+    }
+    state.cacheIndices[0] = slot;
+    state.sampleWeights[0] = vec3(1.0); // throughput applied next by SharcSetThroughput
+    state.pathLength = min(state.pathLength + 1u, SHARC_PROPAGATION_DEPTH - 1u);
+    return true;
+}
+
+// Fold the segment throughput into every stored vertex weight (called after each accepted bounce).
+void SharcSetThroughput(inout SharcState state, vec3 throughput) {
+    for (uint i = 0u; i < state.pathLength; i++) state.sampleWeights[i] *= throughput;
+}
+
+// Sparse update coverage: one random pixel per 5x5 block (~4% of pixels) updates the cache each frame.
+bool isSharcUpdatePixel(uvec2 pixel, uint frameIndex) {
+    uint bs = 5u;
+    uint bx = pixel.x / bs, by = pixel.y / bs;
+    uint h = (bx * 73856093u ^ by * 19349663u ^ frameIndex * 83492791u);
+    return (pixel.x == bx * bs + (h % bs)) && (pixel.y == by * bs + ((h / bs) % bs));
+}
+
 #endif // SHARC_GLSL
