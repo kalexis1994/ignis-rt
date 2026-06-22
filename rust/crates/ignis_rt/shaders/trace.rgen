@@ -49,7 +49,7 @@ void main() {
         float spreadAngle = length(normalize(wY.xyz / wY.w - ro) - rd);
         // DLSS-RR guide buffers: a separate deterministic PSR walk (mirror/glass aware), so reflected
         // and refracted content gets correct virtual depth/motion and stops shimmering.
-        if (rrMode) writeGuidePSR(p, ro, rd);
+        if (rrMode) writeGuidePSR(p, ro, rd, false, 0u, 0u, vec2(0.0), vec3(0.0));
         L = tracePath(ro, rd, spreadAngle, rng);
     } else {
         // No scene yet: show the sky through the primary ray.

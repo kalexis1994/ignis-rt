@@ -87,6 +87,12 @@ mat4x3 rasterO2W(uint instId) {
                   vec3(ri.o2w0.w, ri.o2w1.w, ri.o2w2.w));
 }
 
+// Inverse of an affine objectToWorld (mat4x3) -> worldToObject, for the raster hit's motion vectors.
+mat4x3 invertAffine(mat4x3 m) {
+    mat3 Rinv = inverse(mat3(m[0], m[1], m[2]));
+    return mat4x3(Rinv[0], Rinv[1], Rinv[2], -Rinv * m[3]);
+}
+
 // Write the DLSS guide buffers for the primary hit at pixel p. depth = linear view-space distance
 // (projection of the hit onto the camera forward); motion = where this world point was last frame.
 // EnvBRDFApprox — Epic/Karis split-sum specular albedo. DLSS-RR demodulates the specular lobe by
@@ -1189,7 +1195,8 @@ vec3 directShade(vec3 hitPos, vec3 N, vec3 geoN, vec3 V, vec3 diffAlbedo, vec3 F
 // that world position, the denoiser then reprojects the reflected content (noisy) instead of the
 // static mirror (which made reflections shimmer). Ported in spirit from RTXDI PSRUtils.hlsli.
 // Kept separate from the stochastic colour path: PSR must be deterministic or it jitters itself.
-void writeGuidePSR(uvec2 p, vec3 ro, vec3 rd) {
+void writeGuidePSR(uvec2 p, vec3 ro, vec3 rd,
+                   bool rasterFirst, uint rInst, uint rPrim, vec2 rBc, vec3 rPos) {
     if ((pc.hasTlas & 4u) == 0u) return;
     vec3 primaryRd = rd;
     float pathDist = 0.0;
@@ -1197,22 +1204,31 @@ void writeGuidePSR(uvec2 p, vec3 ro, vec3 rd) {
     float chainRough = 0.0; // max roughness of the reflectors in the chain = the reflection's blur
     int glassDepth = 0; // entry/exit tracking for refraction (robust to flipped normals)
     for (int b = 0; b < 6; b++) {
-        rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ro, 0.001, rd, 1e30);
-        while (rayQueryProceedEXT(rq)) {}
-        if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
-            // Escaped to the sky: a far virtual surface straight along the unfolded direction.
-            vec3 skyPos = pc.camPos.xyz + (pathDist + 1e5) * primaryRd;
-            writeGuide(p, skyPos, skyPos, -primaryRd, 1.0, vec3(0.0), vec3(0.0));
-            return;
+        uint id, prim, iid; vec2 bc; float thit; mat4x3 o2w, w2o;
+        if (rasterFirst && b == 0) {
+            // Injected rasterized primary hit — skips the guide walk's primary ray query too, so the
+            // raster offloads BOTH primary traces (colour path + guides). w2o for object motion.
+            id = rasterInsts.data[rInst].customIndex; prim = rPrim; bc = rBc;
+            iid = rInst; o2w = rasterO2W(rInst); w2o = invertAffine(o2w);
+            thit = length(rPos - ro);
+        } else {
+            rayQueryEXT rq;
+            rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ro, 0.001, rd, 1e30);
+            while (rayQueryProceedEXT(rq)) {}
+            if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+                // Escaped to the sky: a far virtual surface straight along the unfolded direction.
+                vec3 skyPos = pc.camPos.xyz + (pathDist + 1e5) * primaryRd;
+                writeGuide(p, skyPos, skyPos, -primaryRd, 1.0, vec3(0.0), vec3(0.0));
+                return;
+            }
+            id   = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
+            prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+            bc   = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+            thit = rayQueryGetIntersectionTEXT(rq, true);
+            o2w  = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+            iid  = uint(rayQueryGetIntersectionInstanceIdEXT(rq, true)); // per-instance (prev xform)
+            w2o  = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
         }
-        uint id   = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
-        uint prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
-        vec2 bc   = rayQueryGetIntersectionBarycentricsEXT(rq, true);
-        float thit = rayQueryGetIntersectionTEXT(rq, true);
-        mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
-        uint iid = uint(rayQueryGetIntersectionInstanceIdEXT(rq, true)); // per-instance (prev xform)
-        mat4x3 w2o = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
         vec3 N, albedo, emission, geoN;
         float roughness, metallic, ior, transmission, transparentProb;
         bool frontFace, lightPathTransparent;
