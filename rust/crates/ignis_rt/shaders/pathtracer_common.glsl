@@ -1279,22 +1279,39 @@ struct PathCtx {
 // One real (diffuse/specular) bounce. The inner loop swallows transparent/alpha passthroughs and
 // glass hops, which don't spend the bounce budget. Returns true while the path is alive (the caller
 // should keep going), false on termination (miss / RR / max bounce / dead-end). Mutates c + rng.
-bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng) {
+bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng,
+                 bool rasterFirst, uint rInst, uint rPrim, vec2 rBc, vec3 rPos) {
     for (int inner = 0; inner < 128; inner++) {
-        rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, c.ro, 0.001, c.rd, 1e30);
-        while (rayQueryProceedEXT(rq)) {}
-        if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
-            if (DEBUG_PATH && c.b == 0) { c.L = vec3(0.0, 0.0, 1.0); return false; } // blue = sky
-            // Add the sky unless reached by a diffuse bounce while env NEE is active (avoids double count).
-            if (c.b == 0 || !c.lastDiffuse || envDist.data[0] <= 0.0) c.L += c.tp * sky(c.rd);
-            return false;
+        uint id, prim; vec2 bc; float thit; mat4x3 o2w; vec3 hitPos;
+        if (rasterFirst && c.b == 0 && inner == 0) {
+            // Injected rasterized primary hit — skip the ray query (hybrid raster). It's the same
+            // closest hit the opaque-flagged ray query would return; transparency is still handled,
+            // because the inner loop re-traces from here onward via the ray query.
+            RasterInst ri = rasterInsts.data[rInst];
+            id = ri.customIndex; prim = rPrim; bc = rBc;
+            o2w = mat4x3(vec3(ri.o2w0.x, ri.o2w1.x, ri.o2w2.x),
+                         vec3(ri.o2w0.y, ri.o2w1.y, ri.o2w2.y),
+                         vec3(ri.o2w0.z, ri.o2w1.z, ri.o2w2.z),
+                         vec3(ri.o2w0.w, ri.o2w1.w, ri.o2w2.w));
+            hitPos = rPos;
+            thit = length(rPos - c.ro);
+        } else {
+            rayQueryEXT rq;
+            rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, c.ro, 0.001, c.rd, 1e30);
+            while (rayQueryProceedEXT(rq)) {}
+            if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+                if (DEBUG_PATH && c.b == 0) { c.L = vec3(0.0, 0.0, 1.0); return false; } // blue = sky
+                // Add the sky unless reached by a diffuse bounce while env NEE is active (avoids double count).
+                if (c.b == 0 || !c.lastDiffuse || envDist.data[0] <= 0.0) c.L += c.tp * sky(c.rd);
+                return false;
+            }
+            id   = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
+            prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+            bc   = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+            thit = rayQueryGetIntersectionTEXT(rq, true);
+            o2w  = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+            hitPos = c.ro + c.rd * thit;
         }
-        uint id   = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
-        uint prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
-        vec2 bc   = rayQueryGetIntersectionBarycentricsEXT(rq, true);
-        float thit = rayQueryGetIntersectionTEXT(rq, true);
-        mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
 
 #ifdef USE_SER
         // Shader Execution Reordering at the primary hit: regroup warps by material before the
@@ -1311,7 +1328,6 @@ bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng) {
         vec2 surfUV;
         float surfAlpha;
         getSurface(id, prim, bc, o2w, c.rd, c.coneWidth, N, albedo, roughness, metallic, emission, ior, transmission, frontFace, geoN, lightPathTransparent, transparentProb, surfUV, surfAlpha);
-        vec3 hitPos = c.ro + c.rd * thit;
 
         // Stochastic transparent passthrough (Cycles Transparent BSDF / architectural glass): a
         // Transparent-weighted surface passes light straight through with no refraction.
@@ -1438,7 +1454,7 @@ vec3 tracePath(vec3 ro, vec3 rd, float spreadAngle, inout uint rng) {
     c.b = 0; c.glassBounces = 0; c.glassDepth = 0;
     c.isDiffuse = false; c.lastDiffuse = false;
     for (int guard = 0; guard < 512; guard++) {
-        if (!traceBounce(c, spreadAngle, rng)) break;
+        if (!traceBounce(c, spreadAngle, rng, false, 0u, 0u, vec2(0.0), vec3(0.0))) break;
     }
     return c.L;
 }

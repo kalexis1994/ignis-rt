@@ -27,7 +27,7 @@ void main() {
     if (dead) return; // born-dead (empty scene): nothing to do, and don't re-append
 
     g_sampleIdx = uint(pc.sunCol.w);
-    bool alive = traceBounce(c, spreadAngle, rng);
+    bool alive = traceBounce(c, spreadAngle, rng, false, 0u, 0u, vec2(0.0), vec3(0.0));
     storePath(pixel, c, rng, spreadAngle, !alive);
 
     if (alive) {                                  // survivor → append to the next round's queue
