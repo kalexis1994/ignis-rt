@@ -10,6 +10,16 @@
 //! no-op stub so non-RTX / SDK-less builds still work.
 
 use crate::log::log;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Max number of GENERATED frames DLSS-G supports on this GPU (0 = unavailable, 1 = 2x / Ada,
+/// 3 = up to 4x / Blackwell). Detected at NGX init; the addon reads it to build the selector.
+static DLSSG_MAX_FRAMES: AtomicU32 = AtomicU32::new(0);
+
+/// The detected DLSS-G max generated-frame count (see DLSSG_MAX_FRAMES). 0 if unavailable/SDK-less.
+pub fn dlssg_max_frames() -> u32 {
+    DLSSG_MAX_FRAMES.load(Ordering::Relaxed)
+}
 
 #[cfg(have_ngx)]
 mod ffi {
@@ -247,7 +257,12 @@ pub fn init(
         };
         let dlss = get_i("SuperSampling.Available");
         let fg = get_i("FrameGeneration.Available"); // DLSS-G — Ada (40-series) + recent driver
-        log(&format!("NGX: init OK; DLSS available = {dlss}, DLSS-G (FrameGeneration) available = {fg}"));
+        // Max GENERATED frames: 1 = 2x (Ada), 3 = up to 4x (Blackwell MFG). 0 if DLSS-G unavailable.
+        // The param is unset (0) on GPUs without multiframe, but single-frame gen (1) still works.
+        let mfc_max = get_i("DLSSG.MultiFrameCountMax");
+        let max_gen: u32 = if fg != 0 { mfc_max.max(1) as u32 } else { 0 };
+        DLSSG_MAX_FRAMES.store(max_gen, Ordering::Relaxed);
+        log(&format!("NGX: init OK; DLSS available = {dlss}, DLSS-G available = {fg}, max generated frames = {max_gen}"));
         if fg == 0 {
             // Why DLSS-G is unavailable: feature init result + whether a newer driver is needed.
             let needs_drv = get_i("FrameGeneration.NeedsUpdatedDriver");

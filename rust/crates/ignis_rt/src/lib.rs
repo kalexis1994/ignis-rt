@@ -378,6 +378,13 @@ pub extern "C" fn ignis_set_int(key: *const c_char, value: c_int) {
     config::set_int(&unsafe { cstr(key) }, value);
 }
 
+/// Max number of GENERATED frames DLSS Frame Generation supports on this GPU (0 = unavailable,
+/// 1 = 2x / Ada, 3 = up to 4x / Blackwell). The addon reads this to build the frame-gen selector.
+#[no_mangle]
+pub extern "C" fn ignis_dlssg_max_frames() -> c_int {
+    crate::ngx::dlssg_max_frames() as c_int
+}
+
 #[no_mangle]
 pub extern "C" fn ignis_get_int(key: *const c_char) -> c_int {
     config::get_int(&unsafe { cstr(key) })

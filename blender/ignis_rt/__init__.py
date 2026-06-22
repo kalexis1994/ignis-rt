@@ -108,6 +108,27 @@ def _tag_redraw(self, context):
             area.tag_redraw()
 
 
+# Frame Generation selector — the options depend on what the GPU supports (DLSS-G max generated-frame
+# count, queried from NGX at init). Ada (40-series) = 2x; Blackwell (50-series) = up to 4x.
+_fg_items_cache = []
+def _frame_gen_items(self, context):
+    global _fg_items_cache
+    try:
+        from . import dll_wrapper
+        mx = dll_wrapper.dlssg_max_frames()
+    except Exception:
+        mx = 0
+    items = [('OFF', 'Off', 'No frame generation')]
+    if mx >= 1:
+        items.append(('2X', '2x  (1 generated)', 'DLSS Frame Generation — 1 interpolated frame'))
+    if mx >= 2:
+        items.append(('3X', '3x  (2 generated)', 'DLSS Multi Frame Generation — 2 interpolated frames'))
+    if mx >= 3:
+        items.append(('4X', '4x  (3 generated)', 'DLSS Multi Frame Generation — 3 interpolated frames'))
+    _fg_items_cache = items  # keep a reference alive (Blender dynamic-enum GC gotcha)
+    return _fg_items_cache
+
+
 class IgnisRTSceneProperties(bpy.types.PropertyGroup):
     """Scene-level settings shown in Render properties."""
 
@@ -177,6 +198,13 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
         name="Hybrid Rasterization",
         description="Rasterize primary visibility for faster first bounce (uncheck for pure path tracing)",
         default=True,
+        update=_tag_redraw,
+    )
+    frame_gen: EnumProperty(
+        name="Frame Generation",
+        description="DLSS Frame Generation — present interpolated frames between rendered ones "
+                    "(requires a 40-series+ GPU). The options reflect what your GPU supports",
+        items=_frame_gen_items,
         update=_tag_redraw,
     )
 
@@ -439,6 +467,7 @@ class IGNIS_PT_advanced(bpy.types.Panel):
         layout.use_property_split = True
         layout.use_property_decorate = False
         layout.prop(props, "hybrid_rasterization")
+        layout.prop(props, "frame_gen")
         layout.prop(props, "restir_di")
         layout.prop(props, "restir_gi")
         layout.prop(props, "material_sort")

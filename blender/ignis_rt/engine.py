@@ -2280,6 +2280,9 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         dll_wrapper.set_int("dlss_rr_enabled", 1 if props.dlss_rr_enabled else 0)
         dll_wrapper.set_int("use_wavefront", 1 if props.use_wavefront else 0)
         dll_wrapper.set_int("hybrid_rasterization", 1 if props.hybrid_rasterization else 0)
+        # DLSS Frame Generation factor -> number of generated frames (0=off, 1=2x, 2=3x, 3=4x).
+        _fg_map = {'OFF': 0, '2X': 1, '3X': 2, '4X': 3}
+        dll_wrapper.set_int("fg_frames", _fg_map.get(getattr(props, 'frame_gen', 'OFF'), 0))
         dll_wrapper.set_int("backface_culling", 1 if props.backface_culling else 0)
         dll_wrapper.set_int("restir_di", 1 if props.restir_di else 0)
         dll_wrapper.set_int("restir_gi", 1 if props.restir_gi else 0)

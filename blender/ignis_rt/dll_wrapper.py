@@ -240,6 +240,10 @@ def load():
     _lib.ignis_get_int.argtypes = [c_char_p]
     _lib.ignis_get_int.restype = c_int
 
+    if hasattr(_lib, "ignis_dlssg_max_frames"):
+        _lib.ignis_dlssg_max_frames.argtypes = []
+        _lib.ignis_dlssg_max_frames.restype = c_int
+
     _lib.ignis_get_float.argtypes = [c_char_p]
     _lib.ignis_get_float.restype = c_float
 
@@ -557,6 +561,17 @@ def set_sun_params(elevation, azimuth, intensity, cr, cg, cb, sun_size,
 
 def set_int(key: str, value: int):
     _lib.ignis_set_int(key.encode("utf-8"), c_int(value))
+
+
+def dlssg_max_frames() -> int:
+    """Max generated frames DLSS Frame Generation supports on this GPU (0 = unavailable,
+    1 = 2x / Ada, 3 = up to 4x / Blackwell)."""
+    if _lib is None or not hasattr(_lib, "ignis_dlssg_max_frames"):
+        return 0
+    try:
+        return int(_lib.ignis_dlssg_max_frames())
+    except Exception:
+        return 0
 
 
 def get_int(key: str) -> int:
