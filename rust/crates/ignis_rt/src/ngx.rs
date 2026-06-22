@@ -239,10 +239,25 @@ pub fn init(
     let mut caps: *mut std::os::raw::c_void = std::ptr::null_mut();
     let cres = unsafe { NVSDK_NGX_VULKAN_GetCapabilityParameters(&mut caps) };
     if cres == NGX_SUCCESS && !caps.is_null() {
-        let name = std::ffi::CString::new("SuperSampling.Available").unwrap();
-        let mut avail: i32 = 0;
-        unsafe { NVSDK_NGX_Parameter_GetI(caps, name.as_ptr(), &mut avail) };
-        log(&format!("NGX: init OK; DLSS available = {avail}"));
+        let get_i = |n: &str| -> i32 {
+            let c = std::ffi::CString::new(n).unwrap();
+            let mut v: i32 = 0;
+            unsafe { NVSDK_NGX_Parameter_GetI(caps, c.as_ptr(), &mut v) };
+            v
+        };
+        let dlss = get_i("SuperSampling.Available");
+        let fg = get_i("FrameGeneration.Available"); // DLSS-G — Ada (40-series) + recent driver
+        log(&format!("NGX: init OK; DLSS available = {dlss}, DLSS-G (FrameGeneration) available = {fg}"));
+        if fg == 0 {
+            // Why DLSS-G is unavailable: feature init result + whether a newer driver is needed.
+            let needs_drv = get_i("FrameGeneration.NeedsUpdatedDriver");
+            log(&format!(
+                "NGX: DLSS-G unavailable — initResult={:#x}, needsUpdatedDriver={needs_drv}, minDriver={}.{}",
+                get_i("FrameGeneration.FeatureInitResult"),
+                get_i("FrameGeneration.MinDriverVersionMajor"),
+                get_i("FrameGeneration.MinDriverVersionMinor"),
+            ));
+        }
     } else {
         log(&format!("NGX: init OK but GetCapabilityParameters failed (result {cres:#x})"));
     }
