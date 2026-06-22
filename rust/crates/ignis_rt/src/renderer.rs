@@ -463,7 +463,8 @@ pub fn set_camera(view_inverse: &[f32], proj_inverse: &[f32]) {
             // (b) force prev_view_proj == current, zeroing the motion vectors, so the frame visibly
             // rebuilds while moving. Genuine discontinuities (geometry/material/world changes) still
             // reset elsewhere. Only the non-RR accumulation path needs the per-move reset.
-            let rr_active = r.0.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0;
+            let rr_active = r.0.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0
+                && crate::config::get_int("use_wavefront") == 0; // wavefront bypasses DLSS -> non-RR reset
             if !rr_active {
                 r.0.accum_frame = 0;
             }
@@ -1811,7 +1812,8 @@ impl Renderer {
     /// or toggling lights). This mirrors shipping path tracers (e.g. Cyberpunk RT Overdrive), which
     /// never hard-reset on edits — ReSTIR + the denoiser re-converge continuously.
     fn reset_accum_for_edit(&mut self) {
-        let rr_active = self.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0;
+        let rr_active = self.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0
+            && crate::config::get_int("use_wavefront") == 0; // wavefront bypasses DLSS -> non-RR reset
         if !rr_active {
             self.accum_frame = 0;
         }
@@ -2251,7 +2253,8 @@ impl Renderer {
         // In DLSS-RR mode let the denoiser + motion vectors absorb the change (don't reset the
         // accumulator) — otherwise undo/redo and live edits flash a denoiser restart. Non-RR keeps
         // the per-change reset its accumulation needs.
-        let rr_active = self.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0;
+        let rr_active = self.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0
+            && crate::config::get_int("use_wavefront") == 0; // wavefront bypasses DLSS -> non-RR reset
         self.rebuild_tlas(!rr_active)
     }
 
@@ -2389,7 +2392,8 @@ impl Renderer {
         }
         // In DLSS-RR mode the motion vectors carry the object motion, so don't reset accumulation
         // (that would discard the denoiser history and zero the very motion vectors we just wrote).
-        let rr_active = self.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0;
+        let rr_active = self.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0
+            && crate::config::get_int("use_wavefront") == 0; // wavefront bypasses DLSS -> non-RR reset
         self.rebuild_tlas(!rr_active)
     }
 

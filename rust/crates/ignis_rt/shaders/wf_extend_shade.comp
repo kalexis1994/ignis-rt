@@ -1,56 +1,53 @@
 #version 460
 #extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+#include "pathtracer_common.glsl"
 // ── Wavefront path tracer — Stage 2: extend + shade ─────────────────────────────────────────────
-// Phase 0 scaffolding: one thread per path traces the primary ray and writes a flat hit/miss colour
-// to the offscreen image. This only proves the wavefront pipeline runs end-to-end (gen -> trace ->
-// output); real material/NEE/bounce shading (reusing the megakernel's functions via a shared include)
-// lands in Phase 1, where the goal is image parity with trace.rgen. See [[wavefront-plan]].
+// Phase 1b: one thread per path traces the full path via the shared tracePath() and writes the
+// accumulated + tonemapped result. This is a megakernel-in-compute reusing pathtracer_common.glsl —
+// it gives parity with the megakernel (non-RR path; DLSS bypassed for now). The per-bounce split
+// (one bounce per dispatch, the real wavefront win) is Phase 1c. See the wavefront plan in memory.
 
 layout(local_size_x = 64) in;
 
-struct PathState {
-    vec4 ro;   // xyz origin, w = pixel index
-    vec4 rd;   // xyz direction, w = flags
-    vec4 tp;   // xyz throughput, w = pathRough
-    vec4 rad;  // xyz radiance, w = rng seed
-};
+struct PathState { vec4 ro; vec4 rd; vec4 tp; vec4 rad; };
 layout(binding = 19, std430) buffer PathStates { PathState s[]; } paths;
-layout(binding = 1) uniform accelerationStructureEXT tlas;
-layout(binding = 0, rgba32f) uniform image2D outImage;
-
-layout(push_constant) uniform PC {
-    mat4  invViewProj;
-    vec4  camPos;
-    uvec2 dims;
-} pc;
-
-vec3 hashColor(uint i) {
-    uint h = i * 2654435761u; h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
-    return vec3(float(h & 255u), float((h >> 8) & 255u), float((h >> 16) & 255u)) / 255.0;
-}
 
 void main() {
+    uvec2 dims = pc.dims;
     uint idx = gl_GlobalInvocationID.x;
-    uint total = pc.dims.x * pc.dims.y;
-    if (idx >= total) return;
+    if (idx >= dims.x * dims.y) return;
+    uint frame = uint(pc.sunCol.w);
+    g_sampleIdx = frame;
+    uvec2 p = uvec2(idx % dims.x, idx / dims.x);
+    bool hasLut = (pc.hasTlas & 2u) != 0u;
 
     PathState st = paths.s[idx];
     vec3 ro = st.ro.xyz;
     vec3 rd = st.rd.xyz;
-    uint px = floatBitsToUint(st.ro.w);
-    ivec2 p = ivec2(px % pc.dims.x, px / pc.dims.x);
+    // Independent scramble key from the gen stage (its jitter draw used a different key).
+    uint rng = ((p.x * 1973u) ^ (p.y * 9277u) ^ 0x68bc21ebu) | 1u;
 
-    rayQueryEXT rq;
-    rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ro, 0.001, rd, 1e30);
-    while (rayQueryProceedEXT(rq)) {}
-
-    vec3 col;
-    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
-        uint inst = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
-        col = hashColor(inst); // Phase 0 placeholder: per-instance colour (no lighting yet)
+    vec3 L;
+    if ((pc.hasTlas & 1u) != 0u) {
+        // Ray cone for texture LOD (angular size of one pixel), same as the megakernel.
+        vec2 uvY = (vec2(p) + 0.5 + vec2(0.0, 1.0)) / vec2(dims);
+        vec4 wY = pc.invViewProj * vec4(uvY.x * 2.0 - 1.0, 1.0 - uvY.y * 2.0, 1.0, 1.0);
+        float spreadAngle = length(normalize(wY.xyz / wY.w - ro) - rd);
+        L = tracePath(ro, rd, spreadAngle, rng);
     } else {
-        col = vec3(0.05, 0.10, 0.20); // sky placeholder
+        L = sky(rd);
     }
-    imageStore(outImage, p, vec4(col, 1.0));
+
+    // Output: firefly clamp + temporal accumulation + tonemap (non-RR path; Phase 1b bypasses DLSS).
+    L = min(L, vec3(16.0));
+    vec3 accum = (frame == 0u) ? L : imageLoad(accumImage, ivec2(p)).rgb + L;
+    imageStore(accumImage, ivec2(p), vec4(accum, 1.0));
+    vec3 hdr = accum / float(frame + 1u);
+    vec3 display = hasLut ? tonemapLut(hdr) : aces(hdr);
+    imageStore(outImage, ivec2(p), vec4(display, 1.0));
 }

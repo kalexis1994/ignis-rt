@@ -1,46 +1,39 @@
 #version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+#include "pathtracer_common.glsl"
 // ── Wavefront path tracer — Stage 1: ray generation ─────────────────────────────────────────────
-// Phase 0 scaffolding: one thread per pixel writes the primary ray + initial path state into the
-// PathState buffer. Later stages (extend/shade) consume it. The megakernel (trace.rgen) is unchanged
-// and stays the default; this path is gated by the use_wavefront flag. See [[wavefront-plan]].
+// One thread/pixel writes the (jittered) primary ray + initial path state into the PathState buffer.
+// Reuses the shared rand2/pc from pathtracer_common.glsl. The megakernel (trace.rgen) stays default;
+// this runs only under use_wavefront. See the wavefront plan in memory.
 
 layout(local_size_x = 64) in;
 
-// One path in flight. 64 bytes (4 vec4), std430. ro.w carries the pixel index (bit-cast); rd.w holds
-// path flags (bounce/glassDepth/...); tp = throughput; rad = accumulated radiance.
-struct PathState {
-    vec4 ro;   // xyz origin, w = pixel index (uintBitsToFloat)
-    vec4 rd;   // xyz direction, w = flags
-    vec4 tp;   // xyz throughput, w = pathRough
-    vec4 rad;  // xyz radiance, w = rng seed (uintBitsToFloat)
-};
+struct PathState { vec4 ro; vec4 rd; vec4 tp; vec4 rad; }; // ro.w = pixel index; rest for the per-bounce split
 layout(binding = 19, std430) buffer PathStates { PathState s[]; } paths;
 
-// Prefix of CameraPush (shared pipeline layout) — only the fields ray generation needs.
-layout(push_constant) uniform PC {
-    mat4  invViewProj;
-    vec4  camPos;
-    uvec2 dims;
-} pc;
-
-uint pcg(uint v) { uint s = v*747796405u + 2891336453u; uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u; return (w >> 22u) ^ w; }
-
 void main() {
+    uvec2 dims = pc.dims;
     uint idx = gl_GlobalInvocationID.x;
-    uint total = pc.dims.x * pc.dims.y;
-    if (idx >= total) return;
-
-    uint px = idx % pc.dims.x;
-    uint py = idx / pc.dims.x;
-    vec2 uv  = (vec2(px, py) + 0.5) / vec2(pc.dims);
+    if (idx >= dims.x * dims.y) return;
+    uint frame = uint(pc.sunCol.w);
+    g_sampleIdx = frame;
+    uint px = idx % dims.x, py = idx / dims.x;
+    // Sub-pixel jitter for temporal-accumulation AA (matches the megakernel's non-RR path).
+    uint rng = ((px * 1973u) ^ (py * 9277u) ^ 0x9e3779b9u) | 1u;
+    vec2 jitter = (frame == 0u) ? vec2(0.5) : rand2(rng);
+    vec2 uv  = (vec2(px, py) + jitter) / vec2(dims);
     vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     vec4 world = pc.invViewProj * vec4(ndc, 1.0, 1.0);
     vec3 ro = pc.camPos.xyz;
     vec3 rd = (abs(world.w) >= 1e-8) ? normalize(world.xyz / world.w - ro) : vec3(0.0, 0.0, 1.0);
 
     paths.s[idx].ro  = vec4(ro, uintBitsToFloat(idx));
-    paths.s[idx].rd  = vec4(rd, uintBitsToFloat(0u));               // flags = 0 (bounce 0)
-    paths.s[idx].tp  = vec4(1.0, 1.0, 1.0, 0.0);                    // throughput 1, pathRough 0
-    paths.s[idx].rad = vec4(0.0, 0.0, 0.0, uintBitsToFloat(idx * 9781u + 1u)); // radiance 0, rng seed
+    paths.s[idx].rd  = vec4(rd, 0.0);
+    paths.s[idx].tp  = vec4(1.0);
+    paths.s[idx].rad = vec4(0.0);
 }
