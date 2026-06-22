@@ -155,6 +155,245 @@ fn create_storage_image(
     Ok((image, alloc, view))
 }
 
+/// Hybrid-raster G-buffer + graphics pipeline (primary visibility). The raster pass writes
+/// (instanceId, primId) + depth; the wavefront ray-gen reads the hit instead of casting the primary
+/// ray. Allocated at display res; a trace-res viewport renders into the top-left so a DLSS quality
+/// change (which moves trace res) needs no reallocation. See the wavefront plan in memory.
+struct RasterRes {
+    hit: (vk::Image, Allocation, vk::ImageView),     // R32G32_UINT: (instanceId, primId)
+    depth: (vk::Image, Allocation, vk::ImageView),   // D32 depth
+    render_pass: vk::RenderPass,
+    framebuffer: vk::Framebuffer,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+}
+
+/// Per-instance push constants for the raster vertex+fragment shaders (matches raster.vert / .frag).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RasterPush {
+    mvp: [f32; 16],   // viewProj * objectToWorld
+    instance_id: u32, // stored in the hit G-buffer
+}
+
+fn create_shader_module(device: &ash::Device, spv_bytes: &[u8]) -> Result<vk::ShaderModule, String> {
+    let spv = ash::util::read_spv(&mut std::io::Cursor::new(spv_bytes)).map_err(|e| format!("read spv: {e}"))?;
+    unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None) }
+        .map_err(|e| format!("shader module: {e}"))
+}
+
+/// A TLAS instance transform (row-major 3x4 object-to-world) as a column-major glam Mat4 with an
+/// implicit (0,0,0,1) bottom row — for the hybrid-raster per-instance MVP.
+fn mat4_from_3x4(t: &[f32; 12]) -> glam::Mat4 {
+    glam::Mat4::from_cols_array(&[
+        t[0], t[4], t[8], 0.0,
+        t[1], t[5], t[9], 0.0,
+        t[2], t[6], t[10], 0.0,
+        t[3], t[7], t[11], 1.0,
+    ])
+}
+
+fn create_attachment_image(
+    device: &ash::Device,
+    allocator: &mut Allocator,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+    aspect: vk::ImageAspectFlags,
+    name: &'static str,
+) -> Result<(vk::Image, Allocation, vk::ImageView), String> {
+    let ci = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D { width, height, depth: 1 })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(usage)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let image = unsafe { device.create_image(&ci, None) }.map_err(|e| format!("{name} image: {e}"))?;
+    let req = unsafe { device.get_image_memory_requirements(image) };
+    let alloc = allocator
+        .allocate(&AllocationCreateDesc {
+            name,
+            requirements: req,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })
+        .map_err(|e| format!("{name} alloc: {e}"))?;
+    unsafe { device.bind_image_memory(image, alloc.memory(), alloc.offset()) }
+        .map_err(|e| format!("{name} bind: {e}"))?;
+    let view = unsafe {
+        device.create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(aspect)
+                        .level_count(1)
+                        .layer_count(1),
+                ),
+            None,
+        )
+    }
+    .map_err(|e| format!("{name} view: {e}"))?;
+    Ok((image, alloc, view))
+}
+
+fn create_raster_resources(
+    device: &ash::Device,
+    allocator: &mut Allocator,
+    width: u32,
+    height: u32,
+) -> Result<RasterRes, String> {
+    let hit = create_attachment_image(
+        device, allocator, width, height, vk::Format::R32G32_UINT,
+        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE,
+        vk::ImageAspectFlags::COLOR, "raster_hit",
+    )?;
+    let depth = create_attachment_image(
+        device, allocator, width, height, vk::Format::D32_SFLOAT,
+        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT, vk::ImageAspectFlags::DEPTH, "raster_depth",
+    )?;
+
+    // Render pass: a uint color attachment (hit) + depth. Both cleared each frame; the hit attachment
+    // ends in GENERAL so the wavefront can read it as a storage image without a layout transition.
+    let attachments = [
+        vk::AttachmentDescription::default()
+            .format(vk::Format::R32G32_UINT)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::GENERAL),
+        vk::AttachmentDescription::default()
+            .format(vk::Format::D32_SFLOAT)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+    ];
+    let color_ref = [vk::AttachmentReference::default()
+        .attachment(0)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+    let depth_ref = vk::AttachmentReference::default()
+        .attachment(1)
+        .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    let subpass = [vk::SubpassDescription::default()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(&color_ref)
+        .depth_stencil_attachment(&depth_ref)];
+    let render_pass = unsafe {
+        device.create_render_pass(
+            &vk::RenderPassCreateInfo::default().attachments(&attachments).subpasses(&subpass),
+            None,
+        )
+    }
+    .map_err(|e| format!("raster render pass: {e}"))?;
+
+    let fb_views = [hit.2, depth.2];
+    let framebuffer = unsafe {
+        device.create_framebuffer(
+            &vk::FramebufferCreateInfo::default()
+                .render_pass(render_pass)
+                .attachments(&fb_views)
+                .width(width)
+                .height(height)
+                .layers(1),
+            None,
+        )
+    }
+    .map_err(|e| format!("raster framebuffer: {e}"))?;
+
+    // Pipeline layout: only the per-instance push (mvp + instanceId), no descriptor sets.
+    let pc_range = [vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+        .offset(0)
+        .size(std::mem::size_of::<RasterPush>() as u32)];
+    let pipeline_layout = unsafe {
+        device.create_pipeline_layout(
+            &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&pc_range),
+            None,
+        )
+    }
+    .map_err(|e| format!("raster pipeline layout: {e}"))?;
+
+    let vmod = create_shader_module(device, &include_bytes!(concat!(env!("OUT_DIR"), "/raster.vert.spv"))[..])?;
+    let fmod = create_shader_module(device, &include_bytes!(concat!(env!("OUT_DIR"), "/raster.frag.spv"))[..])?;
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vmod)
+            .name(c"main"),
+        vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(fmod)
+            .name(c"main"),
+    ];
+    // Vertex input: position only (the BLAS vertex buffer is 3 floats/vertex).
+    let vtx_binding = [vk::VertexInputBindingDescription::default()
+        .binding(0)
+        .stride(12)
+        .input_rate(vk::VertexInputRate::VERTEX)];
+    let vtx_attr = [vk::VertexInputAttributeDescription::default()
+        .location(0)
+        .binding(0)
+        .format(vk::Format::R32G32B32_SFLOAT)
+        .offset(0)];
+    let vtx_input = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_binding_descriptions(&vtx_binding)
+        .vertex_attribute_descriptions(&vtx_attr);
+    let input_asm = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let viewport_state = vk::PipelineViewportStateCreateInfo::default().viewport_count(1).scissor_count(1);
+    let raster_state = vk::PipelineRasterizationStateCreateInfo::default()
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE) // matches the RT TRIANGLE_FACING_CULL_DISABLE
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(1.0);
+    let ms_state = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let depth_state = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(true)
+        .depth_write_enable(true)
+        .depth_compare_op(vk::CompareOp::LESS);
+    let blend_attach = [vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+    let blend_state = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attach);
+    let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dyn_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
+    let pipeline_ci = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&stages)
+        .vertex_input_state(&vtx_input)
+        .input_assembly_state(&input_asm)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&raster_state)
+        .multisample_state(&ms_state)
+        .depth_stencil_state(&depth_state)
+        .color_blend_state(&blend_state)
+        .dynamic_state(&dyn_state)
+        .layout(pipeline_layout)
+        .render_pass(render_pass)
+        .subpass(0);
+    let pipeline = unsafe {
+        device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_ci], None)
+    }
+    .map_err(|(_, e)| format!("raster pipeline: {e}"))?[0];
+    unsafe {
+        device.destroy_shader_module(vmod, None);
+        device.destroy_shader_module(fmod, None);
+    }
+
+    Ok(RasterRes { hit, depth, render_pass, framebuffer, pipeline_layout, pipeline })
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CameraPush {
@@ -204,6 +443,7 @@ struct Blas {
     ubuf: Option<GpuBuffer>, // per-vertex UVs (for texturing)
     matbuf: Option<GpuBuffer>, // per-triangle material id
     address: vk::DeviceAddress,
+    index_count: u32, // for the hybrid-raster drawIndexed (3 * triangle count)
 }
 
 struct Tlas {
@@ -261,6 +501,7 @@ pub struct Renderer {
     prev_xform_buffer: Option<GpuBuffer>,
     instance_transforms: Vec<[f32; 12]>,
     prev_instance_transforms: Vec<[f32; 12]>,
+    instance_blas: Vec<u32>, // BLAS index per instance, for the hybrid-raster per-instance draws
 
     // Wavefront path tracer (binding 19 + compute pipelines). Off by default; the megakernel
     // (trace.rgen) renders unless use_wavefront is set. See [[wavefront-plan]].
@@ -271,6 +512,9 @@ pub struct Renderer {
     wf_extend_pipeline: Option<vk::Pipeline>,
     wf_resolve_pipeline: Option<vk::Pipeline>,
     wf_compact_pipeline: Option<vk::Pipeline>,
+    // Hybrid rasterization (primary-visibility G-buffer). Off by default; feeds wf_gen when enabled.
+    raster: Option<RasterRes>,
+    raster_debug_pipeline: Option<vk::Pipeline>, // R1 visualization (hashColor of the hit G-buffer)
 
     // Compute pipeline.
     offscreen_view: vk::ImageView,
@@ -1187,6 +1431,21 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                     .descriptor_count(1),
             );
         }
+        // Binding 22: hybrid-raster hit G-buffer (instanceId, primId). The raster pass writes it as a
+        // color attachment; wf_gen / the debug viz read it as a storage image.
+        bindings.push(
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(22)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        );
+        binding_flags.push(vk::DescriptorBindingFlags::PARTIALLY_BOUND);
+        pool_sizes.push(
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1),
+        );
     }
     let mut flags_info =
         vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
@@ -1474,7 +1733,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     };
 
     // Wavefront path tracer pipelines (compute, share the pipeline layout). Phase 0: gen + extend/shade.
-    let (wf_gen_pipeline, wf_extend_pipeline, wf_resolve_pipeline, wf_compact_pipeline) = if rt_supported {
+    let (wf_gen_pipeline, wf_extend_pipeline, wf_resolve_pipeline, wf_compact_pipeline, raster_debug_pipeline) = if rt_supported {
         let mk = |spv_bytes: &[u8], name: &str| -> Result<vk::Pipeline, String> {
             let spv = ash::util::read_spv(&mut std::io::Cursor::new(spv_bytes))
                 .map_err(|e| format!("read {name} spv: {e}"))?;
@@ -1501,10 +1760,31 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         let e = mk(&include_bytes!(concat!(env!("OUT_DIR"), "/wf_extend_shade.comp.spv"))[..], "wf_extend")?;
         let r = mk(&include_bytes!(concat!(env!("OUT_DIR"), "/wf_resolve.comp.spv"))[..], "wf_resolve")?;
         let c = mk(&include_bytes!(concat!(env!("OUT_DIR"), "/wf_compact.comp.spv"))[..], "wf_compact")?;
-        (Some(g), Some(e), Some(r), Some(c))
+        let dbg = mk(&include_bytes!(concat!(env!("OUT_DIR"), "/raster_debug.comp.spv"))[..], "raster_debug")?;
+        (Some(g), Some(e), Some(r), Some(c), Some(dbg))
     } else {
-        (None, None, None, None)
+        (None, None, None, None, None)
     };
+
+    // Hybrid-raster G-buffer + graphics pipeline (primary visibility). Allocated at display res; the
+    // raster + wavefront render into a trace-res viewport. Only on RT devices (it feeds the wavefront).
+    let raster = if rt_supported {
+        Some(create_raster_resources(&device, &mut allocator, width, height)?)
+    } else {
+        None
+    };
+    // Bind the raster hit G-buffer at binding 22 (created after the main descriptor writes above).
+    if let Some(r) = raster.as_ref() {
+        let hit_info = [vk::DescriptorImageInfo::default()
+            .image_view(r.hit.2)
+            .image_layout(vk::ImageLayout::GENERAL)];
+        let w = [vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(22)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .image_info(&hit_info)];
+        unsafe { device.update_descriptor_sets(&w, &[]) };
+    }
 
     // Environment (HDRI) importance-sampling distribution: a storage buffer (binding 17) built by the
     // env_cdf.comp prepass (compute, shares the pipeline layout). Sized for the 256x128 Distribution2D.
@@ -1686,6 +1966,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         prev_xform_buffer: Some(prev_xform_buffer),
         instance_transforms: Vec::new(),
         prev_instance_transforms: Vec::new(),
+        instance_blas: Vec::new(),
         wf_pathstate_buffer,
         wf_queue_buffer,
         wf_ctrl_buffer,
@@ -1693,6 +1974,8 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         wf_extend_pipeline,
         wf_resolve_pipeline,
         wf_compact_pipeline,
+        raster,
+        raster_debug_pipeline,
         offscreen_view,
         ds_layout,
         desc_pool,
@@ -2338,6 +2621,7 @@ impl Renderer {
         // Snapshot the current instance transforms (object motion vectors). gl_InstanceID in the
         // shader is this array order, so the previous-transform buffer is indexed the same way.
         self.instance_transforms = in_slice.iter().map(|i| i.transform).collect();
+        self.instance_blas = in_slice.iter().map(|i| i.blas_index as u32).collect();
 
         // Convert to VkAccelerationStructureInstanceKHR.
         let mut vk_instances: Vec<vk::AccelerationStructureInstanceKHR> = Vec::with_capacity(count as usize);
@@ -2720,9 +3004,15 @@ impl Renderer {
             && self.wf_resolve_pipeline.is_some()
             && self.wf_compact_pipeline.is_some()
             && crate::config::get_int("use_wavefront") != 0;
+        // Hybrid raster (R1 debug): rasterize primary visibility into the G-buffer and hashColor it to
+        // the offscreen, bypassing the path tracer + DLSS. R2 will instead feed wf_gen the hit.
+        let use_raster = self.raster.is_some()
+            && self.raster_debug_pipeline.is_some()
+            && crate::config::get_int("hybrid_rasterization") != 0;
         // The wavefront feeds DLSS the same way the megakernel does (gNoisy + guides at trace res),
         // so RR runs for both. When RR is off, the path tracer writes the offscreen directly.
-        let use_rr = self.rr.is_some()
+        let use_rr = !use_raster
+            && self.rr.is_some()
             && self.tonemap_pipeline.is_some()
             && write_guide
             && crate::config::get_int("dlss_rr_enabled") != 0;
@@ -2871,9 +3161,71 @@ impl Renderer {
                 &push as *const CameraPush as *const u8,
                 std::mem::size_of::<CameraPush>(),
             );
-            // Path trace: wavefront (Phase 0: gen -> extend/shade, writes the offscreen) when enabled;
-            // otherwise the megakernel ray-generation pipeline (RT) or the sky compute fallback.
-            if use_wavefront {
+            // Path trace: hybrid-raster debug (R1) when use_raster; else the wavefront (writes the
+            // offscreen) when enabled; else the megakernel ray-gen (RT) or the sky compute fallback.
+            if use_raster {
+                // ── R1: rasterize primary visibility into the G-buffer, then hashColor it ──
+                // The R1 debug bypasses DLSS, so render at full display res (no upscaling subregion) —
+                // works regardless of the DLSS setting. R2 will switch to trace res (DLSS upscales it).
+                let r = self.raster.as_ref().unwrap();
+                let (tw, th) = (self.width, self.height);
+                let extent = vk::Extent2D { width: tw, height: th };
+                let clear = [
+                    vk::ClearValue { color: vk::ClearColorValue { uint32: [0xFFFF_FFFF, 0, 0, 0] } },
+                    vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } },
+                ];
+                d.cmd_begin_render_pass(
+                    self.cmd,
+                    &vk::RenderPassBeginInfo::default()
+                        .render_pass(r.render_pass)
+                        .framebuffer(r.framebuffer)
+                        .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent })
+                        .clear_values(&clear),
+                    vk::SubpassContents::INLINE,
+                );
+                d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, r.pipeline);
+                d.cmd_set_viewport(self.cmd, 0, &[vk::Viewport {
+                    // Negative height flips Y so the raster matches the path tracer's ndc_y (+1 = top).
+                    x: 0.0, y: th as f32, width: tw as f32, height: -(th as f32), min_depth: 0.0, max_depth: 1.0,
+                }]);
+                d.cmd_set_scissor(self.cmd, 0, &[vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent }]);
+                let view_proj = glam::Mat4::from_cols_array(&cur_vp);
+                let rlayout = r.pipeline_layout;
+                for i in 0..self.instance_transforms.len() {
+                    let bi = self.instance_blas.get(i).copied().unwrap_or(u32::MAX) as usize;
+                    let blas = match self.blas_list.get(bi).and_then(|o| o.as_ref()) {
+                        Some(b) if b.index_count > 0 => b,
+                        _ => continue,
+                    };
+                    let rpush = RasterPush {
+                        mvp: (view_proj * mat4_from_3x4(&self.instance_transforms[i])).to_cols_array(),
+                        instance_id: i as u32,
+                    };
+                    let rbytes = std::slice::from_raw_parts(
+                        &rpush as *const RasterPush as *const u8, std::mem::size_of::<RasterPush>());
+                    d.cmd_push_constants(self.cmd, rlayout,
+                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT, 0, rbytes);
+                    d.cmd_bind_vertex_buffers(self.cmd, 0, &[blas.vbuf.buffer], &[0]);
+                    d.cmd_bind_index_buffer(self.cmd, blas.ibuf.buffer, 0, vk::IndexType::UINT32);
+                    d.cmd_draw_indexed(self.cmd, blas.index_count, 1, 0, 0, 0);
+                }
+                d.cmd_end_render_pass(self.cmd);
+                // Raster color writes (now in GENERAL) -> compute read of the hit G-buffer.
+                let mb = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ);
+                d.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+                // Debug viz: hashColor the G-buffer to the offscreen at trace res.
+                let mut dbg_push = push;
+                dbg_push.dims = [tw, th];
+                let dbg_bytes = std::slice::from_raw_parts(
+                    &dbg_push as *const CameraPush as *const u8, std::mem::size_of::<CameraPush>());
+                d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.raster_debug_pipeline.unwrap());
+                d.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout, 0, &[self.desc_set], &[]);
+                d.cmd_push_constants(self.cmd, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, dbg_bytes);
+                d.cmd_dispatch(self.cmd, tw.div_ceil(8), th.div_ceil(8), 1);
+            } else if use_wavefront {
                 // The wavefront runs at trace (render) resolution = push.dims. In RR mode it emits
                 // gNoisy + guides there for DLSS to upscale; with RR off, trace res == display res and
                 // resolve writes the offscreen directly.
@@ -3309,7 +3661,8 @@ fn build_blas(
     let nbuf = mk(&mesh.normals, "blas_normals")?;
     let ubuf = mk(&mesh.uvs, "blas_uvs")?;
 
-    Ok(Blas { accel: accel_struct, buf, vbuf, ibuf, nbuf, ubuf, matbuf: None, address })
+    Ok(Blas { accel: accel_struct, buf, vbuf, ibuf, nbuf, ubuf, matbuf: None, address,
+        index_count: mesh.indices.len() as u32 })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3579,6 +3932,9 @@ impl Drop for Renderer {
             if let Some(p) = self.wf_compact_pipeline.take() {
                 device.destroy_pipeline(p, None);
             }
+            if let Some(p) = self.raster_debug_pipeline.take() {
+                device.destroy_pipeline(p, None);
+            }
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_descriptor_pool(self.desc_pool, None);
             device.destroy_descriptor_set_layout(self.ds_layout, None);
@@ -3612,6 +3968,17 @@ impl Drop for Renderer {
                         device.destroy_image_view(view, None);
                         device.destroy_image(image, None);
                         let _ = alloc.free(galloc);
+                    }
+                }
+                if let Some(r) = self.raster.take() {
+                    device.destroy_pipeline(r.pipeline, None);
+                    device.destroy_pipeline_layout(r.pipeline_layout, None);
+                    device.destroy_framebuffer(r.framebuffer, None);
+                    device.destroy_render_pass(r.render_pass, None);
+                    for (image, ralloc, view) in [r.hit, r.depth] {
+                        device.destroy_image_view(view, None);
+                        device.destroy_image(image, None);
+                        let _ = alloc.free(ralloc);
                     }
                 }
                 if let Some(b) = self.light_buffer.take() {

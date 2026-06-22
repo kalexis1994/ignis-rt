@@ -18,8 +18,9 @@ fn main() {
         let path = entry.unwrap().path();
         let ext = path.extension().and_then(|e| e.to_str());
         // .comp = compute (ray query). .rgen = ray generation (ray query + Shader Execution
-        // Reordering). glslang infers the stage from the extension.
-        if matches!(ext, Some("comp") | Some("rgen")) {
+        // Reordering). .vert/.frag = the hybrid-raster primary-visibility pipeline. glslang infers
+        // the stage from the extension.
+        if matches!(ext, Some("comp") | Some("rgen") | Some("vert") | Some("frag")) {
             let name = path.file_name().unwrap().to_str().unwrap();
             let out_spv = format!("{out_dir}/{name}.spv");
             println!("cargo:rerun-if-changed={}", path.display());
