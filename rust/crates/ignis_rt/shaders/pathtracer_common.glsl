@@ -72,6 +72,12 @@ layout(push_constant) uniform PC {
     uint  wfOut;         // wavefront compaction: write side (0/1)
 } pc;
 
+// Per-instance raster data (binding 23): objectToWorld (3 vec4 rows) + customIndex, indexed by the
+// draw-order instanceId. Used only to resolve a rasterized primary hit (hybrid raster); the megakernel
+// and the ray-traced wavefront paths never touch it.
+struct RasterInst { vec4 o2w0; vec4 o2w1; vec4 o2w2; uint customIndex; uint rpad0, rpad1, rpad2; };
+layout(binding = 23, std430) readonly buffer RasterInsts { RasterInst data[]; } rasterInsts;
+
 // Write the DLSS guide buffers for the primary hit at pixel p. depth = linear view-space distance
 // (projection of the hit onto the camera forward); motion = where this world point was last frame.
 // EnvBRDFApprox — Epic/Karis split-sum specular albedo. DLSS-RR demodulates the specular lobe by

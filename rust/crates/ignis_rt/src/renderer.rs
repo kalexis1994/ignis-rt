@@ -176,6 +176,17 @@ struct RasterPush {
     instance_id: u32, // stored in the hit G-buffer
 }
 
+/// Per-instance raster record (binding 23), indexed by draw-order instanceId. Lets the wavefront
+/// resolve the raster hit's geometry (customIndex) + transform (objectToWorld). Matches the GLSL
+/// RasterInst in wf_pathstate.glsl: 3 vec4 (o2w rows) + customIndex + padding = 64 bytes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RasterInst {
+    o2w: [f32; 12],   // row-major 3x4 object-to-world (3 vec4 rows in std430)
+    custom_index: u32, // geometry-table index (== BLAS slot)
+    _pad: [u32; 3],
+}
+
 fn create_shader_module(device: &ash::Device, spv_bytes: &[u8]) -> Result<vk::ShaderModule, String> {
     let spv = ash::util::read_spv(&mut std::io::Cursor::new(spv_bytes)).map_err(|e| format!("read spv: {e}"))?;
     unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None) }
@@ -515,6 +526,9 @@ pub struct Renderer {
     // Hybrid rasterization (primary-visibility G-buffer). Off by default; feeds wf_gen when enabled.
     raster: Option<RasterRes>,
     raster_debug_pipeline: Option<vk::Pipeline>, // R1 visualization (hashColor of the hit G-buffer)
+    // Per-instance (objectToWorld + customIndex) for the raster hit, indexed by draw-order instanceId.
+    // Host-visible; rewritten when the instance transforms change. Binding 23.
+    raster_inst_buffer: Option<GpuBuffer>,
 
     // Compute pipeline.
     offscreen_view: vk::ImageView,
@@ -1446,6 +1460,20 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(1),
         );
+        // Binding 23: per-instance raster data (objectToWorld + customIndex) for the raster hit.
+        bindings.push(
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(23)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::COMPUTE),
+        );
+        binding_flags.push(vk::DescriptorBindingFlags::PARTIALLY_BOUND);
+        pool_sizes.push(
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1),
+        );
     }
     let mut flags_info =
         vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
@@ -1785,6 +1813,25 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
             .image_info(&hit_info)];
         unsafe { device.update_descriptor_sets(&w, &[]) };
     }
+    // Per-instance raster data (binding 23): objectToWorld (3 vec4) + customIndex, indexed by the
+    // draw-order instanceId. Host-visible; rewritten when the instance transforms change.
+    let raster_inst_buffer = if rt_supported {
+        Some(GpuBuffer::new(
+            &device, &mut allocator, (MAX_INSTANCES as u64) * 64,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "raster_inst",
+        )?)
+    } else {
+        None
+    };
+    if let Some(b) = raster_inst_buffer.as_ref() {
+        let info = [vk::DescriptorBufferInfo::default().buffer(b.buffer).offset(0).range(vk::WHOLE_SIZE)];
+        let w = [vk::WriteDescriptorSet::default()
+            .dst_set(desc_set)
+            .dst_binding(23)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&info)];
+        unsafe { device.update_descriptor_sets(&w, &[]) };
+    }
 
     // Environment (HDRI) importance-sampling distribution: a storage buffer (binding 17) built by the
     // env_cdf.comp prepass (compute, shares the pipeline layout). Sized for the 256x128 Distribution2D.
@@ -1976,6 +2023,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         wf_compact_pipeline,
         raster,
         raster_debug_pipeline,
+        raster_inst_buffer,
         offscreen_view,
         ds_layout,
         desc_pool,
@@ -2622,6 +2670,19 @@ impl Renderer {
         // shader is this array order, so the previous-transform buffer is indexed the same way.
         self.instance_transforms = in_slice.iter().map(|i| i.transform).collect();
         self.instance_blas = in_slice.iter().map(|i| i.blas_index as u32).collect();
+        // Per-instance raster records (binding 23): the wavefront resolves the raster hit's geometry +
+        // transform from these. custom_index == BLAS slot (descs[] is indexed by BLAS slot).
+        if let Some(b) = self.raster_inst_buffer.as_ref() {
+            let recs: Vec<RasterInst> = in_slice
+                .iter()
+                .map(|i| RasterInst {
+                    o2w: i.transform,
+                    custom_index: i.custom_index,
+                    _pad: [0; 3],
+                })
+                .collect();
+            b.write_bytes(crate::gpu::as_bytes(&recs));
+        }
 
         // Convert to VkAccelerationStructureInstanceKHR.
         let mut vk_instances: Vec<vk::AccelerationStructureInstanceKHR> = Vec::with_capacity(count as usize);
@@ -4000,6 +4061,9 @@ impl Drop for Renderer {
                     b.destroy(&device, alloc);
                 }
                 if let Some(b) = self.wf_pathstate_buffer.take() {
+                    b.destroy(&device, alloc);
+                }
+                if let Some(b) = self.raster_inst_buffer.take() {
                     b.destroy(&device, alloc);
                 }
                 if let Some(b) = self.wf_queue_buffer.take() {
