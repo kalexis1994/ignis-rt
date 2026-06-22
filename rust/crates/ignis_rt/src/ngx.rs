@@ -64,6 +64,7 @@ mod ffi {
     }
 
     pub const NGX_FEATURE_RAY_RECONSTRUCTION: i32 = 13;
+    pub const NGX_FEATURE_FRAME_GENERATION: i32 = 11; // DLSS-G (NVSDK_NGX_Feature_FrameGeneration)
     // Create params.
     pub const PERF_QUALITY_DLAA: i32 = 5;
     pub const DLSS_FLAG_IS_HDR: i32 = 1 << 0;
@@ -457,6 +458,123 @@ pub fn release_rr(rr: RrFeature) {
     }
 }
 
+/// A created DLSS Frame Generation (DLSS-G) feature + its NGX parameter map.
+#[cfg(have_ngx)]
+pub struct FgFeature {
+    pub handle: *mut std::os::raw::c_void,
+    pub params: *mut std::os::raw::c_void,
+}
+#[cfg(have_ngx)]
+unsafe impl Send for FgFeature {}
+
+/// Create the DLSS-G feature at width x height (the presented / backbuffer resolution). `cmd` must be
+/// in the recording state; the caller submits + waits. `backbuffer_format` is the color VkFormat.
+#[cfg(have_ngx)]
+pub fn create_fg(device: u64, cmd: u64, width: u32, height: u32, backbuffer_format: i32) -> Option<FgFeature> {
+    use ffi::*;
+    use std::ffi::CString;
+    use std::os::raw::c_void;
+    let mut params: *mut c_void = std::ptr::null_mut();
+    if unsafe { NVSDK_NGX_VULKAN_AllocateParameters(&mut params) } != NGX_SUCCESS || params.is_null() {
+        log("NGX: AllocateParameters (DLSS-G) failed");
+        return None;
+    }
+    let set_ui = |n: &str, v: u32| { let c = CString::new(n).unwrap(); unsafe { NVSDK_NGX_Parameter_SetUI(params, c.as_ptr(), v) }; };
+    set_ui("CreationNodeMask", 1);
+    set_ui("VisibilityNodeMask", 1);
+    set_ui("Width", width);
+    set_ui("Height", height);
+    set_ui("DLSSG.BackbufferFormat", backbuffer_format as u32);
+    let mut handle: *mut c_void = std::ptr::null_mut();
+    let res = unsafe {
+        NVSDK_NGX_VULKAN_CreateFeature1(device as VkHandle, cmd as VkHandle, NGX_FEATURE_FRAME_GENERATION, params, &mut handle)
+    };
+    if res == NGX_SUCCESS && !handle.is_null() {
+        log(&format!("NGX: DLSS-G feature created OK ({width}x{height})"));
+        Some(FgFeature { handle, params })
+    } else {
+        log(&format!("NGX: CreateFeature DLSS-G FAILED (result {res:#x})"));
+        unsafe { NVSDK_NGX_VULKAN_DestroyParameters(params) };
+        None
+    }
+}
+
+/// Run DLSS Frame Generation for one frame: interpolate between the previously-fed frame and the
+/// current `color`, writing the generated frame to `out_interp` (and `color` through to `out_real`).
+/// `clip_to_prev_clip` reprojects current clip space to the previous frame's (prevViewProj * invVP).
+#[cfg(have_ngx)]
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_fg(
+    cmd: u64,
+    fg: &FgFeature,
+    color: RrImage,      // current frame (final tonemapped color = backbuffer)
+    mvec: RrImage,
+    depth: RrImage,
+    out_interp: RrImage, // generated interpolated frame (output)
+    out_real: RrImage,   // real frame passthrough (output)
+    width: u32,
+    height: u32,
+    multi_frame_count: u32,
+    clip_to_prev_clip: [f32; 16],
+    cam_near: f32,
+    cam_far: f32,
+    reset: bool,
+) -> bool {
+    use ffi::*;
+    use std::ffi::CString;
+    use std::os::raw::c_void;
+    let range = ash::vk::ImageSubresourceRange {
+        aspect_mask: ash::vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1,
+    };
+    let mk = |img: RrImage, rw: bool| ResourceVk {
+        image_view: img.view, image: img.image, subresource: range, format: img.format, width, height, res_type: 0, read_write: rw as u8,
+    };
+    // Must outlive EvaluateFeature_C (referenced by pointer).
+    let mut r_color = mk(color, false);
+    let mut r_mvec = mk(mvec, false);
+    let mut r_depth = mk(depth, false);
+    let mut r_interp = mk(out_interp, true);
+    let mut r_real = mk(out_real, true);
+    let mut m_clip_prev = clip_to_prev_clip;
+
+    let p = fg.params;
+    let set_ptr = |n: &str, r: *mut c_void| { let c = CString::new(n).unwrap(); unsafe { NVSDK_NGX_Parameter_SetVoidPointer(p, c.as_ptr(), r) }; };
+    let set_f = |n: &str, v: f32| { let c = CString::new(n).unwrap(); unsafe { NVSDK_NGX_Parameter_SetF(p, c.as_ptr(), v) }; };
+    let set_ui = |n: &str, v: u32| { let c = CString::new(n).unwrap(); unsafe { NVSDK_NGX_Parameter_SetUI(p, c.as_ptr(), v) }; };
+
+    set_ptr("DLSSG.Backbuffer", &mut r_color as *mut _ as *mut c_void);
+    set_ptr("DLSSG.MVecs", &mut r_mvec as *mut _ as *mut c_void);
+    set_ptr("DLSSG.Depth", &mut r_depth as *mut _ as *mut c_void);
+    set_ptr("DLSSG.OutputInterpolated", &mut r_interp as *mut _ as *mut c_void);
+    set_ptr("DLSSG.OutputReal", &mut r_real as *mut _ as *mut c_void);
+    set_ptr("DLSSG.ClipToPrevClip", m_clip_prev.as_mut_ptr() as *mut c_void);
+    set_ui("DLSSG.MultiFrameCount", multi_frame_count.max(1));
+    set_ui("DLSSG.MultiFrameIndex", 1);
+    set_f("DLSSG.CameraNear", cam_near);
+    set_f("DLSSG.CameraFar", cam_far);
+    set_f("DLSSG.MvecScaleX", 1.0);
+    set_f("DLSSG.MvecScaleY", 1.0);
+    set_ui("DLSSG.DepthInverted", 0);
+    set_ui("DLSSG.ColorBuffersHDR", 1);
+    set_ui("DLSSG.CameraMotionIncluded", 1); // our motion vectors include camera motion
+    set_ui("DLSSG.Reset", reset as u32);
+
+    let res = unsafe { NVSDK_NGX_VULKAN_EvaluateFeature_C(cmd as VkHandle, fg.handle, p, std::ptr::null()) };
+    if res != NGX_SUCCESS {
+        log(&format!("NGX: EvaluateFeature DLSS-G failed (result {res:#x})"));
+        return false;
+    }
+    true
+}
+
+#[cfg(have_ngx)]
+pub fn release_fg(fg: FgFeature) {
+    unsafe {
+        ffi::NVSDK_NGX_VULKAN_ReleaseFeature(fg.handle);
+        ffi::NVSDK_NGX_VULKAN_DestroyParameters(fg.params);
+    }
+}
+
 #[cfg(have_ngx)]
 pub fn shutdown(device: u64) {
     unsafe { ffi::NVSDK_NGX_VULKAN_Shutdown1(device as ffi::VkHandle) };
@@ -496,4 +614,17 @@ pub fn evaluate_rr(
     _color: RrImage, _output: RrImage, _depth: RrImage, _motion: RrImage,
     _normal_rough: RrImage, _albedo: RrImage, _spec_albedo: RrImage,
     _rw: u32, _rh: u32, _dw: u32, _dh: u32, _jx: f32, _jy: f32, _reset: bool, _delta: f32,
+) -> bool { false }
+
+#[cfg(not(have_ngx))]
+pub struct FgFeature;
+#[cfg(not(have_ngx))]
+pub fn create_fg(_d: u64, _c: u64, _w: u32, _h: u32, _fmt: i32) -> Option<FgFeature> { None }
+#[cfg(not(have_ngx))]
+pub fn release_fg(_fg: FgFeature) {}
+#[cfg(not(have_ngx))]
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_fg(
+    _cmd: u64, _fg: &FgFeature, _color: RrImage, _mvec: RrImage, _depth: RrImage,
+    _oi: RrImage, _or: RrImage, _w: u32, _h: u32, _mfc: u32, _m: [f32; 16], _n: f32, _f: f32, _r: bool,
 ) -> bool { false }
