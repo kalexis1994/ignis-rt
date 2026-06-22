@@ -6,48 +6,26 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_GOOGLE_include_directive : require
 #include "pathtracer_common.glsl"
-// ── Wavefront path tracer — Stage 2: extend + shade ─────────────────────────────────────────────
-// Phase 1b: one thread per path traces the full path via the shared tracePath() and writes the
-// accumulated + tonemapped result. This is a megakernel-in-compute reusing pathtracer_common.glsl —
-// it gives parity with the megakernel (non-RR path; DLSS bypassed for now). The per-bounce split
-// (one bounce per dispatch, the real wavefront win) is Phase 1c. See the wavefront plan in memory.
+#include "wf_pathstate.glsl"
+// ── Wavefront path tracer — Stage 2: extend + shade (per-bounce) ─────────────────────────────────
+// One dispatch = one real bounce per live path. Load PathCtx; dead paths early-out (their radiance is
+// already final in the buffer); else run a single traceBounce and store the updated state, flagging
+// the path dead when it terminates. Dispatched MAX_BOUNCES times; the resolve stage reads c.L out.
+// This is the wavefront split — paths die at different depths, so compaction (Phase 2) will skip the
+// dead ones via an indirect dispatch. See the wavefront plan in memory.
 
 layout(local_size_x = 64) in;
-
-struct PathState { vec4 ro; vec4 rd; vec4 tp; vec4 rad; };
-layout(binding = 19, std430) buffer PathStates { PathState s[]; } paths;
 
 void main() {
     uvec2 dims = pc.dims;
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= dims.x * dims.y) return;
-    uint frame = uint(pc.sunCol.w);
-    g_sampleIdx = frame;
-    uvec2 p = uvec2(idx % dims.x, idx / dims.x);
-    bool hasLut = (pc.hasTlas & 2u) != 0u;
 
-    PathState st = paths.s[idx];
-    vec3 ro = st.ro.xyz;
-    vec3 rd = st.rd.xyz;
-    // Independent scramble key from the gen stage (its jitter draw used a different key).
-    uint rng = ((p.x * 1973u) ^ (p.y * 9277u) ^ 0x68bc21ebu) | 1u;
+    uint rng; float spreadAngle; bool dead;
+    PathCtx c = loadPath(idx, rng, spreadAngle, dead);
+    if (dead) return; // already terminated — c.L is final, nothing more to do
 
-    vec3 L;
-    if ((pc.hasTlas & 1u) != 0u) {
-        // Ray cone for texture LOD (angular size of one pixel), same as the megakernel.
-        vec2 uvY = (vec2(p) + 0.5 + vec2(0.0, 1.0)) / vec2(dims);
-        vec4 wY = pc.invViewProj * vec4(uvY.x * 2.0 - 1.0, 1.0 - uvY.y * 2.0, 1.0, 1.0);
-        float spreadAngle = length(normalize(wY.xyz / wY.w - ro) - rd);
-        L = tracePath(ro, rd, spreadAngle, rng);
-    } else {
-        L = sky(rd);
-    }
-
-    // Output: firefly clamp + temporal accumulation + tonemap (non-RR path; Phase 1b bypasses DLSS).
-    L = min(L, vec3(16.0));
-    vec3 accum = (frame == 0u) ? L : imageLoad(accumImage, ivec2(p)).rgb + L;
-    imageStore(accumImage, ivec2(p), vec4(accum, 1.0));
-    vec3 hdr = accum / float(frame + 1u);
-    vec3 display = hasLut ? tonemapLut(hdr) : aces(hdr);
-    imageStore(outImage, ivec2(p), vec4(display, 1.0));
+    g_sampleIdx = uint(pc.sunCol.w);
+    bool alive = traceBounce(c, spreadAngle, rng);
+    storePath(idx, c, rng, spreadAngle, !alive);
 }

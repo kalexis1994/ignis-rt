@@ -6,15 +6,13 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_GOOGLE_include_directive : require
 #include "pathtracer_common.glsl"
+#include "wf_pathstate.glsl"
 // ── Wavefront path tracer — Stage 1: ray generation ─────────────────────────────────────────────
-// One thread/pixel writes the (jittered) primary ray + initial path state into the PathState buffer.
-// Reuses the shared rand2/pc from pathtracer_common.glsl. The megakernel (trace.rgen) stays default;
-// this runs only under use_wavefront. See the wavefront plan in memory.
+// One thread/pixel writes the (jittered) primary ray + the initial PathCtx into the PathState buffer.
+// The per-bounce extend stage then advances each path one real bounce per dispatch. Empty scene =>
+// the path is born dead carrying the sky. See the wavefront plan in memory.
 
 layout(local_size_x = 64) in;
-
-struct PathState { vec4 ro; vec4 rd; vec4 tp; vec4 rad; }; // ro.w = pixel index; rest for the per-bounce split
-layout(binding = 19, std430) buffer PathStates { PathState s[]; } paths;
 
 void main() {
     uvec2 dims = pc.dims;
@@ -23,17 +21,29 @@ void main() {
     uint frame = uint(pc.sunCol.w);
     g_sampleIdx = frame;
     uint px = idx % dims.x, py = idx / dims.x;
-    // Sub-pixel jitter for temporal-accumulation AA (matches the megakernel's non-RR path).
-    uint rng = ((px * 1973u) ^ (py * 9277u) ^ 0x9e3779b9u) | 1u;
-    vec2 jitter = (frame == 0u) ? vec2(0.5) : rand2(rng);
+
+    // Sub-pixel jitter for temporal-accumulation AA (own scramble key, independent of the path rng).
+    uint jrng = ((px * 1973u) ^ (py * 9277u) ^ 0x9e3779b9u) | 1u;
+    vec2 jitter = (frame == 0u) ? vec2(0.5) : rand2(jrng);
     vec2 uv  = (vec2(px, py) + jitter) / vec2(dims);
     vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     vec4 world = pc.invViewProj * vec4(ndc, 1.0, 1.0);
     vec3 ro = pc.camPos.xyz;
     vec3 rd = (abs(world.w) >= 1e-8) ? normalize(world.xyz / world.w - ro) : vec3(0.0, 0.0, 1.0);
+    // Ray-cone spread angle (angular size of one pixel); constant for the whole path.
+    vec2 uvY = (vec2(px, py) + jitter + vec2(0.0, 1.0)) / vec2(dims);
+    vec4 wY = pc.invViewProj * vec4(uvY.x * 2.0 - 1.0, 1.0 - uvY.y * 2.0, 1.0, 1.0);
+    float spreadAngle = length(normalize(wY.xyz / wY.w - ro) - rd);
 
-    paths.s[idx].ro  = vec4(ro, uintBitsToFloat(idx));
-    paths.s[idx].rd  = vec4(rd, 0.0);
-    paths.s[idx].tp  = vec4(1.0);
-    paths.s[idx].rad = vec4(0.0);
+    PathCtx c;
+    c.ro = ro; c.rd = rd; c.tp = vec3(1.0); c.L = vec3(0.0);
+    c.coneWidth = 0.0; c.pathRough = 0.0;
+    c.b = 0; c.glassBounces = 0; c.glassDepth = 0;
+    c.isDiffuse = false; c.lastDiffuse = false;
+    // Path scramble key — the extend stage advances this across dispatches (NEE + bounce sampling).
+    uint rng = ((px * 1973u) ^ (py * 9277u) ^ 0x68bc21ebu) | 1u;
+
+    bool noScene = (pc.hasTlas & 1u) == 0u;
+    if (noScene) c.L = sky(rd); // empty scene: born dead carrying the sky
+    storePath(idx, c, rng, spreadAngle, noScene);
 }

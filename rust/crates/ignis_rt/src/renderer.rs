@@ -265,6 +265,7 @@ pub struct Renderer {
     wf_pathstate_buffer: Option<GpuBuffer>,
     wf_gen_pipeline: Option<vk::Pipeline>,
     wf_extend_pipeline: Option<vk::Pipeline>,
+    wf_resolve_pipeline: Option<vk::Pipeline>,
 
     // Compute pipeline.
     offscreen_view: vk::ImageView,
@@ -995,12 +996,12 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "prev_xforms",
     )?;
 
-    // Wavefront PathState buffer (binding 19): one path in flight per pixel, 64 bytes (4 vec4). Only
-    // used when use_wavefront is on; the megakernel ignores it. Sized at display res (the wavefront
-    // writes the offscreen directly in Phase 0).
+    // Wavefront PathState buffer (binding 19): one path in flight per pixel, 80 bytes (5 vec4) holding
+    // the serialized PathCtx + rng + spreadAngle + flags. Only used when use_wavefront is on; the
+    // megakernel ignores it. Sized at display res (the wavefront runs at display res, bypassing DLSS).
     let wf_pathstate_buffer = if rt_supported {
         Some(GpuBuffer::new(
-            &device, &mut allocator, (width as u64) * (height as u64) * 64,
+            &device, &mut allocator, (width as u64) * (height as u64) * 80,
             vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuOnly, "wf_pathstate",
         )?)
     } else {
@@ -1421,7 +1422,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     };
 
     // Wavefront path tracer pipelines (compute, share the pipeline layout). Phase 0: gen + extend/shade.
-    let (wf_gen_pipeline, wf_extend_pipeline) = if rt_supported {
+    let (wf_gen_pipeline, wf_extend_pipeline, wf_resolve_pipeline) = if rt_supported {
         let mk = |spv_bytes: &[u8], name: &str| -> Result<vk::Pipeline, String> {
             let spv = ash::util::read_spv(&mut std::io::Cursor::new(spv_bytes))
                 .map_err(|e| format!("read {name} spv: {e}"))?;
@@ -1446,9 +1447,10 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         };
         let g = mk(&include_bytes!(concat!(env!("OUT_DIR"), "/wf_gen.comp.spv"))[..], "wf_gen")?;
         let e = mk(&include_bytes!(concat!(env!("OUT_DIR"), "/wf_extend_shade.comp.spv"))[..], "wf_extend")?;
-        (Some(g), Some(e))
+        let r = mk(&include_bytes!(concat!(env!("OUT_DIR"), "/wf_resolve.comp.spv"))[..], "wf_resolve")?;
+        (Some(g), Some(e), Some(r))
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     // Environment (HDRI) importance-sampling distribution: a storage buffer (binding 17) built by the
@@ -1634,6 +1636,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         wf_pathstate_buffer,
         wf_gen_pipeline,
         wf_extend_pipeline,
+        wf_resolve_pipeline,
         offscreen_view,
         ds_layout,
         desc_pool,
@@ -2656,10 +2659,12 @@ impl Renderer {
         // DLSS Ray Reconstruction runs when the feature created, the tonemap pass exists, and the
         // addon enabled it. When active the path tracer emits 1-spp noisy linear color (no accum),
         // NGX denoises, and a separate pass tonemaps the clean output.
-        // Wavefront path tracer (Phase 0): when on, it replaces the megakernel trace and writes the
-        // offscreen directly, bypassing DLSS for now. Megakernel stays the default. See [[wavefront-plan]].
+        // Wavefront path tracer (Phase 1c): gen -> extend×MAX_BOUNCES (one real bounce per dispatch)
+        // -> resolve. Replaces the megakernel trace and writes the offscreen directly, bypassing DLSS
+        // for now. Megakernel stays the default. See [[wavefront-plan]].
         let use_wavefront = self.wf_gen_pipeline.is_some()
             && self.wf_extend_pipeline.is_some()
+            && self.wf_resolve_pipeline.is_some()
             && crate::config::get_int("use_wavefront") != 0;
         let use_rr = !use_wavefront
             && self.rr.is_some()
@@ -2821,19 +2826,32 @@ impl Renderer {
                 d.cmd_bind_descriptor_sets(
                     self.cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout, 0, &[self.desc_set], &[],
                 );
-                // Stage 1: ray generation.
+                // Barrier reused between every stage — each writes the PathState buffer the next reads.
+                let mb = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+                // Stage 1: ray generation -> initial PathState (binding 19).
                 d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.wf_gen_pipeline.unwrap());
                 d.cmd_push_constants(self.cmd, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, wf_bytes);
                 d.cmd_dispatch(self.cmd, groups, 1, 1);
-                let mb = vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ);
+                // Stage 2: extend + shade, ONE real bounce per dispatch. Looped MAX_BOUNCES times (must
+                // match MAX_BOUNCES in pathtracer_common.glsl); paths terminate at different depths and
+                // early-out once dead (compaction to skip them via indirect dispatch is Phase 2).
+                d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.wf_extend_pipeline.unwrap());
+                d.cmd_push_constants(self.cmd, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, wf_bytes);
+                for _ in 0..8 {
+                    d.cmd_pipeline_barrier(
+                        self.cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(), &[mb], &[], &[],
+                    );
+                    d.cmd_dispatch(self.cmd, groups, 1, 1);
+                }
+                // Stage 3: resolve -> firefly clamp + temporal accumulation + tonemap to the offscreen.
                 d.cmd_pipeline_barrier(
                     self.cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::DependencyFlags::empty(), &[mb], &[], &[],
                 );
-                // Stage 2: extend + shade (writes the offscreen).
-                d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.wf_extend_pipeline.unwrap());
+                d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.wf_resolve_pipeline.unwrap());
                 d.cmd_push_constants(self.cmd, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, wf_bytes);
                 d.cmd_dispatch(self.cmd, groups, 1, 1);
             } else if let Some(rt) = self.rt_pipeline_ext.clone() {
@@ -3459,6 +3477,9 @@ impl Drop for Renderer {
                 device.destroy_pipeline(p, None);
             }
             if let Some(p) = self.wf_extend_pipeline.take() {
+                device.destroy_pipeline(p, None);
+            }
+            if let Some(p) = self.wf_resolve_pipeline.take() {
                 device.destroy_pipeline(p, None);
             }
             device.destroy_pipeline_layout(self.pipeline_layout, None);
