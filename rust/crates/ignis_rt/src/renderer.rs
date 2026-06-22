@@ -161,6 +161,7 @@ fn create_storage_image(
 /// change (which moves trace res) needs no reallocation. See the wavefront plan in memory.
 struct RasterRes {
     hit: (vk::Image, Allocation, vk::ImageView),     // R32G32_UINT: (instanceId, primId)
+    pos: (vk::Image, Allocation, vk::ImageView),     // R32G32B32A32_SFLOAT: world position of the hit
     depth: (vk::Image, Allocation, vk::ImageView),   // D32 depth
     render_pass: vk::RenderPass,
     framebuffer: vk::Framebuffer,
@@ -173,6 +174,7 @@ struct RasterRes {
 #[derive(Clone, Copy)]
 struct RasterPush {
     mvp: [f32; 16],   // viewProj * objectToWorld
+    o2w: [f32; 12],   // objectToWorld rows (row-major 3x4), for the world-position G-buffer
     instance_id: u32, // stored in the hit G-buffer
 }
 
@@ -268,6 +270,11 @@ fn create_raster_resources(
         vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE,
         vk::ImageAspectFlags::COLOR, "raster_hit",
     )?;
+    let pos = create_attachment_image(
+        device, allocator, width, height, vk::Format::R32G32B32A32_SFLOAT,
+        vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE,
+        vk::ImageAspectFlags::COLOR, "raster_pos",
+    )?;
     let depth = create_attachment_image(
         device, allocator, width, height, vk::Format::D32_SFLOAT,
         vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT, vk::ImageAspectFlags::DEPTH, "raster_depth",
@@ -277,25 +284,33 @@ fn create_raster_resources(
     // ends in GENERAL so the wavefront can read it as a storage image without a layout transition.
     let attachments = [
         vk::AttachmentDescription::default()
-            .format(vk::Format::R32G32_UINT)
+            .format(vk::Format::R32G32_UINT) // 0: hit (instanceId, primId)
             .samples(vk::SampleCountFlags::TYPE_1)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::STORE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .final_layout(vk::ImageLayout::GENERAL),
         vk::AttachmentDescription::default()
-            .format(vk::Format::D32_SFLOAT)
+            .format(vk::Format::R32G32B32A32_SFLOAT) // 1: world position
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::GENERAL),
+        vk::AttachmentDescription::default()
+            .format(vk::Format::D32_SFLOAT) // 2: depth
             .samples(vk::SampleCountFlags::TYPE_1)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::DONT_CARE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
     ];
-    let color_ref = [vk::AttachmentReference::default()
-        .attachment(0)
-        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+    let color_ref = [
+        vk::AttachmentReference::default().attachment(0).layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+        vk::AttachmentReference::default().attachment(1).layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+    ];
     let depth_ref = vk::AttachmentReference::default()
-        .attachment(1)
+        .attachment(2)
         .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     let subpass = [vk::SubpassDescription::default()
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
@@ -309,7 +324,7 @@ fn create_raster_resources(
     }
     .map_err(|e| format!("raster render pass: {e}"))?;
 
-    let fb_views = [hit.2, depth.2];
+    let fb_views = [hit.2, pos.2, depth.2];
     let framebuffer = unsafe {
         device.create_framebuffer(
             &vk::FramebufferCreateInfo::default()
@@ -375,8 +390,10 @@ fn create_raster_resources(
         .depth_test_enable(true)
         .depth_write_enable(true)
         .depth_compare_op(vk::CompareOp::LESS);
-    let blend_attach = [vk::PipelineColorBlendAttachmentState::default()
-        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+    let blend_attach = [
+        vk::PipelineColorBlendAttachmentState::default().color_write_mask(vk::ColorComponentFlags::RGBA),
+        vk::PipelineColorBlendAttachmentState::default().color_write_mask(vk::ColorComponentFlags::RGBA),
+    ];
     let blend_state = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attach);
     let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dyn_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
@@ -402,7 +419,7 @@ fn create_raster_resources(
         device.destroy_shader_module(fmod, None);
     }
 
-    Ok(RasterRes { hit, depth, render_pass, framebuffer, pipeline_layout, pipeline })
+    Ok(RasterRes { hit, pos, depth, render_pass, framebuffer, pipeline_layout, pipeline })
 }
 
 #[repr(C)]
@@ -1474,6 +1491,20 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1),
         );
+        // Binding 24: hybrid-raster world-position G-buffer (raster writes it, wf_gen reads it).
+        bindings.push(
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(24)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        );
+        binding_flags.push(vk::DescriptorBindingFlags::PARTIALLY_BOUND);
+        pool_sizes.push(
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1),
+        );
     }
     let mut flags_info =
         vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
@@ -1803,14 +1834,14 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     };
     // Bind the raster hit G-buffer at binding 22 (created after the main descriptor writes above).
     if let Some(r) = raster.as_ref() {
-        let hit_info = [vk::DescriptorImageInfo::default()
-            .image_view(r.hit.2)
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let w = [vk::WriteDescriptorSet::default()
-            .dst_set(desc_set)
-            .dst_binding(22)
-            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-            .image_info(&hit_info)];
+        let hit_info = [vk::DescriptorImageInfo::default().image_view(r.hit.2).image_layout(vk::ImageLayout::GENERAL)];
+        let pos_info = [vk::DescriptorImageInfo::default().image_view(r.pos.2).image_layout(vk::ImageLayout::GENERAL)];
+        let w = [
+            vk::WriteDescriptorSet::default().dst_set(desc_set).dst_binding(22)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&hit_info),
+            vk::WriteDescriptorSet::default().dst_set(desc_set).dst_binding(24)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&pos_info),
+        ];
         unsafe { device.update_descriptor_sets(&w, &[]) };
     }
     // Per-instance raster data (binding 23): objectToWorld (3 vec4) + customIndex, indexed by the
@@ -3232,7 +3263,8 @@ impl Renderer {
                 let (tw, th) = (self.width, self.height);
                 let extent = vk::Extent2D { width: tw, height: th };
                 let clear = [
-                    vk::ClearValue { color: vk::ClearColorValue { uint32: [0xFFFF_FFFF, 0, 0, 0] } },
+                    vk::ClearValue { color: vk::ClearColorValue { uint32: [0xFFFF_FFFF, 0, 0, 0] } }, // hit (miss)
+                    vk::ClearValue { color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 0.0] } },   // world pos
                     vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } },
                 ];
                 d.cmd_begin_render_pass(
@@ -3260,6 +3292,7 @@ impl Renderer {
                     };
                     let rpush = RasterPush {
                         mvp: (view_proj * mat4_from_3x4(&self.instance_transforms[i])).to_cols_array(),
+                        o2w: self.instance_transforms[i],
                         instance_id: i as u32,
                     };
                     let rbytes = std::slice::from_raw_parts(
@@ -4036,7 +4069,7 @@ impl Drop for Renderer {
                     device.destroy_pipeline_layout(r.pipeline_layout, None);
                     device.destroy_framebuffer(r.framebuffer, None);
                     device.destroy_render_pass(r.render_pass, None);
-                    for (image, ralloc, view) in [r.hit, r.depth] {
+                    for (image, ralloc, view) in [r.hit, r.pos, r.depth] {
                         device.destroy_image_view(view, None);
                         device.destroy_image(image, None);
                         let _ = alloc.free(ralloc);
