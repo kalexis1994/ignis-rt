@@ -280,8 +280,9 @@ class IgnisRTSceneProperties(bpy.types.PropertyGroup):
     )
     use_wavefront: BoolProperty(
         name="Wavefront Path Tracing",
-        description="Experimental: compute-based multi-kernel path tracing for better GPU occupancy",
-        default=False,
+        description="Compute-based multi-kernel path tracing for better GPU occupancy (the default path; required by Hybrid Rasterization)",
+        default=True,
+        update=_tag_redraw,
     )
 
     # -- Performance --
