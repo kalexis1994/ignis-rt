@@ -270,6 +270,7 @@ pub struct Renderer {
     wf_gen_pipeline: Option<vk::Pipeline>,
     wf_extend_pipeline: Option<vk::Pipeline>,
     wf_resolve_pipeline: Option<vk::Pipeline>,
+    wf_compact_pipeline: Option<vk::Pipeline>,
 
     // Compute pipeline.
     offscreen_view: vk::ImageView,
@@ -1474,7 +1475,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     };
 
     // Wavefront path tracer pipelines (compute, share the pipeline layout). Phase 0: gen + extend/shade.
-    let (wf_gen_pipeline, wf_extend_pipeline, wf_resolve_pipeline) = if rt_supported {
+    let (wf_gen_pipeline, wf_extend_pipeline, wf_resolve_pipeline, wf_compact_pipeline) = if rt_supported {
         let mk = |spv_bytes: &[u8], name: &str| -> Result<vk::Pipeline, String> {
             let spv = ash::util::read_spv(&mut std::io::Cursor::new(spv_bytes))
                 .map_err(|e| format!("read {name} spv: {e}"))?;
@@ -1500,9 +1501,10 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         let g = mk(&include_bytes!(concat!(env!("OUT_DIR"), "/wf_gen.comp.spv"))[..], "wf_gen")?;
         let e = mk(&include_bytes!(concat!(env!("OUT_DIR"), "/wf_extend_shade.comp.spv"))[..], "wf_extend")?;
         let r = mk(&include_bytes!(concat!(env!("OUT_DIR"), "/wf_resolve.comp.spv"))[..], "wf_resolve")?;
-        (Some(g), Some(e), Some(r))
+        let c = mk(&include_bytes!(concat!(env!("OUT_DIR"), "/wf_compact.comp.spv"))[..], "wf_compact")?;
+        (Some(g), Some(e), Some(r), Some(c))
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
 
     // Environment (HDRI) importance-sampling distribution: a storage buffer (binding 17) built by the
@@ -1691,6 +1693,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         wf_gen_pipeline,
         wf_extend_pipeline,
         wf_resolve_pipeline,
+        wf_compact_pipeline,
         offscreen_view,
         ds_layout,
         desc_pool,
@@ -2719,6 +2722,7 @@ impl Renderer {
         let use_wavefront = self.wf_gen_pipeline.is_some()
             && self.wf_extend_pipeline.is_some()
             && self.wf_resolve_pipeline.is_some()
+            && self.wf_compact_pipeline.is_some()
             && crate::config::get_int("use_wavefront") != 0;
         let use_rr = !use_wavefront
             && self.rr.is_some()
@@ -2891,9 +2895,12 @@ impl Renderer {
                         vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_WRITE,
                     )
                     .dst_access_mask(
-                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE
+                            | vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::INDIRECT_COMMAND_READ,
                     );
-                let wf_stage = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
+                let wf_stage = vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::TRANSFER
+                    | vk::PipelineStageFlags::DRAW_INDIRECT;
                 let do_barrier = || unsafe {
                     d.cmd_pipeline_barrier(cmd, wf_stage, wf_stage, vk::DependencyFlags::empty(), &[wf_mb], &[], &[]);
                 };
@@ -2907,24 +2914,34 @@ impl Renderer {
                     );
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
                 };
-                // Control init: count0 = N (every pixel live in round 0), count1 = 0.
+                // Control init: count0 = N (every pixel live in round 0), count1 = 0, and the round-0
+                // indirect args = ceil(N / 64) workgroups (offset 8) + argsY = argsZ = 1. Later rounds
+                // get their args from the compaction pass.
                 d.cmd_fill_buffer(cmd, ctrl, 0, 4, n);
                 d.cmd_fill_buffer(cmd, ctrl, 4, 4, 0);
+                d.cmd_fill_buffer(cmd, ctrl, 8, 4, n.div_ceil(64));
+                d.cmd_fill_buffer(cmd, ctrl, 12, 8, 1);
                 // Stage 1: ray generation -> PathState + identity live queue (half 0).
                 d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.wf_gen_pipeline.unwrap());
                 push_wf(0, 0);
                 d.cmd_dispatch(cmd, groups, 1, 1);
-                // Stage 2: extend, ONE real bounce per dispatch, over the live queue. Looped MAX_BOUNCES
-                // times (must match MAX_BOUNCES in pathtracer_common.glsl). Phase 2a still dispatches the
-                // full grid (threads past the live count early-out); 2b swaps this for dispatch-indirect.
-                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.wf_extend_pipeline.unwrap());
+                // Stage 2: extend, ONE real bounce per dispatch, over the LIVE paths only — a
+                // dispatch-indirect over the compacted count, so dead paths never get threads. The
+                // compaction pass then turns the new survivor count into the next round's indirect args.
+                // Looped MAX_BOUNCES times (must match MAX_BOUNCES in pathtracer_common.glsl).
                 for r in 0u32..8 {
                     let (wi, wo) = (r & 1, (r + 1) & 1);
                     do_barrier();
                     d.cmd_fill_buffer(cmd, ctrl, (wo as u64) * 4, 4, 0); // reset the write side's live count
                     do_barrier();
                     push_wf(wi, wo);
-                    d.cmd_dispatch(cmd, groups, 1, 1);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.wf_extend_pipeline.unwrap());
+                    d.cmd_dispatch_indirect(cmd, ctrl, 8); // ceil(live / 64) workgroups
+                    do_barrier();
+                    // Compaction: turn the survivor count into the next round's indirect args (1 thread).
+                    push_wf(wi, wo);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.wf_compact_pipeline.unwrap());
+                    d.cmd_dispatch(cmd, 1, 1, 1);
                 }
                 // Stage 3: resolve -> firefly clamp + temporal accumulation + tonemap to the offscreen.
                 do_barrier();
@@ -3557,6 +3574,9 @@ impl Drop for Renderer {
                 device.destroy_pipeline(p, None);
             }
             if let Some(p) = self.wf_resolve_pipeline.take() {
+                device.destroy_pipeline(p, None);
+            }
+            if let Some(p) = self.wf_compact_pipeline.take() {
                 device.destroy_pipeline(p, None);
             }
             device.destroy_pipeline_layout(self.pipeline_layout, None);

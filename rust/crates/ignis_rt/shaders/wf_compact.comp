@@ -1,0 +1,23 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+#include "pathtracer_common.glsl"
+#include "wf_pathstate.glsl"
+// ── Wavefront path tracer — compaction (between extend rounds) ───────────────────────────────────
+// A single thread turns the live-path count just produced by the extend round (count[wfOut]) into the
+// VkDispatchIndirectCommand the NEXT extend round dispatches over — so only the surviving paths get
+// threads. The extend stage uses local_size_x = 64, hence ceil(count / 64) workgroups. The ray_query
+// extension is enabled only because the shared include declares it; this stage never traces.
+
+layout(local_size_x = 1) in;
+
+void main() {
+    uint count = wfc.c[pc.wfOut];
+    wfc.c[2] = (count + 63u) / 64u; // argsX = workgroups for the next extend (offset 8 in the buffer)
+    wfc.c[3] = 1u;                  // argsY
+    wfc.c[4] = 1u;                  // argsZ
+}
