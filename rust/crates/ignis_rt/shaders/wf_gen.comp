@@ -46,4 +46,8 @@ void main() {
     bool noScene = (pc.hasTlas & 1u) == 0u;
     if (noScene) c.L = sky(rd); // empty scene: born dead carrying the sky
     storePath(idx, c, rng, spreadAngle, noScene);
+
+    // Seed round 0's live queue (half 0) with the identity mapping; the CPU sets count0 = N. Dead
+    // (empty-scene) paths stay in the queue but early-out in extend, so they never get re-appended.
+    wfq.q[idx] = idx;
 }

@@ -17,15 +17,21 @@
 layout(local_size_x = 64) in;
 
 void main() {
-    uvec2 dims = pc.dims;
-    uint idx = gl_GlobalInvocationID.x;
-    if (idx >= dims.x * dims.y) return;
+    uint n = pc.dims.x * pc.dims.y;
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= wfc.c[pc.wfIn]) return;            // past this round's live-path count
+    uint pixel = wfq.q[pc.wfIn * n + tid];        // the live path's pixel index (1 path/pixel)
 
     uint rng; float spreadAngle; bool dead;
-    PathCtx c = loadPath(idx, rng, spreadAngle, dead);
-    if (dead) return; // already terminated — c.L is final, nothing more to do
+    PathCtx c = loadPath(pixel, rng, spreadAngle, dead);
+    if (dead) return; // born-dead (empty scene): nothing to do, and don't re-append
 
     g_sampleIdx = uint(pc.sunCol.w);
     bool alive = traceBounce(c, spreadAngle, rng);
-    storePath(idx, c, rng, spreadAngle, !alive);
+    storePath(pixel, c, rng, spreadAngle, !alive);
+
+    if (alive) {                                  // survivor → append to the next round's queue
+        uint slot = atomicAdd(wfc.c[pc.wfOut], 1u);
+        wfq.q[pc.wfOut * n + slot] = pixel;
+    }
 }

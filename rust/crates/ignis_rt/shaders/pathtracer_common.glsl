@@ -68,6 +68,8 @@ layout(push_constant) uniform PC {
     mat4  prevViewProj; // forward view-proj of the previous frame (DLSS motion vectors)
     vec2  jitter;       // DLSS-RR: deterministic sub-pixel offset from pixel center [-0.5,0.5]
     uint  emissiveCount; // number of emissive triangles for NEE (0 = none)
+    uint  wfIn;          // wavefront compaction: read side (0/1) of the ping-pong live-path queue
+    uint  wfOut;         // wavefront compaction: write side (0/1)
 } pc;
 
 // Write the DLSS guide buffers for the primary hit at pixel p. depth = linear view-space distance

@@ -7,6 +7,11 @@
 struct PathState { vec4 s0; vec4 s1; vec4 s2; vec4 s3; vec4 s4; };
 layout(binding = 19, std430) buffer PathStates { PathState s[]; } paths;
 
+// Compaction (Phase 2): a ping-pong queue of still-alive pixel indices + a control buffer. The extend
+// stage reads queue half pc.wfIn, appends survivors to half pc.wfOut, and atomic-bumps the live count.
+layout(binding = 20, std430) buffer WfQueue { uint q[]; } wfq;  // 2 halves of N pixels
+layout(binding = 21, std430) buffer WfCtrl  { uint c[]; } wfc;  // [count0, count1, argsX, argsY, argsZ]
+
 const uint PATH_DEAD = 4u; // flag bit (bit0 = isDiffuse, bit1 = lastDiffuse, bit2 = dead)
 
 void storePath(uint idx, PathCtx c, uint rng, float spreadAngle, bool dead) {

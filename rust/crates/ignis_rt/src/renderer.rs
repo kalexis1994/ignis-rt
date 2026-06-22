@@ -168,8 +168,10 @@ struct CameraPush {
     prev_view_proj: [f32; 16], // forward view-proj of the previous frame (DLSS motion vectors)
     jitter: [f32; 2],  // DLSS-RR sub-pixel offset from pixel center [-0.5,0.5]; 0 when RR inactive
     emissive_count: u32, // emissive triangle count for NEE (0 = none)
+    wf_in: u32,          // wavefront compaction: read side (0/1) of the ping-pong live-path queue
+    wf_out: u32,         // wavefront compaction: write side (0/1)
     _pad: u32,
-} // 208 bytes (push-constant max is 256 on the target GPUs)
+} // 216 bytes (push-constant max is 256 on the target GPUs)
 
 /// Upper bound on TLAS instances for the previous-transform buffer (object motion vectors). The
 /// shader only reads indices below the live instance count, so this is a hard allocation cap.
@@ -263,6 +265,8 @@ pub struct Renderer {
     // Wavefront path tracer (binding 19 + compute pipelines). Off by default; the megakernel
     // (trace.rgen) renders unless use_wavefront is set. See [[wavefront-plan]].
     wf_pathstate_buffer: Option<GpuBuffer>,
+    wf_queue_buffer: Option<GpuBuffer>,
+    wf_ctrl_buffer: Option<GpuBuffer>,
     wf_gen_pipeline: Option<vk::Pipeline>,
     wf_extend_pipeline: Option<vk::Pipeline>,
     wf_resolve_pipeline: Option<vk::Pipeline>,
@@ -1007,6 +1011,29 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     } else {
         None
     };
+    // Wavefront compaction (binding 20): ping-pong live-path queues — 2 halves of N u32 each holding
+    // the pixel indices still alive. The extend stage reads one half and atomic-appends survivors to
+    // the other. (binding 21) control buffer: [count0, count1, argsX, argsY, argsZ] — the per-round
+    // live counts + the VkDispatchIndirectCommand the next extend dispatches over (offset 8).
+    let wf_queue_buffer = if rt_supported {
+        Some(GpuBuffer::new(
+            &device, &mut allocator, (width as u64) * (height as u64) * 4 * 2,
+            vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuOnly, "wf_queue",
+        )?)
+    } else {
+        None
+    };
+    let wf_ctrl_buffer = if rt_supported {
+        Some(GpuBuffer::new(
+            &device, &mut allocator, 32,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::INDIRECT_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryLocation::GpuOnly, "wf_ctrl",
+        )?)
+    } else {
+        None
+    };
 
     // Compute pipeline.
     // Binding 0: offscreen storage image (always). Binding 1: TLAS — only on RT devices
@@ -1144,7 +1171,8 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         // Binding 17: environment (HDRI) luminance distribution — built by env_cdf.comp, read by trace.
         // Binding 18: previous-frame instance transforms (object motion vectors), written per frame.
         // Binding 19: wavefront PathState buffer (gen writes, extend/shade consumes; megakernel ignores).
-        for b in 16u32..=19u32 {
+        // Binding 20: wavefront live-path queue (ping-pong). Binding 21: wavefront compaction control.
+        for b in 16u32..=21u32 {
             bindings.push(
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(b)
@@ -1211,6 +1239,12 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         .offset(0)
         .range(vk::WHOLE_SIZE)];
     let wf_pathstate_info = wf_pathstate_buffer.as_ref().map(|b| {
+        [vk::DescriptorBufferInfo::default().buffer(b.buffer).offset(0).range(vk::WHOLE_SIZE)]
+    });
+    let wf_queue_info = wf_queue_buffer.as_ref().map(|b| {
+        [vk::DescriptorBufferInfo::default().buffer(b.buffer).offset(0).range(vk::WHOLE_SIZE)]
+    });
+    let wf_ctrl_info = wf_ctrl_buffer.as_ref().map(|b| {
         [vk::DescriptorBufferInfo::default().buffer(b.buffer).offset(0).range(vk::WHOLE_SIZE)]
     });
     let gi = |v: vk::ImageView| [vk::DescriptorImageInfo::default()
@@ -1280,6 +1314,24 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 vk::WriteDescriptorSet::default()
                     .dst_set(desc_set)
                     .dst_binding(19)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(info),
+            );
+        }
+        if let Some(info) = wf_queue_info.as_ref() {
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(desc_set)
+                    .dst_binding(20)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(info),
+            );
+        }
+        if let Some(info) = wf_ctrl_info.as_ref() {
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(desc_set)
+                    .dst_binding(21)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .buffer_info(info),
             );
@@ -1634,6 +1686,8 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         instance_transforms: Vec::new(),
         prev_instance_transforms: Vec::new(),
         wf_pathstate_buffer,
+        wf_queue_buffer,
+        wf_ctrl_buffer,
         wf_gen_pipeline,
         wf_extend_pipeline,
         wf_resolve_pipeline,
@@ -2705,6 +2759,8 @@ impl Renderer {
             prev_view_proj: prev_vp,
             jitter,
             emissive_count: self.emissive_count,
+            wf_in: 0,  // set per round in the wavefront dispatch loop
+            wf_out: 0,
             _pad: 0,
         };
         self.prev_view_proj = cur_vp;
@@ -2818,42 +2874,63 @@ impl Renderer {
                 // so override the push dims with the display size.
                 let mut wf_push = push;
                 wf_push.dims = [self.width, self.height];
-                let wf_bytes = std::slice::from_raw_parts(
-                    &wf_push as *const CameraPush as *const u8,
-                    std::mem::size_of::<CameraPush>(),
-                );
                 let groups = (self.width * self.height).div_ceil(64);
                 d.cmd_bind_descriptor_sets(
                     self.cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout, 0, &[self.desc_set], &[],
                 );
-                // Barrier reused between every stage — each writes the PathState buffer the next reads.
-                let mb = vk::MemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
-                // Stage 1: ray generation -> initial PathState (binding 19).
-                d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.wf_gen_pipeline.unwrap());
-                d.cmd_push_constants(self.cmd, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, wf_bytes);
-                d.cmd_dispatch(self.cmd, groups, 1, 1);
-                // Stage 2: extend + shade, ONE real bounce per dispatch. Looped MAX_BOUNCES times (must
-                // match MAX_BOUNCES in pathtracer_common.glsl); paths terminate at different depths and
-                // early-out once dead (compaction to skip them via indirect dispatch is Phase 2).
-                d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.wf_extend_pipeline.unwrap());
-                d.cmd_push_constants(self.cmd, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, wf_bytes);
-                for _ in 0..8 {
-                    d.cmd_pipeline_barrier(
-                        self.cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER,
-                        vk::DependencyFlags::empty(), &[mb], &[], &[],
+                // Phase 2 compaction: a ping-pong live-path queue (binding 20) + control buffer (21).
+                // Each extend round reads the live pixel indices, traces one bounce, and atomic-appends
+                // survivors to the other half; resolve reads every path's final radiance. One broad
+                // barrier covers the compute stages + the fillBuffer count resets (over-sync but correct).
+                let n = self.width * self.height;
+                let ctrl = self.wf_ctrl_buffer.as_ref().unwrap().buffer;
+                let cmd = self.cmd;
+                let layout = self.pipeline_layout;
+                let wf_mb = vk::MemoryBarrier::default()
+                    .src_access_mask(
+                        vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_WRITE,
+                    )
+                    .dst_access_mask(
+                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
                     );
-                    d.cmd_dispatch(self.cmd, groups, 1, 1);
+                let wf_stage = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
+                let do_barrier = || unsafe {
+                    d.cmd_pipeline_barrier(cmd, wf_stage, wf_stage, vk::DependencyFlags::empty(), &[wf_mb], &[], &[]);
+                };
+                let push_wf = |wf_in: u32, wf_out: u32| unsafe {
+                    let mut p = wf_push;
+                    p.wf_in = wf_in;
+                    p.wf_out = wf_out;
+                    let bytes = std::slice::from_raw_parts(
+                        &p as *const CameraPush as *const u8,
+                        std::mem::size_of::<CameraPush>(),
+                    );
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
+                };
+                // Control init: count0 = N (every pixel live in round 0), count1 = 0.
+                d.cmd_fill_buffer(cmd, ctrl, 0, 4, n);
+                d.cmd_fill_buffer(cmd, ctrl, 4, 4, 0);
+                // Stage 1: ray generation -> PathState + identity live queue (half 0).
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.wf_gen_pipeline.unwrap());
+                push_wf(0, 0);
+                d.cmd_dispatch(cmd, groups, 1, 1);
+                // Stage 2: extend, ONE real bounce per dispatch, over the live queue. Looped MAX_BOUNCES
+                // times (must match MAX_BOUNCES in pathtracer_common.glsl). Phase 2a still dispatches the
+                // full grid (threads past the live count early-out); 2b swaps this for dispatch-indirect.
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.wf_extend_pipeline.unwrap());
+                for r in 0u32..8 {
+                    let (wi, wo) = (r & 1, (r + 1) & 1);
+                    do_barrier();
+                    d.cmd_fill_buffer(cmd, ctrl, (wo as u64) * 4, 4, 0); // reset the write side's live count
+                    do_barrier();
+                    push_wf(wi, wo);
+                    d.cmd_dispatch(cmd, groups, 1, 1);
                 }
                 // Stage 3: resolve -> firefly clamp + temporal accumulation + tonemap to the offscreen.
-                d.cmd_pipeline_barrier(
-                    self.cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::DependencyFlags::empty(), &[mb], &[], &[],
-                );
-                d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, self.wf_resolve_pipeline.unwrap());
-                d.cmd_push_constants(self.cmd, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, wf_bytes);
-                d.cmd_dispatch(self.cmd, groups, 1, 1);
+                do_barrier();
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.wf_resolve_pipeline.unwrap());
+                push_wf(0, 0);
+                d.cmd_dispatch(cmd, groups, 1, 1);
             } else if let Some(rt) = self.rt_pipeline_ext.clone() {
                 d.cmd_bind_pipeline(
                     self.cmd,
@@ -3536,6 +3613,12 @@ impl Drop for Renderer {
                     b.destroy(&device, alloc);
                 }
                 if let Some(b) = self.wf_pathstate_buffer.take() {
+                    b.destroy(&device, alloc);
+                }
+                if let Some(b) = self.wf_queue_buffer.take() {
+                    b.destroy(&device, alloc);
+                }
+                if let Some(b) = self.wf_ctrl_buffer.take() {
                     b.destroy(&device, alloc);
                 }
                 if self.has_lut {
