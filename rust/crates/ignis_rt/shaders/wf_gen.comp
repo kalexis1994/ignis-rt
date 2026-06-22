@@ -80,6 +80,7 @@ void main() {
         noRasterHit(idx);
     }
     storePath(idx, c, rng, spreadAngle, dead);
+    SharcState sharc; SharcInit(sharc); storeSharcState(idx, sharc); // SHARC: empty update state at path birth
 
     // Seed round 0's live queue (half 0) with the identity mapping; the CPU sets count0 = N. Dead
     // (empty-scene) paths stay in the queue but early-out in extend, so they never get re-appended.

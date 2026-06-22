@@ -1299,7 +1299,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     // (s5..s6). Only used when use_wavefront is on; the megakernel ignores it. Sized at display res.
     let wf_pathstate_buffer = if rt_supported {
         Some(GpuBuffer::new(
-            &device, &mut allocator, (width as u64) * (height as u64) * 112,
+            &device, &mut allocator, (width as u64) * (height as u64) * 192,
             vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuOnly, "wf_pathstate",
         )?)
     } else {
@@ -3261,7 +3261,7 @@ impl Renderer {
         // SHARC radiance cache (Blender "sharc_enabled"). 0 capacity disables it in-shader. Scene scale
         // sets the voxel sizing (camera-relative LOD grid); 1.0 ~= 1-unit voxels near the camera.
         let sharc_capacity = if crate::config::get_int("sharc_enabled") != 0 { SHARC_CAPACITY } else { 0 };
-        let sharc_scene_scale = 1.0f32; // TODO SHARC-3: derive from the scene AABB
+        let sharc_scene_scale = 4.0f32; // ~0.25-unit voxels near the camera; TODO SHARC-3: from the AABB
         let push = CameraPush {
             inv_view_proj: self.inv_view_proj,
             cam_pos: cam,

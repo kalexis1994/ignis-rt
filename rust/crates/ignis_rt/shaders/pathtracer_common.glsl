@@ -1334,7 +1334,8 @@ struct PathCtx {
 // glass hops, which don't spend the bounce budget. Returns true while the path is alive (the caller
 // should keep going), false on termination (miss / RR / max bounce / dead-end). Mutates c + rng.
 bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng,
-                 bool rasterFirst, uint rInst, uint rPrim, vec2 rBc, vec3 rPos) {
+                 bool rasterFirst, uint rInst, uint rPrim, vec2 rBc, vec3 rPos,
+                 inout SharcState sharc, bool sharcUpdate) {
     for (int inner = 0; inner < 128; inner++) {
         uint id, prim; vec2 bc; float thit; mat4x3 o2w; vec3 hitPos;
         if (rasterFirst && c.b == 0 && inner == 0) {
@@ -1353,6 +1354,7 @@ bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng,
                 if (DEBUG_PATH && c.b == 0) { c.L = vec3(0.0, 0.0, 1.0); return false; } // blue = sky
                 // Add the sky unless reached by a diffuse bounce while env NEE is active (avoids double count).
                 if (c.b == 0 || !c.lastDiffuse || envDist.data[0] <= 0.0) c.L += c.tp * sky(c.rd);
+                if (sharcUpdate && pc.sharcCapacity > 0u) SharcUpdateMiss(sharc, sky(c.rd));
                 return false;
             }
             id   = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
@@ -1415,6 +1417,23 @@ bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng,
             return false;
         }
 
+        // ── SHARC ── At a secondary opaque hit: non-update pixels read the cached outgoing radiance and
+        // terminate (skipping the shade + the deeper bounces); update pixels keep tracing to fill it.
+        SharcGrid sharcG = sharcGrid();
+        bool sharcOn = pc.sharcCapacity > 0u;
+        // The cache stores view-INDEPENDENT diffuse radiance, so only use it on diffuse surfaces (skip
+        // glass/transmission + sharp specular), and only when the segment exceeds the voxel size (closer
+        // than that the coarse cache leaks a neighbour's lighting across surfaces).
+        bool sharcDiffuse = transmission < 0.3 && roughness > 0.3;
+        if (sharcOn && !sharcUpdate && sharcDiffuse && c.b >= 1
+            && thit > sharcVoxelSize(sharcGetLevel(hitPos, sharcG), sharcG)) {
+            vec3 cached;
+            if (SharcGetCachedRadiance(sharcG, hitPos, N, pc.sharcCapacity, cached)) {
+                c.L += c.tp * cached; // use the cached outgoing radiance + terminate the path
+                return false;
+            }
+        }
+
         // Emitted radiance from this surface (emissive materials).
         c.L += c.tp * emission;
 
@@ -1428,7 +1447,13 @@ bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng,
         float alpha = max(regRough * regRough, 1e-3);
 
         // Direct lighting (NEE: diffuse + specular glints from sun/lights, soft shadows).
-        c.L += c.tp * directShade(hitPos, N, geoN, V, diffAlbedo, F0, alpha, c.b, rng);
+        vec3 directLight = directShade(hitPos, N, geoN, V, diffAlbedo, F0, alpha, c.b, rng);
+        c.L += c.tp * directLight;
+        // SHARC update: write this voxel's outgoing direct radiance + backpropagate to prior vertices.
+        // Only cache diffuse surfaces (glass/specular are view-dependent; the path passes through them).
+        if (sharcOn && sharcUpdate && sharcDiffuse) {
+            SharcUpdateHit(sharcG, sharc, hitPos, N, emission + directLight, rnd(rng), pc.sharcCapacity, thit);
+        }
 
         // BRDF bounce. A transmissive (glass) interaction is chosen with probability pTrans.
         c.lastDiffuse = false;
@@ -1468,6 +1493,7 @@ bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng,
         float lumS = dot(F0, vec3(0.299, 0.587, 0.114));
         float pSpec = clamp(lumS / (lumS + lumD + 1e-4), 0.1, 0.9);
         c.ro = hitPos + geoN * 0.002;   // offset along geometric normal (silhouette-safe)
+        vec3 sharcTpBefore = c.tp;      // SHARC: snapshot to derive this bounce's throughput factor
         if (rnd(rng) < pSpec) {
             vec3 H = sampleGgxVndf(u, V, N, alpha);
             vec3 Ldir = reflect(c.rd, H);
@@ -1489,6 +1515,8 @@ bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng,
             if (rnd(rng) > q) return false;
             c.tp /= q;
         }
+        // SHARC: fold this bounce's throughput (BSDF * Russian roulette) into the stored vertex weights.
+        if (sharcOn && sharcUpdate) SharcSetThroughput(sharc, c.tp / max(sharcTpBefore, vec3(1e-6)));
         c.b++;
         if (c.b >= int(pc.maxBounces)) return false;
         return true;   // real bounce taken; the path continues
@@ -1497,14 +1525,15 @@ bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng,
 }
 
 // Megakernel entry: run the whole path by looping traceBounce. Same image as before the split.
-vec3 tracePath(vec3 ro, vec3 rd, float spreadAngle, inout uint rng) {
+vec3 tracePath(vec3 ro, vec3 rd, float spreadAngle, inout uint rng, bool sharcUpdate) {
     PathCtx c;
     c.ro = ro; c.rd = rd; c.tp = vec3(1.0); c.L = vec3(0.0);
     c.coneWidth = 0.0; c.pathRough = 0.0;
     c.b = 0; c.glassBounces = 0; c.glassDepth = 0;
     c.isDiffuse = false; c.lastDiffuse = false;
+    SharcState sharc; SharcInit(sharc); // megakernel keeps the SHARC update state in a local
     for (int guard = 0; guard < 512; guard++) {
-        if (!traceBounce(c, spreadAngle, rng, false, 0u, 0u, vec2(0.0), vec3(0.0))) break;
+        if (!traceBounce(c, spreadAngle, rng, false, 0u, 0u, vec2(0.0), vec3(0.0), sharc, sharcUpdate)) break;
     }
     return c.L;
 }

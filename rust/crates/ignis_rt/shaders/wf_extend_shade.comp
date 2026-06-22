@@ -31,7 +31,12 @@ void main() {
     // The injected raster primary hit applies only to the first real bounce (c.b == 0).
     uint rInst = 0u, rPrim = 0u; vec2 rBc = vec2(0.0); vec3 rPos = vec3(0.0);
     bool rasterFirst = (c.b == 0) && loadRasterHit(pixel, rInst, rPrim, rBc, rPos);
-    bool alive = traceBounce(c, spreadAngle, rng, rasterFirst, rInst, rPrim, rBc, rPos);
+    // SHARC: carry the update state across bounces; ~4% of pixels populate the cache, the rest query it.
+    SharcState sharc = loadSharcState(pixel);
+    bool sharcUpdate = pc.sharcCapacity > 0u
+        && isSharcUpdatePixel(uvec2(pixel % pc.dims.x, pixel / pc.dims.x), uint(pc.sunCol.w));
+    bool alive = traceBounce(c, spreadAngle, rng, rasterFirst, rInst, rPrim, rBc, rPos, sharc, sharcUpdate);
+    storeSharcState(pixel, sharc);
     storePath(pixel, c, rng, spreadAngle, !alive);
 
     if (alive) {                                  // survivor → append to the next round's queue
