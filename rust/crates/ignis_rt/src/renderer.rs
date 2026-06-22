@@ -442,6 +442,10 @@ struct CameraPush {
     sample_idx: u32,     // current sample 0..spp-1, set per round in the wavefront dispatch loop
 } // 224 bytes (push-constant max is 256 on the target GPUs)
 
+// SHARC (Spatial Hash Radiance Cache) world-space cache size, in voxels/slots. Power of two. The basic
+// phase uses 1M (~40 MiB: keys = cap*8, data = cap*32). NVIDIA's baseline is 2^22; bump once it works.
+const SHARC_CAPACITY: u32 = 1 << 20;
+
 /// Upper bound on TLAS instances for the previous-transform buffer (object motion vectors). The
 /// shader only reads indices below the live instance count, so this is a hard allocation cap.
 const MAX_INSTANCES: u32 = 65536;
@@ -538,6 +542,8 @@ pub struct Renderer {
     wf_pathstate_buffer: Option<GpuBuffer>,
     wf_queue_buffer: Option<GpuBuffer>,
     wf_ctrl_buffer: Option<GpuBuffer>,
+    sharc_keys_buffer: Option<GpuBuffer>, // SHARC hash keys (uint64), binding 25
+    sharc_data_buffer: Option<GpuBuffer>, // SHARC accum + resolved radiance, binding 26
     wf_gen_pipeline: Option<vk::Pipeline>,
     wf_extend_pipeline: Option<vk::Pipeline>,
     wf_resolve_pipeline: Option<vk::Pipeline>,
@@ -1318,6 +1324,22 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
     } else {
         None
     };
+    // SHARC SSBOs (bindings 25 = uint64 keys, 26 = [accum: cap*4 uint][resolved: cap*4 uint]). GpuOnly,
+    // zero-filled at scene init; TRANSFER_DST for the fill. Allocated even when SHARC is off (the config
+    // pushes capacity 0 to disable in-shader) so the descriptor set stays static.
+    let sharc_usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
+    let sharc_keys_buffer = if rt_supported {
+        Some(GpuBuffer::new(&device, &mut allocator, SHARC_CAPACITY as u64 * 8,
+            sharc_usage, MemoryLocation::GpuOnly, "sharc_keys")?)
+    } else {
+        None
+    };
+    let sharc_data_buffer = if rt_supported {
+        Some(GpuBuffer::new(&device, &mut allocator, SHARC_CAPACITY as u64 * 32,
+            sharc_usage, MemoryLocation::GpuOnly, "sharc_data")?)
+    } else {
+        None
+    };
 
     // Compute pipeline.
     // Binding 0: offscreen storage image (always). Binding 1: TLAS — only on RT devices
@@ -1514,6 +1536,22 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(1),
         );
+        // Bindings 25-26: SHARC hash keys (uint64) + data (accum/resolved). Both PT paths use them.
+        for b in [25u32, 26u32] {
+            bindings.push(
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(b)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::COMPUTE),
+            );
+            binding_flags.push(vk::DescriptorBindingFlags::PARTIALLY_BOUND);
+            pool_sizes.push(
+                vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(1),
+            );
+        }
     }
     let mut flags_info =
         vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
@@ -1572,6 +1610,12 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         [vk::DescriptorBufferInfo::default().buffer(b.buffer).offset(0).range(vk::WHOLE_SIZE)]
     });
     let wf_ctrl_info = wf_ctrl_buffer.as_ref().map(|b| {
+        [vk::DescriptorBufferInfo::default().buffer(b.buffer).offset(0).range(vk::WHOLE_SIZE)]
+    });
+    let sharc_keys_info = sharc_keys_buffer.as_ref().map(|b| {
+        [vk::DescriptorBufferInfo::default().buffer(b.buffer).offset(0).range(vk::WHOLE_SIZE)]
+    });
+    let sharc_data_info = sharc_data_buffer.as_ref().map(|b| {
         [vk::DescriptorBufferInfo::default().buffer(b.buffer).offset(0).range(vk::WHOLE_SIZE)]
     });
     let gi = |v: vk::ImageView| [vk::DescriptorImageInfo::default()
@@ -1659,6 +1703,24 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
                 vk::WriteDescriptorSet::default()
                     .dst_set(desc_set)
                     .dst_binding(21)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(info),
+            );
+        }
+        if let Some(info) = sharc_keys_info.as_ref() {
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(desc_set)
+                    .dst_binding(25)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(info),
+            );
+        }
+        if let Some(info) = sharc_data_info.as_ref() {
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(desc_set)
+                    .dst_binding(26)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .buffer_info(info),
             );
@@ -2076,6 +2138,8 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         wf_pathstate_buffer,
         wf_queue_buffer,
         wf_ctrl_buffer,
+        sharc_keys_buffer,
+        sharc_data_buffer,
         wf_gen_pipeline,
         wf_extend_pipeline,
         wf_resolve_pipeline,
@@ -4279,6 +4343,12 @@ impl Drop for Renderer {
                     b.destroy(&device, alloc);
                 }
                 if let Some(b) = self.wf_ctrl_buffer.take() {
+                    b.destroy(&device, alloc);
+                }
+                if let Some(b) = self.sharc_keys_buffer.take() {
+                    b.destroy(&device, alloc);
+                }
+                if let Some(b) = self.sharc_data_buffer.take() {
                     b.destroy(&device, alloc);
                 }
                 if self.has_lut {
