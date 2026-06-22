@@ -1250,195 +1250,187 @@ void writeGuidePSR(uvec2 p, vec3 ro, vec3 rd) {
 }
 
 
-// Path-tracing loop (trace -> NEE -> bounce, MAX_BOUNCES deep). Shared by the megakernel (trace.rgen)
-// and the wavefront extend/shade stage. The caller sets up the primary ray, jitter, g_sampleIdx + rng,
-// and (for DLSS) the guides; this returns the path radiance L.
-vec3 tracePath(vec3 ro, vec3 rd, float spreadAngle, inout uint rng) {
-        vec3 L = vec3(0.0);
-        float coneWidth = 0.0;
-        vec3 tp = vec3(1.0); // throughput
-        float pathRough = 0.0; // max surface roughness seen so far (path roughness regularization)
-        bool lastDiffuse = false; // was the previous bounce a diffuse scatter? (env NEE double-count)
-        int glassBounces = 0; // dielectric interfaces don't spend the diffuse/specular budget
-        bool isDiffuse = false; // ray has scattered diffusely -> "Is Diffuse Ray" for Light Path glass
-        int glassDepth = 0;   // how many glass surfaces deep the ray is (0 = outside). Decides
-                              // entering vs exiting WITHOUT trusting the mesh normal, which is
-                              // unreliable on flipped/inconsistent faces (caused blue TIR "mirror" glass).
+// ── Path tracer core, factored for both the megakernel and the wavefront ────────────────────────
+// PathCtx carries everything that must survive between bounces. The megakernel keeps it in locals
+// (tracePath loops traceBounce); the wavefront serializes it to the PathState buffer and calls
+// traceBounce once per dispatch. See the wavefront plan in memory.
+struct PathCtx {
+    vec3 ro;            // current ray origin
+    vec3 rd;            // current ray direction
+    vec3 tp;            // throughput
+    vec3 L;             // accumulated radiance
+    float coneWidth;    // ray-cone width (texture LOD)
+    float pathRough;    // max surface roughness seen so far (path roughness regularization)
+    int b;              // real (budget-spending) bounces taken so far
+    int glassBounces;   // dielectric/passthrough hops (don't spend the bounce budget)
+    int glassDepth;     // how many glass surfaces deep (0 = outside)
+    bool isDiffuse;     // ray has scattered diffusely ("Is Diffuse Ray" for Light Path glass)
+    bool lastDiffuse;   // previous bounce was a diffuse scatter (env NEE double-count)
+};
 
-        for (int b = 0; b < MAX_BOUNCES; b++) {
-            rayQueryEXT rq;
-            rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, ro, 0.001, rd, 1e30);
-            while (rayQueryProceedEXT(rq)) {}
-            if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
-                if (DEBUG_PATH && b == 0) { L = vec3(0.0, 0.0, 1.0); break; } // blue = sky
-                // Add the sky unless it was reached by a diffuse bounce while env NEE is active —
-                // that vertex's environment NEE already accounted for it (avoids double counting).
-                if (b == 0 || !lastDiffuse || envDist.data[0] <= 0.0) {
-                    L += tp * sky(rd);
-                }
-                break;
-            }
-            uint id   = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
-            uint prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
-            vec2 bc   = rayQueryGetIntersectionBarycentricsEXT(rq, true);
-            float thit = rayQueryGetIntersectionTEXT(rq, true);
-            mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+// One real (diffuse/specular) bounce. The inner loop swallows transparent/alpha passthroughs and
+// glass hops, which don't spend the bounce budget. Returns true while the path is alive (the caller
+// should keep going), false on termination (miss / RR / max bounce / dead-end). Mutates c + rng.
+bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng) {
+    for (int inner = 0; inner < 128; inner++) {
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, c.ro, 0.001, c.rd, 1e30);
+        while (rayQueryProceedEXT(rq)) {}
+        if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+            if (DEBUG_PATH && c.b == 0) { c.L = vec3(0.0, 0.0, 1.0); return false; } // blue = sky
+            // Add the sky unless reached by a diffuse bounce while env NEE is active (avoids double count).
+            if (c.b == 0 || !c.lastDiffuse || envDist.data[0] <= 0.0) c.L += c.tp * sky(c.rd);
+            return false;
+        }
+        uint id   = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
+        uint prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+        vec2 bc   = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+        float thit = rayQueryGetIntersectionTEXT(rq, true);
+        mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
 
 #ifdef USE_SER
-            // Shader Execution Reordering: at the primary hit, regroup the warps by material so the
-            // divergent work that follows (Node VM execution, texturing, BSDF, bounce) runs coherently.
-            // The ray query results are already in locals (rq is dead past here), so this is safe.
-            // Gated by bit4 of hasTlas so we can A/B the perf with it on vs off. Only in the SER
-            // variant — the plain variant (older RTX without VK_NV_ray_tracing_invocation_reorder)
-            // omits it entirely so the shader carries no SER capability.
-            if (b == 0 && (pc.hasTlas & 16u) != 0u) {
-                reorderThreadNV(MatIds(descs[id].mat).m[prim], 16);
-            }
+        // Shader Execution Reordering at the primary hit: regroup warps by material before the
+        // divergent Node VM / texturing / BSDF work. Only in the SER variant (megakernel raygen).
+        if (c.b == 0 && (pc.hasTlas & 16u) != 0u) {
+            reorderThreadNV(MatIds(descs[id].mat).m[prim], 16);
+        }
 #endif
 
-            coneWidth += thit * spreadAngle; // ray-cone width at this hit (for texture LOD)
-            vec3 N, albedo, emission, geoN;
-            float roughness, metallic, ior, transmission, transparentProb;
-            bool frontFace, lightPathTransparent;
-            vec2 surfUV;
-            float surfAlpha;
-            getSurface(id, prim, bc, o2w, rd, coneWidth, N, albedo, roughness, metallic, emission, ior, transmission, frontFace, geoN, lightPathTransparent, transparentProb, surfUV, surfAlpha);
-            vec3 hitPos = ro + rd * thit;
+        c.coneWidth += thit * spreadAngle; // ray-cone width at this hit (for texture LOD)
+        vec3 N, albedo, emission, geoN;
+        float roughness, metallic, ior, transmission, transparentProb;
+        bool frontFace, lightPathTransparent;
+        vec2 surfUV;
+        float surfAlpha;
+        getSurface(id, prim, bc, o2w, c.rd, c.coneWidth, N, albedo, roughness, metallic, emission, ior, transmission, frontFace, geoN, lightPathTransparent, transparentProb, surfUV, surfAlpha);
+        vec3 hitPos = c.ro + c.rd * thit;
 
-            // Stochastic transparent passthrough (Cycles Transparent BSDF / architectural glass,
-            // port of raygen_blender.rgen:2163). A Transparent-weighted surface (multB>0) passes
-            // light straight through with NO refraction; the Fresnel reflection fraction falls
-            // through to the glass/BRDF below. This is what makes "Window Glass" look like a clean
-            // window instead of distorted/TIR'd refractive glass.
-            {
-                float tProb = transparentProb;
-                if (tProb > 0.0) {
-                    float cosTheta = abs(dot(N, -rd));
-                    float iorG = max(ior, 1.01);
-                    float f0 = (iorG - 1.0) / (iorG + 1.0); f0 *= f0;
-                    float fresnelRefl = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
-                    tProb = 1.0 - fresnelRefl;   // Fresnel transmission probability
-                }
-                if (tProb > 0.0 && rnd(rng) < tProb) {
-                    ro = hitPos + rd * 0.002;    // straight through, no bend, no shading
-                    if (++glassBounces >= 32) break;
-                    b--;
-                    continue;
-                }
+        // Stochastic transparent passthrough (Cycles Transparent BSDF / architectural glass): a
+        // Transparent-weighted surface passes light straight through with no refraction.
+        {
+            float tProb = transparentProb;
+            if (tProb > 0.0) {
+                float cosTheta = abs(dot(N, -c.rd));
+                float iorG = max(ior, 1.01);
+                float f0 = (iorG - 1.0) / (iorG + 1.0); f0 *= f0;
+                float fresnelRefl = f0 + (1.0 - f0) * pow(1.0 - cosTheta, 5.0);
+                tProb = 1.0 - fresnelRefl;   // Fresnel transmission probability
             }
-            // Light-path-transparent glass: secondary specular/reflection rays pass through cheaply
-            // (camera rays still see the glass). Port of raygen_blender.rgen:2186.
-            if (lightPathTransparent && b > 0 && !isDiffuse) {
-                ro = hitPos + rd * 0.002;
-                if (++glassBounces >= 32) break;
-                b--;
+            if (tProb > 0.0 && rnd(rng) < tProb) {
+                c.ro = hitPos + c.rd * 0.002;    // straight through, no bend, no shading
+                if (++c.glassBounces >= 32) return false;
                 continue;
-            }
-            // Alpha transparency (Cycles BLEND, stochastic): with probability (1 - alpha) the ray
-            // passes straight through without shading. Makes alpha-masked billboards (fire/leaves/
-            // decals) transparent where the texture alpha is ~0, instead of opaque squares.
-            if (surfAlpha < 0.999 && rnd(rng) >= surfAlpha) {
-                ro = hitPos + rd * 0.0005;
-                if (++glassBounces >= 64) break;
-                b--;
-                continue;
-            }
-
-            // DLSS-RR guide buffers are written by writeGuidePSR (a separate deterministic PSR walk
-            // started before this loop), not here — the stochastic colour path would jitter them.
-
-            // DEBUG: visualize the surface UV of the primary hit (red=U, green=V, tiled). A clean
-            // per-island gradient = correct UVs; noise/garbage = wrong UV layer or broken UV data.
-            if (DEBUG_PATH && b == 0) {
-                L = vec3(fract(surfUV.x), fract(surfUV.y), 0.0);
-                break;
-            }
-
-            // Emitted radiance from this surface (emissive materials light the scene + glow).
-            L += tp * emission;
-
-            // Transmissive surfaces have no Lambertian lobe (light passes through, not scatters).
-            vec3 diffAlbedo = albedo * (1.0 - metallic) * (1.0 - transmission);
-            vec3 V = -rd;
-            vec3 F0 = mix(vec3(0.04), albedo, metallic);
-            // Path roughness regularization (RTXPT-style): a glossy lobe that follows a rougher path
-            // vertex is widened to at least that roughness. Kills caustic-like firefly paths (diffuse
-            // -> glossy -> bright light) and cleans the noisy reflected content inside glossy metals,
-            // at the cost of slight bias. The primary hit (pathRough == 0) is untouched, so direct
-            // highlights and true mirrors stay sharp; only indirect glossy bounces get regularized.
-            float regRough = max(roughness, pathRough);
-            pathRough = max(pathRough, roughness); // propagate to subsequent bounces
-            float alpha = max(regRough * regRough, 1e-3);
-
-            // Direct lighting (diffuse + specular glints from sun/lights, soft shadows).
-            L += tp * directShade(hitPos, N, geoN, V, diffAlbedo, F0, alpha, b, rng);
-
-            // BRDF bounce. A transmissive (glass) interaction is chosen with probability
-            // pTrans; otherwise we pick the diffuse or the GGX specular lobe.
-            lastDiffuse = false;
-            vec2 u = rand2(rng);
-            float pTrans = clamp(transmission, 0.0, 1.0) * (1.0 - metallic);
-            if (pTrans > 0.001 && rnd(rng) < pTrans) {
-                // Rough dielectric: sample a microfacet half-vector, then split reflect/refract
-                // by the dielectric Fresnel term (the choice cancels out of the throughput).
-                float iorC = max(ior, 1.001);
-                // Entering = ray currently outside any glass. Robust to flipped/bad mesh normals:
-                // the camera is always outside, so the first glass hit can never be a (TIR-prone) exit.
-                bool entering = (glassDepth == 0);
-                vec3 Hn = (alpha > 1.5e-3) ? sampleGgxVndf(u, V, N, alpha) : N;
-                float etaFresnel = entering ? iorC : (1.0 / iorC);   // n_t / n_i
-                float F = fresnelDielectric(dot(V, Hn), etaFresnel);
-                vec3 dir;
-                vec3 tint = vec3(1.0);
-                bool crossed = false;
-                if (rnd(rng) < F) {
-                    dir = reflect(rd, Hn);                            // surface reflection (untinted)
-                } else {
-                    float etaRefract = entering ? (1.0 / iorC) : iorC; // n_i / n_t for GLSL refract
-                    dir = refract(rd, Hn, etaRefract);
-                    if (dot(dir, dir) < 1e-8) dir = reflect(rd, Hn);  // total internal reflection
-                    else { tint = sqrt(max(albedo, vec3(0.0))); crossed = true; } // transmission (Cycles sqrt tint)
-                }
-                glassDepth = crossed ? (entering ? glassDepth + 1 : max(glassDepth - 1, 0)) : glassDepth;
-                // Fresnel split is unbiased, so only the VNDF masking term G1 remains (1 for smooth glass).
-                float w = (alpha > 1.5e-3) ? smithG1(max(abs(dot(N, dir)), 1e-4), alpha) : 1.0;
-                tp *= tint * w / pTrans;
-                // Offset toward the side the ray leaves on (robust for close/parallel glass panes).
-                ro = hitPos + ((dot(dir, N) >= 0.0) ? N : -N) * 0.001;
-                rd = dir;
-                // Glass interfaces don't consume the main bounce budget (so stacked/nearby glass
-                // doesn't run out of bounces and turn black); cap total dielectric hops instead.
-                if (++glassBounces >= 32) break;
-                b--;
-            } else {
-                float invOpaque = 1.0 / max(1.0 - pTrans, 1e-3);
-                float lumD = dot(diffAlbedo, vec3(0.299, 0.587, 0.114));
-                float lumS = dot(F0, vec3(0.299, 0.587, 0.114));
-                float pSpec = clamp(lumS / (lumS + lumD + 1e-4), 0.1, 0.9);
-                ro = hitPos + geoN * 0.002;   // offset along geometric normal (silhouette-safe)
-                if (rnd(rng) < pSpec) {
-                    vec3 H = sampleGgxVndf(u, V, N, alpha);
-                    vec3 Ldir = reflect(rd, H);
-                    if (dot(Ldir, N) <= 0.0) break;
-                    float VdotH = max(dot(V, H), 0.0);
-                    vec3 F = F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
-                    // VNDF estimator: BRDF*cos/pdf simplifies to F * G1(L).
-                    tp *= F * smithG1(max(dot(N, Ldir), 0.0), alpha) * invOpaque / pSpec;
-                    rd = Ldir;
-                } else {
-                    rd = cosineHemisphere(N, u);
-                    tp *= diffAlbedo * invOpaque / (1.0 - pSpec);
-                    isDiffuse = true; // subsequent hits see this as an "Is Diffuse Ray"
-                    lastDiffuse = (b <= 1) && ((pc.hasTlas & 32u) != 0u); // env NEE ran -> skip sky on escape
-                }
-            }
-
-            // Russian roulette after a couple of bounces.
-            if (b >= 2) {
-                float q = clamp(max(tp.r, max(tp.g, tp.b)), 0.05, 1.0);
-                if (rnd(rng) > q) break;
-                tp /= q;
             }
         }
-    return L;
+        // Light-path-transparent glass: secondary specular/reflection rays pass through cheaply.
+        if (lightPathTransparent && c.b > 0 && !c.isDiffuse) {
+            c.ro = hitPos + c.rd * 0.002;
+            if (++c.glassBounces >= 32) return false;
+            continue;
+        }
+        // Alpha transparency (Cycles BLEND, stochastic): probability (1 - alpha) passes through.
+        if (surfAlpha < 0.999 && rnd(rng) >= surfAlpha) {
+            c.ro = hitPos + c.rd * 0.0005;
+            if (++c.glassBounces >= 64) return false;
+            continue;
+        }
+
+        // DEBUG: visualize the surface UV of the primary hit (red=U, green=V, tiled).
+        if (DEBUG_PATH && c.b == 0) {
+            c.L = vec3(fract(surfUV.x), fract(surfUV.y), 0.0);
+            return false;
+        }
+
+        // Emitted radiance from this surface (emissive materials).
+        c.L += c.tp * emission;
+
+        // Transmissive surfaces have no Lambertian lobe.
+        vec3 diffAlbedo = albedo * (1.0 - metallic) * (1.0 - transmission);
+        vec3 V = -c.rd;
+        vec3 F0 = mix(vec3(0.04), albedo, metallic);
+        // Path roughness regularization (RTXPT-style): a glossy lobe after a rougher vertex is widened.
+        float regRough = max(roughness, c.pathRough);
+        c.pathRough = max(c.pathRough, roughness);
+        float alpha = max(regRough * regRough, 1e-3);
+
+        // Direct lighting (NEE: diffuse + specular glints from sun/lights, soft shadows).
+        c.L += c.tp * directShade(hitPos, N, geoN, V, diffAlbedo, F0, alpha, c.b, rng);
+
+        // BRDF bounce. A transmissive (glass) interaction is chosen with probability pTrans.
+        c.lastDiffuse = false;
+        vec2 u = rand2(rng);
+        float pTrans = clamp(transmission, 0.0, 1.0) * (1.0 - metallic);
+        if (pTrans > 0.001 && rnd(rng) < pTrans) {
+            // Rough dielectric: sample a microfacet half-vector, split reflect/refract by Fresnel.
+            float iorC = max(ior, 1.001);
+            bool entering = (c.glassDepth == 0); // camera is always outside -> first glass hit enters
+            vec3 Hn = (alpha > 1.5e-3) ? sampleGgxVndf(u, V, N, alpha) : N;
+            float etaFresnel = entering ? iorC : (1.0 / iorC);
+            float F = fresnelDielectric(dot(V, Hn), etaFresnel);
+            vec3 dir;
+            vec3 tint = vec3(1.0);
+            bool crossed = false;
+            if (rnd(rng) < F) {
+                dir = reflect(c.rd, Hn);                          // surface reflection (untinted)
+            } else {
+                float etaRefract = entering ? (1.0 / iorC) : iorC;
+                dir = refract(c.rd, Hn, etaRefract);
+                if (dot(dir, dir) < 1e-8) dir = reflect(c.rd, Hn); // total internal reflection
+                else { tint = sqrt(max(albedo, vec3(0.0))); crossed = true; }
+            }
+            c.glassDepth = crossed ? (entering ? c.glassDepth + 1 : max(c.glassDepth - 1, 0)) : c.glassDepth;
+            float w = (alpha > 1.5e-3) ? smithG1(max(abs(dot(N, dir)), 1e-4), alpha) : 1.0;
+            c.tp *= tint * w / pTrans;
+            c.ro = hitPos + ((dot(dir, N) >= 0.0) ? N : -N) * 0.001;
+            c.rd = dir;
+            // Glass interfaces don't spend the bounce budget; cap total dielectric hops instead.
+            if (++c.glassBounces >= 32) return false;
+            continue;   // not a real bounce -> keep tracing in the inner loop
+        }
+
+        // Opaque diffuse/specular: this IS a real bounce.
+        float invOpaque = 1.0 / max(1.0 - pTrans, 1e-3);
+        float lumD = dot(diffAlbedo, vec3(0.299, 0.587, 0.114));
+        float lumS = dot(F0, vec3(0.299, 0.587, 0.114));
+        float pSpec = clamp(lumS / (lumS + lumD + 1e-4), 0.1, 0.9);
+        c.ro = hitPos + geoN * 0.002;   // offset along geometric normal (silhouette-safe)
+        if (rnd(rng) < pSpec) {
+            vec3 H = sampleGgxVndf(u, V, N, alpha);
+            vec3 Ldir = reflect(c.rd, H);
+            if (dot(Ldir, N) <= 0.0) return false;
+            float VdotH = max(dot(V, H), 0.0);
+            vec3 F = F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
+            c.tp *= F * smithG1(max(dot(N, Ldir), 0.0), alpha) * invOpaque / pSpec;
+            c.rd = Ldir;
+        } else {
+            c.rd = cosineHemisphere(N, u);
+            c.tp *= diffAlbedo * invOpaque / (1.0 - pSpec);
+            c.isDiffuse = true;
+            c.lastDiffuse = (c.b <= 1) && ((pc.hasTlas & 32u) != 0u);
+        }
+
+        // Russian roulette after a couple of real bounces (uses the entering bounce count).
+        if (c.b >= 2) {
+            float q = clamp(max(c.tp.r, max(c.tp.g, c.tp.b)), 0.05, 1.0);
+            if (rnd(rng) > q) return false;
+            c.tp /= q;
+        }
+        c.b++;
+        if (c.b >= MAX_BOUNCES) return false;
+        return true;   // real bounce taken; the path continues
+    }
+    return false;       // inner loop overflow (pathological glass/alpha stack)
+}
+
+// Megakernel entry: run the whole path by looping traceBounce. Same image as before the split.
+vec3 tracePath(vec3 ro, vec3 rd, float spreadAngle, inout uint rng) {
+    PathCtx c;
+    c.ro = ro; c.rd = rd; c.tp = vec3(1.0); c.L = vec3(0.0);
+    c.coneWidth = 0.0; c.pathRough = 0.0;
+    c.b = 0; c.glassBounces = 0; c.glassDepth = 0;
+    c.isDiffuse = false; c.lastDiffuse = false;
+    for (int guard = 0; guard < 512; guard++) {
+        if (!traceBounce(c, spreadAngle, rng)) break;
+    }
+    return c.L;
 }
