@@ -20,13 +20,29 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= dims.x * dims.y) return;
     uint frame = uint(pc.sunCol.w);
+    bool rrMode = (pc.hasTlas & 8u) != 0u; // DLSS Ray Reconstruction active this frame
     bool hasLut = (pc.hasTlas & 2u) != 0u;
     ivec2 p = ivec2(int(idx % dims.x), int(idx / dims.x));
 
     uint rng; float spreadAngle; bool dead;
     PathCtx c = loadPath(idx, rng, spreadAngle, dead);
 
-    // Firefly clamp + temporal accumulation + tonemap (matches the megakernel's non-RR output).
+    if (rrMode) {
+        // DLSS-RR: emit the noisy 1-spp linear radiance to gNoisy (no accumulation/tonemap). NGX
+        // denoises it temporally using the guide buffers + motion vectors; a separate pass tonemaps the
+        // clean output. Sanitize NaN/Inf + hue-preserving firefly clamp, matching the megakernel.
+        vec3 col = c.L;
+        col = mix(col, vec3(0.0), isnan(col));
+        col = mix(col, vec3(0.0), isinf(col));
+        col = max(col, vec3(0.0));
+        const float MAX_RADIANCE = 30.0;
+        float maxC = max(col.r, max(col.g, col.b));
+        if (maxC > MAX_RADIANCE) col *= MAX_RADIANCE / maxC;
+        imageStore(gNoisy, p, vec4(col, 1.0));
+        return;
+    }
+
+    // Non-RR: firefly clamp + temporal accumulation + tonemap to the offscreen.
     vec3 L = min(c.L, vec3(16.0));
     vec3 accum = (frame == 0u) ? L : imageLoad(accumImage, p).rgb + L;
     imageStore(accumImage, p, vec4(accum, 1.0));

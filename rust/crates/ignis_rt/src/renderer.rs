@@ -469,8 +469,7 @@ pub fn set_camera(view_inverse: &[f32], proj_inverse: &[f32]) {
             // (b) force prev_view_proj == current, zeroing the motion vectors, so the frame visibly
             // rebuilds while moving. Genuine discontinuities (geometry/material/world changes) still
             // reset elsewhere. Only the non-RR accumulation path needs the per-move reset.
-            let rr_active = r.0.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0
-                && crate::config::get_int("use_wavefront") == 0; // wavefront bypasses DLSS -> non-RR reset
+            let rr_active = r.0.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0;
             if !rr_active {
                 r.0.accum_frame = 0;
             }
@@ -1872,8 +1871,7 @@ impl Renderer {
     /// or toggling lights). This mirrors shipping path tracers (e.g. Cyberpunk RT Overdrive), which
     /// never hard-reset on edits — ReSTIR + the denoiser re-converge continuously.
     fn reset_accum_for_edit(&mut self) {
-        let rr_active = self.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0
-            && crate::config::get_int("use_wavefront") == 0; // wavefront bypasses DLSS -> non-RR reset
+        let rr_active = self.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0;
         if !rr_active {
             self.accum_frame = 0;
         }
@@ -2313,8 +2311,7 @@ impl Renderer {
         // In DLSS-RR mode let the denoiser + motion vectors absorb the change (don't reset the
         // accumulator) — otherwise undo/redo and live edits flash a denoiser restart. Non-RR keeps
         // the per-change reset its accumulation needs.
-        let rr_active = self.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0
-            && crate::config::get_int("use_wavefront") == 0; // wavefront bypasses DLSS -> non-RR reset
+        let rr_active = self.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0;
         self.rebuild_tlas(!rr_active)
     }
 
@@ -2452,8 +2449,7 @@ impl Renderer {
         }
         // In DLSS-RR mode the motion vectors carry the object motion, so don't reset accumulation
         // (that would discard the denoiser history and zero the very motion vectors we just wrote).
-        let rr_active = self.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0
-            && crate::config::get_int("use_wavefront") == 0; // wavefront bypasses DLSS -> non-RR reset
+        let rr_active = self.rr.is_some() && crate::config::get_int("dlss_rr_enabled") != 0;
         self.rebuild_tlas(!rr_active)
     }
 
@@ -2724,8 +2720,9 @@ impl Renderer {
             && self.wf_resolve_pipeline.is_some()
             && self.wf_compact_pipeline.is_some()
             && crate::config::get_int("use_wavefront") != 0;
-        let use_rr = !use_wavefront
-            && self.rr.is_some()
+        // The wavefront feeds DLSS the same way the megakernel does (gNoisy + guides at trace res),
+        // so RR runs for both. When RR is off, the path tracer writes the offscreen directly.
+        let use_rr = self.rr.is_some()
             && self.tonemap_pipeline.is_some()
             && write_guide
             && crate::config::get_int("dlss_rr_enabled") != 0;
@@ -2775,7 +2772,10 @@ impl Renderer {
         // The path trace writes its images from the ray-generation stage (RT pipeline) or the
         // compute stage (sky fallback); the NGX eval + tonemap are compute. Bracket-barriers that
         // touch the trace's outputs use this combined mask so no dependency is missed either way.
-        let trace_stage = if self.rt_pipeline_ext.is_some() {
+        // The wavefront writes its noisy colour + guides from compute; the megakernel from ray-gen.
+        let trace_stage = if use_wavefront {
+            vk::PipelineStageFlags::COMPUTE_SHADER
+        } else if self.rt_pipeline_ext.is_some() {
             vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR
         } else {
             vk::PipelineStageFlags::COMPUTE_SHADER
@@ -2874,11 +2874,11 @@ impl Renderer {
             // Path trace: wavefront (Phase 0: gen -> extend/shade, writes the offscreen) when enabled;
             // otherwise the megakernel ray-generation pipeline (RT) or the sky compute fallback.
             if use_wavefront {
-                // Wavefront runs at display resolution and writes the offscreen directly (no DLSS yet),
-                // so override the push dims with the display size.
-                let mut wf_push = push;
-                wf_push.dims = [self.width, self.height];
-                let groups = (self.width * self.height).div_ceil(64);
+                // The wavefront runs at trace (render) resolution = push.dims. In RR mode it emits
+                // gNoisy + guides there for DLSS to upscale; with RR off, trace res == display res and
+                // resolve writes the offscreen directly.
+                let wf_push = push;
+                let groups = (self.trace_width * self.trace_height).div_ceil(64);
                 d.cmd_bind_descriptor_sets(
                     self.cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout, 0, &[self.desc_set], &[],
                 );
@@ -2886,7 +2886,7 @@ impl Renderer {
                 // Each extend round reads the live pixel indices, traces one bounce, and atomic-appends
                 // survivors to the other half; resolve reads every path's final radiance. One broad
                 // barrier covers the compute stages + the fillBuffer count resets (over-sync but correct).
-                let n = self.width * self.height;
+                let n = self.trace_width * self.trace_height;
                 let ctrl = self.wf_ctrl_buffer.as_ref().unwrap().buffer;
                 let cmd = self.cmd;
                 let layout = self.pipeline_layout;

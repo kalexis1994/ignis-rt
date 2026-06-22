@@ -19,12 +19,14 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= dims.x * dims.y) return;
     uint frame = uint(pc.sunCol.w);
+    bool rrMode = (pc.hasTlas & 8u) != 0u; // DLSS Ray Reconstruction active this frame
     g_sampleIdx = frame;
     uint px = idx % dims.x, py = idx / dims.x;
 
-    // Sub-pixel jitter for temporal-accumulation AA (own scramble key, independent of the path rng).
+    // Sub-pixel jitter: in RR mode the deterministic Halton offset the CPU also feeds NGX (so the
+    // denoiser knows the sample positions); otherwise a random offset for temporal-accumulation AA.
     uint jrng = ((px * 1973u) ^ (py * 9277u) ^ 0x9e3779b9u) | 1u;
-    vec2 jitter = (frame == 0u) ? vec2(0.5) : rand2(jrng);
+    vec2 jitter = rrMode ? (vec2(0.5) + pc.jitter) : ((frame == 0u) ? vec2(0.5) : rand2(jrng));
     vec2 uv  = (vec2(px, py) + jitter) / vec2(dims);
     vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     vec4 world = pc.invViewProj * vec4(ndc, 1.0, 1.0);
@@ -34,6 +36,10 @@ void main() {
     vec2 uvY = (vec2(px, py) + jitter + vec2(0.0, 1.0)) / vec2(dims);
     vec4 wY = pc.invViewProj * vec4(uvY.x * 2.0 - 1.0, 1.0 - uvY.y * 2.0, 1.0, 1.0);
     float spreadAngle = length(normalize(wY.xyz / wY.w - ro) - rd);
+
+    // DLSS-RR guide buffers (depth/normal/albedo/motion) via the deterministic PSR walk, same as the
+    // megakernel — written only in RR mode (the stochastic colour path would jitter them).
+    if (rrMode && (pc.hasTlas & 1u) != 0u) writeGuidePSR(uvec2(px, py), ro, rd);
 
     PathCtx c;
     c.ro = ro; c.rd = rd; c.tp = vec3(1.0); c.L = vec3(0.0);
