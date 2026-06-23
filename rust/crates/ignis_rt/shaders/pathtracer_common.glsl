@@ -572,7 +572,18 @@ float gradientLinear(vec3 p)    { return clamp(p.x, 0.0, 1.0); }
 float gradientQuadratic(vec3 p) { float r = max(p.x, 0.0); return clamp(r * r, 0.0, 1.0); }
 float gradientSpherical(vec3 p) { return max(1.0 - length(p), 0.0); }
 float gradientRadial(vec3 p)    { return atan(p.y, p.x) / (2.0 * PI) + 0.5; }
-// Voronoi F1 — squared-then-sqrt nearest cell-point distance.
+// Cycles PCG-3D integer hash (util/hash.h:50) for Voronoi cell jitter — uint logical shifts, NOT the
+// Jenkins bit-extraction we used before (which gave a different point distribution → Voronoi never
+// matched Cycles even for default F1). uvec3(ivec3) bit-reinterprets negative cell coords like Cycles.
+uvec3 pcg3d_i(uvec3 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    v ^= (v >> 16u);
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    return v & 0x7FFFFFFFu;
+}
+vec3 hashI3F3(ivec3 k) { return vec3(pcg3d_i(uvec3(k))) * (1.0 / 2147483647.0); }
+// Voronoi F1 — squared-then-sqrt nearest cell-point distance (Euclidean, Cycles-exact PCG jitter).
 float voronoiF1(vec3 p, float randomness) {
     vec3 fl = floor(p);
     vec3 f  = fract(p);
@@ -581,9 +592,7 @@ float voronoiF1(vec3 p, float randomness) {
     for (int j = -1; j <= 1; j++)
     for (int i = -1; i <= 1; i++) {
         vec3 offset = vec3(float(i), float(j), float(k));
-        uvec3 cellId = uvec3(ivec3(fl) + ivec3(i, j, k));
-        uint h = hash3(cellId);
-        vec3 jitter = vec3(float(h & 0xFFFFu)/65535.0, float((h>>8u)&0xFFFFu)/65535.0, float((h>>16u)&0xFFFFu)/65535.0);
+        vec3 jitter = hashI3F3(ivec3(fl) + ivec3(i, j, k));
         vec3 diff = (offset + randomness * jitter) - f;
         minDist = min(minDist, dot(diff, diff));
     }
