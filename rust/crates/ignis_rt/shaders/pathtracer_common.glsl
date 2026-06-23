@@ -639,6 +639,37 @@ vec4 evalColorRamp(uint mi, uint dataOff, uint stopCount, float factor) {
     return prevCol;
 }
 
+// rgb_ramp_lookup (cycles-main/src/kernel/svm/ramp.h:57-93) for a single channel.
+// The baked curve table lives in mats[mi].nodeVmCode[dataOff + j] as uvec4, with
+// table[j] = (R,G,B,_) packed in (.x,.y,.z); `chan` selects which of R/G/B to read.
+// interpolate is always true for svm_node_curves (ramp.h:125-127).
+float rampLookup1(uint mi, uint dataOff, uint tableSize, float f, bool extrapolate, int chan) {
+    int size = int(tableSize);
+    if ((f < 0.0 || f > 1.0) && extrapolate) {
+        float t0, dy;
+        if (f < 0.0) {                                                // ramp.h:67-71
+            t0 = uintBitsToFloat(mats[mi].nodeVmCode[dataOff][chan]);
+            dy = t0 - uintBitsToFloat(mats[mi].nodeVmCode[dataOff + 1u][chan]);
+            f = -f;
+        } else {                                                     // ramp.h:72-76
+            t0 = uintBitsToFloat(mats[mi].nodeVmCode[dataOff + uint(size - 1)][chan]);
+            dy = t0 - uintBitsToFloat(mats[mi].nodeVmCode[dataOff + uint(size - 2)][chan]);
+            f = f - 1.0;
+        }
+        return t0 + dy * f * float(size - 1);                        // ramp.h:77
+    }
+
+    f = clamp(f, 0.0, 1.0) * float(size - 1);                        // ramp.h:80 (saturatef)
+    int i = clamp(int(f), 0, size - 1);                              // ramp.h:83
+    float t = f - float(i);                                          // ramp.h:84
+    float a = uintBitsToFloat(mats[mi].nodeVmCode[dataOff + uint(i)][chan]); // ramp.h:86
+    if (t > 0.0) {                                                   // ramp.h:88 (interpolate==true)
+        float a1 = uintBitsToFloat(mats[mi].nodeVmCode[dataOff + uint(i + 1)][chan]);
+        a = (1.0 - t) * a + t * a1;                                  // ramp.h:89
+    }
+    return a;
+}
+
 struct VmResult {
     vec3 baseColor; float roughness; float metallic; vec3 emission; float emissionStrength;
     float alpha; float ior; float transmission; float normalStrength; vec2 transformedUV;
@@ -831,7 +862,21 @@ VmResult executeNodeVm(uint mi, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 norma
             float ior = uintBitsToFloat(instr.y); float NdotV = abs(dot(normal, -viewDir));
             float f0 = pow((ior-1.0)/(ior+1.0), 2.0); R[dst].x = f0 + (1.0-f0)*pow(1.0-NdotV, 5.0);
         }
-        else if (op == 0x84u) { R[dst] = R[sA]; pc += 6u; }          // RGB_CURVES: passthrough (Stage 2+)
+        else if (op == 0x84u) {                                      // RGB_CURVES (svm_node_curves, ramp.h:114-134)
+            uint tableSize  = instr.y & 0x7FFFFFFFu;                 // table size (bit31 = extrapolate flag)
+            bool extrapolate = (instr.y & 0x80000000u) != 0u;
+            float minX = uintBitsToFloat(instr.z);
+            float maxX = uintBitsToFloat(instr.w);
+            uint dataOff = pc + 1u;                                  // baked table follows the opcode word
+            vec3 color = R[sA].rgb;
+            float fac = R[sB].x;
+            vec3 relpos = (color - vec3(minX)) / (maxX - minX);      // ramp.h:122-123
+            float r = rampLookup1(mi, dataOff, tableSize, relpos.x, extrapolate, 0); // R uses .x (ramp.h:125)
+            float g = rampLookup1(mi, dataOff, tableSize, relpos.y, extrapolate, 1); // G uses .y (ramp.h:126)
+            float b = rampLookup1(mi, dataOff, tableSize, relpos.z, extrapolate, 2); // B uses .z (ramp.h:127)
+            R[dst] = vec4(mix(color, vec3(r, g, b), fac), R[sA].a);  // ramp.h:129
+            pc += tableSize;                                         // skip the trailing table (loop does pc++)
+        }
         else if (op == 0x58u) {                                      // TEX_CHECKER (Cycles 3-axis parity)
             float scale = uintBitsToFloat(instr.y);
             vec3 p = R[sA].xyz * scale;                              // full 3D co*scale (checker.h:37)

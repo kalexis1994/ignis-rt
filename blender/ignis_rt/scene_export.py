@@ -2328,6 +2328,84 @@ class _NodeVmCompiler:
             self.instructions.append(_make_instr(opcode, dst, srcA, srcB, imm_y, imm_z, imm_w))
         return dst
 
+    def _bake_rgb_curve_table(self, from_node, table_size):
+        """Bake a ShaderNodeRGBCurve into a Cycles-parity float3 table: sample i =
+        (R(C(t)), G(C(t)), B(C(t))), t = minX + (i/(n-1))*(maxX-minX), the combined 'C' curve
+        (curves[3]) applied FIRST. Mirrors blender-main intern/cycles/blender/util.h
+        curvemapping_color_to_array, sampled at table_size points instead of 257 (the nodeVmCode
+        buffer only fits ~16)."""
+        mapping = from_node.mapping
+        if mapping is None:
+            return (0.0, 1.0, False, [(0.0, 0.0, 0.0)] * table_size)
+        try:
+            mapping.update()       # keep the mapping on the non-premultiplied table path
+        except Exception:
+            pass
+        try:
+            mapping.initialize()
+        except Exception:
+            pass
+        curves = mapping.curves
+        curve_r, curve_g, curve_b, curve_c = curves[0], curves[1], curves[2], curves[3]
+        # min/max x = TRUE union of the 4 curves' end control points (Cycles curvemapping_minmax,
+        # util.h:161-173 seeds FLT_MAX/-FLT_MAX, NOT 0..1 — the 0..1 seed diverges once a user drags
+        # an endpoint off 0/1). Fall back to 0..1 only if no points are readable.
+        min_x, max_x = float('inf'), float('-inf')
+        for cv in (curve_r, curve_g, curve_b, curve_c):
+            try:
+                pts = cv.points
+                min_x = min(min_x, pts[0].location.x)
+                max_x = max(max_x, pts[-1].location.x)
+            except Exception:
+                pass
+        if not (min_x < max_x):
+            min_x, max_x = 0.0, 1.0
+        range_x = max_x - min_x
+        try:
+            extrapolate = (mapping.extend == 'EXTRAPOLATED')   # CUMA_EXTEND_EXTRAPOLATE
+        except Exception:
+            extrapolate = False
+        ev = mapping.evaluate
+        samples = []
+        n = max(table_size - 1, 1)
+        for i in range(table_size):
+            t = min_x + (float(i) / float(n)) * range_x
+            cc = ev(curve_c, t)     # combined C curve FIRST
+            r = ev(curve_r, cc)
+            g = ev(curve_g, cc)
+            b = ev(curve_b, cc)
+            samples.append((r, g, b))
+        return (min_x, max_x, extrapolate, samples)
+
+    def _emit_rgb_curves_branch(self, from_node, node_id, dst, _depth):
+        """Emit op 0x84 (_OP_RGB_CURVES) + the trailing baked table, wiring Color->srcA, Fac->srcB.
+        The opcode word + all TABLE_SIZE data words must fit ATOMICALLY (else the GLSL reads a
+        truncated table = silent wrong curve) — passthrough the Color input if they don't."""
+        color_inp = from_node.inputs.get('Color')
+        fac_inp = from_node.inputs.get('Fac')
+        color_reg = self._compile_node(color_inp, _depth + 1)   # -> srcA
+        if fac_inp is not None:
+            fac_reg = self._compile_node(fac_inp, _depth + 1)   # -> srcB
+        else:
+            fac_reg = self._alloc_reg()
+            self._emit(_OP_LOAD_SCALAR, fac_reg, imm_y=_floatBits(1.0))
+        TABLE_SIZE = 16
+        # Atomic fit: opcode word + all TABLE_SIZE data words, or passthrough. A half-written table
+        # with imm_y still saying 16 would make the GLSL read past the written data.
+        if len(self.instructions) + 1 + TABLE_SIZE > 64:
+            self.node_reg_cache[node_id] = color_reg
+            return color_reg
+        min_x, max_x, extrapolate, samples = self._bake_rgb_curve_table(from_node, TABLE_SIZE)
+        imm_y = (TABLE_SIZE & 0x7FFFFFFF) | (0x80000000 if extrapolate else 0)
+        self._emit(_OP_RGB_CURVES, dst, srcA=color_reg, srcB=fac_reg,
+                   imm_y=imm_y, imm_z=_floatBits(min_x), imm_w=_floatBits(max_x))
+        # TABLE_SIZE raw data words (.x/.y/.z = R/G/B, .w unused) — bypass _emit so no opcode packs
+        # into .x; the fit was verified above, so append unconditionally.
+        for (r, g, b) in samples:
+            self.instructions.append((_floatBits(r), _floatBits(g), _floatBits(b), 0))
+        self.node_reg_cache[node_id] = dst
+        return dst
+
     def _compile_node(self, socket, _depth=0):
         """Compile the node chain feeding into a socket. Returns register index."""
         if socket is None or _depth > 8:
@@ -2723,20 +2801,9 @@ class _NodeVmCompiler:
             self.node_reg_cache[node_id] = dst
             return dst
 
-        # ── RGB Curves — passthrough ──
-        # Baked LUT produces incorrect blue tint. Needs investigation into
-        # how Cycles' BKE_curvemap_evaluateF differs from Python mapping.evaluate().
+        # ── RGB Curves — baked 16-sample Cycles table (svm_node_curves / op 0x84) ──
         if from_node.type == 'CURVE_RGB':
-            color_inp = from_node.inputs.get('Color')
-            if color_inp and color_inp.is_linked:
-                reg = self._compile_node(color_inp, _depth + 1)
-                self.node_reg_cache[node_id] = reg
-                return reg
-            c = color_inp.default_value if color_inp else (0.8, 0.8, 0.8, 1.0)
-            self._emit(_OP_LOAD_CONST, dst, imm_y=_floatBits(c[0]),
-                       imm_z=_floatBits(c[1]), imm_w=_floatBits(c[2]))
-            self.node_reg_cache[node_id] = dst
-            return dst
+            return self._emit_rgb_curves_branch(from_node, node_id, dst, _depth)
 
         # ── Noise Texture ──
         if from_node.type == 'TEX_NOISE':
