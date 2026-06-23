@@ -423,6 +423,27 @@ float fresnelDielectric(float cosThetaI, float eta) {
     return 0.5 * (rs * rs + rp * rp);
 }
 
+// Single-scatter GGX directional albedo (Karis 2014 split-sum analytic fit, evaluated for F0=1).
+// ~1.0 at roughness 0 (no energy loss), dropping toward ~0.45 at roughness 1 where single-scatter
+// GGX loses ~half its energy. Drives the multiscatter compensation below.
+float ggxDirectionalAlbedo(float NdotV, float alpha) {
+    float rough = sqrt(clamp(alpha, 0.0, 1.0));
+    vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+    vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
+    vec4 r = rough * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * NdotV)) * r.x + r.y;
+    vec2 sb = vec2(-1.04, 1.04) * a004 + r.zw;
+    return clamp(sb.x + sb.y, 1e-3, 1.0);
+}
+// Multiscatter energy compensation (Karis/Filament): boosts the single-scatter GGX lobe to recover
+// the energy it loses at higher roughness, so rough metals/glossy don't darken. For white F0 this
+// equals Cycles' energy_scale = 1/E (bsdf_microfacet.h:389-440); for coloured F0 (metals) it is the
+// standard real-time approximation of Cycles' coloured darkening term.
+vec3 ggxEnergyComp(vec3 F0, float NdotV, float alpha) {
+    float Ess = ggxDirectionalAlbedo(NdotV, alpha);
+    return 1.0 + F0 * (1.0 / Ess - 1.0);
+}
+
 // Cook-Torrance BRDF value (Lambertian diffuse albedo/pi + GGX specular) for a light
 // direction. Multiply by (radiance * NdotL) for the contribution. Physically consistent
 // with the indirect bounce (cosine-sampled diffuse implies the same albedo/pi).
@@ -435,7 +456,7 @@ vec3 brdf(vec3 N, vec3 V, vec3 Ldir, vec3 diffAlbedo, vec3 F0, float alpha) {
     vec3 F = F0 + (1.0 - F0) * pow(1.0 - vh, 5.0);
     float G = smithG1(nv, alpha) * smithG1(nl, alpha);
     vec3 spec = ggxD(nh, alpha) * G * F / (4.0 * nv * nl);
-    return diffAlbedo * (1.0 / PI) + spec;
+    return diffAlbedo * (1.0 / PI) + spec * ggxEnergyComp(F0, nv, alpha);
 }
 
 // Sample a direction within a cone of half-angle acos(cosThetaMax) around `axis`.
@@ -486,11 +507,12 @@ float srgb1(float c) { return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1
 vec3 srgbToLinear(vec3 c) { return vec3(srgb1(c.r), srgb1(c.g), srgb1(c.b)); }
 
 // ── Procedural noise (Cycles-exact, ported from include/noise.glsl) ──
-// Jenkins Lookup3 integer hash (Cycles util/hash.h hash_uint3).
+// Jenkins Lookup3 integer hash (Cycles util/hash.h hash_uint3). Seed = 0xdeadbeef + (3<<2) + 13
+// = 0xdeadbf08 — must match Cycles bit-for-bit or every Perlin/fBM/cell pattern desyncs.
 uint hash3(uvec3 k) {
-    uint a = 0xdeadbf0eu + k.x;
-    uint b = 0xdeadbf0eu + k.y;
-    uint c = 0xdeadbf0eu + k.z;
+    uint a = 0xdeadbf08u + k.x;
+    uint b = 0xdeadbf08u + k.y;
+    uint c = 0xdeadbf08u + k.z;
     c ^= b; c -= (b << 14u) | (b >> 18u);
     a ^= c; a -= (c << 11u) | (c >> 21u);
     b ^= a; b -= (a << 25u) | (a >> 7u);
@@ -528,17 +550,20 @@ float perlinNoise3D(vec3 p) {
     float x11 = mix(g011, g111, u.x);
     return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
 }
+// Cycles snoise_3d: signed Perlin scaled to ~[-1,1] by noise_scale3 = 0.9820 (svm/noise.h:679).
+// fBM and the Noise/bump opcodes must route through this, not raw perlinNoise3D, to match amplitude.
+float snoise3D(vec3 p) { return 0.9820 * perlinNoise3D(p); }
 // Normalized fBM (Cycles fractal_noise.h noise_fbm), remapped to ~[0,1].
 float fbm3D(vec3 p, float detail, float roughness, float lacunarity) {
     float fscale = 1.0, amp = 1.0, maxamp = 0.0, sum = 0.0;
     int nOctaves = int(detail);
     for (int i = 0; i <= nOctaves; i++) {
-        sum += perlinNoise3D(fscale * p) * amp;
+        sum += snoise3D(fscale * p) * amp;
         maxamp += amp; amp *= roughness; fscale *= lacunarity;
     }
     float rmd = detail - floor(detail);
     if (rmd != 0.0) {
-        float sum2 = sum + perlinNoise3D(fscale * p) * amp;
+        float sum2 = sum + snoise3D(fscale * p) * amp;
         return mix(0.5 * sum / maxamp + 0.5, 0.5 * sum2 / (maxamp + amp) + 0.5, rmd);
     }
     return 0.5 * sum / maxamp + 0.5;
@@ -1500,7 +1525,8 @@ bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng,
             if (dot(Ldir, N) <= 0.0) return false;
             float VdotH = max(dot(V, H), 0.0);
             vec3 F = F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
-            c.tp *= F * smithG1(max(dot(N, Ldir), 0.0), alpha) * invOpaque / pSpec;
+            c.tp *= F * smithG1(max(dot(N, Ldir), 0.0), alpha)
+                  * ggxEnergyComp(F0, max(dot(N, V), 1e-4), alpha) * invOpaque / pSpec;
             c.rd = Ldir;
         } else {
             c.rd = cosineHemisphere(N, u);
