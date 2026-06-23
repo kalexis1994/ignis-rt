@@ -555,13 +555,15 @@ float perlinNoise3D(vec3 p) {
 float snoise3D(vec3 p) { return 0.9820 * perlinNoise3D(p); }
 // Normalized fBM (Cycles fractal_noise.h noise_fbm), remapped to ~[0,1].
 float fbm3D(vec3 p, float detail, float roughness, float lacunarity) {
+    float dc = clamp(detail, 0.0, 15.0);            // Cycles clamps Detail to [0,15] (noisetex.h:259)
+    float rough = max(roughness, 0.0);              // and Roughness to >= 0 (noisetex.h:260)
     float fscale = 1.0, amp = 1.0, maxamp = 0.0, sum = 0.0;
-    int nOctaves = int(detail);
+    int nOctaves = int(dc);
     for (int i = 0; i <= nOctaves; i++) {
         sum += snoise3D(fscale * p) * amp;
-        maxamp += amp; amp *= roughness; fscale *= lacunarity;
+        maxamp += amp; amp *= rough; fscale *= lacunarity;
     }
-    float rmd = detail - floor(detail);
+    float rmd = dc - floor(dc);
     if (rmd != 0.0) {
         float sum2 = sum + snoise3D(fscale * p) * amp;
         return mix(0.5 * sum / maxamp + 0.5, 0.5 * sum2 / (maxamp + amp) + 0.5, rmd);
@@ -830,12 +832,20 @@ VmResult executeNodeVm(uint mi, vec2 uv, vec3 worldPos, vec3 viewDir, vec3 norma
             float f0 = pow((ior-1.0)/(ior+1.0), 2.0); R[dst].x = f0 + (1.0-f0)*pow(1.0-NdotV, 5.0);
         }
         else if (op == 0x84u) { R[dst] = R[sA]; pc += 6u; }          // RGB_CURVES: passthrough (Stage 2+)
-        else if (op == 0x58u) {                                      // TEX_CHECKER
+        else if (op == 0x58u) {                                      // TEX_CHECKER (Cycles 3-axis parity)
             float scale = uintBitsToFloat(instr.y);
-            vec2 cuv = R[sA].xy * scale;
-            float check = mod(floor(cuv.x) + floor(cuv.y), 2.0);
-            vec4 color2 = vec4(uintBitsToFloat(instr.z), uintBitsToFloat(instr.w), uintBitsToFloat(instr.w), 1.0);
-            R[dst] = (check < 0.5) ? R[sB] : color2;
+            vec3 p = R[sA].xyz * scale;                              // full 3D co*scale (checker.h:37)
+            p = (p + vec3(1e-6)) * 0.999999;                         // per-axis precision nudge (checker.h:18)
+            int xi = abs(int(floor(p.x)));
+            int yi = abs(int(floor(p.y)));
+            int zi = abs(int(floor(p.z)));
+            bool exy = ((xi & 1) == (yi & 1));
+            bool ez  = ((zi & 1) != 0);
+            float f = (exy == ez) ? 1.0 : 0.0;                       // ((xi%2==yi%2)==(zi%2)), checker.h:25
+            // color1 = R[sB] (register, full RGB); color2 from immediates (blue==green until the encoder
+            // carries a 3rd float — grey checkers are exact, a coloured-blue color2 is pending FIX-encoder).
+            vec3 color2 = vec3(uintBitsToFloat(instr.z), uintBitsToFloat(instr.w), uintBitsToFloat(instr.w));
+            R[dst] = vec4((f == 1.0) ? R[sB].rgb : color2, 1.0);     // f==1 -> color1 (checker.h:41)
         }
         else if (op == 0x80u) {                                      // TEX_NOISE (fBM)
             float scale = uintBitsToFloat(instr.y);
@@ -1337,7 +1347,9 @@ void writeGuidePSR(uvec2 p, vec3 ro, vec3 rd,
         vec3 F0 = mix(vec3(0.04), albedo, metallic);
         float NdotV = max(dot(N, -rd), 1e-3);
         vec3 specAlb = EnvBRDFApprox(F0, roughness, NdotV);
-        writeGuide(p, vpos, prevVpos, vN, max(roughness, chainRough), albedo, specAlb);
+        // Diffuse guide demodulated by metalness (RR Guide §3.4.1: diffuse reflectance only). Metals
+        // have ~0 diffuse reflectance — their colour drives F0 -> the specular-albedo guide instead.
+        writeGuide(p, vpos, prevVpos, vN, max(roughness, chainRough), albedo * (1.0 - metallic), specAlb);
         return;
     }
     // Too many delta bounces: fall back to the deepest virtual position (rough/far).

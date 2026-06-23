@@ -319,7 +319,10 @@ pub fn create_rr(
     set_ui("OutWidth", display_w); // output (display) resolution
     set_ui("OutHeight", display_h);
     set_i("PerfQualityValue", perf_quality);
-    set_i("DLSS.Feature.Create.Flags", DLSS_FLAG_IS_HDR | DLSS_FLAG_MV_LOWRES | DLSS_FLAG_AUTO_EXPOSURE);
+    // RR does NOT support exposure / auto-exposure (RR Integration Guide §3.7) — must NOT set the
+    // AUTO_EXPOSURE flag. Pre.Exposure / Exposure.Scale stay pinned to 1.0 (set at eval) to avoid the
+    // NGX divide-by-zero, which is the real reason exposure is neutralised here.
+    set_i("DLSS.Feature.Create.Flags", DLSS_FLAG_IS_HDR | DLSS_FLAG_MV_LOWRES);
     set_i("DLSS.Denoise.Mode", DENOISE_MODE_DL_UNIFIED);
     set_ui("DLSS.Roughness.Mode", ROUGHNESS_MODE_PACKED);
     set_ui("DLSS.Use.HW.Depth", 0);
