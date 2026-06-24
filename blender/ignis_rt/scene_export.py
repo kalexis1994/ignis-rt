@@ -3681,10 +3681,20 @@ class _NodeVmCompiler:
             _glossy_ctx = g2 if (p2 and p2.type == 'BSDF_GLOSSY') else g1
             rough_out = self._compile_principled_scalar_ctx(_glossy, 'Roughness', 0.5, _glossy_ctx)
             self._emit(_OP_OUTPUT_ROUGH, srcA=rough_out)
-            # Metallic = 0 (dielectric specular, not metallic)
-            metal_zero = self._alloc_reg()
-            self._emit(_OP_LOAD_SCALAR, metal_zero, imm_y=_floatBits(0.0))
-            self._emit(_OP_OUTPUT_METAL, srcA=metal_zero)
+            # A Cycles Glossy BSDF is a FULL coloured specular reflection (F0 = its colour) — metallic
+            # behaviour, NOT a 0.04 dielectric. So Mix(Diffuse, Glossy, fac) = (1-fac)*diffuse +
+            # fac*glossy is expressed exactly by the uber's metallic param: metallic = the Glossy
+            # side's blend weight. Previously metallic was hard-zeroed, so the fac never reached the
+            # specular (fac=0.2 and fac=0.9 rendered identically). w = fac if Glossy is the fac=1
+            # (B) input, else 1-fac.
+            if p2 and p2.type == 'BSDF_GLOSSY':
+                metal_reg = fac_reg                      # Glossy on the B (fac=1) side -> w = fac
+            else:
+                metal_reg = self._alloc_reg()            # Glossy on the A (fac=0) side -> w = 1 - fac
+                one_reg = self._alloc_reg()
+                self._emit(_OP_LOAD_SCALAR, one_reg, imm_y=_floatBits(1.0))
+                self._emit(_OP_MATH_SUB, metal_reg, srcA=one_reg, srcB=fac_reg)
+            self._emit(_OP_OUTPUT_METAL, srcA=metal_reg)
         else:
             # General blend of roughness and metallic
             _rough_default_a = 1.0 if (p1 and p1.type == 'BSDF_DIFFUSE') else 0.5
