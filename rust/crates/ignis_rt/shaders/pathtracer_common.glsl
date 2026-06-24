@@ -1261,10 +1261,10 @@ vec3 directShade(vec3 hitPos, vec3 N, vec3 geoN, vec3 V, vec3 diffAlbedo, vec3 F
             float eCos = dot(-eDir, es.normal); // emitter facing the shading point
             if (eNdotL > 0.0 && eCos > 0.0 && eDist > 0.01 && !occluded(o, eDir, eDist - 0.01)) {
                 vec3 eRadiance = es.emission * eCos / (eDist * eDist);
-                float bsdfPdf  = eNdotL / PI;                       // diffuse cosine pdf
-                float lightPdf = es.pdf * eDist * eDist / eCos;     // area -> solid-angle pdf
-                float mis = (lightPdf * lightPdf) / (lightPdf * lightPdf + bsdfPdf * bsdfPdf + 1e-8);
-                sum += brdf(N, V, eDir, diffAlbedo, F0, alpha) * eNdotL * eRadiance * mis / max(es.pdf, 1e-6);
+                // Light-only (no MIS weight): the forward BSDF-strategy emission is now skipped at
+                // bounce-reached emitters (see the emission gate above), so NEE carries the FULL
+                // emitter contribution. Keeping a MIS weight here would under-count it.
+                sum += brdf(N, V, eDir, diffAlbedo, F0, alpha) * eNdotL * eRadiance / max(es.pdf, 1e-6);
             }
         }
     }
@@ -1525,13 +1525,29 @@ bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng,
             }
         }
 
-        // Emitted radiance from this surface (emissive materials).
-        c.L += c.tp * emission;
+        // Emitted radiance from this surface. Light-sampling strategy: only add the forward (BSDF)
+        // term when the camera sees the emitter directly (b==0) or there is no emissive NEE. At a
+        // bounce-reached emitter (b>0) with NEE active, the emitter is already counted by the previous
+        // vertex's (now-unweighted) emissive NEE; adding the forward term too double-counts it (lamps +
+        // their bounce light were up to ~2x too bright, washing the scene). Mirrors the env diffuse-skip.
+        if (c.b == 0u || pc.emissiveCount == 0u) {
+            c.L += c.tp * emission;
+        }
 
         // Transmissive surfaces have no Lambertian lobe.
         vec3 diffAlbedo = albedo * (1.0 - metallic) * (1.0 - transmission);
         vec3 V = -c.rd;
         vec3 F0 = mix(vec3(0.04), albedo, metallic);
+        // Dielectric specular->diffuse energy layering (Cycles closure_layering_weight, bsdf_util.h:491):
+        // the specular lobe reflects part of the incoming energy, so the diffuse below must lose it.
+        // Without this the spec was added ON TOP at full strength, so every dielectric surface read too
+        // bright / flat / washed (the lift grows toward grazing angles). Attenuating diffAlbedo here
+        // covers BOTH the direct (brdf) and the indirect bounce, which reuse this same diffAlbedo.
+        {
+            float NdotV_lay = max(dot(N, V), 1e-3);
+            vec3 specAlb_lay = EnvBRDFApprox(F0, roughness, NdotV_lay);
+            diffAlbedo *= 1.0 - max(specAlb_lay.r, max(specAlb_lay.g, specAlb_lay.b));
+        }
         // Path roughness regularization (RTXPT-style): a glossy lobe after a rougher vertex is widened.
         float regRough = max(roughness, c.pathRough);
         c.pathRough = max(c.pathRough, roughness);
