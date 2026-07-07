@@ -14,6 +14,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
 mod config;
+mod gl_interop;
 mod gpu;
 mod log;
 mod ngx;
@@ -359,9 +360,13 @@ pub extern "C" fn ignis_readback_hdr_float(_out_pixels: *mut f32, _pixel_count: 
     false
 }
 
+/// Zero-copy GL display: draws the completed frame straight into Blender's bound GL framebuffer
+/// (shared VkImage -> GL memory object). Returns false when the interop is unavailable or not
+/// yet warm — the addon then falls back to the CPU readback path, so this can never blank the
+/// viewport. Must be called with Blender's GL context current (view_draw guarantees it).
 #[no_mangle]
-pub extern "C" fn ignis_draw_gl(_viewport_width: u32, _viewport_height: u32) -> bool {
-    false
+pub extern "C" fn ignis_draw_gl(viewport_width: u32, viewport_height: u32) -> bool {
+    renderer::draw_gl(viewport_width, viewport_height)
 }
 
 // ============================================================================

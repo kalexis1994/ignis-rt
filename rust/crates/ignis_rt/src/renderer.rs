@@ -602,6 +602,19 @@ pub struct Renderer {
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
 
+    // GL interop: double-buffered exportable R8G8B8A8 images (OPAQUE_WIN32 NT handles) the
+    // offscreen is blitted into each frame; Blender's GL context imports + draws them
+    // zero-copy (gl_interop.rs). Raw vkAllocateMemory — gpu-allocator can't export.
+    shared_images: [vk::Image; 2],
+    shared_memory: [vk::DeviceMemory; 2],
+    shared_handles: [isize; 2],   // Win32 HANDLEs as integers (keeps the struct Send)
+    shared_alloc_sizes: [u64; 2],
+    shared_init: [bool; 2],   // first blit uses UNDEFINED as the old layout
+    shared_write_idx: u32,
+    shared_ready: bool,
+    shared_blitted: bool,     // at least one frame landed in a shared buffer
+    gl_generation: u64,       // identifies this renderer instance to gl_interop
+
     // Core (destroyed last).
     allocator: Option<Allocator>,
     command_pool: vk::CommandPool,
@@ -921,6 +934,19 @@ pub fn update_texture_descriptors() {
 pub fn render_frame() {
     if let Some(r) = RENDERER.lock().unwrap().as_mut() {
         r.0.render();
+    }
+}
+
+// Monotonic id per Renderer instance — tells gl_interop when its imports went stale (resize
+// recreates the renderer and thus the shared images).
+static GL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Zero-copy GL display path: draw the last completed frame into Blender's currently bound GL
+/// framebuffer. Returns false whenever the fallback readback should be used instead.
+pub fn draw_gl(viewport_w: u32, viewport_h: u32) -> bool {
+    match RENDERER.lock().unwrap().as_mut() {
+        Some(r) => r.0.draw_gl_impl(viewport_w, viewport_h),
+        None => false,
     }
 }
 
@@ -2188,6 +2214,15 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         readback_ptr,
         cmd,
         fence,
+        shared_images: [vk::Image::null(); 2],
+        shared_memory: [vk::DeviceMemory::null(); 2],
+        shared_handles: [0; 2],
+        shared_alloc_sizes: [0; 2],
+        shared_init: [false; 2],
+        shared_write_idx: 0,
+        shared_ready: false,
+        shared_blitted: false,
+        gl_generation: GL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         allocator: Some(allocator),
         command_pool,
         device,
@@ -3860,6 +3895,72 @@ impl Renderer {
                 &[region],
             );
 
+            // GL interop: also blit the display image into this frame's shared buffer (RGBA32F ->
+            // RGBA8 conversion happens in the blit). rb_img is already TRANSFER_SRC here.
+            if self.shared_ready {
+                let wi = self.shared_write_idx as usize;
+                let old_layout = if self.shared_init[wi] {
+                    vk::ImageLayout::GENERAL
+                } else {
+                    vk::ImageLayout::UNDEFINED
+                };
+                let to_dst = vk::ImageMemoryBarrier::default()
+                    .old_layout(old_layout)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(self.shared_images[wi])
+                    .subresource_range(range);
+                d.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[], &[], &[to_dst],
+                );
+                let layers = vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1);
+                let full = [
+                    vk::Offset3D { x: 0, y: 0, z: 0 },
+                    vk::Offset3D { x: self.width as i32, y: self.height as i32, z: 1 },
+                ];
+                let blit = vk::ImageBlit::default()
+                    .src_subresource(layers)
+                    .dst_subresource(layers)
+                    .src_offsets(full)
+                    .dst_offsets(full);
+                d.cmd_blit_image(
+                    self.cmd,
+                    rb_img,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    self.shared_images[wi],
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[blit],
+                    vk::Filter::NEAREST,
+                );
+                // GENERAL for the cross-API (GL) read.
+                let to_general = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::MEMORY_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(self.shared_images[wi])
+                    .subresource_range(range);
+                d.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[], &[], &[to_general],
+                );
+                self.shared_init[wi] = true;
+            }
+
             let _ = d.end_command_buffer(self.cmd);
             let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd));
             // GPU frame time: render() submits then blocks on the fence, so wall-clock around the
@@ -3867,6 +3968,12 @@ impl Renderer {
             let t0 = std::time::Instant::now();
             let _ = d.queue_submit(self.queue, &[submit], self.fence);
             let _ = d.wait_for_fences(&[self.fence], true, u64::MAX);
+            // GL interop: this frame's shared buffer is complete — swap so draw_gl reads it
+            // (write_idx ^ 1) while the next frame blits into the other one (tear-free).
+            if self.shared_ready {
+                self.shared_write_idx ^= 1;
+                self.shared_blitted = true;
+            }
             let ms = t0.elapsed().as_secs_f32() * 1000.0;
             self.ft_ema = if self.ft_ema <= 0.0 { ms } else { self.ft_ema * 0.9 + ms * 0.1 };
             self.ft_count = self.ft_count.wrapping_add(1);
@@ -3889,6 +3996,103 @@ impl Renderer {
         let avail = (self.width as usize) * (self.height as usize) * 4;
         let n = (pixel_count * 4).min(avail);
         unsafe { std::ptr::copy_nonoverlapping(self.readback_ptr as *const f32, out, n) };
+    }
+
+    // ── GL interop (zero-copy display) ──────────────────────────────────────────────────
+
+    /// Create the two exportable R8G8B8A8 shared images + NT handles (port of the C++
+    /// Interop::CreateSharedImageSlot). Raw vkAllocateMemory: export needs
+    /// VkExportMemoryAllocateInfo, which gpu-allocator can't attach.
+    fn create_shared_images(&mut self) -> Result<(), String> {
+        let ext_win32 = ash::khr::external_memory_win32::Device::new(&self.instance, &self.device);
+        let mem_props =
+            unsafe { self.instance.get_physical_device_memory_properties(self.physical_device) };
+        for i in 0..2 {
+            let mut ext_info = vk::ExternalMemoryImageCreateInfo::default()
+                .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32);
+            let img_ci = vk::ImageCreateInfo::default()
+                .push_next(&mut ext_info)
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .extent(vk::Extent3D { width: self.width, height: self.height, depth: 1 })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let img = unsafe { self.device.create_image(&img_ci, None) }
+                .map_err(|e| format!("shared image create: {e}"))?;
+            let req = unsafe { self.device.get_image_memory_requirements(img) };
+            let mut type_idx = u32::MAX;
+            for t in 0..mem_props.memory_type_count {
+                if (req.memory_type_bits & (1u32 << t)) != 0
+                    && mem_props.memory_types[t as usize]
+                        .property_flags
+                        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                {
+                    type_idx = t;
+                    break;
+                }
+            }
+            if type_idx == u32::MAX {
+                return Err("no DEVICE_LOCAL memory type for the shared image".into());
+            }
+            let mut export_info = vk::ExportMemoryAllocateInfo::default()
+                .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32);
+            let alloc_info = vk::MemoryAllocateInfo::default()
+                .push_next(&mut export_info)
+                .allocation_size(req.size)
+                .memory_type_index(type_idx);
+            let mem = unsafe { self.device.allocate_memory(&alloc_info, None) }
+                .map_err(|e| format!("shared memory alloc: {e}"))?;
+            unsafe { self.device.bind_image_memory(img, mem, 0) }
+                .map_err(|e| format!("shared bind: {e}"))?;
+            let handle_info = vk::MemoryGetWin32HandleInfoKHR::default()
+                .memory(mem)
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32);
+            let handle = unsafe { ext_win32.get_memory_win32_handle(&handle_info) }
+                .map_err(|e| format!("get_memory_win32_handle: {e}"))?;
+            self.shared_images[i] = img;
+            self.shared_memory[i] = mem;
+            self.shared_handles[i] = handle as isize;
+            self.shared_alloc_sizes[i] = req.size;
+        }
+        self.shared_ready = true;
+        log(&format!(
+            "gl-interop: shared images created {}x{} (RGBA8, double-buffered)",
+            self.width, self.height
+        ));
+        Ok(())
+    }
+
+    fn draw_gl_impl(&mut self, _viewport_w: u32, _viewport_h: u32) -> bool {
+        if !self.rt_supported || crate::gl_interop::is_disabled() {
+            return false;
+        }
+        if !self.shared_ready {
+            if let Err(e) = self.create_shared_images() {
+                log(&format!("gl-interop: {e} — permanent readback fallback"));
+                crate::gl_interop::disable();
+                return false;
+            }
+            // The blit into the shared buffers starts NEXT render; show this frame via readback.
+            return false;
+        }
+        let handles = [
+            self.shared_handles[0] as *mut std::ffi::c_void,
+            self.shared_handles[1] as *mut std::ffi::c_void,
+        ];
+        if !crate::gl_interop::ensure_ready(
+            handles, self.shared_alloc_sizes, self.width, self.height, self.gl_generation,
+        ) {
+            return false;
+        }
+        if !self.shared_blitted {
+            return false; // nothing landed in a shared buffer yet
+        }
+        crate::gl_interop::draw(self.shared_write_idx ^ 1) // the completed buffer
     }
 }
 
@@ -4328,6 +4532,18 @@ impl Drop for Renderer {
             device.destroy_image(self.offscreen_image, None);
             device.destroy_image(self.accum_image, None);
             device.destroy_buffer(self.readback_buffer, None);
+            // GL interop: release the GL imports (if a GL context is current) then the exported
+            // Vulkan images/memory and their NT handles.
+            crate::gl_interop::shutdown();
+            for i in 0..2 {
+                if self.shared_images[i] != vk::Image::null() {
+                    device.destroy_image(self.shared_images[i], None);
+                }
+                if self.shared_memory[i] != vk::DeviceMemory::null() {
+                    device.free_memory(self.shared_memory[i], None);
+                }
+                crate::gl_interop::close_handle(self.shared_handles[i]);
+            }
             if let Some(alloc) = &mut self.allocator {
                 for t in self.textures.drain(..) {
                     device.destroy_image_view(t.view, None);
