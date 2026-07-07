@@ -500,6 +500,108 @@ bool occluded(vec3 o, vec3 d, float tmax) {
 }
 
 // ============================================================================
+// Volumes — Cycles Principled Volume, P1: homogeneous analytic. Port of the C++
+// include/volume_march.glsl (coefficients are Cycles-exact, incl. the sqrt on
+// AbsorptionColor). Heterogeneous noise + OpenVDB grids come in later phases.
+// Material encoding (byte-identical to the C++): flags bit2=volume, bit3=volume-only,
+// bit4=hetero; density=sunSpecular, anisotropy=sunSpecularEXP, scatter colour=base
+// colour, nodeVmCode[2]=absorption.rgb+emissionStrength, [3]=emission.rgb+temperature,
+// [4].x=blackbody intensity.
+// ============================================================================
+
+// Henyey-Greenstein phase function (Cycles volume.h; eval == pdf, g clamped by caller).
+float henyeyGreensteinPhase(float cosTheta, float g) {
+    if (abs(g) < 1e-4) return 0.25 / PI;
+    float g2 = g * g;
+    float denom = 1.0 + g2 - 2.0 * g * cosTheta;
+    return (1.0 - g2) / (4.0 * PI * denom * sqrt(denom));
+}
+
+// Cycles Principled Volume coefficients. NOTE the sqrt on absorptionColor (svm closure):
+// sigma_a = (1-color) * (1-sqrt(absorptionColor)) * density.
+void computeVolumeCoefficients(vec3 scatterColor, vec3 absorptionColor, float density,
+                               out vec3 sigma_s, out vec3 sigma_a, out vec3 sigma_t) {
+    sigma_s = scatterColor * density;
+    sigma_a = max(vec3(1.0) - scatterColor, vec3(0.0))
+            * max(vec3(1.0) - sqrt(max(absorptionColor, vec3(0.0))), vec3(0.0))
+            * density;
+    sigma_t = sigma_s + sigma_a;
+}
+
+// Decode a volume material's coefficients straight from the material buffer (shared by the
+// shadow + guide paths, which don't run getSurface).
+void volumeCoeffsFor(uint matId, out vec3 sigma_s, out vec3 sigma_a, out vec3 sigma_t) {
+    // Direct member reads (no 2204-byte struct copy into registers).
+    vec3 aCol = vec3(uintBitsToFloat(mats[matId].nodeVmCode[2].x), uintBitsToFloat(mats[matId].nodeVmCode[2].y),
+                     uintBitsToFloat(mats[matId].nodeVmCode[2].z));
+    computeVolumeCoefficients(vec3(mats[matId].baseR, mats[matId].baseG, mats[matId].baseB), aCol,
+                              mats[matId].sunSpecular, sigma_s, sigma_a, sigma_t);
+}
+
+// Distance to the next boundary of the SAME instance (the volume's exit). Identity by the TLAS
+// custom index (== descs[] index), always available at every call site. NOTES: (a) the BLAS is
+// built with GeometryFlagsKHR::OPAQUE (renderer.rs), which auto-commits and skips candidates —
+// force NoOpaque so the candidate loop actually runs; (b) accept ANY face of the same instance
+// (not just back faces): from just inside the entry, the next same-instance boundary IS the exit
+// for a closed mesh, and this stays correct under mirrored/negative-scale transforms where the
+// winding (and so front/back) is flipped.
+float traceVolumeExit(vec3 entryPos, vec3 dir, uint volumeId) {
+    float exitDist = 10.0;
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, tlas, gl_RayFlagsNoOpaqueEXT, 0xFFu, entryPos, 0.0015, dir, 1e5);
+    while (rayQueryProceedEXT(rq)) {
+        if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+            uint hid = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false));
+            if (hid == volumeId) {
+                rayQueryConfirmIntersectionEXT(rq);
+            }
+        }
+    }
+    if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+        exitDist = rayQueryGetIntersectionTEXT(rq, true);
+    }
+    return max(exitDist, 0.005);
+}
+
+// Shadow transmittance: like occluded() but volume-aware — a volume boundary attenuates by
+// Beer-Lambert over its inside segment instead of hard-blocking, and see-through glass still
+// passes. Returns vec3(0) when an opaque surface blocks the light. Closest-hit per iteration
+// (no TerminateOnFirstHit) so the t0 marching is ordered.
+vec3 shadowT(vec3 o, vec3 d, float tmax) {
+    vec3 T = vec3(1.0);
+    float t0 = 0.001;
+    for (int i = 0; i < 8; i++) {
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, o, t0, d, tmax);
+        while (rayQueryProceedEXT(rq)) {}
+        if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT)
+            return T; // reached the light
+        uint id    = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
+        uint prim  = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+        float hitT = rayQueryGetIntersectionTEXT(rq, true);
+        GeomDesc gd = descs[id];
+        uint matId = 0u; uint mFlags = 0u;
+        if (gd.mat != 0ul) { matId = MatIds(gd.mat).m[prim]; mFlags = mats[matId].flags; }
+        if ((mFlags & 4u) != 0u) {
+            // Volume boundary: the front face attenuates over the inside segment (clipped to the
+            // light distance — the light may sit inside the volume); the back face just passes.
+            if (rayQueryGetIntersectionFrontFaceEXT(rq, true)) {
+                float seg = min(traceVolumeExit(o + d * (hitT + 5e-4), d, id), tmax - hitT);
+                vec3 ss, sa, st;
+                volumeCoeffsFor(matId, ss, sa, st);
+                T *= exp(-st * max(seg, 0.0));
+                if (max(T.r, max(T.g, T.b)) < 1e-3) return vec3(0.0);
+            }
+            t0 = hitT + 0.001;
+            continue;
+        }
+        if (!matSeeThrough(id, prim)) return vec3(0.0); // opaque blocker
+        t0 = hitT + 0.001; // skip this glass layer, keep going
+    }
+    return T;
+}
+
+// ============================================================================
 // Node VM (Stage 1: textures + Mix/Math/ColorRamp; procedurals come in Stage 2).
 // Ported from ignis-rt's node_vm.glsl — interprets the bytecode our addon generates.
 // ============================================================================
@@ -553,8 +655,8 @@ float perlinNoise3D(vec3 p) {
 // Cycles snoise_3d: signed Perlin scaled to ~[-1,1] by noise_scale3 = 0.9820 (svm/noise.h:679).
 // fBM and the Noise/bump opcodes must route through this, not raw perlinNoise3D, to match amplitude.
 float snoise3D(vec3 p) { return 0.9820 * perlinNoise3D(p); }
-// Normalized fBM (Cycles fractal_noise.h noise_fbm), remapped to ~[0,1].
-float fbm3D(vec3 p, float detail, float roughness, float lacunarity) {
+// fBM (Cycles fractal_noise.h noise_fbm) with the Normalize toggle; normalized output ~[0,1].
+float noise_fbm_3d(vec3 p, float detail, float roughness, float lacunarity, bool normalize) {
     float dc = clamp(detail, 0.0, 15.0);            // Cycles clamps Detail to [0,15] (noisetex.h:259)
     float rough = max(roughness, 0.0);              // and Roughness to >= 0 (noisetex.h:260)
     float fscale = 1.0, amp = 1.0, maxamp = 0.0, sum = 0.0;
@@ -566,9 +668,14 @@ float fbm3D(vec3 p, float detail, float roughness, float lacunarity) {
     float rmd = dc - floor(dc);
     if (rmd != 0.0) {
         float sum2 = sum + snoise3D(fscale * p) * amp;
-        return mix(0.5 * sum / maxamp + 0.5, 0.5 * sum2 / (maxamp + amp) + 0.5, rmd);
+        return normalize ? mix(0.5 * sum / maxamp + 0.5, 0.5 * sum2 / (maxamp + amp) + 0.5, rmd)
+                         : mix(sum, sum2, rmd);
     }
-    return 0.5 * sum / maxamp + 0.5;
+    return normalize ? (0.5 * sum / maxamp + 0.5) : sum;
+}
+// Normalized fBM (the Noise Texture opcode's flavour).
+float fbm3D(vec3 p, float detail, float roughness, float lacunarity) {
+    return noise_fbm_3d(p, detail, roughness, lacunarity, true);
 }
 float gradientLinear(vec3 p)    { return clamp(p.x, 0.0, 1.0); }
 float gradientQuadratic(vec3 p) { float r = max(p.x, 0.0); return clamp(r * r, 0.0, 1.0); }
@@ -611,6 +718,179 @@ float magicTexture(vec3 p, float distortion) {
     float z = sin((p.x + p.y - p.z) * 5.0);
     if (distortion > 0.0) { x = sin(x*distortion); y = sin(y*distortion); z = sin(z*distortion); }
     return (x + y + z) / 3.0 * 0.5 + 0.5;
+}
+
+// ── Extended noise (the volume smoke chain + future Noise-node fractal types) ──
+// Jenkins hash_uint4 (Cycles util/hash.h): seed 0xdeadbeef+(4<<2)+13 = 0xdeadbf0c, mix()+final().
+// NOTE: the C++ old noise.glsl used the wrong seed family here; this one matches Cycles.
+uint hash4(uvec4 k) {
+    uint a = 0xdeadbf0cu + k.x, b = 0xdeadbf0cu + k.y, c = 0xdeadbf0cu + k.z;
+    // mix(a,b,c)
+    a -= c; a ^= (c << 4u)  | (c >> 28u); c += b;
+    b -= a; b ^= (a << 6u)  | (a >> 26u); a += c;
+    c -= b; c ^= (b << 8u)  | (b >> 24u); b += a;
+    a -= c; a ^= (c << 16u) | (c >> 16u); c += b;
+    b -= a; b ^= (a << 19u) | (a >> 13u); a += c;
+    c -= b; c ^= (b << 4u)  | (b >> 28u); b += a;
+    a += k.w;
+    // final(a,b,c)
+    c ^= b; c -= (b << 14u) | (b >> 18u);
+    a ^= c; a -= (c << 11u) | (c >> 21u);
+    b ^= a; b -= (a << 25u) | (a >> 7u);
+    c ^= b; c -= (b << 16u) | (b >> 16u);
+    a ^= c; a -= (c << 4u)  | (c >> 28u);
+    b ^= a; b -= (a << 14u) | (a >> 18u);
+    c ^= b; c -= (b << 24u) | (b >> 8u);
+    return c;
+}
+// Cycles grad4 (noise.h).
+float gradientDot4(uint hash, float x, float y, float z, float w) {
+    uint h = hash & 31u;
+    float u = h < 24u ? x : y;
+    float v = h < 16u ? y : z;
+    float s = h < 8u  ? z : w;
+    return ((h & 1u) != 0u ? -u : u) + ((h & 2u) != 0u ? -v : v) + ((h & 4u) != 0u ? -s : s);
+}
+// 4D Perlin — quintic fade, quadrilinear (Cycles perlin_4d).
+float perlinNoise4D(vec4 p) {
+    vec4 fl = floor(p);
+    ivec4 i = ivec4(fl);
+    vec4 f = p - fl;
+    vec4 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    float g0000 = gradientDot4(hash4(uvec4(i)),                  f.x,     f.y,     f.z,     f.w);
+    float g1000 = gradientDot4(hash4(uvec4(i + ivec4(1,0,0,0))), f.x-1.0, f.y,     f.z,     f.w);
+    float g0100 = gradientDot4(hash4(uvec4(i + ivec4(0,1,0,0))), f.x,     f.y-1.0, f.z,     f.w);
+    float g1100 = gradientDot4(hash4(uvec4(i + ivec4(1,1,0,0))), f.x-1.0, f.y-1.0, f.z,     f.w);
+    float g0010 = gradientDot4(hash4(uvec4(i + ivec4(0,0,1,0))), f.x,     f.y,     f.z-1.0, f.w);
+    float g1010 = gradientDot4(hash4(uvec4(i + ivec4(1,0,1,0))), f.x-1.0, f.y,     f.z-1.0, f.w);
+    float g0110 = gradientDot4(hash4(uvec4(i + ivec4(0,1,1,0))), f.x,     f.y-1.0, f.z-1.0, f.w);
+    float g1110 = gradientDot4(hash4(uvec4(i + ivec4(1,1,1,0))), f.x-1.0, f.y-1.0, f.z-1.0, f.w);
+    float g0001 = gradientDot4(hash4(uvec4(i + ivec4(0,0,0,1))), f.x,     f.y,     f.z,     f.w-1.0);
+    float g1001 = gradientDot4(hash4(uvec4(i + ivec4(1,0,0,1))), f.x-1.0, f.y,     f.z,     f.w-1.0);
+    float g0101 = gradientDot4(hash4(uvec4(i + ivec4(0,1,0,1))), f.x,     f.y-1.0, f.z,     f.w-1.0);
+    float g1101 = gradientDot4(hash4(uvec4(i + ivec4(1,1,0,1))), f.x-1.0, f.y-1.0, f.z,     f.w-1.0);
+    float g0011 = gradientDot4(hash4(uvec4(i + ivec4(0,0,1,1))), f.x,     f.y,     f.z-1.0, f.w-1.0);
+    float g1011 = gradientDot4(hash4(uvec4(i + ivec4(1,0,1,1))), f.x-1.0, f.y,     f.z-1.0, f.w-1.0);
+    float g0111 = gradientDot4(hash4(uvec4(i + ivec4(0,1,1,1))), f.x,     f.y-1.0, f.z-1.0, f.w-1.0);
+    float g1111 = gradientDot4(hash4(uvec4(i + ivec4(1,1,1,1))), f.x-1.0, f.y-1.0, f.z-1.0, f.w-1.0);
+    float x00 = mix(g0000, g1000, u.x); float x10 = mix(g0100, g1100, u.x);
+    float x01 = mix(g0010, g1010, u.x); float x11 = mix(g0110, g1110, u.x);
+    float x02 = mix(g0001, g1001, u.x); float x12 = mix(g0101, g1101, u.x);
+    float x03 = mix(g0011, g1011, u.x); float x13 = mix(g0111, g1111, u.x);
+    float y0 = mix(x00, x10, u.y); float y1 = mix(x01, x11, u.y);
+    float y2 = mix(x02, x12, u.y); float y3 = mix(x03, x13, u.y);
+    return mix(mix(y0, y1, u.z), mix(y2, y3, u.z), u.w);
+}
+// Cycles snoise_4d: noise_scale4 = 0.8344 (noise.h:686).
+float snoise4D(vec4 p) { return 0.8344 * perlinNoise4D(p); }
+float noise_fbm_4d(vec4 p, float detail, float roughness, float lacunarity, bool normalize) {
+    float dc = clamp(detail, 0.0, 15.0);
+    float rough = max(roughness, 0.0);
+    float fscale = 1.0, amp = 1.0, maxamp = 0.0, sum = 0.0;
+    int nOctaves = int(dc);
+    for (int i = 0; i <= nOctaves; i++) {
+        sum += snoise4D(fscale * p) * amp;
+        maxamp += amp; amp *= rough; fscale *= lacunarity;
+    }
+    float rmd = dc - floor(dc);
+    if (rmd != 0.0) {
+        float sum2 = sum + snoise4D(fscale * p) * amp;
+        return normalize ? mix(0.5 * sum / maxamp + 0.5, 0.5 * sum2 / (maxamp + amp) + 0.5, rmd)
+                         : mix(sum, sum2, rmd);
+    }
+    return normalize ? (0.5 * sum / maxamp + 0.5) : sum;
+}
+// Musgrave fractal variants (Cycles fractal_noise.h; in 4.1+ merged into the Noise node's Type).
+float noise_multi_fractal_3d(vec3 p, float detail, float roughness, float lacunarity) {
+    float value = 1.0, pwr = 1.0;
+    int nOctaves = int(clamp(detail, 0.0, 15.0));
+    for (int i = 0; i <= nOctaves; i++) {
+        value *= (pwr * snoise3D(p) + 1.0);
+        pwr *= roughness; p *= lacunarity;
+    }
+    float rmd = clamp(detail, 0.0, 15.0) - floor(clamp(detail, 0.0, 15.0));
+    if (rmd != 0.0) value *= (rmd * pwr * snoise3D(p) + 1.0);
+    return value;
+}
+float noise_hetero_terrain_3d(vec3 p, float detail, float roughness, float lacunarity, float offset) {
+    float pwr = roughness;
+    float value = offset + snoise3D(p);
+    p *= lacunarity;
+    int nOctaves = int(clamp(detail, 0.0, 15.0));
+    for (int i = 1; i <= nOctaves; i++) {
+        value += (snoise3D(p) + offset) * pwr * value;
+        pwr *= roughness; p *= lacunarity;
+    }
+    float rmd = clamp(detail, 0.0, 15.0) - floor(clamp(detail, 0.0, 15.0));
+    if (rmd != 0.0) value += rmd * (snoise3D(p) + offset) * pwr * value;
+    return value;
+}
+float noise_hybrid_multi_fractal_3d(vec3 p, float detail, float roughness, float lacunarity, float offset, float gain) {
+    float pwr = 1.0, value = 0.0, weight = 1.0;
+    int nOctaves = int(clamp(detail, 0.0, 15.0));
+    for (int i = 0; (weight > 0.001) && (i <= nOctaves); i++) {
+        weight = min(weight, 1.0);
+        float signal_ = (snoise3D(p) + offset) * pwr;
+        pwr *= roughness;
+        value += weight * signal_;
+        weight *= gain * signal_;
+        p *= lacunarity;
+    }
+    float rmd = clamp(detail, 0.0, 15.0) - floor(clamp(detail, 0.0, 15.0));
+    if ((rmd != 0.0) && (weight > 0.001)) {
+        weight = min(weight, 1.0);
+        value += rmd * weight * (snoise3D(p) + offset) * pwr;
+    }
+    return value;
+}
+float noise_ridged_multi_fractal_3d(vec3 p, float detail, float roughness, float lacunarity, float offset, float gain) {
+    float pwr = roughness;
+    float signal_ = offset - abs(snoise3D(p));
+    signal_ *= signal_;
+    float value = signal_;
+    int nOctaves = int(clamp(detail, 0.0, 15.0));
+    for (int i = 1; i <= nOctaves; i++) {
+        p *= lacunarity;
+        float weight = clamp(signal_ * gain, 0.0, 1.0);
+        signal_ = offset - abs(snoise3D(p));
+        signal_ *= signal_;
+        signal_ *= weight;
+        value += signal_ * pwr;
+        pwr *= roughness;
+    }
+    return value;
+}
+// Dispatch by NodeNoiseType (0=Multifractal 1=fBM 2=Hybrid 3=Ridged 4=HeteroTerrain).
+float noiseSelect3D(vec3 p, float detail, float roughness, float lacunarity,
+                    float offset, float gain, int noiseType, bool normalize) {
+    if (noiseType == 0) return noise_multi_fractal_3d(p, detail, roughness, lacunarity);
+    if (noiseType == 2) return noise_hybrid_multi_fractal_3d(p, detail, roughness, lacunarity, offset, gain);
+    if (noiseType == 3) return noise_ridged_multi_fractal_3d(p, detail, roughness, lacunarity, offset, gain);
+    if (noiseType == 4) return noise_hetero_terrain_3d(p, detail, roughness, lacunarity, offset);
+    return noise_fbm_3d(p, detail, roughness, lacunarity, normalize);
+}
+// Gradient types missing from the base set (Cycles gradient.h) + the dispatch.
+float gradientEasing(vec3 p) { float r = clamp(p.x, 0.0, 1.0); float t = r * r; return 3.0 * t - 2.0 * t * r; }
+float gradientDiagonal(vec3 p) { return clamp((p.x + p.y) * 0.5, 0.0, 1.0); }
+float gradientQuadraticSphere(vec3 p) { float r = max(1.0 - length(p), 0.0); return r * r; }
+float gradientSelect(vec3 p, int gtype) {
+    if (gtype == 1) return gradientQuadratic(p);
+    if (gtype == 2) return gradientEasing(p);
+    if (gtype == 3) return gradientDiagonal(p);
+    if (gtype == 4) return gradientSpherical(p);
+    if (gtype == 5) return gradientQuadraticSphere(p);
+    if (gtype == 6) return gradientRadial(p);
+    return gradientLinear(p);
+}
+// 16-entry uniform colour-ramp LUT (the addon bakes the volume chain's ColorRamp into this).
+float sampleColorRamp16(float t, vec4 r0, vec4 r1, vec4 r2, vec4 r3) {
+    t = clamp(t, 0.0, 1.0);
+    float ramp[16] = float[16](r0.x, r0.y, r0.z, r0.w, r1.x, r1.y, r1.z, r1.w,
+                               r2.x, r2.y, r2.z, r2.w, r3.x, r3.y, r3.z, r3.w);
+    float idx = t * 15.0;
+    int i0 = int(floor(idx));
+    int i1 = min(i0 + 1, 15);
+    return mix(ramp[i0], ramp[i1], idx - float(i0));
 }
 vec3 brickTexture(vec3 p, float scale, float mortarSize, vec3 color1, vec3 color2, vec3 mortarColor) {
     vec2 uvB = p.xy * scale;
@@ -1182,6 +1462,196 @@ EmissiveSample sampleEmissiveTriangle(uint triCount, float r, vec2 baryRnd) {
     return s;
 }
 
+// Direct light arriving at a point INSIDE a volume, HG phase-weighted and shadow-tested:
+// sun + scene lights (centre-sampled) + one emissive-triangle NEE sample + isotropic sky.
+// Shared by the homogeneous and heterogeneous volume paths (interior fog is usually lamp-lit).
+vec3 volumeDirectAt(vec3 samplePos, vec3 rd, float anisotropy, inout uint rng) {
+    vec3 L_in = vec3(0.0);
+    // Sun.
+    if (pc.sunDir.w > 0.0) {
+        vec3 sDir = normalize(pc.sunDir.xyz);
+        vec3 sVis = shadowT(samplePos, sDir, 10000.0);
+        if (sVis != vec3(0.0)) {
+            L_in += pc.sunCol.rgb * min(pc.sunDir.w, 4.0)
+                  * henyeyGreensteinPhase(dot(rd, sDir), anisotropy) * sVis;
+        }
+    }
+    // Scene lights (point/spot/area sampled at centre — P1 approximation).
+    for (uint vli = 0u; vli < pc.numLights; vli++) {
+        Light VL = lights[vli];
+        vec3 toL = VL.posRange.xyz - samplePos;
+        float ld = length(toL);
+        if (VL.posRange.w > 0.0 && ld > VL.posRange.w) continue;
+        vec3 lDir = toL / max(ld, 1e-4);
+        float spotAtten = 1.0;
+        bool vIsSpot = (VL.posRange.w < 0.0) && (VL.tanSizeY.w < 0.0);
+        if (vIsSpot) {
+            float tSpot = clamp((dot(-lDir, VL.dirSizeX.xyz) - VL.dirSizeX.w) * abs(VL.tanSizeY.w), 0.0, 1.0);
+            spotAtten = tSpot * tSpot * (3.0 - 2.0 * tSpot);
+            if (spotAtten <= 0.0) continue;
+        }
+        vec3 lVis = shadowT(samplePos, lDir, ld - 0.01);
+        if (lVis == vec3(0.0)) continue;
+        L_in += VL.colInt.rgb * VL.colInt.w * spotAtten
+              * henyeyGreensteinPhase(dot(rd, lDir), anisotropy) * lVis / (ld * ld + 1e-3);
+    }
+    // Emissive triangles (mesh lamps), one NEE sample.
+    if (pc.emissiveCount > 0u) {
+        EmissiveSample ves = sampleEmissiveTriangle(pc.emissiveCount, rnd(rng), rand2(rng));
+        if (ves.pdf > 0.0) {
+            vec3 toE = ves.position - samplePos;
+            float eD = length(toE);
+            vec3 eDir = toE / max(eD, 1e-4);
+            float eCos = dot(-eDir, ves.normal);
+            if (eCos > 0.0 && eD > 0.01) {
+                vec3 eVis = shadowT(samplePos, eDir, eD - 0.01);
+                if (eVis != vec3(0.0)) {
+                    L_in += ves.emission * eCos * henyeyGreensteinPhase(dot(rd, eDir), anisotropy)
+                          * eVis / ((eD * eD) * max(ves.pdf, 1e-6));
+                }
+            }
+        }
+    }
+    L_in += sky(rd) * 0.25 / PI; // isotropic sky ambient (C++ approximation)
+    return L_in;
+}
+
+// Heterogeneous volume: fixed-step march with the exported noise chain driving the scatter
+// colour (or emission). Port of the C++ marchVolumeHeterogeneous, but on the Cycles-exact Rust
+// noise base (fixed hash seed + snoise scales) and with the lighting evaluated ONCE at a
+// weighted-reservoir-picked scatter point (transmittance*sigma_s-proportional) using the full
+// shadowed light set — instead of the C++'s per-step unshadowed sun + 1 random light (leaky).
+void marchVolumeHetero(vec3 entryPos, vec3 rd, float marchDist, mat4x3 w2o, uint matId,
+                       vec3 scatterColor, vec3 absorbCol, float density, float anisotropy,
+                       vec3 emColor, float emStrength, float temperature, float blackbody,
+                       inout uint rng, inout vec3 L, inout vec3 tp) {
+    // Decode the noise-chain descriptor (byte-identical to the C++ layout).
+    float noiseScale  = uintBitsToFloat(mats[matId].nodeVmPad0);
+    float noiseDetail = uintBitsToFloat(mats[matId].nodeVmPad1);
+    float noiseBright = uintBitsToFloat(mats[matId].nodeVmPad2);
+    float noiseRough  = uintBitsToFloat(mats[matId].nodeVmCode[0].x);
+    float noiseLac    = uintBitsToFloat(mats[matId].nodeVmCode[0].y);
+    float noiseContr  = uintBitsToFloat(mats[matId].nodeVmCode[0].z);
+    uint  noiseDims   = mats[matId].nodeVmCode[0].w;
+    vec3  mapOffset   = vec3(uintBitsToFloat(mats[matId].nodeVmCode[1].x),
+                             uintBitsToFloat(mats[matId].nodeVmCode[1].y),
+                             uintBitsToFloat(mats[matId].nodeVmCode[1].z));
+    float noiseW      = uintBitsToFloat(mats[matId].nodeVmCode[1].w);
+    uint  typeNorm    = mats[matId].nodeVmCode[4].y;
+    int   noiseType   = int(typeNorm & 0xFFFFu);
+    bool  noiseNorm   = ((typeNorm >> 16u) & 0xFFFFu) != 0u;
+    float noiseOffset = uintBitsToFloat(mats[matId].nodeVmCode[4].z);
+    float noiseGain   = uintBitsToFloat(mats[matId].nodeVmCode[4].w);
+    vec3  bboxMin     = vec3(uintBitsToFloat(mats[matId].nodeVmCode[5].x),
+                             uintBitsToFloat(mats[matId].nodeVmCode[5].y),
+                             uintBitsToFloat(mats[matId].nodeVmCode[5].z));
+    vec3  bboxRange   = max(vec3(uintBitsToFloat(mats[matId].nodeVmCode[6].x),
+                                 uintBitsToFloat(mats[matId].nodeVmCode[6].y),
+                                 uintBitsToFloat(mats[matId].nodeVmCode[6].z)) - bboxMin, vec3(1e-4));
+    vec4  mapRow0     = vec4(uintBitsToFloat(mats[matId].nodeVmCode[7].x), uintBitsToFloat(mats[matId].nodeVmCode[7].y),
+                             uintBitsToFloat(mats[matId].nodeVmCode[7].z), uintBitsToFloat(mats[matId].nodeVmCode[7].w));
+    vec4  mapRow1     = vec4(uintBitsToFloat(mats[matId].nodeVmCode[8].x), uintBitsToFloat(mats[matId].nodeVmCode[8].y),
+                             uintBitsToFloat(mats[matId].nodeVmCode[8].z), uintBitsToFloat(mats[matId].nodeVmCode[8].w));
+    vec4  mapRow2     = vec4(uintBitsToFloat(mats[matId].nodeVmCode[9].x), uintBitsToFloat(mats[matId].nodeVmCode[9].y),
+                             uintBitsToFloat(mats[matId].nodeVmCode[9].z), uintBitsToFloat(mats[matId].nodeVmCode[9].w));
+    float distortion  = uintBitsToFloat(mats[matId].nodeVmCode[10].x);
+    int   gradType    = int(mats[matId].nodeVmCode[10].y);
+    float mixFactor   = uintBitsToFloat(mats[matId].nodeVmCode[10].z);
+    uint  volFlags2   = mats[matId].nodeVmCode[10].w;
+    bool useObjCoords = (volFlags2 & 1u)  != 0u;
+    bool hasFullMtx   = (volFlags2 & 2u)  != 0u;
+    bool hasGradient  = (volFlags2 & 4u)  != 0u;
+    bool hasMix       = (volFlags2 & 8u)  != 0u;
+    bool hasRamp      = (volFlags2 & 16u) != 0u;
+    bool hasDistort   = (volFlags2 & 32u) != 0u;
+    uint chainTarget  = (volFlags2 >> 8u) & 0xFu;
+    vec4 rampLut0 = vec4(0.0), rampLut1 = vec4(0.0), rampLut2 = vec4(0.0), rampLut3 = vec4(0.0);
+    if (hasRamp) {
+        rampLut0 = vec4(uintBitsToFloat(mats[matId].nodeVmCode[11].x), uintBitsToFloat(mats[matId].nodeVmCode[11].y),
+                        uintBitsToFloat(mats[matId].nodeVmCode[11].z), uintBitsToFloat(mats[matId].nodeVmCode[11].w));
+        rampLut1 = vec4(uintBitsToFloat(mats[matId].nodeVmCode[12].x), uintBitsToFloat(mats[matId].nodeVmCode[12].y),
+                        uintBitsToFloat(mats[matId].nodeVmCode[12].z), uintBitsToFloat(mats[matId].nodeVmCode[12].w));
+        rampLut2 = vec4(uintBitsToFloat(mats[matId].nodeVmCode[13].x), uintBitsToFloat(mats[matId].nodeVmCode[13].y),
+                        uintBitsToFloat(mats[matId].nodeVmCode[13].z), uintBitsToFloat(mats[matId].nodeVmCode[13].w));
+        rampLut3 = vec4(uintBitsToFloat(mats[matId].nodeVmCode[14].x), uintBitsToFloat(mats[matId].nodeVmCode[14].y),
+                        uintBitsToFloat(mats[matId].nodeVmCode[14].z), uintBitsToFloat(mats[matId].nodeVmCode[14].w));
+    }
+
+    const int MAX_STEPS = 32;
+    float stepSize = max(marchDist / float(MAX_STEPS), 0.02);
+    int numSteps = min(int(marchDist / stepSize), MAX_STEPS);
+    vec3 volT = vec3(1.0);
+    vec3 Wsum = vec3(0.0);       // Σ T_i·sigma_s_i·dt — the total single-scatter weight
+    float wRunning = 0.0;        // scalar running total for the reservoir pick
+    vec3 pickPos = entryPos; bool havePick = false;
+    vec3 volEmission = vec3(0.0);
+
+    for (int s = 0; s < numSteps; s++) {
+        float t = (float(s) + 0.5) * stepSize;
+        vec3 samplePos = entryPos + rd * t;
+
+        float localEmStr = emStrength;
+        vec3 localScatter = scatterColor;
+        if (noiseScale > 0.0) {
+            vec3 objPos = w2o * vec4(samplePos, 1.0);
+            vec3 baseCoord = useObjCoords ? objPos : (objPos - bboxMin) / bboxRange;
+            vec3 mapped = hasFullMtx
+                ? vec3(dot(mapRow0.xyz, baseCoord) + mapRow0.w,
+                       dot(mapRow1.xyz, baseCoord) + mapRow1.w,
+                       dot(mapRow2.xyz, baseCoord) + mapRow2.w)
+                : baseCoord + mapOffset;
+            float n;
+            if (noiseDims == 4u) {
+                vec4 np4 = vec4(mapped, noiseW) * noiseScale;
+                if (hasDistort && distortion != 0.0) {
+                    np4 += vec4(perlinNoise4D(np4 + vec4(0,0,0,200)), perlinNoise4D(np4 + vec4(0,0,0,100)),
+                                perlinNoise4D(np4), perlinNoise4D(np4 + vec4(0,0,0,150))) * distortion;
+                }
+                n = noise_fbm_4d(np4, noiseDetail, noiseRough, noiseLac, noiseNorm);
+            } else {
+                vec3 np = mapped * noiseScale;
+                if (hasDistort && distortion != 0.0) {
+                    np += vec3(perlinNoise3D(np + vec3(13.5)), perlinNoise3D(np),
+                               perlinNoise3D(np - vec3(13.5))) * distortion;
+                }
+                n = noiseSelect3D(np, noiseDetail, noiseRough, noiseLac, noiseOffset, noiseGain, noiseType, noiseNorm);
+            }
+            n = max((1.0 + noiseContr) * n + (noiseBright - 0.5 * noiseContr), 0.0); // BrightContrast
+            float chainValue = n;
+            if (hasMix && hasGradient)      chainValue = mix(n, gradientSelect(mapped, gradType), mixFactor);
+            else if (hasGradient)           chainValue = gradientSelect(mapped, gradType);
+            if (hasRamp)                    chainValue = sampleColorRamp16(chainValue, rampLut0, rampLut1, rampLut2, rampLut3);
+            if (chainTarget == 0u)          localScatter *= chainValue;
+            else if (chainTarget == 1u)     localEmStr = chainValue;
+        }
+
+        vec3 sigma_s, sigma_a, sigma_t;
+        computeVolumeCoefficients(localScatter, absorbCol, density, sigma_s, sigma_a, sigma_t);
+        if (max(sigma_t.r, max(sigma_t.g, sigma_t.b)) >= 1e-4) {
+            // Reservoir-pick the lighting sample point ∝ this step's scatter weight.
+            vec3 wi = volT * sigma_s * stepSize;
+            float ws = dot(wi, vec3(0.2126, 0.7152, 0.0722));
+            Wsum += wi;
+            wRunning += ws;
+            if (ws > 0.0 && rnd(rng) * wRunning < ws) { pickPos = samplePos; havePick = true; }
+            // Emission accumulates deterministically per step.
+            if (localEmStr > 0.0) volEmission += volT * emColor * localEmStr * stepSize;
+            if (blackbody > 0.0 && temperature > 0.0) {
+                float bbPower = blackbody * 5.67e-8 * temperature * temperature * temperature * temperature * 1e-12;
+                vec3 bbColor = vec3(1.0, clamp((temperature - 1000.0) / 5000.0, 0.0, 1.0),
+                                    clamp((temperature - 3000.0) / 7000.0, 0.0, 1.0));
+                volEmission += volT * bbColor * bbPower * stepSize;
+            }
+            volT *= exp(-sigma_t * stepSize);
+            if (max(volT.r, max(volT.g, volT.b)) < 0.001) break;
+        }
+    }
+
+    vec3 inscatter = havePick ? Wsum * volumeDirectAt(pickPos, rd, anisotropy, rng) : vec3(0.0);
+    L += tp * (inscatter + volEmission);
+    tp *= volT;
+}
+
 // Direct lighting (NEE): sun + scene lights, each shadow-tested, with full diffuse+GGX BRDF
 // so glossy/metal surfaces get specular highlights (glints) from the lights.
 vec3 directShade(vec3 hitPos, vec3 N, vec3 geoN, vec3 V, vec3 diffAlbedo, vec3 F0, float alpha, int bounce, inout uint rng) {
@@ -1195,9 +1665,12 @@ vec3 directShade(vec3 hitPos, vec3 N, vec3 geoN, vec3 V, vec3 diffAlbedo, vec3 F
     float sunSize = pc.camPos.w;
     if (sunSize > 1e-4) sunDir = sample_cone(sunDir, cos(sunSize), rand2(rng));
     float ndl = max(dot(N, sunDir), 0.0);
-    if (ndl > 0.0 && !occluded(o, sunDir, 10000.0)) {
-        vec3 Li = pc.sunCol.rgb * min(pc.sunDir.w, 4.0);
-        sum += brdf(N, V, sunDir, diffAlbedo, F0, alpha) * Li * ndl;
+    if (ndl > 0.0) {
+        vec3 sVis = shadowT(o, sunDir, 10000.0); // volume-aware: fog attenuates instead of hard-blocking
+        if (sVis != vec3(0.0)) {
+            vec3 Li = pc.sunCol.rgb * min(pc.sunDir.w, 4.0);
+            sum += brdf(N, V, sunDir, diffAlbedo, F0, alpha) * Li * ndl * sVis;
+        }
     }
     // Scene lights, all soft-shadowed by sampling a point on the light's surface (Cycles-style).
     // Type encoding from the addon (shared with C++): posRange.w < 0 = area OR spot, and the
@@ -1243,9 +1716,11 @@ vec3 directShade(vec3 hitPos, vec3 N, vec3 geoN, vec3 V, vec3 diffAlbedo, vec3 F
         if (L.posRange.w > 0.0 && dist > L.posRange.w) continue;
         vec3 Ldir = toL / max(dist, 1e-4);
         float nl = max(dot(N, Ldir), 0.0);
-        if (nl <= 0.0 || occluded(o, Ldir, dist - 0.01)) continue;
+        if (nl <= 0.0) continue;
+        vec3 lVis = shadowT(o, Ldir, dist - 0.01);
+        if (lVis == vec3(0.0)) continue;
         vec3 Li = L.colInt.rgb * L.colInt.w * spotAtten / (dist*dist + 1e-3);
-        sum += brdf(N, V, Ldir, diffAlbedo, F0, alpha) * Li * nl;
+        sum += brdf(N, V, Ldir, diffAlbedo, F0, alpha) * Li * nl * lVis;
     }
     // Emissive triangle NEE (area lights from geometry), power-importance-sampled with a power-
     // heuristic MIS against the BSDF. Without this, an emissive panel is only seen when a path ray
@@ -1259,12 +1734,15 @@ vec3 directShade(vec3 hitPos, vec3 N, vec3 geoN, vec3 V, vec3 diffAlbedo, vec3 F
             vec3 eDir = toE / max(eDist, 1e-4);
             float eNdotL = max(dot(N, eDir), 0.0);
             float eCos = dot(-eDir, es.normal); // emitter facing the shading point
-            if (eNdotL > 0.0 && eCos > 0.0 && eDist > 0.01 && !occluded(o, eDir, eDist - 0.01)) {
-                vec3 eRadiance = es.emission * eCos / (eDist * eDist);
-                // Light-only (no MIS weight): the forward BSDF-strategy emission is now skipped at
-                // bounce-reached emitters (see the emission gate above), so NEE carries the FULL
-                // emitter contribution. Keeping a MIS weight here would under-count it.
-                sum += brdf(N, V, eDir, diffAlbedo, F0, alpha) * eNdotL * eRadiance / max(es.pdf, 1e-6);
+            if (eNdotL > 0.0 && eCos > 0.0 && eDist > 0.01) {
+                vec3 eVis = shadowT(o, eDir, eDist - 0.01);
+                if (eVis != vec3(0.0)) {
+                    vec3 eRadiance = es.emission * eCos / (eDist * eDist);
+                    // Light-only (no MIS weight): the forward BSDF-strategy emission is now skipped at
+                    // bounce-reached emitters (see the emission gate above), so NEE carries the FULL
+                    // emitter contribution. Keeping a MIS weight here would under-count it.
+                    sum += brdf(N, V, eDir, diffAlbedo, F0, alpha) * eNdotL * eRadiance * eVis / max(es.pdf, 1e-6);
+                }
             }
         }
     }
@@ -1277,8 +1755,11 @@ vec3 directShade(vec3 hitPos, vec3 N, vec3 geoN, vec3 V, vec3 diffAlbedo, vec3 F
         EnvSample en = sampleEnvironment(rand2(rng));
         if (en.pdf > 0.0) {
             float eNdotL = max(dot(N, en.dir), 0.0);
-            if (eNdotL > 0.0 && !occluded(o, en.dir, 1e30)) {
-                sum += brdf(N, V, en.dir, diffAlbedo, F0, alpha) * eNdotL * en.radiance / en.pdf;
+            if (eNdotL > 0.0) {
+                vec3 eVis = shadowT(o, en.dir, 1e30);
+                if (eVis != vec3(0.0)) {
+                    sum += brdf(N, V, en.dir, diffAlbedo, F0, alpha) * eNdotL * en.radiance * eVis / en.pdf;
+                }
             }
         }
     }
@@ -1334,6 +1815,36 @@ void writeGuidePSR(uvec2 p, vec3 ro, vec3 rd,
         getSurface(id, prim, bc, o2w, rd, 0.0, N, albedo, roughness, metallic, emission, ior, transmission, frontFace, geoN, lightPathTransparent, transparentProb, surfUV, surfAlpha);
         vec3 hitPos = ro + rd * thit;
         pathDist += thit;
+
+        // Volume boundary (P1): thin fog unfolds straight through (the guide describes what's
+        // behind; the fog itself stays noisy colour for the denoiser). A DENSE volume records a
+        // fog guide at the mean free path instead — a stable, reprojectable depth — because the
+        // content behind it is invisible and a see-through guide would make RR reproject garbage.
+        // Everything here is analytic/deterministic (PSR must not jitter itself).
+        {
+            GeomDesc vgd = descs[id];
+            if (vgd.mat != 0ul) {
+                uint vMatId = MatIds(vgd.mat).m[prim];
+                if ((mats[vMatId].flags & 4u) != 0u) {
+                    if (frontFace && mats[vMatId].sunSpecular > 0.0) {
+                        float exitDist = traceVolumeExit(hitPos + rd * 5e-4, rd, id);
+                        vec3 ss, sa, st;
+                        volumeCoeffsFor(vMatId, ss, sa, st);
+                        float sT = dot(st, vec3(1.0 / 3.0));
+                        if (exp(-sT * exitDist) <= 0.5) {
+                            float mfp = min(1.0 / max(sT, 1e-4), exitDist);
+                            vec3 fogPos = pc.camPos.xyz + (pathDist + mfp) * primaryRd;
+                            writeGuide(p, fogPos, fogPos, -primaryRd, 1.0,
+                                       vec3(mats[vMatId].baseR, mats[vMatId].baseG, mats[vMatId].baseB),
+                                       vec3(0.0));
+                            return;
+                        }
+                    }
+                    ro = hitPos + rd * 0.001; // thin (or back face): straight through
+                    continue;
+                }
+            }
+        }
 
         bool smoothSurf = roughness < 0.05;
         // PSR follows not just perfect mirrors but moderately glossy metals (the lobe centre is the
@@ -1471,6 +1982,94 @@ bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng,
         vec2 surfUV;
         float surfAlpha;
         getSurface(id, prim, bc, o2w, c.rd, c.coneWidth, N, albedo, roughness, metallic, emission, ior, transmission, frontFace, geoN, lightPathTransparent, transparentProb, surfUV, surfAlpha);
+
+        // ── Volume materials (Cycles Principled Volume / Volume Scatter — P1: homogeneous) ──
+        // Replaces the surface shading entirely (short-circuits the transparent cascade, SHARC and
+        // the BSDF tail). The crossing does NOT consume a real bounce (glassBounces-guarded skip,
+        // like glass passthrough). Deep bounces (c.b>=2) pass through unmarched, matching the C++.
+        {
+            GeomDesc vgd = descs[id];
+            uint vMatId = 0u; uint vFlags = 0u;
+            if (vgd.mat != 0ul) { vMatId = MatIds(vgd.mat).m[prim]; vFlags = mats[vMatId].flags; }
+            if ((vFlags & 4u) != 0u) {
+                float density = mats[vMatId].sunSpecular;
+                float continueT = 0.002; // default: straight past the boundary (back face / deep / empty)
+                if (frontFace && c.b < 2 && density > 0.0) {
+                    vec3 entryPos = hitPos + c.rd * 5e-4;
+                    float marchDist = traceVolumeExit(entryPos, c.rd, id);
+                    // Geometry INSIDE the volume clips the march; the next loop iteration then hits
+                    // and shades that surface normally (fog in front of it already accounted).
+                    {
+                        rayQueryEXT irq;
+                        rayQueryInitializeEXT(irq, tlas, gl_RayFlagsOpaqueEXT, 0xFFu, entryPos, 0.001, c.rd, marchDist - 0.001);
+                        while (rayQueryProceedEXT(irq)) {}
+                        if (rayQueryGetIntersectionTypeEXT(irq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+                            uint iId = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(irq, true));
+                            if (iId != id) marchDist = rayQueryGetIntersectionTEXT(irq, true);
+                        }
+                    }
+                    // Decode (byte-identical layout to the C++): anisotropy, absorption, emission,
+                    // blackbody. Direct member reads — no 2204-byte struct copy into registers.
+                    float anisotropy = clamp(mats[vMatId].sunSpecularEXP, -0.99, 0.99);
+                    vec3 scatterCol = vec3(mats[vMatId].baseR, mats[vMatId].baseG, mats[vMatId].baseB);
+                    vec3 absorbCol = vec3(uintBitsToFloat(mats[vMatId].nodeVmCode[2].x),
+                                          uintBitsToFloat(mats[vMatId].nodeVmCode[2].y),
+                                          uintBitsToFloat(mats[vMatId].nodeVmCode[2].z));
+                    float emStrength = uintBitsToFloat(mats[vMatId].nodeVmCode[2].w);
+                    vec3 emColor = vec3(uintBitsToFloat(mats[vMatId].nodeVmCode[3].x),
+                                        uintBitsToFloat(mats[vMatId].nodeVmCode[3].y),
+                                        uintBitsToFloat(mats[vMatId].nodeVmCode[3].z));
+                    float temperature = uintBitsToFloat(mats[vMatId].nodeVmCode[3].w);
+                    float blackbody = uintBitsToFloat(mats[vMatId].nodeVmCode[4].x);
+
+                    if ((vFlags & 16u) != 0u) {
+                        // Heterogeneous (noise-driven smoke): fixed-step march with the exported
+                        // noise chain. Radiance goes straight to c.L (never into SHARC).
+                        mat4x3 vw2o = invertAffine(o2w);
+                        marchVolumeHetero(entryPos, c.rd, marchDist, vw2o, vMatId,
+                                          scatterCol, absorbCol, density, anisotropy,
+                                          emColor, emStrength, temperature, blackbody,
+                                          rng, c.L, c.tp);
+                    } else {
+                        // Homogeneous (analytic, no stepping). In-scatter: ONE stochastic scatter
+                        // point, distance-sampled proportional to transmittance (the closed-form
+                        // (1-T)/sigma_t weight is the matching estimator) — the sun-shadow boundary
+                        // becomes noise the accumulation/DLSS smooths instead of a razor-hard cut.
+                        vec3 sigma_s, sigma_a, sigma_t;
+                        computeVolumeCoefficients(scatterCol, absorbCol, density, sigma_s, sigma_a, sigma_t);
+                        vec3 T = exp(-sigma_t * marchDist);
+                        vec3 invSigmaT = vec3(1.0) / max(sigma_t, vec3(1e-4));
+                        float sBar = max(dot(sigma_t, vec3(1.0 / 3.0)), 1e-4);
+                        float tS = -log(1.0 - rnd(rng) * (1.0 - exp(-sBar * marchDist))) / sBar;
+                        vec3 samplePos = entryPos + c.rd * clamp(tS, 0.0, marchDist);
+                        vec3 L_in = volumeDirectAt(samplePos, c.rd, anisotropy, rng);
+                        vec3 inscatter = sigma_s * L_in * (vec3(1.0) - T) * invSigmaT;
+
+                        // Volume emission (+ approximate blackbody — Planck-exact comes in P2).
+                        vec3 volEmission = vec3(0.0);
+                        if (emStrength > 0.0) volEmission = emColor * emStrength * (vec3(1.0) - T) * invSigmaT;
+                        if (blackbody > 0.0 && temperature > 0.0) {
+                            float bbPower = blackbody * 5.67e-8 * temperature * temperature * temperature * temperature * 1e-12;
+                            vec3 bbColor = vec3(1.0, clamp((temperature - 1000.0) / 5000.0, 0.0, 1.0),
+                                                clamp((temperature - 3000.0) / 7000.0, 0.0, 1.0));
+                            volEmission += bbColor * bbPower * (vec3(1.0) - T) * invSigmaT;
+                        }
+
+                        // Direct to c.L — deliberately NOT into SHARC (a volume event has no surface
+                        // position/normal; caching it would poison neighbouring cells).
+                        c.L += c.tp * (inscatter + volEmission);
+                        c.tp *= T;
+                    }
+                    continueT = max(marchDist - 1e-3, 0.002); // continue from just before the exit/inner hit
+                    c.ro = entryPos;
+                } else {
+                    c.ro = hitPos;
+                }
+                c.ro += c.rd * continueT;
+                if (++c.glassBounces >= 32) return false;
+                continue;
+            }
+        }
 
         // Stochastic transparent passthrough (Cycles Transparent BSDF / architectural glass): a
         // Transparent-weighted surface passes light straight through with no refraction.
