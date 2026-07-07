@@ -613,6 +613,7 @@ pub struct Renderer {
     shared_write_idx: u32,
     shared_ready: bool,
     shared_blitted: bool,     // at least one frame landed in a shared buffer
+    render_pending: bool,     // a pipelined render is in flight (fence not yet waited)
     gl_generation: u64,       // identifies this renderer instance to gl_interop
 
     // Core (destroyed last).
@@ -951,8 +952,9 @@ pub fn draw_gl(viewport_w: u32, viewport_h: u32) -> bool {
 }
 
 pub fn readback(out: *mut f32, pixel_count: u32) -> bool {
-    match RENDERER.lock().unwrap().as_ref() {
+    match RENDERER.lock().unwrap().as_mut() {
         Some(r) => {
+            r.0.wait_render_pending(); // a pipelined frame may still be writing the readback buffer
             r.0.copy_to(out, pixel_count as usize);
             true
         }
@@ -2222,6 +2224,7 @@ fn build(width: u32, height: u32) -> Result<Renderer, String> {
         shared_write_idx: 0,
         shared_ready: false,
         shared_blitted: false,
+        render_pending: false,
         gl_generation: GL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         allocator: Some(allocator),
         command_pool,
@@ -2274,6 +2277,7 @@ impl Renderer {
     }
 
     fn flush_mesh_batch(&mut self) -> i32 {
+        self.wait_render_pending(); // shares cmd/fence with the pipelined render
         if self.accel_ext.is_none() {
             log("flush_mesh_batch: RT not supported, skipping BLAS build");
             self.queued.clear();
@@ -2378,6 +2382,7 @@ impl Renderer {
     }
 
     fn set_materials(&mut self, bytes: &[u8]) {
+        self.wait_render_pending(); // the in-flight frame reads this buffer
         if bytes.is_empty() || self.accel_ext.is_none() {
             return;
         }
@@ -2491,6 +2496,7 @@ impl Renderer {
     }
 
     fn set_lights(&mut self, floats: &[f32], count: u32) {
+        self.wait_render_pending(); // the in-flight frame reads this buffer
         // The addon re-sends lights every frame; skip work + accumulation reset if unchanged.
         if count == self.light_count && floats == self.light_data.as_slice() {
             return;
@@ -2582,6 +2588,7 @@ impl Renderer {
 
     /// Upload the OCIO view-transform LUT as a 3D texture (RGB -> RGBA) bound at binding 7.
     fn set_lut(&mut self, data: &[f32], size: u32) {
+        self.wait_render_pending(); // shares cmd/fence with the pipelined render
         if self.accel_ext.is_none() || size < 2 {
             return;
         }
@@ -2706,6 +2713,7 @@ impl Renderer {
 
     /// Upload one pending texture (front of the queue) to the GPU. Returns false when empty.
     fn upload_one_texture(&mut self) -> bool {
+        self.wait_render_pending(); // shares cmd/fence with the pipelined render
         if self.pending_tex.is_empty() {
             return false;
         }
@@ -2820,6 +2828,7 @@ impl Renderer {
     /// accumulator; the live sync skips it in DLSS-RR mode, where the motion vectors carry the object
     /// motion so the denoiser need not reset. Also refreshes the motion-vector transform snapshot.
     fn rebuild_tlas(&mut self, reset_accum: bool) -> bool {
+        self.wait_render_pending(); // shares cmd/fence with the pipelined render
         let accel = match self.accel_ext.clone() {
             Some(a) => a,
             None => return false,
@@ -2929,6 +2938,7 @@ impl Renderer {
     /// geometry or materials. This was a no-op stub before — moving an object only updated on the next
     /// full build_tlas (i.e. after deselecting), so the render appeared frozen mid-drag.
     fn update_instance_transforms(&mut self, indices: &[u32], transforms: &[f32]) -> bool {
+        self.wait_render_pending(); // shares cmd/fence with the pipelined render
         if self.tlas_instance_data.is_empty() {
             return false;
         }
@@ -3008,6 +3018,7 @@ impl Renderer {
     /// re-allocate the guide buffers at the new trace resolution, rebind them, and recreate the NGX
     /// feature. Triggered live from render() when the addon changes the DLSS settings.
     fn reinit_dlss(&mut self, quality: i32) {
+        self.wait_render_pending(); // shares cmd/fence with the pipelined render
         self.dlss_quality = quality;
         if self.rr.is_none() || self.guide.is_none() {
             return;
@@ -3125,7 +3136,39 @@ impl Renderer {
         log(&format!("DLSS re-init: trace {tw}x{th} -> display {dw}x{dh} (q={quality})"));
     }
 
+    /// Complete the in-flight pipelined frame, if any: wait its fence, publish its shared buffer
+    /// (the ping-pong swap), and record the wait as the "gpu wait" metric (~0 means the render
+    /// fully overlapped Blender's between-frame gap). MUST run before any use of self.cmd /
+    /// self.fence (submit_oneshot resets both) and before any write to GPU-visible buffers —
+    /// that is why every mutating entry point calls this first.
+    fn wait_render_pending(&mut self) {
+        if !self.render_pending {
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        unsafe {
+            let _ = self.device.wait_for_fences(&[self.fence], true, u64::MAX);
+        }
+        self.render_pending = false;
+        if self.shared_ready {
+            self.shared_write_idx ^= 1; // publish the completed buffer to draw_gl
+            self.shared_blitted = true;
+        }
+        let ms = t0.elapsed().as_secs_f32() * 1000.0;
+        self.ft_ema = if self.ft_ema <= 0.0 { ms } else { self.ft_ema * 0.9 + ms * 0.1 };
+        self.ft_count = self.ft_count.wrapping_add(1);
+        if self.ft_count % 60 == 0 {
+            log(&format!(
+                "gpu wait: {:.2} ms (pipelined; ~0 = render fully overlaps the viewport gap), SER {}",
+                self.ft_ema,
+                if self.ser { "on" } else { "off" }
+            ));
+        }
+    }
+
     fn render(&mut self) {
+        // Pipelining: finish the previous frame before touching cmd/fence or GPU state.
+        self.wait_render_pending();
         // Live DLSS quality / RR-enable change: re-init the DLSS pipeline (re-allocate guides +
         // recreate the NGX feature at the new trace resolution) without reloading geometry.
         if self.rr.is_some() {
@@ -3963,27 +4006,33 @@ impl Renderer {
 
             let _ = d.end_command_buffer(self.cmd);
             let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd));
-            // GPU frame time: render() submits then blocks on the fence, so wall-clock around the
-            // wait ~= GPU work. EMA-smoothed; logged periodically to compare SER on vs off.
             let t0 = std::time::Instant::now();
             let _ = d.queue_submit(self.queue, &[submit], self.fence);
-            let _ = d.wait_for_fences(&[self.fence], true, u64::MAX);
-            // GL interop: this frame's shared buffer is complete — swap so draw_gl reads it
-            // (write_idx ^ 1) while the next frame blits into the other one (tear-free).
-            if self.shared_ready {
-                self.shared_write_idx ^= 1;
-                self.shared_blitted = true;
-            }
-            let ms = t0.elapsed().as_secs_f32() * 1000.0;
-            self.ft_ema = if self.ft_ema <= 0.0 { ms } else { self.ft_ema * 0.9 + ms * 0.1 };
-            self.ft_count = self.ft_count.wrapping_add(1);
-            if self.ft_count % 60 == 0 {
-                log(&format!(
-                    "frame time: {:.2} ms ({:.0} fps), SER {}",
-                    self.ft_ema,
-                    1000.0 / self.ft_ema.max(1e-3),
-                    if self.ser { "on" } else { "off" }
-                ));
+            if self.shared_ready && !crate::gl_interop::is_disabled() {
+                // PIPELINING (needs the zero-copy GL path: no CPU readback of this frame): don't
+                // block — the GPU crunches this frame while Python/Blender spend their ~34ms
+                // between frames (the viewport gap). The NEXT render() — or any GPU-state
+                // mutation, via wait_render_pending() — waits the fence and publishes the shared
+                // buffer. draw_gl meanwhile shows the PREVIOUS completed buffer (ping-pong).
+                self.render_pending = true;
+            } else {
+                // Readback fallback: the CPU is about to read the pixels — stay synchronous.
+                let _ = d.wait_for_fences(&[self.fence], true, u64::MAX);
+                if self.shared_ready {
+                    self.shared_write_idx ^= 1;
+                    self.shared_blitted = true;
+                }
+                let ms = t0.elapsed().as_secs_f32() * 1000.0;
+                self.ft_ema = if self.ft_ema <= 0.0 { ms } else { self.ft_ema * 0.9 + ms * 0.1 };
+                self.ft_count = self.ft_count.wrapping_add(1);
+                if self.ft_count % 60 == 0 {
+                    log(&format!(
+                        "frame time: {:.2} ms ({:.0} fps), SER {}",
+                        self.ft_ema,
+                        1000.0 / self.ft_ema.max(1e-3),
+                        if self.ser { "on" } else { "off" }
+                    ));
+                }
             }
         }
         self.accum_frame = self.accum_frame.wrapping_add(1);
