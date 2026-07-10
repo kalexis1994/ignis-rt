@@ -589,7 +589,12 @@ vec3 shadowT(vec3 o, vec3 d, float tmax) {
                 float seg = min(traceVolumeExit(o + d * (hitT + 5e-4), d, id), tmax - hitT);
                 vec3 ss, sa, st;
                 volumeCoeffsFor(matId, ss, sa, st);
-                T *= exp(-st * max(seg, 0.0));
+                // Heterogeneous (noise) volumes: the shadow segment can't afford the noise march,
+                // but using the CONSTANT density over-extinguishes exponentially — the fBM chain
+                // averages ~0.5 (and the smoke has holes). Scale the optical depth accordingly,
+                // or a room fog silently ate all NEE light (everything shadow-occluded).
+                float densScale = ((mFlags & 16u) != 0u) ? 0.5 : 1.0;
+                T *= exp(-st * densScale * max(seg, 0.0));
                 if (max(T.r, max(T.g, T.b)) < 1e-3) return vec3(0.0);
             }
             t0 = hitT + 0.001;
@@ -1472,7 +1477,7 @@ vec3 volumeDirectAt(vec3 samplePos, vec3 rd, float anisotropy, inout uint rng) {
         vec3 sDir = normalize(pc.sunDir.xyz);
         vec3 sVis = shadowT(samplePos, sDir, 10000.0);
         if (sVis != vec3(0.0)) {
-            L_in += pc.sunCol.rgb * min(pc.sunDir.w, 4.0)
+            L_in += pc.sunCol.rgb * pc.sunDir.w
                   * henyeyGreensteinPhase(dot(rd, sDir), anisotropy) * sVis;
         }
     }
@@ -1490,9 +1495,17 @@ vec3 volumeDirectAt(vec3 samplePos, vec3 rd, float anisotropy, inout uint rng) {
             spotAtten = tSpot * tSpot * (3.0 - 2.0 * tSpot);
             if (spotAtten <= 0.0) continue;
         }
+        float vAreaFactor = 1.0;
+        bool vIsArea = (VL.posRange.w < 0.0) && (VL.tanSizeY.w >= 0.0);
+        if (vIsArea) {
+            // Same Cycles area estimator as directShade: ×A ×cosθ_e, one-sided.
+            float cosE = dot(-lDir, VL.dirSizeX.xyz);
+            if (cosE <= 0.0) continue;
+            vAreaFactor = cosE * abs(VL.dirSizeX.w * VL.tanSizeY.w);
+        }
         vec3 lVis = shadowT(samplePos, lDir, ld - 0.01);
         if (lVis == vec3(0.0)) continue;
-        L_in += VL.colInt.rgb * VL.colInt.w * spotAtten
+        L_in += VL.colInt.rgb * VL.colInt.w * spotAtten * vAreaFactor
               * henyeyGreensteinPhase(dot(rd, lDir), anisotropy) * lVis / (ld * ld + 1e-3);
     }
     // Emissive triangles (mesh lamps), one NEE sample.
@@ -1502,7 +1515,7 @@ vec3 volumeDirectAt(vec3 samplePos, vec3 rd, float anisotropy, inout uint rng) {
             vec3 toE = ves.position - samplePos;
             float eD = length(toE);
             vec3 eDir = toE / max(eD, 1e-4);
-            float eCos = dot(-eDir, ves.normal);
+            float eCos = abs(dot(-eDir, ves.normal)); // double-sided (Cycles mesh emission)
             if (eCos > 0.0 && eD > 0.01) {
                 vec3 eVis = shadowT(samplePos, eDir, eD - 0.01);
                 if (eVis != vec3(0.0)) {
@@ -1668,7 +1681,8 @@ vec3 directShade(vec3 hitPos, vec3 N, vec3 geoN, vec3 V, vec3 diffAlbedo, vec3 F
     if (ndl > 0.0) {
         vec3 sVis = shadowT(o, sunDir, 10000.0); // volume-aware: fog attenuates instead of hard-blocking
         if (sVis != vec3(0.0)) {
-            vec3 Li = pc.sunCol.rgb * min(pc.sunDir.w, 4.0);
+            vec3 Li = pc.sunCol.rgb * pc.sunDir.w; // full sun irradiance — Cycles doesn't cap it; the
+                                                   // old min(...,4.0) crushed sun/shadow contrast
             sum += brdf(N, V, sunDir, diffAlbedo, F0, alpha) * Li * ndl * sVis;
         }
     }
@@ -1717,9 +1731,19 @@ vec3 directShade(vec3 hitPos, vec3 N, vec3 geoN, vec3 V, vec3 diffAlbedo, vec3 F
         vec3 Ldir = toL / max(dist, 1e-4);
         float nl = max(dot(N, Ldir), 0.0);
         if (nl <= 0.0) continue;
+        float areaFactor = 1.0;
+        if (isArea) {
+            // Cycles area-light estimator: contribution = L·A·cosθ_e/d² — the uniform-rect pdf is
+            // 1/A (×A) and the panel emits ONE-SIDED Lambert (×cosθ_e, reject behind). Without ×A
+            // every fixture under 1m² was 1/A too bright (0.3m panel ≈ 11×); without cosθ_e it lit
+            // at full strength sideways; without the facing test it lit things BEHIND the panel.
+            float cosE = dot(-Ldir, L.dirSizeX.xyz);
+            if (cosE <= 0.0) continue;
+            areaFactor = cosE * abs(L.dirSizeX.w * L.tanSizeY.w);
+        }
         vec3 lVis = shadowT(o, Ldir, dist - 0.01);
         if (lVis == vec3(0.0)) continue;
-        vec3 Li = L.colInt.rgb * L.colInt.w * spotAtten / (dist*dist + 1e-3);
+        vec3 Li = L.colInt.rgb * L.colInt.w * spotAtten * areaFactor / (dist*dist + 1e-3);
         sum += brdf(N, V, Ldir, diffAlbedo, F0, alpha) * Li * nl * lVis;
     }
     // Emissive triangle NEE (area lights from geometry), power-importance-sampled with a power-
@@ -1733,7 +1757,10 @@ vec3 directShade(vec3 hitPos, vec3 N, vec3 geoN, vec3 V, vec3 diffAlbedo, vec3 F
             float eDist = length(toE);
             vec3 eDir = toE / max(eDist, 1e-4);
             float eNdotL = max(dot(N, eDir), 0.0);
-            float eCos = dot(-eDir, es.normal); // emitter facing the shading point
+            // DOUBLE-SIDED emitter cosine: Cycles mesh emission emits from BOTH faces. The old
+            // one-sided dot() rejected every sample whose triangle normal faced away — a lamp
+            // or window-portal mesh with normals pointing "outward" cast NO light at all.
+            float eCos = abs(dot(-eDir, es.normal));
             if (eNdotL > 0.0 && eCos > 0.0 && eDist > 0.01) {
                 vec3 eVis = shadowT(o, eDir, eDist - 0.01);
                 if (eVis != vec3(0.0)) {
@@ -1914,6 +1941,23 @@ void writeGuidePSR(uvec2 p, vec3 ro, vec3 rd,
 }
 
 
+// Diagnostic: paint the emissive-NEE chain state instead of rendering (set true + deploy, read
+// the viewport as a false-colour map: WHITE=emissive surface, GREEN∝light, BLUE∝occluded,
+// PURPLE∝facing away, YELLOW=broken pdf). Found the 256-tri emissive cap bug.
+const bool DEBUG_EMISSIVE = false;
+
+// Cycles-style indirect clamp (integrator sample_clamp_indirect, default 30): per-CONTRIBUTION,
+// hue-preserving (scales the RGB sum down), applied only past the first bounce — direct light is
+// NEVER clamped (integrator.cpp:310, light_passes.h:126). Replaces the old whole-sample
+// per-channel min(L,16), which both kept 1.6-3x more indirect energy than Cycles AND turned every
+// bright COLOURED contribution grey (e.g. a warm (40,8,2) lamp bounce became (16,8,2)) — a big
+// part of the brighter/desaturated/flatter mismatch vs Cycles.
+vec3 clampIndirect(vec3 v, int bounce) {
+    if (bounce == 0) return v;
+    float s = v.r + v.g + v.b;
+    return (s > 30.0) ? v * (30.0 / s) : v;
+}
+
 // ── Path tracer core, factored for both the megakernel and the wavefront ────────────────────────
 // PathCtx carries everything that must survive between bounces. The megakernel keeps it in locals
 // (tracePath loops traceBounce); the wavefront serializes it to the PathState buffer and calls
@@ -1955,7 +1999,7 @@ bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng,
             if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
                 if (DEBUG_PATH && c.b == 0) { c.L = vec3(0.0, 0.0, 1.0); return false; } // blue = sky
                 // Add the sky unless reached by a diffuse bounce while env NEE is active (avoids double count).
-                if (c.b == 0 || !c.lastDiffuse || envDist.data[0] <= 0.0) c.L += c.tp * sky(c.rd);
+                if (c.b == 0 || !c.lastDiffuse || envDist.data[0] <= 0.0) c.L += clampIndirect(c.tp * sky(c.rd), c.b);
                 if (sharcUpdate && pc.sharcCapacity > 0u) SharcUpdateMiss(sharc, sky(c.rd));
                 return false;
             }
@@ -2119,7 +2163,7 @@ bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng,
             && thit > sharcVoxelSize(sharcGetLevel(hitPos, sharcG), sharcG)) {
             vec3 cached;
             if (SharcGetCachedRadiance(sharcG, hitPos, N, pc.sharcCapacity, cached)) {
-                c.L += c.tp * cached; // use the cached outgoing radiance + terminate the path
+                c.L += clampIndirect(c.tp * cached, c.b); // cached outgoing radiance (always indirect) + terminate
                 return false;
             }
         }
@@ -2130,7 +2174,7 @@ bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng,
         // vertex's (now-unweighted) emissive NEE; adding the forward term too double-counts it (lamps +
         // their bounce light were up to ~2x too bright, washing the scene). Mirrors the env diffuse-skip.
         if (c.b == 0u || pc.emissiveCount == 0u) {
-            c.L += c.tp * emission;
+            c.L += clampIndirect(c.tp * emission, c.b);
         }
 
         // Transmissive surfaces have no Lambertian lobe.
@@ -2152,9 +2196,47 @@ bool traceBounce(inout PathCtx c, float spreadAngle, inout uint rng,
         c.pathRough = max(c.pathRough, roughness);
         float alpha = max(regRough * regRough, 1e-3);
 
+        // ── DEBUG_EMISSIVE v2: 16-sample false-colour map of the emissive-NEE chain ──
+        // WHITE = this surface itself is emissive (in the renderer's set!) | RED = zero triangles |
+        // GREEN ∝ real emissive light arriving | BLUE ∝ fraction shadow-occluded |
+        // PURPLE ∝ fraction facing away | YELLOW ∝ fraction with broken pdf.
+        if (DEBUG_EMISSIVE && c.b == 0) {
+            vec3 dbg = vec3(0.0);
+            if (pc.emissiveCount == 0u) {
+                dbg = vec3(1.0, 0.0, 0.0);
+            } else if (dot(emission, vec3(1.0)) > 0.0) {
+                dbg = vec3(1.0); // WHITE: the renderer sees THIS mesh as emissive
+            } else {
+                vec3 so = hitPos + geoN * 0.002;
+                vec3 lightSum = vec3(0.0);
+                float occ = 0.0, away = 0.0, badPdf = 0.0;
+                const int NDBG = 16;
+                for (int di = 0; di < NDBG; di++) {
+                    EmissiveSample es = sampleEmissiveTriangle(pc.emissiveCount, rnd(rng), rand2(rng));
+                    if (es.pdf <= 0.0) { badPdf += 1.0; continue; }
+                    vec3 toE = es.position - so;
+                    float eDist = length(toE);
+                    vec3 eDir = toE / max(eDist, 1e-4);
+                    float eNdotL = max(dot(N, eDir), 0.0);
+                    float eCos = abs(dot(-eDir, es.normal));
+                    if (eNdotL <= 0.0) { away += 1.0; continue; }
+                    vec3 eVis = shadowT(so, eDir, eDist - 0.01);
+                    if (eVis == vec3(0.0)) { occ += 1.0; continue; }
+                    lightSum += es.emission * eCos * eNdotL * eVis / max(es.pdf, 1e-6) / (eDist * eDist);
+                }
+                float g = clamp(dot(lightSum, vec3(0.333)) / float(NDBG) * 4.0, 0.0, 1.0);
+                dbg = vec3(0.0, g, 0.0)
+                    + vec3(0.0, 0.0, 0.6) * (occ / float(NDBG))
+                    + vec3(0.5, 0.0, 0.5) * (away / float(NDBG))
+                    + vec3(0.6, 0.6, 0.0) * (badPdf / float(NDBG));
+            }
+            c.L = dbg;
+            return false;
+        }
+
         // Direct lighting (NEE: diffuse + specular glints from sun/lights, soft shadows).
         vec3 directLight = directShade(hitPos, N, geoN, V, diffAlbedo, F0, alpha, c.b, rng);
-        c.L += c.tp * directLight;
+        c.L += clampIndirect(c.tp * directLight, c.b); // b==0 -> direct, never clamped (Cycles)
         // SHARC update: write this voxel's outgoing direct radiance + backpropagate to prior vertices.
         // Only cache diffuse surfaces (glass/specular are view-dependent; the path passes through them).
         if (sharcOn && sharcUpdate && sharcDiffuse) {

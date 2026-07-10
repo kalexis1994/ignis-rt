@@ -1792,7 +1792,9 @@ def export_lights(depsgraph):
         # For normalized point lights: contribution ≈ energy / (π × r²).
         # Our shader applies 1/r² attenuation, so pass energy/π as intensity.
         # Cycles-matching: energy/π with global normalization correction
-        intensity = energy / (math.pi * 10.0)
+        # Cycles radiant intensity = Power/4π (watts over the sphere); the shader applies 1/d².
+        # The old divisor (π·10 ≈ 31.4) was a hand-tuned fudge ~2.5x dimmer than Cycles' 4π.
+        intensity = energy / (4.0 * math.pi)
 
         # Direction and tangent (for area lights)
         # Area light emits along -Z local axis in Blender
@@ -1877,6 +1879,12 @@ def export_lights(depsgraph):
     return lights
 
 
+# Names of materials that exported emissive light (filled by the emissive export; engine.py's
+# view_update checks moved objects against this to know when the NEE buffer needs re-baking —
+# the buffer stores WORLD-SPACE triangles, so a moved lamp's light stays behind otherwise).
+LAST_EMISSIVE_MATS = set()
+
+
 def export_emissive_triangles_fast(depsgraph, unique_meshes, scene_instances, mat_name_to_index):
     """Fast emissive triangle export using already-exported mesh data.
 
@@ -1885,7 +1893,8 @@ def export_emissive_triangles_fast(depsgraph, unique_meshes, scene_instances, ma
 
     Returns a flat list of floats: 16 floats per triangle (max 256 triangles).
     """
-    MAX_EMISSIVE_TRIS = 256
+    MAX_EMISSIVE_TRIS = 4096  # was 256 — a single high-poly lamp shade filled the whole budget
+                              # and every other lamp exported ZERO light (user-visible bug)
     emissive_tris = []
 
     if not unique_meshes or not scene_instances:
@@ -1905,26 +1914,32 @@ def export_emissive_triangles_fast(depsgraph, unique_meshes, scene_instances, ma
             em_strength = 0.0
             if mat.use_nodes and mat.node_tree:
                 for node in mat.node_tree.nodes:
+                    # RESOLVE linked sockets (Blackbody/RGB/ColorRamp chains): reading
+                    # default_value on a linked Emission Color exported WHITE into the NEE
+                    # light buffer. _safe_emission falls back to white if the chain can't
+                    # be evaluated (never kills the lamp).
                     if node.type == 'BSDF_PRINCIPLED':
-                        es = node.inputs.get('Emission Strength')
-                        em_strength = float(es.default_value) if es else 0.0
+                        c_, em_strength = _safe_emission(node.inputs.get('Emission Color'),
+                                                         node.inputs.get('Emission Strength'), 0.0)
                         if em_strength > 0.0:
-                            ec = node.inputs.get('Emission Color')
-                            if ec and hasattr(ec.default_value, '__len__'):
-                                em_color = tuple(float(ec.default_value[i]) for i in range(3))
+                            em_color = c_
                         break
                     elif node.type == 'EMISSION':
-                        s = node.inputs.get('Strength')
-                        c = node.inputs.get('Color')
-                        if s: em_strength = float(s.default_value)
-                        if c: em_color = tuple(float(c.default_value[i]) for i in range(3))
+                        em_color, em_strength = _safe_emission(node.inputs.get('Color'),
+                                                               node.inputs.get('Strength'), 1.0)
                         break
             mat_emission[mat.name] = (em_color, em_strength)
+            if em_strength > 0.0:
+                LAST_EMISSIVE_MATS.add(mat.name)
+                print(f"[ignis-emissive] '{mat.name}': color=({em_color[0]:.3f},{em_color[1]:.3f},{em_color[2]:.3f}) "
+                      f"strength={em_strength:.2f} -> NEE radiance=({em_color[0]*em_strength:.2f},{em_color[1]*em_strength:.2f},{em_color[2]*em_strength:.2f})")
 
     # Process each instance using pre-exported mesh data
     for inst_data in scene_instances:
-        if len(emissive_tris) >= MAX_EMISSIVE_TRIS:
-            break
+        if len(emissive_tris) >= 65536:
+            break  # collection guard only — the power sort below picks the top MAX_EMISSIVE_TRIS;
+                   # breaking at MAX during COLLECTION made the sort useless (object-order truncation:
+                   # lamps late in the scene never even entered the candidate set)
 
         mesh_key = inst_data["mesh_key"]
         if mesh_key not in unique_meshes:
@@ -1973,8 +1988,8 @@ def export_emissive_triangles_fast(depsgraph, unique_meshes, scene_instances, ma
 
         n_slots = len(slot_emission)
         for ti in range(tri_count):
-            if len(emissive_tris) >= MAX_EMISSIVE_TRIS:
-                break
+            if len(emissive_tris) >= 65536:
+                break  # collection guard — the power sort keeps the top MAX_EMISSIVE_TRIS
 
             mat_idx = min(int(tri_mat[ti]), n_slots - 1)
             em_color, em_strength = slot_emission[max(mat_idx, 0)]
@@ -2038,7 +2053,8 @@ def export_emissive_triangles(depsgraph):
     Returns a flat list of floats: 16 floats per triangle (max 256 triangles).
     Layout per tri: [v0.xyz, area, v1.xyz, cdf, v2.xyz, totalPower, emission.rgb, 0]
     """
-    MAX_EMISSIVE_TRIS = 256
+    MAX_EMISSIVE_TRIS = 4096  # was 256 — a single high-poly lamp shade filled the whole budget
+                              # and every other lamp exported ZERO light (user-visible bug)
     emissive_tris = []  # list of (power, [16 floats])
 
     for instance in depsgraph.object_instances:
@@ -2056,13 +2072,11 @@ def export_emissive_triangles(depsgraph):
                 continue
             for node in mat.node_tree.nodes:
                 if node.type == 'BSDF_PRINCIPLED':
-                    es_inp = node.inputs.get('Emission Strength')
-                    if es_inp and float(es_inp.default_value) > 0.0:
+                    if _safe_emission(None, node.inputs.get('Emission Strength'), 0.0)[1] > 0.0:
                         has_emission = True
                         break
                 elif node.type == 'EMISSION':
-                    strength_inp = node.inputs.get('Strength')
-                    if strength_inp and float(strength_inp.default_value) > 0.0:
+                    if _safe_emission(None, node.inputs.get('Strength'), 1.0)[1] > 0.0:
                         has_emission = True
                         break
             if has_emission:
@@ -2097,25 +2111,17 @@ def export_emissive_triangles(depsgraph):
             em_strength = 0.0
             if mat and mat.use_nodes and mat.node_tree:
                 for node in mat.node_tree.nodes:
+                    # Resolve linked emission sockets (Blackbody etc.) with the white fallback
+                    # for unresolvable chains (see _safe_emission / mat_emission).
                     if node.type == 'BSDF_PRINCIPLED':
-                        es_inp = node.inputs.get('Emission Strength')
-                        em_strength = float(es_inp.default_value) if es_inp else 0.0
+                        c_, em_strength = _safe_emission(node.inputs.get('Emission Color'),
+                                                         node.inputs.get('Emission Strength'), 0.0)
                         if em_strength > 0.0:
-                            ec_inp = node.inputs.get('Emission Color')
-                            if ec_inp and hasattr(ec_inp.default_value, '__len__'):
-                                ec = ec_inp.default_value
-                                em_color = (float(ec[0]), float(ec[1]), float(ec[2]))
-                            else:
-                                em_color = (1.0, 1.0, 1.0)
+                            em_color = c_
                         break
                     elif node.type == 'EMISSION':
-                        strength_inp = node.inputs.get('Strength')
-                        color_inp = node.inputs.get('Color')
-                        if strength_inp:
-                            em_strength = float(strength_inp.default_value)
-                        if color_inp:
-                            c = color_inp.default_value
-                            em_color = (float(c[0]), float(c[1]), float(c[2]))
+                        em_color, em_strength = _safe_emission(node.inputs.get('Color'),
+                                                               node.inputs.get('Strength'), 1.0)
                         break
             slot_emission.append((em_color, em_strength))
 
@@ -2155,8 +2161,8 @@ def export_emissive_triangles(depsgraph):
         world_pos_vk[:, 2] *= -1.0
 
         for ti in emissive_indices:
-            if len(emissive_tris) >= MAX_EMISSIVE_TRIS:
-                break
+            if len(emissive_tris) >= 65536:
+                break  # collection guard — the power sort keeps the top MAX_EMISSIVE_TRIS
 
             mat_idx = clamped_mat[ti]
             em_color, em_strength = slot_emission[mat_idx]
@@ -4225,6 +4231,34 @@ def _blackbody_to_rgb(temperature):
     return (r, g, b)
 
 
+def _safe_emission(color_sock, strength_sock, strength_default):
+    """Resolve an emission (color, strength) pair for the NEE light buffer, robustly.
+    Resolves LINKED sockets (Blackbody/RGB/ColorRamp chains) via the _resolve helpers; but a
+    linked chain the resolver can't evaluate (e.g. texture/sky-driven colour) can come back
+    ~black — and black light from a linked socket almost always means 'resolution failed', not
+    artist intent — so fall back to the socket default (the old too-white-but-working
+    behaviour) instead of silently killing the lamp."""
+    try:
+        s = float(_resolve_scalar_input(strength_sock, strength_default))
+    except Exception:
+        try:
+            s = float(strength_sock.default_value) if strength_sock else strength_default
+        except Exception:
+            s = strength_default
+    try:
+        c = tuple(float(v) for v in _resolve_color_input(color_sock, (1.0, 1.0, 1.0))[:3])
+    except Exception:
+        c = (1.0, 1.0, 1.0)
+    if color_sock is not None and getattr(color_sock, 'is_linked', False) and (c[0] + c[1] + c[2]) < 1e-4:
+        dv = getattr(color_sock, 'default_value', None)
+        if dv is not None and hasattr(dv, '__len__'):
+            c = (float(dv[0]), float(dv[1]), float(dv[2]))
+        else:
+            c = (1.0, 1.0, 1.0)
+        print(f"[ignis-emissive] linked colour chain resolved ~black -> falling back to socket default ({c[0]:.2f},{c[1]:.2f},{c[2]:.2f})")
+    return c, s
+
+
 def _resolve_scalar_input(socket, default=0.5, _depth=0):
     """Resolve a scalar socket value, following links recursively."""
     if socket is None or _depth > 8:
@@ -4398,10 +4432,14 @@ def _resolve_color_input(socket, default=(0.8, 0.8, 0.8), _depth=0):
                 max(0, (c[1]-luma)*sat*val + luma),
                 max(0, (c[2]-luma)*sat*val + luma))
 
-    # Sky/procedural textures — can't evaluate per-pixel, use subdued default
-    # Sky textures produce varied colors; average is much dimmer than pure sky blue
+    # Sky/procedural textures — can't evaluate per-pixel; use a representative average.
+    # A clear daytime sky dome averages ~0.3-0.5 luminance (slightly blue). The old
+    # (0.03,0.035,0.05) was ~10x too dim: a sky-driven emission portal (window daylight,
+    # Emission <- ... <- Sky Texture at strength 20) exported almost no NEE light and the
+    # whole room went dark. Cycles evaluates the true shader per-sample; this flat average
+    # is the right order of magnitude + hue for the light such a portal casts.
     if from_node.type in ('TEX_SKY', 'TEX_ENVIRONMENT'):
-        return (0.03, 0.035, 0.05)  # dim sky average
+        return (0.35, 0.42, 0.58)
     if from_node.type in ('TEX_NOISE', 'TEX_VORONOI', 'TEX_MUSGRAVE', 'TEX_CHECKER',
                            'TEX_WAVE', 'TEX_GRADIENT', 'TEX_MAGIC', 'TEX_BRICK'):
         return (0.5, 0.5, 0.5)  # neutral gray for procedurals

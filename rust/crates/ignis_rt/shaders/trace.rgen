@@ -84,9 +84,11 @@ void main() {
         return;
     }
 
-    // Firefly clamp: cap a single sample's radiance so rare bright paths don't dominate
-    // (mild bias, big noise reduction — they converge very slowly otherwise).
-    L = min(L, vec3(16.0));
+    // Firefly control now happens per-contribution inside the path (Cycles-style indirect clamp,
+    // hue-preserving, direct exempt) — the old whole-sample per-channel min(L,16) both kept more
+    // indirect energy than Cycles and desaturated bright coloured samples. Keep fp-safety only.
+    L = mix(L, vec3(0.0), isnan(L));
+    L = clamp(L, vec3(0.0), vec3(65504.0));
 
     // Temporal accumulation: average this frame's estimate into the running sum.
     vec3 accum = (frame == 0u) ? L : imageLoad(accumImage, ivec2(p)).rgb + L;
