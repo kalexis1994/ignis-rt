@@ -433,6 +433,9 @@ _ignis_materials_dirty = False  # need materials-only re-upload (property tweak)
 _ignis_tlas_dirty = False      # need TLAS rebuild only (move/hide/show/delete)
 _ignis_objects_dirty = False   # need FULL transform sync (Scene change, add/remove)
 _ignis_changed_objects = set() # names of individual objects whose transforms changed
+_ignis_lights_dirty = False    # a light object/data changed -> re-export + re-upload lights
+_ignis_emissive_dirty = False  # an emissive mesh moved/changed -> re-bake the NEE triangle buffer
+_ignis_live_dbg_seen = set()   # one-shot debug logging for the live-refresh detection
 _ignis_cached_tlas = []        # [(mesh_key, obj_key, transform), ...] from last full sync
 _ignis_objkey_to_tlas = {}     # obj_key → [indices into _ignis_cached_tlas]
 # Hierarchy cache: parent Empty → child instances (avoids depsgraph iteration)
@@ -553,7 +556,7 @@ def _on_undo_redo(scene, depsgraph=None):
 def _on_depsgraph_update(scene, depsgraph=None):
     """Catch ALL depsgraph changes including modifier property edits.
     Blender doesn't always call RenderEngine.view_update for these."""
-    global _ignis_deformed_meshes, _ignis_changed_objects
+    global _ignis_deformed_meshes, _ignis_changed_objects, _ignis_lights_dirty, _ignis_emissive_dirty
     if _load_stage != LOAD_IDLE or not _ignis_blas_handles:
         return
     if not depsgraph:
@@ -561,8 +564,25 @@ def _on_depsgraph_update(scene, depsgraph=None):
     _needs_redraw = False
     for update in depsgraph.updates:
         uid = update.id
+        if isinstance(uid, bpy.types.Light):
+            _ignis_lights_dirty = True  # light DATA edit (colour/power/size)
         if isinstance(uid, bpy.types.Object):
             _ignis_changed_objects.add(uid.name)
+            # Live light refresh (drags come through THIS handler, not view_update): a moved
+            # light re-exports the light buffer; a moved EMISSIVE mesh re-bakes the NEE
+            # triangle buffer (it stores baked world-space positions).
+            if uid.type == 'LIGHT':
+                _ignis_lights_dirty = True
+            elif uid.type in {'MESH', 'EMPTY', 'CURVE', 'SURFACE', 'META', 'FONT'} and update.is_updated_transform:
+                # A moved emissive mesh must re-bake the NEE buffer (it stores baked WORLD-SPACE
+                # positions). We can't map the grabbed object to an emissive material — lamps are
+                # usually EMPTY-instanced collections, so the emissive mesh never gets its own
+                # transform update. So re-bake on ANY geometry/instancer MOVE when the scene has
+                # emissives; the slow exporter reads live matrices + resolves instances, catching
+                # whatever actually moved. (Coarse but correct; re-bakes on unrelated moves too.)
+                if getattr(scene_export, 'LAST_EMISSIVE_MATS', None):
+                    _ignis_emissive_dirty = True
+                    _needs_redraw = True
             # Only flag for deformation if object has deforming modifiers
             if uid.name in _ignis_blas_handles and update.is_updated_geometry and len(uid.modifiers) > 0:
                 # Filter: only modifiers that ACTUALLY deform geometry at runtime
@@ -1435,6 +1455,12 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 n_emissive = len(emissive_data) // 16
                 dll_wrapper.upload_emissive_triangles(emissive_data, n_emissive)
                 _log(f"Stage FINALIZE: {n_emissive} emissive triangles uploaded")
+                # Self-heal: the fast exporter (cached mesh data) undercounts emissive light in
+                # some scenes (user-observed: undo triggered the SLOW re-bake and the lighting
+                # visibly strengthened to the correct level). Schedule a slow re-bake with live
+                # depsgraph matrices on the first draw.
+                global _ignis_emissive_dirty
+                _ignis_emissive_dirty = True
             except Exception:
                 _log_exception("FINALIZE emissive triangles")
                 _log("Stage FINALIZE: emissive export failed, continuing without MIS")
@@ -1488,7 +1514,7 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
         - Material/NodeTree changed → fast material re-upload
         """
         global _ignis_full_dirty, _ignis_materials_dirty, _ignis_objects_dirty, _ignis_changed_objects
-        global _ignis_deformed_meshes
+        global _ignis_deformed_meshes, _ignis_lights_dirty, _ignis_emissive_dirty
 
         if _load_stage != LOAD_IDLE:
             return
@@ -1510,6 +1536,19 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 if update.is_updated_geometry and uid.name in _ignis_blas_handles:
                     if uid.data:
                         deformed_mesh_names.add(uid.data.name)
+                # Live light refresh: moving a light object must re-export the light buffer, and
+                # moving an EMISSIVE mesh must re-bake the NEE triangle buffer (it stores baked
+                # WORLD-SPACE positions — the visible mesh moves with the TLAS but its light
+                # stayed behind otherwise).
+                if uid.type == 'LIGHT':
+                    _ignis_lights_dirty = True
+                elif uid.type in {'MESH', 'EMPTY', 'CURVE', 'SURFACE', 'META', 'FONT'} and update.is_updated_transform:
+                    # See _on_depsgraph_update: re-bake emissives on any geometry/instancer move
+                    # (lamps are usually EMPTY-instanced collections that never match by material).
+                    if getattr(scene_export, 'LAST_EMISSIVE_MATS', None):
+                        _ignis_emissive_dirty = True
+            elif isinstance(uid, bpy.types.Light):
+                _ignis_lights_dirty = True  # light DATA edit (colour/power/size)
             elif isinstance(uid, bpy.types.Material):
                 has_material_change = True
             elif isinstance(uid, bpy.types.NodeTree):
@@ -1886,6 +1925,25 @@ class IgnisRenderEngine(bpy.types.RenderEngine):
                 _ignis_full_dirty = False
 
         # ── Fast incremental updates (no loading screen needed) ──
+        global _ignis_lights_dirty, _ignis_emissive_dirty
+        if _ignis_lights_dirty:
+            # Live light refresh: cheap (N lights x 16 floats); the Rust setter dedups and
+            # resets the accumulation (RR-aware) only when the data actually changed.
+            _ignis_lights_dirty = False
+            try:
+                _light_data = scene_export.export_lights(depsgraph)
+                dll_wrapper.upload_lights(_light_data, len(_light_data) // 16)
+            except Exception:
+                _log_exception("live light update")
+        if _ignis_emissive_dirty:
+            # Live emissive re-bake: the SLOW exporter reads the CURRENT depsgraph matrices
+            # (the fast one uses transforms cached at load time = stale positions).
+            _ignis_emissive_dirty = False
+            try:
+                _em_data = scene_export.export_emissive_triangles(depsgraph)
+                dll_wrapper.upload_emissive_triangles(_em_data, len(_em_data) // 16)
+            except Exception:
+                _log_exception("live emissive update")
         if _ignis_materials_dirty:
             # Re-export material parameters + Node VM bytecode.
             # Uses existing material/texture index mapping to keep BLAS IDs valid.
